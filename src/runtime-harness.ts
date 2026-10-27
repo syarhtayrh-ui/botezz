@@ -104,7 +104,13 @@ export async function getRuntimeHarness(): Promise<HarnessSingleton> {
     settingsRepo,
   });
 
-  const initialView = controller.startHandler.renderMainMenu();
+  const rawInitialView = controller.startHandler.renderMainMenu({ isAdmin: true });
+  const initialView = await controller.uiState.deliverView({
+    userId: config.TELEGRAM_ADMIN_ID,
+    view: rawInitialView,
+    pendingWorkflow: 'NONE',
+    preferEdit: false,
+  });
 
   const instance: HarnessSingleton = {
     config,

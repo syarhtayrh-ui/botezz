@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import vm from 'node:vm';
 import pino from 'pino';
 import makeWASocket, {
-  useMultiFileAuthState,
+  useMultiFileAuthState as loadMultiFileAuthState,
   DisconnectReason,
   fetchLatestBaileysVersion,
   Browsers,
@@ -562,7 +562,7 @@ export class AthanasiaBaileysSessionDriver implements WhatsAppSessionDriver {
   public async connect(callbacks: ConnectionEventCallbacks): Promise<void> {
     await this.disconnect();
 
-    const { state, saveCreds } = await useMultiFileAuthState(this.authDir);
+    const { state, saveCreds } = await loadMultiFileAuthState(this.authDir);
     let version: [number, number, number] | undefined;
     try {
       const latest = await fetchLatestBaileysVersion();

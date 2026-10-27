@@ -3,7 +3,12 @@ import { TaskManager } from '../../tasks/task-manager';
 import { SettingsRepository } from '../../database/repositories/settings-repository';
 import { AuditRepository } from '../../database/repositories/audit-repository';
 import { BotViewResponse } from '../workflows/pairing-workflow';
-import { buildBackCancelRow } from '../keyboards/main-menu';
+import {
+  buildBackCancelRow,
+  buildAppNavigationRow,
+  InlineKeyboardRows,
+  InlineButtonSpec,
+} from '../keyboards/main-menu';
 import { formatSessionStatusArabic } from '../keyboards/session-menu';
 import { formatRuntime, formatMemory } from './start';
 import {
@@ -108,11 +113,20 @@ export class ToolsHandler {
         [
           {
             text: '⭐ إدارة الاشتراكات',
-            callbackData: 'settings:view_access',
+            callbackData: 'menu:subscriptions:page:1',
           },
-          { text: '🔙 القائمة الرئيسية', callbackData: 'menu:main' },
+          {
+            text: '🛡️ لوحة تحكم المشرف',
+            callbackData: 'menu:admin',
+          },
         ],
+        buildAppNavigationRow({
+          backCallback: 'nav:back',
+          refreshCallback: 'menu:tools',
+        }),
       ],
+      toastText: '🛠️ قائمة الأدوات والفحص المتقدم',
+      route: 'menu:tools',
     };
   }
 
@@ -797,25 +811,35 @@ export class ToolsHandler {
   }
 
   /**
-   * Implements `/ceksender` — detailed inspection of all sessions, sockets, and InMemoryStore stats.
+   * Implements `/ceksender` & Sender Management (`menu:senders:page:<n>`) —
+   * paginated inspection of all sessions, sockets, and InMemoryStore stats.
    */
-  public renderSenderDiagnostics(): BotViewResponse {
+  public renderSenderDiagnostics(page = 1): BotViewResponse {
     const sessions = this.sessionManager.listSessions();
     if (sessions.length === 0) {
       return {
         text:
-          `📱 *فحص مقابس وجلسات الإرسال (/ceksender)*\n\n` +
+          `📱 *إدارة وفحص مقابس وجلسات الإرسال (/ceksender)*\n\n` +
           `لا توجد جلسات مسجلة حالياً. استخدم زر **📲 ربط حساب واتساب** أو الأمر \`/requestpair +966501234567\` لإضافة جلسة.`,
         keyboard: [
-          [
-            { text: '📲 ربط حساب واتساب', callbackData: 'menu:link_account' },
-            { text: '🔙 قائمة الأدوات', callbackData: 'menu:tools' },
-          ],
+          [{ text: '📲 ربط حساب واتساب', callbackData: 'menu:link_account' }],
+          buildAppNavigationRow({
+            backCallback: 'nav:back',
+            refreshCallback: 'menu:senders:page:1',
+          }),
         ],
+        toastText: '📱 لا توجد جلسات مسجلة حالياً',
+        route: 'menu:senders:page:1',
       };
     }
 
-    const lines = sessions.map((sess, idx) => {
+    const pageSize = 4;
+    const totalPages = Math.max(1, Math.ceil(sessions.length / pageSize));
+    const currentPage = Math.min(Math.max(1, page), totalPages);
+    const startIdx = (currentPage - 1) * pageSize;
+    const slice = sessions.slice(startIdx, startIdx + pageSize);
+
+    const lines = slice.map((sess, idx) => {
       let socketSummary = '⚪ المقبس غير نشط في الذاكرة';
       try {
         const drv = this.sessionManager.getDriver(sess.id);
@@ -829,25 +853,65 @@ export class ToolsHandler {
       }
 
       return (
-        `${idx + 1}. *${sess.label}* (\`${sess.id}\`)\n` +
+        `${startIdx + idx + 1}. *${sess.label}* (\`${sess.id}\`)\n` +
         `   📌 الحالة: ${formatSessionStatusArabic(sess.status)}\n` +
         `   📱 الرقم المقنع: \`${sess.masked_phone || 'غير مقترن'}\`\n` +
         `   ${socketSummary}`
       );
     });
 
+    const rows: InlineKeyboardRows = [];
+    for (const sess of slice) {
+      rows.push([
+        {
+          text: `⚙️ إدارة المقبس: ${sess.label} (${sess.id})`,
+          callbackData: `sess:view:${sess.id}`,
+        },
+      ]);
+    }
+
+    if (totalPages > 1) {
+      const navRow: InlineButtonSpec[] = [];
+      if (currentPage > 1) {
+        navRow.push({
+          text: '⬅️ السابق',
+          callbackData: `menu:senders:page:${currentPage - 1}`,
+        });
+      }
+      navRow.push({
+        text: `صفحة ${currentPage}/${totalPages}`,
+        callbackData: `menu:senders:page:${currentPage}`,
+      });
+      if (currentPage < totalPages) {
+        navRow.push({
+          text: 'التالي ➡️',
+          callbackData: `menu:senders:page:${currentPage + 1}`,
+        });
+      }
+      rows.push(navRow);
+    }
+
+    rows.push([
+      { text: '➕ ربط مرسل جديد', callbackData: 'menu:link_account' },
+      { text: '📋 إدارة الجلسات', callbackData: 'menu:sessions:page:1' },
+    ]);
+
+    rows.push(
+      buildAppNavigationRow({
+        backCallback: 'nav:back',
+        refreshCallback: `menu:senders:page:${currentPage}`,
+      })
+    );
+
     return {
       text:
         `📱 *تقرير فحص جلسات ومقابس واتساب (/ceksender)*\n` +
+        `إجمالي المرسلين: *${sessions.length}* (صفحة ${currentPage}/${totalPages})\n` +
         `━━━━━━━━━━━━━━━━━━\n` +
         `${lines.join('\n\n')}`,
-      keyboard: [
-        [
-          { text: '🔄 تحديث الفحص', callbackData: 'tools:ceksender' },
-          { text: '📋 إدارة الجلسات', callbackData: 'menu:sessions:page:1' },
-        ],
-        [{ text: '🔙 قائمة الأدوات', callbackData: 'menu:tools' }],
-      ],
+      keyboard: rows,
+      toastText: `🔌 إدارة المرسلين (صفحة ${currentPage}/${totalPages})`,
+      route: `menu:senders:page:${currentPage}`,
     };
   }
 
@@ -884,10 +948,15 @@ export class ToolsHandler {
       keyboard: [
         [
           { text: '📱 تفاصيل المقابس (/ceksender)', callbackData: 'tools:ceksender' },
-          { text: '🔄 تحديث التقرير', callbackData: 'tools:cekall' },
+          { text: '📡 حالة الجلسات', callbackData: 'menu:session_status' },
         ],
-        [{ text: '🔙 قائمة الأدوات', callbackData: 'menu:tools' }],
+        buildAppNavigationRow({
+          backCallback: 'menu:tools',
+          refreshCallback: 'tools:cekall',
+        }),
       ],
+      toastText: '📊 التقرير الشامل للنظام',
+      route: 'tools:cekall',
     };
   }
 
@@ -908,11 +977,14 @@ export class ToolsHandler {
         `📅 *تاريخ انتهاء الاشتراك:* \`${prem.formattedExpiry}\`\n` +
         `⏳ *مهلة التهدئة الحالية:* \`${cooldownSec} ثانية\``,
       keyboard: [
-        [
-          { text: '📊 التقرير الشامل (/cekall)', callbackData: 'tools:cekall' },
-          { text: '🔙 قائمة الأدوات', callbackData: 'menu:tools' },
-        ],
+        [{ text: '📊 التقرير الشامل (/cekall)', callbackData: 'tools:cekall' }],
+        buildAppNavigationRow({
+          backCallback: 'menu:tools',
+          refreshCallback: 'tools:info',
+        }),
       ],
+      toastText: '🪪 بطاقة معلومات الحساب',
+      route: 'tools:info',
     };
   }
 

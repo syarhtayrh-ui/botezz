@@ -469,3 +469,267 @@ test('Deep /testfunction controls: manual maxSends (/settfmax & UI), inline flag
     await env.cleanup();
   }
 });
+
+test('Stateful Single-Message UI: editMessageText, editMessageReplyMarkup, "message is not modified" handling, fallback on deleted message, and prompt answerCallbackQuery', async () => {
+  const env = createTestEnvironment();
+  try {
+    const adminId = env.config.TELEGRAM_ADMIN_ID;
+
+    // Seed 2 connected sessions
+    const s1 = env.sessionManager.createSession('جلسة 1', adminId);
+    const s2 = env.sessionManager.createSession('جلسة 2', adminId);
+    await env.sessionManager.initiatePairing({
+      sessionId: s1.id,
+      rawPhoneNumber: '+966501112222',
+      actorTelegramId: adminId,
+    });
+    await env.sessionManager.initiatePairing({
+      sessionId: s2.id,
+      rawPhoneNumber: '+966503334444',
+      actorTelegramId: adminId,
+    });
+
+    // Instrumented mock Telegram transport to verify exact grammY behavior
+    const transportCalls = {
+      sentMessages: [] as Array<{ id: number; text: string }>,
+      editedTexts: [] as Array<{ id: number; text: string }>,
+      editedMarkups: [] as Array<{ id: number }>,
+      answeredCallbacks: [] as Array<{ text?: string; showAlert?: boolean }>,
+      simulateNotModifiedOnNextEdit: false,
+      simulateDeletedMessageOnNextEdit: false,
+    };
+    let nextMsgId = 5000;
+
+    const transport = {
+      sendNewMessage: async (text: string) => {
+        nextMsgId += 1;
+        transportCalls.sentMessages.push({ id: nextMsgId, text });
+        return { messageId: nextMsgId };
+      },
+      editMessageText: async (messageId: number, text: string) => {
+        if (transportCalls.simulateNotModifiedOnNextEdit) {
+          transportCalls.simulateNotModifiedOnNextEdit = false;
+          throw new Error('GrammyError: Call to editMessageText failed! (400: Bad Request: message is not modified)');
+        }
+        if (transportCalls.simulateDeletedMessageOnNextEdit) {
+          transportCalls.simulateDeletedMessageOnNextEdit = false;
+          throw new Error('GrammyError: Call to editMessageText failed! (400: Bad Request: message to edit not found)');
+        }
+        transportCalls.editedTexts.push({ id: messageId, text });
+      },
+      editMessageReplyMarkup: async (messageId: number) => {
+        transportCalls.editedMarkups.push({ id: messageId });
+      },
+      answerCallbackQuery: async (opts?: { text?: string; showAlert?: boolean }) => {
+        transportCalls.answeredCallbacks.push(opts || {});
+      },
+    };
+
+    // 1. Initial /start sends the first menu message (#5001)
+    const startView = await env.controller.handleTextMessage(
+      adminId,
+      '/start',
+      undefined,
+      { transport }
+    );
+    assert.equal(transportCalls.sentMessages.length, 1);
+    assert.equal(startView.uiMeta?.deliveryMode, 'NEW_MESSAGE');
+    assert.equal(startView.uiMeta?.activeMessageId, 5001);
+
+    // 2. Pressing a menu button edits message #5001 via editMessageText (does NOT send a new message!)
+    const sessionsView = await env.controller.handleCallbackQuery(
+      adminId,
+      'menu:sessions:page:1',
+      { transport }
+    );
+    assert.equal(transportCalls.sentMessages.length, 1); // Still only 1 message ever sent!
+    assert.equal(transportCalls.editedTexts.length, 1);
+    assert.equal(transportCalls.editedTexts[0].id, 5001);
+    assert.equal(sessionsView.uiMeta?.deliveryMode, 'EDIT_TEXT');
+    assert.equal(sessionsView.uiMeta?.activeMessageId, 5001);
+    assert.equal(transportCalls.answeredCallbacks.length, 1);
+
+    // 3. When only the inline keyboard changes (e.g., toggling session checkboxes in send_text workflow),
+    // editMessageReplyMarkup is used instead of editMessageText!
+    await env.controller.handleCallbackQuery(adminId, 'menu:send_text', {
+      transport,
+    });
+    await env.controller.handleTextMessage(adminId, '+966559990000', undefined, {
+      transport,
+    });
+    await env.controller.handleTextMessage(
+      adminId,
+      'رسالة تجريبية لتحديث الأزرار فقط',
+      undefined,
+      { transport }
+    );
+
+    const beforeMarkupCount = transportCalls.editedMarkups.length;
+    const beforeTextCount = transportCalls.editedTexts.length;
+
+    const toggledView = await env.controller.handleCallbackQuery(
+      adminId,
+      `wf_msg:toggle_sess:${s1.id}`,
+      { transport }
+    );
+    assert.equal(toggledView.uiMeta?.deliveryMode, 'EDIT_MARKUP');
+    assert.equal(transportCalls.editedMarkups.length, beforeMarkupCount + 1);
+    assert.equal(transportCalls.editedTexts.length, beforeTextCount); // Text was NOT re-edited!
+    assert.equal(transportCalls.sentMessages.length, 1); // Still only 1 message!
+
+    // 4. Graceful handling of Telegram's "Bad Request: message is not modified"
+    transportCalls.simulateNotModifiedOnNextEdit = true;
+    const refreshNotModified = await env.controller.handleCallbackQuery(
+      adminId,
+      'nav:refresh',
+      { transport, skipDuplicateCheck: true }
+    );
+    assert.equal(refreshNotModified.uiMeta?.deliveryMode, 'NOT_MODIFIED');
+    assert.equal(transportCalls.sentMessages.length, 1); // Did NOT fall back to sending a duplicate message!
+
+    // 5. Fallback to sending a new message ONLY when existing message cannot be edited (e.g., deleted by user)
+    transportCalls.simulateDeletedMessageOnNextEdit = true;
+    const recoveredView = await env.controller.handleCallbackQuery(
+      adminId,
+      'menu:settings',
+      { transport }
+    );
+    assert.equal(recoveredView.uiMeta?.deliveryMode, 'NEW_MESSAGE');
+    assert.equal(recoveredView.uiMeta?.activeMessageId, 5002);
+    assert.equal(transportCalls.sentMessages.length, 2);
+  } finally {
+    await env.cleanup();
+  }
+});
+
+test('Application-Like Navigation (Back, Home, Refresh), Anti-Double-Tap Deduplication, Workflow Cancellation, and Arbitrary Message Isolation', async () => {
+  const env = createTestEnvironment();
+  try {
+    const adminId = env.config.TELEGRAM_ADMIN_ID;
+
+    // Initialize active menu message via /start
+    const home0 = await env.controller.handleTextMessage(adminId, '/start');
+    assert.equal(home0.uiMeta?.currentRoute, 'menu:main');
+
+    // Navigate: Main Menu -> Settings -> Subscriptions
+    const settingsView = await env.controller.handleCallbackQuery(
+      adminId,
+      'menu:settings'
+    );
+    assert.ok(settingsView.text.includes('إعدادات النظام والأمان'));
+    assert.equal(settingsView.uiMeta?.currentRoute, 'menu:settings');
+    assert.equal(settingsView.uiMeta?.canGoBack, true);
+
+    const subsView = await env.controller.handleCallbackQuery(
+      adminId,
+      'menu:subscriptions:page:1'
+    );
+    assert.ok(subsView.text.includes('إدارة الاشتراكات ومجموعات التفعيل'));
+    assert.equal(subsView.uiMeta?.currentRoute, 'menu:subscriptions:page:1');
+
+    // Press Back (nav:back) -> returns to Settings!
+    const backToSettings = await env.controller.handleCallbackQuery(
+      adminId,
+      'nav:back'
+    );
+    assert.ok(backToSettings.text.includes('إعدادات النظام والأمان'));
+    assert.equal(backToSettings.uiMeta?.currentRoute, 'menu:settings');
+
+    // Press Refresh (nav:refresh) -> refreshes Settings in-place!
+    const refreshedSettings = await env.controller.handleCallbackQuery(
+      adminId,
+      'nav:refresh'
+    );
+    assert.ok(refreshedSettings.text.includes('إعدادات النظام والأمان'));
+    assert.equal(refreshedSettings.toastText, '🔄 تم تحديث البيانات');
+
+    // Press Home (nav:home) -> returns to Main Menu and clears Back history!
+    const backHome = await env.controller.handleCallbackQuery(adminId, 'nav:home');
+    assert.ok(backHome.text.includes('مرحباً بك في لوحة التحكم المركزية'));
+    assert.equal(backHome.uiMeta?.currentRoute, 'menu:main');
+    assert.equal(backHome.uiMeta?.canGoBack, false);
+
+    // Test Repeated Button Taps (Anti-Double-Tap): two rapid identical taps on settings:cycle_cooldown
+    const beforeCooldown = env.settingsRepo.getCooldownSeconds();
+    const [tap1, tap2] = await Promise.all([
+      env.controller.handleCallbackQuery(adminId, 'settings:cycle_cooldown'),
+      env.controller.handleCallbackQuery(adminId, 'settings:cycle_cooldown'),
+    ]);
+    assert.notEqual(tap1.uiMeta?.deliveryMode, 'DUPLICATE_BLOCKED');
+    assert.equal(tap2.uiMeta?.deliveryMode, 'DUPLICATE_BLOCKED');
+    // Cooldown was only cycled ONCE (0 -> 3), not twice!
+    assert.NotEqual?.(env.settingsRepo.getCooldownSeconds(), beforeCooldown);
+    assert.equal(env.settingsRepo.getCooldownSeconds(), 3);
+    // Reset cooldown to 0 for subsequent tests
+    env.settingsRepo.setCooldownSeconds(0);
+
+    // Test Interactive Workflow + Cancellation + Arbitrary Message Isolation
+    const promptSub = await env.controller.handleCallbackQuery(
+      adminId,
+      'sub:prompt_add'
+    );
+    assert.ok(promptSub.text.includes('إضافة اشتراك مميز جديد'));
+    assert.equal(env.controller.getConversationMode(adminId), 'SETTINGS');
+
+    // Cancel workflow via workflow:cancel button
+    const cancelledView = await env.controller.handleCallbackQuery(
+      adminId,
+      'workflow:cancel'
+    );
+    assert.equal(env.controller.getConversationMode(adminId), 'NONE');
+    assert.ok(cancelledView.text.includes('تم إلغاء العملية الحالية'));
+
+    // Now send an arbitrary non-command message while mode === 'NONE':
+    // It must NOT be interpreted as a subscription or phone input!
+    const arbitraryMsgView = await env.controller.handleTextMessage(
+      adminId,
+      '999888777 30'
+    );
+    assert.ok(arbitraryMsgView.text.includes('لا توجد عملية إدخال نصي نشطة حالياً'));
+    assert.equal(env.settingsRepo.listPremiumSubscriptions().length, 0);
+
+    // Test interactive session rename workflow & destructive confirmation dialogs
+    const s1 = env.sessionManager.createSession('الاسم القديم', adminId);
+    const renamePrompt = await env.controller.handleCallbackQuery(
+      adminId,
+      `sess:prompt_rename:${s1.id}`
+    );
+    assert.ok(renamePrompt.text.includes('تحديد اسم الجلسة'));
+    const renamedView = await env.controller.handleTextMessage(
+      adminId,
+      'حساب الدعم الفني الموحد'
+    );
+    assert.ok(renamedView.text.includes('تم تحديث اسم الجلسة بنجاح'));
+    assert.equal(
+      env.sessionManager.getSession(s1.id)?.label,
+      'حساب الدعم الفني الموحد'
+    );
+
+    // Verify all 10 application menus render cleanly without sending extra messages
+    const statusOverview = await env.controller.handleCallbackQuery(
+      adminId,
+      'menu:session_status'
+    );
+    assert.ok(statusOverview.text.includes('لوحة حالة الجلسات الحية'));
+
+    const sendersMenu = await env.controller.handleCallbackQuery(
+      adminId,
+      'menu:senders:page:1'
+    );
+    assert.ok(sendersMenu.text.includes('تقرير فحص جلسات ومقابس واتساب'));
+
+    const adminControls = await env.controller.handleCallbackQuery(
+      adminId,
+      'menu:admin'
+    );
+    assert.ok(adminControls.text.includes('لوحة تحكم المشرف العام'));
+
+    // Every single interaction reused the exact same initial message ID!
+    assert.equal(adminControls.uiMeta?.stats.sentCount, 1);
+    assert.ok((adminControls.uiMeta?.stats.editedTextCount ?? 0) >= 8);
+    assert.ok((adminControls.uiMeta?.stats.callbackAnsweredCount ?? 0) >= 8);
+  } finally {
+    await env.cleanup();
+  }
+});
+

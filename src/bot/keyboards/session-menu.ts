@@ -1,5 +1,9 @@
 import { SessionRecord } from '../../database/repositories/session-repository';
-import { InlineKeyboardRows, InlineButtonSpec } from './main-menu';
+import {
+  InlineKeyboardRows,
+  InlineButtonSpec,
+  buildAppNavigationRow,
+} from './main-menu';
 
 const STATUS_BADGE_ARABIC: Record<SessionRecord['status'], string> = {
   CONNECTED: '🟢 متصل',
@@ -17,7 +21,7 @@ export function formatSessionStatusArabic(status: SessionRecord['status']): stri
 }
 
 /**
- * Builds the Session Management Submenu with pagination and all 8 actions from Section 3.
+ * Builds the Session Management Submenu with pagination and consistent navigation.
  */
 export function buildSessionManagementKeyboard(params: {
   sessions: SessionRecord[];
@@ -69,19 +73,26 @@ export function buildSessionManagementKeyboard(params: {
 
   rows.push([
     { text: '📲 ربط جلسة جديدة', callbackData: 'menu:link_account' },
-    { text: '🔄 تحديث حالة الاتصال', callbackData: `sess:refresh:${currentPage}` },
+    { text: '📡 ملخص حالة الجلسات', callbackData: 'menu:session_status' },
   ]);
 
   rows.push([
     { text: '☑️ تحديد عدة جلسات لعملية', callbackData: 'menu:send_text' },
-    { text: '🔙 القائمة الرئيسية', callbackData: 'menu:main' },
+    { text: '🧹 تنظيف غير المتصل', callbackData: 'sess:confirm_purge_inactive' },
   ]);
+
+  rows.push(
+    buildAppNavigationRow({
+      backCallback: 'nav:back',
+      refreshCallback: `sess:refresh:${currentPage}`,
+    })
+  );
 
   return { rows, totalPages, currentPage };
 }
 
 /**
- * Builds the individual session details action keyboard (reconnect, disconnect, remove, groups).
+ * Builds the individual session details action keyboard (reconnect, disconnect, rename, remove, groups).
  */
 export function buildSessionDetailKeyboard(session: SessionRecord): InlineKeyboardRows {
   const rows: InlineKeyboardRows = [];
@@ -99,10 +110,16 @@ export function buildSessionDetailKeyboard(session: SessionRecord): InlineKeyboa
   }
 
   rows.push([
+    { text: '✏️ تغيير اسم الجلسة', callbackData: `sess:prompt_rename:${session.id}` },
     { text: '🗑️ حذف الجلسة نهائياً', callbackData: `sess:confirm_remove:${session.id}` },
   ]);
 
-  rows.push([{ text: '🔙 رجوع لإدارة الجلسات', callbackData: 'menu:sessions:page:1' }]);
+  rows.push(
+    buildAppNavigationRow({
+      backCallback: 'menu:sessions:page:1',
+      refreshCallback: `sess:view:${session.id}`,
+    })
+  );
   return rows;
 }
 
@@ -148,7 +165,8 @@ export function buildMultiSessionSelectorKeyboard(params: {
   ]);
 
   rows.push([
-    { text: '🔙 رجوع', callbackData: 'menu:main' },
+    { text: '🔙 رجوع', callbackData: 'nav:back' },
+    { text: '🏠 الرئيسية', callbackData: 'menu:main' },
     { text: '❌ إلغاء العملية', callbackData: 'workflow:cancel' },
   ]);
 

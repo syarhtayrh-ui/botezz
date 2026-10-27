@@ -367,3 +367,23 @@ test('Extracted Nebula utilities: invite code, channel links, IPv4/IPv6, URL sho
   assert.equal(stats.cachedMessagesCount, 100); // Capped at 100
   unbind();
 });
+
+test('Role-aware Main Menu keyboard filters privileged admin options for non-admin users', async () => {
+  const { buildMainMenuKeyboard } = await import('../../src/bot/keyboards/main-menu');
+  const adminKb = buildMainMenuKeyboard({ isAdmin: true });
+  const userKb = buildMainMenuKeyboard({ isAdmin: false });
+
+  const adminCallbacks = adminKb.flat().map((b) => b.callbackData);
+  const userCallbacks = userKb.flat().map((b) => b.callbackData);
+
+  assert.ok(adminCallbacks.includes('menu:admin'));
+  assert.ok(adminCallbacks.includes('menu:subscriptions:page:1'));
+  assert.ok(adminCallbacks.includes('menu:settings'));
+  assert.ok(adminCallbacks.includes('menu:audit:page:1'));
+
+  assert.ok(!userCallbacks.includes('menu:admin'));
+  assert.ok(!userCallbacks.includes('menu:subscriptions:page:1'));
+  assert.ok(!userCallbacks.includes('menu:settings'));
+  assert.ok(!userCallbacks.includes('menu:audit:page:1'));
+});
+

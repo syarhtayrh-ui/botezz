@@ -1,4 +1,7 @@
-import { buildMainMenuKeyboard } from '../keyboards/main-menu';
+import {
+  buildMainMenuKeyboard,
+  buildAppNavigationRow,
+} from '../keyboards/main-menu';
 import { BotViewResponse } from '../workflows/pairing-workflow';
 import { SessionManager } from '../../whatsapp/session-manager';
 import { TaskManager } from '../../tasks/task-manager';
@@ -29,7 +32,11 @@ export class StartHandler {
     private readonly taskManager: TaskManager
   ) {}
 
-  public renderMainMenu(): BotViewResponse {
+  public renderMainMenu(options?: {
+    isAdmin?: boolean;
+    noticeBanner?: string;
+  }): BotViewResponse {
+    const isAdmin = options?.isAdmin ?? true;
     const sessions = this.sessionManager.listSessions();
     const connectedCount = sessions.filter(
       (s) => s.status === 'CONNECTED' || s.status === 'AUTHENTICATED'
@@ -37,11 +44,65 @@ export class StartHandler {
 
     return {
       text:
+        (options?.noticeBanner ? `${options.noticeBanner}\n━━━━━━━━━━━━━━━━━━\n` : '') +
         `👋 *مرحباً بك في لوحة التحكم المركزية لجلسات واتساب*\n\n` +
         `📱 إجمالي الجلسات المسجلة: *${sessions.length}* (المتصل منها: *${connectedCount}*)\n` +
         `⏱️ مدة التشغيل: \`${formatRuntime()}\` | الذاكرة: \`${formatMemory()}\`\n` +
         `⚡ اختر العملية المطلوبة من القائمة التفاعلية أدناه:`,
-      keyboard: buildMainMenuKeyboard(),
+      keyboard: buildMainMenuKeyboard({ isAdmin }),
+      toastText: '🏠 القائمة الرئيسية',
+      route: 'menu:main',
+    };
+  }
+
+  public renderAdminControls(): BotViewResponse {
+    const sessions = this.sessionManager.listSessions();
+    const connectedCount = sessions.filter(
+      (s) => s.status === 'CONNECTED' || s.status === 'AUTHENTICATED'
+    ).length;
+    const inactiveCount = sessions.length - connectedCount;
+    const stats = this.taskManager.getRunnerStats();
+
+    return {
+      text:
+        `🛡️ *لوحة تحكم المشرف العام (Admin Controls)*\n` +
+        `━━━━━━━━━━━━━━━━━━\n` +
+        `📱 *الجلسات:* ${connectedCount} متصلة / ${inactiveCount} غير متصلة\n` +
+        `🔄 *المهام المتزامنة:* ${stats.active}/${stats.max} نشطة (${stats.queued} في الطابور)\n` +
+        `⏱️ *مدة التشغيل:* \`${formatRuntime()}\` | *الذاكرة:* \`${formatMemory()}\`\n\n` +
+        `اختر الإجراء الإداري المطلوب:`,
+      keyboard: [
+        [
+          { text: '📊 مراقبة المهام الجارية', callbackData: 'menu:tasks:page:1' },
+          { text: '📜 سجل النشاط الأمني', callbackData: 'menu:audit:page:1' },
+        ],
+        [
+          {
+            text: '⭐ إدارة الاشتراكات (Premium)',
+            callbackData: 'menu:subscriptions:page:1',
+          },
+          { text: '⚙️ إعدادات النظام والحماية', callbackData: 'menu:settings' },
+        ],
+        [
+          {
+            text: '🧪 مختبر الدوال (/testfunction)',
+            callbackData: 'tools:prompt_testfunction',
+          },
+          { text: '📊 التقرير الشامل (/cekall)', callbackData: 'tools:cekall' },
+        ],
+        [
+          {
+            text: `🧹 تنظيف الجلسات غير المتصلة (${inactiveCount})`,
+            callbackData: 'sess:confirm_purge_inactive',
+          },
+        ],
+        buildAppNavigationRow({
+          backCallback: 'nav:back',
+          refreshCallback: 'menu:admin',
+        }),
+      ],
+      toastText: '🛡️ لوحة تحكم المشرف',
+      route: 'menu:admin',
     };
   }
 
@@ -57,8 +118,8 @@ export class StartHandler {
 
     return {
       text:
-        `ℹ️ *المساعدة وحالة النظام (System Health)*\n\n` +
-        `🟢 *حالة التطبيق:* يعمل بشكل سليم\n` +
+        `ℹ️ *المساعدة وحالة النظام (Help & System Status)*\n\n` +
+        `🟢 *حالة التطبيق:* يعمل بشكل سليم (واجهة الرسالة التفاعلية الموحدة)\n` +
         `🤖 *واجهة تيليجرام:* متصلة ومحمية بقائمة السماح (Allowlist)\n` +
         `📱 *الجلسات المتصلة:* ${connectedCount} | *غير المتصلة:* ${disconnectedCount}\n` +
         `🔄 *المهام الجارية حالياً:* ${stats.active} (الحد الأقصى المتزامن: ${stats.max})\n` +
@@ -70,14 +131,16 @@ export class StartHandler {
         `تعتمد هذه المنصة على مكتبة Athanasia Baileys (\`athanasia-baileys@1.0.0\`) كبروتوكول غير رسمي لواتساب ويب. قد تخضع الحسابات لقيود المنصة أو انتهاء صلاحية الجلسات عند تغيير البروتوكول.`,
       keyboard: [
         [
-          { text: '📱 فحص المقابس (/ceksender)', callbackData: 'tools:ceksender' },
+          { text: '🔌 إدارة المرسلين (/ceksender)', callbackData: 'menu:senders:page:1' },
           { text: '📊 التقرير الشامل (/cekall)', callbackData: 'tools:cekall' },
         ],
-        [
-          { text: '🔄 تحديث حالة النظام', callbackData: 'menu:help_status' },
-          { text: '🔙 القائمة الرئيسية', callbackData: 'menu:main' },
-        ],
+        buildAppNavigationRow({
+          backCallback: 'nav:back',
+          refreshCallback: 'menu:help_status',
+        }),
       ],
+      toastText: 'ℹ️ المساعدة وحالة النظام',
+      route: 'menu:help_status',
     };
   }
 }

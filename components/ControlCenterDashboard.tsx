@@ -23,6 +23,29 @@ export interface InlineButtonSpec {
 export interface BotViewResponse {
   text: string;
   keyboard: InlineButtonSpec[][];
+  toastText?: string;
+  showAlert?: boolean;
+  route?: string;
+  uiMeta?: {
+    deliveryMode:
+      | 'EDIT_TEXT'
+      | 'EDIT_MARKUP'
+      | 'NOT_MODIFIED'
+      | 'NEW_MESSAGE'
+      | 'DUPLICATE_BLOCKED';
+    activeMessageId: number;
+    currentRoute: string;
+    canGoBack: boolean;
+    pendingWorkflow: string;
+    stats: {
+      sentCount: number;
+      editedTextCount: number;
+      editedMarkupCount: number;
+      notModifiedCount: number;
+      duplicateBlockedCount: number;
+      callbackAnsweredCount: number;
+    };
+  };
 }
 
 export interface SessionRecord {
@@ -410,6 +433,44 @@ export default function ControlCenterDashboard({
               {/* Bot Message Screen & Inline Keyboard Buttons */}
               <div className="p-6 flex-1 flex flex-col justify-between space-y-6 bg-slate-950/60">
                 <div className="space-y-4">
+                  {/* Single-Message Application State & Callback Feedback Bar */}
+                  <div className="px-3.5 py-2 rounded-lg border border-slate-800/90 bg-slate-900/80 flex flex-wrap items-center justify-between gap-3 text-xs tabular-nums">
+                    <div className="flex flex-wrap items-center gap-3 text-slate-300">
+                      <span>
+                        معرف الرسالة الثابتة:{' '}
+                        <strong dir="ltr" className="text-sky-300">
+                          #{data.botView.uiMeta?.activeMessageId ?? 1001}
+                        </strong>
+                      </span>
+                      <span aria-hidden="true">·</span>
+                      <span>
+                        نمط التحديث:{' '}
+                        <strong dir="ltr" className="text-emerald-300">
+                          {data.botView.uiMeta?.deliveryMode === 'EDIT_MARKUP'
+                            ? 'editMessageReplyMarkup'
+                            : data.botView.uiMeta?.deliveryMode === 'EDIT_TEXT'
+                              ? 'editMessageText'
+                              : data.botView.uiMeta?.deliveryMode === 'NOT_MODIFIED'
+                                ? 'notModified (Cached)'
+                                : 'Single-Message Active'}
+                        </strong>
+                      </span>
+                      <span aria-hidden="true">·</span>
+                      <span>
+                        التعديلات الفورية:{' '}
+                        <strong className="text-white">
+                          {(data.botView.uiMeta?.stats.editedTextCount ?? 0) +
+                            (data.botView.uiMeta?.stats.editedMarkupCount ?? 0)}
+                        </strong>
+                      </span>
+                    </div>
+                    {data.botView.toastText && (
+                      <div className="text-sky-300 font-medium truncate max-w-xs">
+                        🔔 {data.botView.toastText}
+                      </div>
+                    )}
+                  </div>
+
                   {/* Message Bubble */}
                   <div className="p-5 rounded-lg border border-slate-800 bg-slate-900 text-sm leading-relaxed whitespace-pre-wrap text-slate-100 tabular-nums">
                     {data.botView.text}

@@ -148,8 +148,14 @@ export class TasksHandler {
               ]
             : []),
         ],
-        [{ text: '🔙 القائمة الرئيسية', callbackData: 'menu:main' }],
+        [
+          { text: '🔙 رجوع', callbackData: 'nav:back' },
+          { text: '🔄 تحديث', callbackData: `menu:audit:page:${currentPage}` },
+          { text: '🏠 الرئيسية', callbackData: 'menu:main' },
+        ],
       ].filter((r) => r.length > 0),
+      toastText: `📜 سجل النشاط (صفحة ${currentPage}/${totalPages})`,
+      route: `menu:audit:page:${currentPage}`,
     };
   }
 }

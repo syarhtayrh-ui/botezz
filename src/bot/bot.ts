@@ -4,7 +4,7 @@ import {
   verifyTelegramAdmin,
   createGrammyAuthorizationMiddleware,
 } from './middleware/authorization';
-import { toGrammyInlineKeyboard, buildBackCancelRow } from './keyboards/main-menu';
+import { buildBackCancelRow, buildAppNavigationRow } from './keyboards/main-menu';
 import { formatSessionStatusArabic } from './keyboards/session-menu';
 import { PairingWorkflow, BotViewResponse } from './workflows/pairing-workflow';
 import { MessageWorkflow } from './workflows/message-workflow';
@@ -18,6 +18,12 @@ import { GroupsHandler } from './handlers/groups';
 import { TasksHandler } from './handlers/tasks';
 import { SettingsHandler } from './handlers/settings';
 import { ToolsHandler, DEFAULT_SAMPLE_TEST_FUNCTION } from './handlers/tools';
+import {
+  BotUiStateManager,
+  TelegramMessageTransport,
+  createGrammyTransport,
+  isNavigableRoute,
+} from './ui-state';
 import { SessionManager } from '../whatsapp/session-manager';
 import { TaskManager } from '../tasks/task-manager';
 import { SendMessageOperation } from '../whatsapp/operations/send-message';
@@ -33,6 +39,15 @@ import { createLogger } from '../logging/logger';
 
 const log = createLogger('telegram-bot');
 
+export type ConversationMode =
+  | 'NONE'
+  | 'PAIRING'
+  | 'MESSAGE'
+  | 'MEDIA'
+  | 'GROUP'
+  | 'TOOLS'
+  | 'SETTINGS';
+
 export interface TelegramControllerDeps {
   config: AppConfig;
   sessionManager: SessionManager;
@@ -42,13 +57,24 @@ export interface TelegramControllerDeps {
   groupOps: GroupOperations;
   auditRepo: AuditRepository;
   settingsRepo: SettingsRepository;
+  duplicateTapWindowMs?: number;
+  callbackTimeoutMs?: number;
+}
+
+export interface HandleInteractionOptions {
+  transport?: TelegramMessageTransport;
+  skipDuplicateCheck?: boolean;
 }
 
 /**
- * Unified Telegram Bot Controller.
- * Used identically by the live grammY Bot instance and by automated integration tests / web harness.
+ * Unified Stateful Telegram Bot Controller.
+ * Powers both the live grammY Bot instance and automated integration tests / web simulator.
+ * Implements single-message editing (`editMessageText` / `editMessageReplyMarkup`),
+ * consistent application navigation (`Back`, `Home`, `Refresh`, `Cancel`),
+ * anti-double-tap deduplication, and strict input workflow state tracking.
  */
 export class TelegramBotController {
+  public readonly uiState: BotUiStateManager;
   public readonly pairingWorkflow: PairingWorkflow;
   public readonly messageWorkflow: MessageWorkflow;
   public readonly mediaWorkflow: MediaWorkflow;
@@ -63,12 +89,14 @@ export class TelegramBotController {
   public readonly settingsHandler: SettingsHandler;
   public readonly toolsHandler: ToolsHandler;
 
-  private activeConversationMode = new Map<
-    number,
-    'NONE' | 'PAIRING' | 'MESSAGE' | 'MEDIA' | 'GROUP' | 'TOOLS'
-  >();
+  private activeConversationMode = new Map<number, ConversationMode>();
 
   constructor(private readonly deps: TelegramControllerDeps) {
+    this.uiState = new BotUiStateManager({
+      duplicateTapWindowMs: deps.duplicateTapWindowMs ?? 75,
+      callbackTimeoutMs: deps.callbackTimeoutMs ?? 12_000,
+    });
+
     this.pairingWorkflow = new PairingWorkflow(deps.sessionManager);
     this.messageWorkflow = new MessageWorkflow(
       deps.sessionManager,
@@ -111,21 +139,47 @@ export class TelegramBotController {
     );
   }
 
+  public getConversationMode(adminId: number): ConversationMode {
+    return this.activeConversationMode.get(adminId) || 'NONE';
+  }
+
   private cancelAllWorkflowsForAdmin(adminId: number): void {
     this.pairingWorkflow.cancel(adminId);
     this.messageWorkflow.cancel(adminId);
     this.mediaWorkflow.cancel(adminId);
     this.groupWorkflow.cancel(adminId);
     this.toolsHandler.cancel(adminId);
+    this.settingsHandler.cancel(adminId);
     this.activeConversationMode.set(adminId, 'NONE');
+  }
+
+  private async runWithTimeout<T>(work: () => Promise<T>): Promise<T> {
+    const timeoutMs = this.uiState.callbackTimeoutMs;
+    return new Promise<T>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        reject(new Error('انتهت مهلة معالجة الزر التفاعلي. يرجى المحاولة مرة أخرى.'));
+      }, timeoutMs);
+      work()
+        .then((res) => {
+          clearTimeout(timer);
+          resolve(res);
+        })
+        .catch((err) => {
+          clearTimeout(timer);
+          reject(err);
+        });
+    });
   }
 
   /**
    * Processes any incoming callback query after verifying the numeric Telegram admin ID.
+   * Updates the existing menu message in-place (`editMessageText` / `editMessageReplyMarkup`),
+   * answers callback queries promptly, and prevents duplicate operations on repeated taps.
    */
   public async handleCallbackQuery(
     actorUserId: number,
-    callbackData: string
+    callbackData: string,
+    options?: HandleInteractionOptions
   ): Promise<BotViewResponse> {
     verifyTelegramAdmin({
       candidateUserId: actorUserId,
@@ -134,33 +188,192 @@ export class TelegramBotController {
       auditRepo: this.deps.auditRepo,
     });
 
+    if (!options?.skipDuplicateCheck) {
+      const lock = this.uiState.tryAcquireCallbackLock(actorUserId, callbackData);
+      if (!lock.acquired) {
+        this.uiState.recordCallbackAnswered(actorUserId);
+        if (options?.transport?.answerCallbackQuery) {
+          await options.transport.answerCallbackQuery({
+            text: '⏳ جاري تنفيذ العملية، يرجى عدم تكرار النقر...',
+            showAlert: false,
+          });
+        }
+        const sess = this.uiState.getOrCreateSession(actorUserId);
+        const fallbackView =
+          sess.lastView || this.startHandler.renderMainMenu({ isAdmin: true });
+        return {
+          ...fallbackView,
+          toastText: '⏳ تم تجاهل النقرة المكررة',
+          uiMeta: {
+            deliveryMode: 'DUPLICATE_BLOCKED',
+            activeMessageId: sess.activeMessageId ?? 1000,
+            currentRoute: sess.currentRoute,
+            canGoBack: sess.history.length > 0,
+            pendingWorkflow: this.getConversationMode(actorUserId),
+            stats: { ...sess.stats },
+          },
+        };
+      }
+    }
+
+    let callbackAnswered = false;
+    try {
+      const view = await this.runWithTimeout(() =>
+        this.routeCallbackQueryInternal(actorUserId, callbackData)
+      );
+
+      // Answer callback query promptly before or alongside message edit
+      this.uiState.recordCallbackAnswered(actorUserId);
+      callbackAnswered = true;
+      if (options?.transport?.answerCallbackQuery) {
+        await options.transport.answerCallbackQuery({
+          text: view.toastText,
+          showAlert: view.showAlert,
+        });
+      }
+
+      const sess = this.uiState.getOrCreateSession(actorUserId);
+      const preferEdit = sess.activeMessageId !== undefined;
+      return await this.uiState.deliverView({
+        userId: actorUserId,
+        view,
+        pendingWorkflow: this.getConversationMode(actorUserId),
+        preferEdit,
+        transport: options?.transport,
+      });
+    } catch (err) {
+      const safeErr = toSafeArabicError(err);
+      if (!callbackAnswered) {
+        this.uiState.recordCallbackAnswered(actorUserId);
+        if (options?.transport?.answerCallbackQuery) {
+          await options.transport.answerCallbackQuery({
+            text: safeErr.userMessage,
+            showAlert: true,
+          });
+        }
+      }
+      const errorView: BotViewResponse = {
+        text: `⚠️ *تعذر إكمال الإجراء المطلوب:*\n${safeErr.userMessage}`,
+        keyboard: [
+          buildAppNavigationRow({
+            backCallback: 'nav:back',
+            refreshCallback: 'nav:refresh',
+          }),
+        ],
+        toastText: safeErr.userMessage,
+        showAlert: true,
+      };
+      const sess = this.uiState.getOrCreateSession(actorUserId);
+      return await this.uiState.deliverView({
+        userId: actorUserId,
+        view: errorView,
+        pendingWorkflow: this.getConversationMode(actorUserId),
+        preferEdit: sess.activeMessageId !== undefined,
+        transport: options?.transport,
+      });
+    } finally {
+      if (!options?.skipDuplicateCheck) {
+        this.uiState.releaseCallbackLock(actorUserId, callbackData);
+      }
+    }
+  }
+
+  private async routeCallbackQueryInternal(
+    actorUserId: number,
+    callbackData: string
+  ): Promise<BotViewResponse> {
+    // Handle universal application navigation actions: Home, Cancel, Back, Refresh
     if (
       callbackData === 'menu:main' ||
-      callbackData === 'workflow:cancel' ||
+      callbackData === 'nav:home' ||
       callbackData === '/start'
     ) {
       this.cancelAllWorkflowsForAdmin(actorUserId);
-      return this.startHandler.renderMainMenu();
+      this.uiState.resetHome(actorUserId);
+      return this.startHandler.renderMainMenu({ isAdmin: true });
     }
 
-    // 1 & 2: Link WhatsApp Account / Add Another Account
+    if (callbackData === 'workflow:cancel' || callbackData === 'nav:cancel') {
+      const wasActive = this.getConversationMode(actorUserId) !== 'NONE';
+      this.cancelAllWorkflowsForAdmin(actorUserId);
+      this.uiState.resetHome(actorUserId);
+      const view = this.startHandler.renderMainMenu({
+        isAdmin: true,
+        noticeBanner: wasActive
+          ? '✅ *تم إلغاء العملية الحالية وإعادة ضبط حالة الإدخال.*'
+          : undefined,
+      });
+      return {
+        ...view,
+        toastText: '❌ تم إلغاء العملية الحالية',
+      };
+    }
+
+    if (callbackData === 'nav:back') {
+      this.cancelAllWorkflowsForAdmin(actorUserId);
+      const targetRoute = this.uiState.popPreviousRoute(actorUserId);
+      const view = await this.routeCallbackQueryInternal(actorUserId, targetRoute);
+      return {
+        ...view,
+        toastText: '🔙 العودة للقائمة السابقة',
+      };
+    }
+
+    if (callbackData === 'nav:refresh') {
+      const currentRoute = this.uiState.getCurrentRoute(actorUserId);
+      const targetRoute =
+        currentRoute && currentRoute !== 'nav:refresh' ? currentRoute : 'menu:main';
+      const view = await this.routeCallbackQueryInternal(actorUserId, targetRoute);
+      return {
+        ...view,
+        toastText: '🔄 تم تحديث البيانات',
+      };
+    }
+
+    if (isNavigableRoute(callbackData)) {
+      this.uiState.recordRouteTransition(actorUserId, callbackData);
+    }
+
+    // 1 & 2: Link WhatsApp Account / Add Another Account / Session Naming
     if (
       callbackData === 'menu:link_account' ||
-      callbackData === 'menu:add_account'
+      callbackData === 'menu:add_account' ||
+      callbackData === 'menu:pair'
     ) {
       this.cancelAllWorkflowsForAdmin(actorUserId);
       this.activeConversationMode.set(actorUserId, 'PAIRING');
       return this.pairingWorkflow.startNewLinking(actorUserId);
     }
+    if (callbackData.startsWith('pair:prompt_label:')) {
+      const sessId = callbackData.slice('pair:prompt_label:'.length);
+      this.activeConversationMode.set(actorUserId, 'PAIRING');
+      return this.pairingWorkflow.promptSessionLabel(actorUserId, sessId, false);
+    }
+    if (callbackData.startsWith('sess:prompt_rename:')) {
+      const sessId = callbackData.slice('sess:prompt_rename:'.length);
+      this.cancelAllWorkflowsForAdmin(actorUserId);
+      this.activeConversationMode.set(actorUserId, 'PAIRING');
+      return this.pairingWorkflow.promptSessionLabel(actorUserId, sessId, true);
+    }
 
-    // 3: Manage Sessions
+    // 3: Manage Sessions & Session Status
+    if (callbackData === 'menu:sessions') {
+      return this.sessionsHandler.renderSessionsList(1);
+    }
     if (callbackData.startsWith('menu:sessions:page:')) {
       const page = Number(callbackData.split(':').pop() || '1');
       return this.sessionsHandler.renderSessionsList(page);
     }
+    if (callbackData === 'menu:session_status') {
+      return this.sessionsHandler.renderSessionStatusOverview();
+    }
     if (callbackData.startsWith('sess:refresh:')) {
       const page = Number(callbackData.split(':').pop() || '1');
-      return this.sessionsHandler.renderSessionsList(page);
+      const view = this.sessionsHandler.renderSessionsList(page);
+      return {
+        ...view,
+        toastText: '🔄 تم تحديث حالة الجلسات',
+      };
     }
     if (callbackData.startsWith('sess:view:')) {
       const sessionId = callbackData.slice('sess:view:'.length);
@@ -187,6 +400,12 @@ export class TelegramBotController {
     if (callbackData.startsWith('sess:remove:')) {
       const sessionId = callbackData.slice('sess:remove:'.length);
       return this.sessionsHandler.handleRemove(sessionId, actorUserId);
+    }
+    if (callbackData === 'sess:confirm_purge_inactive') {
+      return this.sessionsHandler.renderConfirmPurgeInactive();
+    }
+    if (callbackData === 'sess:purge_inactive') {
+      return this.sessionsHandler.handlePurgeInactive(actorUserId);
     }
 
     // 4: Send Text Message Workflow
@@ -253,7 +472,13 @@ export class TelegramBotController {
     }
     if (callbackData.startsWith('grp:list:')) {
       const sessionId = callbackData.slice('grp:list:'.length);
-      return this.groupsHandler.renderSessionGroups(sessionId);
+      return this.groupsHandler.renderSessionGroups(sessionId, 1);
+    }
+    if (callbackData.startsWith('grp:list_page:')) {
+      const parts = callbackData.split(':');
+      const sessionId = parts[2];
+      const page = Number(parts[3] || '1');
+      return this.groupsHandler.renderSessionGroups(sessionId, page);
     }
     if (callbackData.startsWith('grp:view:')) {
       const parts = callbackData.split(':');
@@ -303,7 +528,11 @@ export class TelegramBotController {
       return this.groupWorkflow.executeJoinGroup(actorUserId);
     }
 
-    // 8: Task Monitor
+    // 8: Task Monitor & Admin Controls
+    if (callbackData === 'menu:admin') {
+      this.cancelAllWorkflowsForAdmin(actorUserId);
+      return this.startHandler.renderAdminControls();
+    }
     if (callbackData.startsWith('menu:tasks:page:')) {
       const page = Number(callbackData.split(':').pop() || '1');
       return this.tasksHandler.renderTaskMonitor(page);
@@ -323,7 +552,7 @@ export class TelegramBotController {
       return this.tasksHandler.renderAuditHistory(page);
     }
 
-    // 10: Settings & Access Control (including Nebula Cooldown & Subscriptions)
+    // 10: Settings, Cooldown & Subscriptions Management
     if (callbackData === 'menu:settings' || callbackData === '/controls') {
       this.cancelAllWorkflowsForAdmin(actorUserId);
       return this.settingsHandler.renderSettings();
@@ -337,16 +566,55 @@ export class TelegramBotController {
     if (callbackData === 'settings:cycle_cooldown') {
       return this.settingsHandler.cycleCooldown(actorUserId);
     }
-    if (callbackData === 'settings:view_access') {
-      return this.settingsHandler.renderAccessControlSummary();
+    if (callbackData === 'settings:prompt_cooldown') {
+      this.cancelAllWorkflowsForAdmin(actorUserId);
+      this.activeConversationMode.set(actorUserId, 'SETTINGS');
+      return this.settingsHandler.promptCustomCooldown(actorUserId);
+    }
+    if (
+      callbackData === 'settings:view_access' ||
+      callbackData === 'menu:subscriptions'
+    ) {
+      this.cancelAllWorkflowsForAdmin(actorUserId);
+      return this.settingsHandler.renderSubscriptionsMenu(1);
+    }
+    if (callbackData.startsWith('menu:subscriptions:page:')) {
+      const page = Number(callbackData.split(':').pop() || '1');
+      this.cancelAllWorkflowsForAdmin(actorUserId);
+      return this.settingsHandler.renderSubscriptionsMenu(page);
+    }
+    if (callbackData === 'sub:prompt_add') {
+      this.cancelAllWorkflowsForAdmin(actorUserId);
+      this.activeConversationMode.set(actorUserId, 'SETTINGS');
+      return this.settingsHandler.promptAddSubscription(actorUserId);
+    }
+    if (callbackData === 'sub:prompt_add_group') {
+      this.cancelAllWorkflowsForAdmin(actorUserId);
+      this.activeConversationMode.set(actorUserId, 'SETTINGS');
+      return this.settingsHandler.promptAddClaimGroup(actorUserId);
+    }
+    if (callbackData.startsWith('sub:confirm_remove:')) {
+      const targetId = callbackData.slice('sub:confirm_remove:'.length);
+      return this.settingsHandler.renderConfirmRemoveSubscription(targetId);
+    }
+    if (callbackData.startsWith('sub:remove:')) {
+      const targetId = callbackData.slice('sub:remove:'.length);
+      return this.settingsHandler.handleRemoveSubscription(targetId, actorUserId);
     }
 
     // 11: Help and System Status
-    if (callbackData === 'menu:help_status') {
+    if (callbackData === 'menu:help_status' || callbackData === 'menu:help') {
       return this.startHandler.renderHelpAndSystemStatus();
     }
 
-    // 12: Integrated Tools & Diagnostics (extracted from Nebula bot)
+    // 12: Sender Management & Integrated Tools & Diagnostics
+    if (callbackData === 'menu:senders' || callbackData === 'tools:ceksender') {
+      return this.toolsHandler.renderSenderDiagnostics(1);
+    }
+    if (callbackData.startsWith('menu:senders:page:')) {
+      const page = Number(callbackData.split(':').pop() || '1');
+      return this.toolsHandler.renderSenderDiagnostics(page);
+    }
     if (callbackData === 'menu:tools' || callbackData === '/tools') {
       this.cancelAllWorkflowsForAdmin(actorUserId);
       return this.toolsHandler.renderToolsMenu();
@@ -407,9 +675,6 @@ export class TelegramBotController {
       this.activeConversationMode.set(actorUserId, 'TOOLS');
       return this.toolsHandler.promptShortlink(actorUserId);
     }
-    if (callbackData === 'tools:ceksender') {
-      return this.toolsHandler.renderSenderDiagnostics();
-    }
     if (callbackData === 'tools:cekall') {
       return this.toolsHandler.renderCheckAllReport(actorUserId);
     }
@@ -420,16 +685,19 @@ export class TelegramBotController {
       return this.toolsHandler.executeEarthquakeCheck();
     }
 
-    return this.startHandler.renderMainMenu();
+    return this.startHandler.renderMainMenu({ isAdmin: true });
   }
 
   /**
    * Processes incoming text messages or commands after verifying the numeric Telegram admin ID.
+   * Reuses and edits the active menu message whenever practical, and only routes non-command text
+   * to a workflow when a workflow state is explicitly active.
    */
   public async handleTextMessage(
     actorUserId: number,
     text: string,
-    repliedText?: string
+    repliedText?: string,
+    options?: HandleInteractionOptions
   ): Promise<BotViewResponse> {
     verifyTelegramAdmin({
       candidateUserId: actorUserId,
@@ -438,17 +706,45 @@ export class TelegramBotController {
       auditRepo: this.deps.auditRepo,
     });
 
+    const view = await this.routeTextMessageInternal(
+      actorUserId,
+      text,
+      repliedText
+    );
+    const sess = this.uiState.getOrCreateSession(actorUserId);
+    const preferEdit = sess.activeMessageId !== undefined;
+
+    return this.uiState.deliverView({
+      userId: actorUserId,
+      view,
+      pendingWorkflow: this.getConversationMode(actorUserId),
+      preferEdit,
+      transport: options?.transport,
+    });
+  }
+
+  private async routeTextMessageInternal(
+    actorUserId: number,
+    text: string,
+    repliedText?: string
+  ): Promise<BotViewResponse> {
     const trimmed = text.trim();
     if (trimmed === '/start' || trimmed === '/menu') {
       this.cancelAllWorkflowsForAdmin(actorUserId);
-      return this.startHandler.renderMainMenu();
+      this.uiState.resetHome(actorUserId);
+      return this.startHandler.renderMainMenu({ isAdmin: true });
     }
     if (trimmed === '/status' || trimmed === '/help') {
+      this.uiState.recordRouteTransition(actorUserId, 'menu:help_status');
       return this.startHandler.renderHelpAndSystemStatus();
     }
     if (trimmed === '/cancel') {
       this.cancelAllWorkflowsForAdmin(actorUserId);
-      return this.startHandler.renderMainMenu();
+      this.uiState.resetHome(actorUserId);
+      return this.startHandler.renderMainMenu({
+        isAdmin: true,
+        noticeBanner: '✅ *تم إلغاء العملية الجارية والعودة للقائمة الرئيسية.*',
+      });
     }
 
     // Check command cooldown if text starts with '/' (except /setcooldown so admin can always adjust it)
@@ -464,34 +760,57 @@ export class TelegramBotController {
           const safeErr = toSafeArabicError(err);
           return {
             text: safeErr.userMessage,
-            keyboard: [[{ text: '🔙 القائمة الرئيسية', callbackData: 'menu:main' }]],
+            keyboard: [
+              buildAppNavigationRow({
+                backCallback: 'nav:back',
+                refreshCallback: 'nav:refresh',
+              }),
+            ],
           };
         }
       }
 
-      if (command === '/controls') {
+      if (command === '/controls' || command === '/settings') {
         this.cancelAllWorkflowsForAdmin(actorUserId);
+        this.uiState.recordRouteTransition(actorUserId, 'menu:settings');
         return this.settingsHandler.renderSettings();
+      }
+
+      if (command === '/admin') {
+        this.cancelAllWorkflowsForAdmin(actorUserId);
+        this.uiState.recordRouteTransition(actorUserId, 'menu:admin');
+        return this.startHandler.renderAdminControls();
+      }
+
+      if (command === '/sessions') {
+        this.cancelAllWorkflowsForAdmin(actorUserId);
+        this.uiState.recordRouteTransition(actorUserId, 'menu:sessions:page:1');
+        return this.sessionsHandler.renderSessionsList(1);
       }
 
       if (command === '/tools') {
         this.cancelAllWorkflowsForAdmin(actorUserId);
+        this.uiState.recordRouteTransition(actorUserId, 'menu:tools');
         return this.toolsHandler.renderToolsMenu();
       }
 
       if (command === '/ceksender') {
-        return this.toolsHandler.renderSenderDiagnostics();
+        this.uiState.recordRouteTransition(actorUserId, 'menu:senders:page:1');
+        return this.toolsHandler.renderSenderDiagnostics(1);
       }
 
       if (command === '/cekall') {
+        this.uiState.recordRouteTransition(actorUserId, 'tools:cekall');
         return this.toolsHandler.renderCheckAllReport(actorUserId);
       }
 
       if (command === '/info' || command === '/cekprem') {
+        this.uiState.recordRouteTransition(actorUserId, 'tools:info');
         return this.toolsHandler.renderUserInfo(actorUserId);
       }
 
       if (command === '/gempa') {
+        this.uiState.recordRouteTransition(actorUserId, 'tools:gempa');
         return this.toolsHandler.executeEarthquakeCheck();
       }
 
@@ -593,7 +912,10 @@ export class TelegramBotController {
                 },
                 { text: '📱 فحص المقابس', callbackData: 'tools:ceksender' },
               ],
-              [{ text: '🔙 القائمة الرئيسية', callbackData: 'menu:main' }],
+              buildAppNavigationRow({
+                backCallback: 'menu:sessions:page:1',
+                refreshCallback: `sess:view:${result.session.id}`,
+              }),
             ],
           };
         } catch (err) {
@@ -613,33 +935,15 @@ export class TelegramBotController {
             return {
               text: `✅ *تم حذف الجلسة ومجلد مصادقتها بنجاح:* \`${args[0]}\``,
               keyboard: [
-                [
-                  { text: '📋 إدارة الجلسات', callbackData: 'menu:sessions:page:1' },
-                  { text: '🔙 القائمة الرئيسية', callbackData: 'menu:main' },
-                ],
+                [{ text: '📋 إدارة الجلسات', callbackData: 'menu:sessions:page:1' }],
+                buildAppNavigationRow({
+                  backCallback: 'menu:sessions:page:1',
+                  refreshCallback: 'menu:sessions:page:1',
+                }),
               ],
             };
           }
-          // If no sessionId passed, purge disconnected / logged-out / failed sessions
-          const allSessions = this.deps.sessionManager.listSessions();
-          const inactive = allSessions.filter(
-            (s) => s.status !== 'CONNECTED' && s.status !== 'AUTHENTICATED'
-          );
-          for (const sess of inactive) {
-            await this.deps.sessionManager.removeSession(sess.id, actorUserId);
-          }
-          return {
-            text:
-              inactive.length > 0
-                ? `✅ *تم تنظيف وإعادة تعيين ${inactive.length} جلسة غير متصلة بنجاح دون إيقاف الخادم.*`
-                : `ℹ️ جميع الجلسات الحالية (${allSessions.length}) متصلة ونشطة. لحذف جلسة محددة استخدم \`/resetsession <sessionId>\`.`,
-            keyboard: [
-              [
-                { text: '📋 إدارة الجلسات', callbackData: 'menu:sessions:page:1' },
-                { text: '🔙 القائمة الرئيسية', callbackData: 'menu:main' },
-              ],
-            ],
-          };
+          return this.sessionsHandler.handlePurgeInactive(actorUserId);
         } catch (err) {
           const safeErr = toSafeArabicError(err);
           return {
@@ -664,10 +968,11 @@ export class TelegramBotController {
           return {
             text: `✅ *تم ضبط مهلة التهدئة (Cooldown) على:* \`${updated} ثانية\``,
             keyboard: [
-              [
-                { text: '⚙️ الإعدادات', callbackData: 'menu:settings' },
-                { text: '🔙 القائمة الرئيسية', callbackData: 'menu:main' },
-              ],
+              [{ text: '⚙️ الإعدادات', callbackData: 'menu:settings' }],
+              buildAppNavigationRow({
+                backCallback: 'menu:settings',
+                refreshCallback: 'menu:settings',
+              }),
             ],
           };
         } catch (err) {
@@ -680,7 +985,11 @@ export class TelegramBotController {
       }
 
       // Premium user & group commands: /addpremium, /delpremium, /addgcpremium, /delgcpremium
-      if (command === '/addpremium' || command === '/addgcpremium') {
+      if (
+        command === '/addpremium' ||
+        command === '/addprem' ||
+        command === '/addgcpremium'
+      ) {
         try {
           const targetId = args[0] || '';
           const daysRaw = (args[1] || '').replace(/d$/i, '');
@@ -705,9 +1014,15 @@ export class TelegramBotController {
               `📅 صالح حتى: \`${entry.expiresAtIso.slice(0, 10)}\` (${entry.durationDays} يوم)`,
             keyboard: [
               [
-                { text: '⭐ عرض الاشتراكات', callbackData: 'settings:view_access' },
-                { text: '🔙 القائمة الرئيسية', callbackData: 'menu:main' },
+                {
+                  text: '⭐ عرض الاشتراكات',
+                  callbackData: 'menu:subscriptions:page:1',
+                },
               ],
+              buildAppNavigationRow({
+                backCallback: 'menu:subscriptions:page:1',
+                refreshCallback: 'menu:subscriptions:page:1',
+              }),
             ],
           };
         } catch (err) {
@@ -716,12 +1031,16 @@ export class TelegramBotController {
             text:
               `⚠️ *تعذر إضافة الاشتراك:*\n${safeErr.userMessage}\n` +
               `الصيغة: \`${command} 123456789 30\``,
-            keyboard: [buildBackCancelRow('settings:view_access')],
+            keyboard: [buildBackCancelRow('menu:subscriptions:page:1')],
           };
         }
       }
 
-      if (command === '/delpremium' || command === '/delgcpremium') {
+      if (
+        command === '/delpremium' ||
+        command === '/delprem' ||
+        command === '/delgcpremium'
+      ) {
         const targetId = args[0] || '';
         const removed = this.deps.settingsRepo.removePremiumSubscription(targetId);
         return {
@@ -730,11 +1049,21 @@ export class TelegramBotController {
             : `ℹ️ المعرف \`${targetId || '—'}\` غير موجود في قائمة الاشتراكات النشطة.`,
           keyboard: [
             [
-              { text: '⭐ عرض الاشتراكات', callbackData: 'settings:view_access' },
-              { text: '🔙 القائمة الرئيسية', callbackData: 'menu:main' },
+              {
+                text: '⭐ عرض الاشتراكات',
+                callbackData: 'menu:subscriptions:page:1',
+              },
             ],
+            buildAppNavigationRow({
+              backCallback: 'menu:subscriptions:page:1',
+              refreshCallback: 'menu:subscriptions:page:1',
+            }),
           ],
         };
+      }
+
+      if (command === '/listprem') {
+        return this.settingsHandler.renderSubscriptionsMenu(1);
       }
 
       // Claim groups commands: /addgb, /delgb, /listgb, /claim
@@ -750,16 +1079,22 @@ export class TelegramBotController {
               `🆔 المعرف: \`${entry.groupId}\``,
             keyboard: [
               [
-                { text: '⭐ إدارة الاشتراكات', callbackData: 'settings:view_access' },
-                { text: '🔙 القائمة الرئيسية', callbackData: 'menu:main' },
+                {
+                  text: '⭐ إدارة الاشتراكات',
+                  callbackData: 'menu:subscriptions:page:1',
+                },
               ],
+              buildAppNavigationRow({
+                backCallback: 'menu:subscriptions:page:1',
+                refreshCallback: 'menu:subscriptions:page:1',
+              }),
             ],
           };
         } catch (err) {
           const safeErr = toSafeArabicError(err);
           return {
             text: `⚠️ ${safeErr.userMessage}`,
-            keyboard: [buildBackCancelRow('settings:view_access')],
+            keyboard: [buildBackCancelRow('menu:subscriptions:page:1')],
           };
         }
       }
@@ -773,15 +1108,21 @@ export class TelegramBotController {
             : `ℹ️ المجموعة \`${groupId || '—'}\` غير مسجلة في القائمة.`,
           keyboard: [
             [
-              { text: '⭐ إدارة الاشتراكات', callbackData: 'settings:view_access' },
-              { text: '🔙 القائمة الرئيسية', callbackData: 'menu:main' },
+              {
+                text: '⭐ إدارة الاشتراكات',
+                callbackData: 'menu:subscriptions:page:1',
+              },
             ],
+            buildAppNavigationRow({
+              backCallback: 'menu:subscriptions:page:1',
+              refreshCallback: 'menu:subscriptions:page:1',
+            }),
           ],
         };
       }
 
       if (command === '/listgb') {
-        return this.settingsHandler.renderAccessControlSummary();
+        return this.settingsHandler.renderSubscriptionsMenu(1);
       }
 
       if (command === '/claim') {
@@ -796,19 +1137,24 @@ export class TelegramBotController {
             `🆔 المعرف: \`${entry.targetId}\`\n` +
             `📅 تاريخ الانتهاء: \`${entry.expiresAtIso.slice(0, 10)}\``,
           keyboard: [
-            [
-              { text: '🪪 بطاقة الحساب (/info)', callbackData: 'tools:info' },
-              { text: '🔙 القائمة الرئيسية', callbackData: 'menu:main' },
-            ],
+            [{ text: '🪪 بطاقة الحساب (/info)', callbackData: 'tools:info' }],
+            buildAppNavigationRow({
+              backCallback: 'menu:main',
+              refreshCallback: 'tools:info',
+            }),
           ],
         };
       }
     }
 
-    const mode = this.activeConversationMode.get(actorUserId) || 'NONE';
+    const mode = this.getConversationMode(actorUserId);
 
     if (mode === 'PAIRING') {
-      return this.pairingWorkflow.handlePhoneInput(actorUserId, trimmed);
+      const res = await this.pairingWorkflow.handlePhoneInput(actorUserId, trimmed);
+      if (!this.pairingWorkflow.getState(actorUserId)) {
+        this.activeConversationMode.set(actorUserId, 'NONE');
+      }
+      return res;
     }
 
     if (mode === 'MESSAGE') {
@@ -849,12 +1195,32 @@ export class TelegramBotController {
       return response;
     }
 
-    return this.startHandler.renderMainMenu();
+    if (mode === 'SETTINGS') {
+      const response = this.settingsHandler.handleGuidedInput(
+        actorUserId,
+        trimmed
+      );
+      const nextStep = this.settingsHandler.getStep(actorUserId);
+      this.activeConversationMode.set(
+        actorUserId,
+        nextStep === 'NONE' ? 'NONE' : 'SETTINGS'
+      );
+      return response;
+    }
+
+    // Requirement 3: Do not interpret arbitrary messages as workflow inputs unless a workflow state is active.
+    return this.startHandler.renderMainMenu({
+      isAdmin: true,
+      noticeBanner:
+        'ℹ️ *لا توجد عملية إدخال نصي نشطة حالياً.*\nيرجى اختيار العملية المطلوبة من الأزرار التفاعلية أدناه أو إرسال أمر مباشر يبدأ بـ `/`.',
+    });
   }
 }
 
 /**
- * Builds a production grammY Bot instance wired to the TelegramBotController.
+ * Builds a production grammY Bot instance wired to the stateful TelegramBotController.
+ * Uses `editMessageText` and `editMessageReplyMarkup` to update the active menu message
+ * in-place rather than sending a new message on every button press.
  */
 export function createGrammyBot(
   controller: TelegramBotController,
@@ -868,25 +1234,30 @@ export function createGrammyBot(
 
   bot.on('callback_query:data', async (ctx) => {
     try {
-      const view = await controller.handleCallbackQuery(
-        ctx.from.id,
-        ctx.callbackQuery.data
+      const transport = createGrammyTransport(
+        ctx as unknown as Parameters<typeof createGrammyTransport>[0],
+        controller.uiState,
+        ctx.from.id
       );
-      await ctx.answerCallbackQuery();
-      await ctx.reply(view.text, {
-        parse_mode: 'Markdown',
-        reply_markup: toGrammyInlineKeyboard(view.keyboard),
-      });
+      await controller.handleCallbackQuery(
+        ctx.from.id,
+        ctx.callbackQuery.data,
+        { transport }
+      );
     } catch (err) {
       const safeErr = toSafeArabicError(err);
       log.error('Telegram callback error', {
         category: safeErr.category,
         error: safeErr.sanitizedTechnicalMessage,
       });
-      await ctx.answerCallbackQuery({
-        text: safeErr.userMessage,
-        show_alert: true,
-      });
+      try {
+        await ctx.answerCallbackQuery({
+          text: safeErr.userMessage,
+          show_alert: true,
+        });
+      } catch {
+        // Ignore if callback query was already answered
+      }
     }
   });
 
@@ -896,15 +1267,17 @@ export function createGrammyBot(
         ctx.message.reply_to_message?.text ||
         ctx.message.reply_to_message?.caption ||
         undefined;
-      const view = await controller.handleTextMessage(
+      const transport = createGrammyTransport(
+        ctx as unknown as Parameters<typeof createGrammyTransport>[0],
+        controller.uiState,
+        ctx.from.id
+      );
+      await controller.handleTextMessage(
         ctx.from.id,
         ctx.message.text,
-        repliedText
+        repliedText,
+        { transport }
       );
-      await ctx.reply(view.text, {
-        parse_mode: 'Markdown',
-        reply_markup: toGrammyInlineKeyboard(view.keyboard),
-      });
     } catch (err) {
       const safeErr = toSafeArabicError(err);
       log.error('Telegram text message error', {

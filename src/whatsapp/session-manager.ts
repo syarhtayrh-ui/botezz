@@ -471,6 +471,29 @@ export class SessionManager {
     return this.sessionRepo.findById(sessionId);
   }
 
+  public renameSession(
+    sessionId: string,
+    newLabel: string,
+    actorTelegramId: number
+  ): SessionRecord {
+    const clean = newLabel.trim();
+    if (!clean || clean.length < 2 || clean.length > 50) {
+      throw new ValidationError('اسم الجلسة يجب أن يكون بين حرفين و 50 حرفاً.');
+    }
+    const updated = this.sessionRepo.updateLabel(sessionId, clean);
+    if (!updated) {
+      throw new ValidationError('الجلسة المحددة غير موجودة.');
+    }
+    this.auditRepo.record({
+      actorTelegramId,
+      action: 'SESSION_RENAMED',
+      targetId: sessionId,
+      outcome: 'SUCCESS',
+      metadata: { label: clean },
+    });
+    return updated;
+  }
+
   public async shutdownAll(): Promise<void> {
     this.isShuttingDown = true;
     for (const sessionId of this.reconnectTimers.keys()) {

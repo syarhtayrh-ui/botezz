@@ -2,7 +2,11 @@ import { SessionManager } from '../../whatsapp/session-manager';
 import { GroupOperations } from '../../whatsapp/operations/group-operations';
 import { GroupWorkflow } from '../workflows/group-workflow';
 import { BotViewResponse } from '../workflows/pairing-workflow';
-import { InlineKeyboardRows } from '../keyboards/main-menu';
+import {
+  InlineKeyboardRows,
+  InlineButtonSpec,
+  buildAppNavigationRow,
+} from '../keyboards/main-menu';
 import { toSafeArabicError } from '../../utils/errors';
 
 export class GroupsHandler {
@@ -30,7 +34,12 @@ export class GroupsHandler {
     rows.push([
       { text: '🔗 الانضمام إلى مجموعة برابط دعوة', callbackData: 'menu:join_group' },
     ]);
-    rows.push([{ text: '🔙 القائمة الرئيسية', callbackData: 'menu:main' }]);
+    rows.push(
+      buildAppNavigationRow({
+        backCallback: 'nav:back',
+        refreshCallback: 'menu:groups',
+      })
+    );
 
     return {
       text:
@@ -39,15 +48,26 @@ export class GroupsHandler {
           ? `اختر الجلسة المتصلة لعرض المجموعات المتاحة وإدارتها:`
           : `⚠️ لا توجد جلسات متصلة حالياً. يرجى ربط جلسة أو إعادة اتصالها أولاً.`),
       keyboard: rows,
+      toastText: '👥 إدارة المجموعات',
+      route: 'menu:groups',
     };
   }
 
-  public async renderSessionGroups(sessionId: string): Promise<BotViewResponse> {
+  public async renderSessionGroups(
+    sessionId: string,
+    page = 1
+  ): Promise<BotViewResponse> {
     try {
       const groups = await this.groupOps.listGroups(sessionId);
+      const pageSize = 5;
+      const totalPages = Math.max(1, Math.ceil(groups.length / pageSize));
+      const currentPage = Math.min(Math.max(1, page), totalPages);
+      const startIdx = (currentPage - 1) * pageSize;
+      const slice = groups.slice(startIdx, startIdx + pageSize);
+
       const rows: InlineKeyboardRows = [];
 
-      for (const g of groups) {
+      for (const g of slice) {
         const roleTag = g.isBotAdmin ? '🛡️ مشرف' : '👤 عضو';
         rows.push([
           {
@@ -57,12 +77,35 @@ export class GroupsHandler {
         ]);
       }
 
-      rows.push([
-        { text: '🔙 رجوع لإدارة المجموعات', callbackData: 'menu:groups' },
-        { text: '🏠 القائمة الرئيسية', callbackData: 'menu:main' },
-      ]);
+      if (totalPages > 1) {
+        const navRow: InlineButtonSpec[] = [];
+        if (currentPage > 1) {
+          navRow.push({
+            text: '⬅️ السابق',
+            callbackData: `grp:list_page:${sessionId}:${currentPage - 1}`,
+          });
+        }
+        navRow.push({
+          text: `صفحة ${currentPage}/${totalPages}`,
+          callbackData: `grp:list_page:${sessionId}:${currentPage}`,
+        });
+        if (currentPage < totalPages) {
+          navRow.push({
+            text: 'التالي ➡️',
+            callbackData: `grp:list_page:${sessionId}:${currentPage + 1}`,
+          });
+        }
+        rows.push(navRow);
+      }
 
-      const summaryLines = groups
+      rows.push(
+        buildAppNavigationRow({
+          backCallback: 'menu:groups',
+          refreshCallback: `grp:list:${sessionId}`,
+        })
+      );
+
+      const summaryLines = slice
         .map(
           (g) =>
             `• *${g.subject}* — ${g.isBotAdmin ? '🛡️ مشرف' : '👤 عضو'} (${g.size} مشارك)`
@@ -72,16 +115,25 @@ export class GroupsHandler {
       return {
         text:
           `👥 *المجموعات المتاحة للجلسة (${sessionId})*\n` +
-          `عدد المجموعات: *${groups.length}*\n\n` +
+          `عدد المجموعات: *${groups.length}* (صفحة ${currentPage}/${totalPages})\n\n` +
           `${summaryLines}\n\n` +
           `اختر مجموعة لعرض تفاصيلها، المشاركين، أو تنفيذ إجراءات الإدارة:`,
         keyboard: rows,
+        toastText: `👥 مجموعات ${sessionId}`,
+        route: `grp:list:${sessionId}`,
       };
     } catch (err) {
       const safeErr = toSafeArabicError(err);
       return {
         text: `⚠️ ${safeErr.userMessage}`,
-        keyboard: [[{ text: '🔙 رجوع لإدارة المجموعات', callbackData: 'menu:groups' }]],
+        keyboard: [
+          buildAppNavigationRow({
+            backCallback: 'menu:groups',
+            refreshCallback: 'menu:groups',
+          }),
+        ],
+        toastText: safeErr.userMessage,
+        showAlert: true,
       };
     }
   }

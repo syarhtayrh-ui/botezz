@@ -1,5 +1,9 @@
 import { TaskWithResults } from '../../database/repositories/task-repository';
-import { InlineKeyboardRows, InlineButtonSpec } from './main-menu';
+import {
+  InlineKeyboardRows,
+  InlineButtonSpec,
+  buildAppNavigationRow,
+} from './main-menu';
 
 const TASK_STATUS_ARABIC: Record<TaskWithResults['status'], string> = {
   PENDING: '⏳ قيد الانتظار',
@@ -68,10 +72,12 @@ export function buildTaskListKeyboard(params: {
     rows.push(navRow);
   }
 
-  rows.push([
-    { text: '🔄 تحديث المهام', callbackData: `menu:tasks:page:${currentPage}` },
-    { text: '🔙 القائمة الرئيسية', callbackData: 'menu:main' },
-  ]);
+  rows.push(
+    buildAppNavigationRow({
+      backCallback: 'nav:back',
+      refreshCallback: `menu:tasks:page:${currentPage}`,
+    })
+  );
 
   return { rows, currentPage, totalPages };
 }
@@ -83,9 +89,11 @@ export function buildTaskDetailKeyboard(task: TaskWithResults): InlineKeyboardRo
       { text: '🛑 طلب إلغاء المهمة', callbackData: `task:cancel:${task.id}` },
     ]);
   }
-  rows.push([
-    { text: '🔄 تحديث النتيجة', callbackData: `task:view:${task.id}` },
-    { text: '🔙 رجوع لقائمة المهام', callbackData: 'menu:tasks:page:1' },
-  ]);
+  rows.push(
+    buildAppNavigationRow({
+      backCallback: 'menu:tasks:page:1',
+      refreshCallback: `task:view:${task.id}`,
+    })
+  );
   return rows;
 }

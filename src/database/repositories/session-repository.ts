@@ -144,6 +144,19 @@ export class SessionRepository {
     return this.findById(params.id);
   }
 
+  public updateLabel(id: string, label: string): SessionRecord | undefined {
+    const clean = label.trim();
+    if (!clean || clean.length > 64) {
+      return undefined;
+    }
+    const now = new Date().toISOString();
+    const stmt = this.db.sqlite.prepare(
+      'UPDATE sessions SET label = ?, updated_at = ? WHERE id = ?'
+    );
+    stmt.run(clean, now, id);
+    return this.findById(id);
+  }
+
   public deleteById(id: string): boolean {
     const stmt = this.db.sqlite.prepare('DELETE FROM sessions WHERE id = ?');
     const result = stmt.run(id);
