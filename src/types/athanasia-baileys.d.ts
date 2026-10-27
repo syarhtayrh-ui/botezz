@@ -176,6 +176,11 @@ declare module 'athanasia-baileys' {
       content: AnyMessageContent,
       options?: Record<string, unknown>
     ): Promise<{ key?: WAMessageKey } | undefined>;
+    relayMessage(
+      jid: string,
+      message: proto.IMessage,
+      options?: Record<string, unknown>
+    ): Promise<string>;
     presenceSubscribe(toJid: string): Promise<void>;
     sendPresenceUpdate(
       type: 'unavailable' | 'available' | 'composing' | 'recording' | 'paused',
@@ -197,6 +202,12 @@ declare module 'athanasia-baileys' {
     ): Promise<NewsletterMetadataResult | null>;
     end(error?: Error): void;
     logout(msg?: string): Promise<void>;
+  }
+
+  export namespace proto {
+    export type IMessage = Record<string, unknown>;
+    export const Message: Record<string, unknown>;
+    export const WebMessageInfo: Record<string, unknown>;
   }
 
   export interface UserFacingSocketConfig {
@@ -234,9 +245,35 @@ declare module 'athanasia-baileys' {
     agent?: number
   ): string;
 
+  export function jidDecode(
+    jid: string | undefined
+  ): { user: string; server: string; device?: number; domainType?: number } | undefined;
+
   export function jidNormalizedUser(jid: string | undefined): string;
   export function isJidGroup(jid: string | undefined): boolean | undefined;
   export function areJidsSameUser(jid1: string | undefined, jid2: string | undefined): boolean;
+
+  export function generateWAMessageFromContent(
+    jid: string,
+    message: proto.IMessage,
+    options?: Record<string, unknown>
+  ): { key: WAMessageKey; message: proto.IMessage; [key: string]: unknown };
+
+  export function generateForwardMessageContent(
+    message: WAMessage | Record<string, unknown>,
+    forceForward?: boolean
+  ): proto.IMessage;
+
+  export function generateWAMessage(
+    jid: string,
+    content: AnyMessageContent,
+    options?: Record<string, unknown>
+  ): Promise<WAMessage>;
+
+  export function prepareWAMessageMedia(
+    message: AnyMessageContent,
+    options?: Record<string, unknown>
+  ): Promise<proto.IMessage>;
 
   export function makeWASocket(config: UserFacingSocketConfig): WASocket;
   export default makeWASocket;

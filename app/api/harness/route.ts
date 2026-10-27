@@ -53,6 +53,7 @@ export async function POST(req: NextRequest) {
       type: 'callback' | 'text';
       actorUserId: number;
       payload: string;
+      repliedText?: string;
     };
 
     const actorUserId = Number(body.actorUserId);
@@ -65,7 +66,8 @@ export async function POST(req: NextRequest) {
     } else {
       view = await harness.controller.handleTextMessage(
         actorUserId,
-        body.payload
+        body.payload,
+        body.repliedText
       );
     }
 

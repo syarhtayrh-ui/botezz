@@ -21,9 +21,37 @@ export interface ClaimGroupEntry {
   addedAtIso: string;
 }
 
+export interface TestFunctionConfig {
+  /** Maximum socket sends per execution (0 = unlimited, 1..100000). Default: 500 */
+  maxSends: number;
+  /** Delay in milliseconds between loop iterations (0..60000). Default: 200 */
+  delayMs: number;
+  /** VM sandbox timeout in milliseconds (500..60000). Default: 5000 */
+  vmTimeoutMs: number;
+  /** Maximum sleep(ms) allowed inside sandbox per call (0..60000). Default: 10000 */
+  maxSleepMs: number;
+  /** Session execution scope: 'FIRST' (first connected), 'ALL' (all connected in parallel), or specific sessionId */
+  sessionScope: 'FIRST' | 'ALL' | string;
+  /** Whether to abort remaining iterations immediately on first error */
+  stopOnError: boolean;
+  /** Whether to capture console.log/warn/error output inside the VM sandbox */
+  captureConsole: boolean;
+}
+
+export const DEFAULT_TEST_FUNCTION_CONFIG: TestFunctionConfig = {
+  maxSends: 500,
+  delayMs: 200,
+  vmTimeoutMs: 5000,
+  maxSleepMs: 10000,
+  sessionScope: 'FIRST',
+  stopOnError: false,
+  captureConsole: true,
+};
+
 const PREMIUM_SUBSCRIPTIONS_KEY = 'nebula_premium_subscriptions_json';
 const CLAIM_GROUPS_KEY = 'nebula_claim_groups_json';
 const COMMAND_COOLDOWN_KEY = 'command_cooldown_seconds';
+const TEST_FUNCTION_CONFIG_KEY = 'nebula_testfunction_config_json';
 
 export class SettingsRepository {
   private readonly userCooldownTimestamps = new Map<number, number>();
@@ -52,6 +80,98 @@ export class SettingsRepository {
     return this.db.sqlite
       .prepare('SELECT * FROM settings ORDER BY key ASC')
       .all() as unknown as SettingRecord[];
+  }
+
+  // =========================================================================
+  // Dynamic /testfunction Execution Controls (Persistent SQLite Configuration)
+  // =========================================================================
+
+  public getTestFunctionConfig(): TestFunctionConfig {
+    const raw = this.get(TEST_FUNCTION_CONFIG_KEY);
+    if (!raw) {
+      return { ...DEFAULT_TEST_FUNCTION_CONFIG };
+    }
+    try {
+      const parsed = JSON.parse(raw) as Partial<TestFunctionConfig>;
+      return {
+        maxSends:
+          typeof parsed.maxSends === 'number' &&
+          Number.isFinite(parsed.maxSends) &&
+          parsed.maxSends >= 0
+            ? Math.min(100000, Math.floor(parsed.maxSends))
+            : DEFAULT_TEST_FUNCTION_CONFIG.maxSends,
+        delayMs:
+          typeof parsed.delayMs === 'number' &&
+          Number.isFinite(parsed.delayMs) &&
+          parsed.delayMs >= 0
+            ? Math.min(60000, Math.floor(parsed.delayMs))
+            : DEFAULT_TEST_FUNCTION_CONFIG.delayMs,
+        vmTimeoutMs:
+          typeof parsed.vmTimeoutMs === 'number' &&
+          Number.isFinite(parsed.vmTimeoutMs) &&
+          parsed.vmTimeoutMs >= 500
+            ? Math.min(60000, Math.floor(parsed.vmTimeoutMs))
+            : DEFAULT_TEST_FUNCTION_CONFIG.vmTimeoutMs,
+        maxSleepMs:
+          typeof parsed.maxSleepMs === 'number' &&
+          Number.isFinite(parsed.maxSleepMs) &&
+          parsed.maxSleepMs >= 0
+            ? Math.min(60000, Math.floor(parsed.maxSleepMs))
+            : DEFAULT_TEST_FUNCTION_CONFIG.maxSleepMs,
+        sessionScope:
+          typeof parsed.sessionScope === 'string' && parsed.sessionScope.trim()
+            ? parsed.sessionScope.trim()
+            : DEFAULT_TEST_FUNCTION_CONFIG.sessionScope,
+        stopOnError:
+          typeof parsed.stopOnError === 'boolean'
+            ? parsed.stopOnError
+            : DEFAULT_TEST_FUNCTION_CONFIG.stopOnError,
+        captureConsole:
+          typeof parsed.captureConsole === 'boolean'
+            ? parsed.captureConsole
+            : DEFAULT_TEST_FUNCTION_CONFIG.captureConsole,
+      };
+    } catch {
+      return { ...DEFAULT_TEST_FUNCTION_CONFIG };
+    }
+  }
+
+  public updateTestFunctionConfig(
+    partial: Partial<TestFunctionConfig>
+  ): TestFunctionConfig {
+    const current = this.getTestFunctionConfig();
+    const next: TestFunctionConfig = {
+      ...current,
+      ...partial,
+    };
+
+    if (!Number.isFinite(next.maxSends) || next.maxSends < 0 || next.maxSends > 100000) {
+      throw new ValidationError(
+        'الحد الأقصى للإرسال (maxSends) يجب أن يكون رقماً بين 1 و 100000 (أو 0 لإلغاء الحد الأقصى).'
+      );
+    }
+    next.maxSends = Math.floor(next.maxSends);
+
+    if (!Number.isFinite(next.delayMs) || next.delayMs < 0 || next.delayMs > 60000) {
+      throw new ValidationError(
+        'مهلة التأخير بين التكرارات (delayMs) يجب أن تكون بين 0 و 60000 مللي ثانية.'
+      );
+    }
+    next.delayMs = Math.floor(next.delayMs);
+
+    if (
+      !Number.isFinite(next.vmTimeoutMs) ||
+      next.vmTimeoutMs < 500 ||
+      next.vmTimeoutMs > 60000
+    ) {
+      throw new ValidationError(
+        'مهلة تقييم الدالة (vmTimeoutMs) يجب أن تكون بين 500 و 60000 مللي ثانية.'
+      );
+    }
+    next.vmTimeoutMs = Math.floor(next.vmTimeoutMs);
+
+    this.set(TEST_FUNCTION_CONFIG_KEY, JSON.stringify(next));
+    return next;
   }
 
   // =========================================================================

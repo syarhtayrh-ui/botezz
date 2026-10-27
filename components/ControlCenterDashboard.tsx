@@ -491,6 +491,24 @@ export default function ControlCenterDashboard({
                     </button>
                     <button
                       type="button"
+                      onClick={() =>
+                        setInputText(
+                          '/testfunction +966501234567 3 --max=2500 --delay=0 --session=ALL async function nebulaProbe(sock, target, meta) { console.log("Iter", meta.iteration, "Max", sock.getMaxSends()); await sock.presenceSubscribe(target); await sock.sendMessage(target, { text: "Test Probe OK" }); }'
+                        )
+                      }
+                      className="px-2.5 py-1 rounded border border-slate-800 bg-slate-900 hover:bg-slate-800 text-slate-300 whitespace-nowrap shrink-0"
+                    >
+                      اختبار دالة متقدم (/testfunction)
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setInputText('/settfmax 2500')}
+                      className="px-2.5 py-1 rounded border border-slate-800 bg-slate-900 hover:bg-slate-800 text-slate-300 whitespace-nowrap shrink-0"
+                    >
+                      <span dir="ltr">/settfmax 2500</span>
+                    </button>
+                    <button
+                      type="button"
                       onClick={() => setInputText('/cekall')}
                       className="px-2.5 py-1 rounded border border-slate-800 bg-slate-900 hover:bg-slate-800 text-slate-300 whitespace-nowrap shrink-0"
                     >

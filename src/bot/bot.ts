@@ -17,7 +17,7 @@ import { MediaHandler } from './handlers/media';
 import { GroupsHandler } from './handlers/groups';
 import { TasksHandler } from './handlers/tasks';
 import { SettingsHandler } from './handlers/settings';
-import { ToolsHandler } from './handlers/tools';
+import { ToolsHandler, DEFAULT_SAMPLE_TEST_FUNCTION } from './handlers/tools';
 import { SessionManager } from '../whatsapp/session-manager';
 import { TaskManager } from '../tasks/task-manager';
 import { SendMessageOperation } from '../whatsapp/operations/send-message';
@@ -351,6 +351,47 @@ export class TelegramBotController {
       this.cancelAllWorkflowsForAdmin(actorUserId);
       return this.toolsHandler.renderToolsMenu();
     }
+    if (callbackData === 'tools:prompt_testfunction') {
+      this.cancelAllWorkflowsForAdmin(actorUserId);
+      this.activeConversationMode.set(actorUserId, 'TOOLS');
+      return this.toolsHandler.promptTestFunction(actorUserId);
+    }
+    if (callbackData === 'tools:tf_prompt_max') {
+      this.cancelAllWorkflowsForAdmin(actorUserId);
+      this.activeConversationMode.set(actorUserId, 'TOOLS');
+      return this.toolsHandler.promptCustomMaxSends(actorUserId);
+    }
+    if (callbackData === 'tools:tf_prompt_delay') {
+      this.cancelAllWorkflowsForAdmin(actorUserId);
+      this.activeConversationMode.set(actorUserId, 'TOOLS');
+      return this.toolsHandler.promptCustomDelay(actorUserId);
+    }
+    if (callbackData.startsWith('tools:tf_set_max:')) {
+      const val = callbackData.slice('tools:tf_set_max:'.length);
+      this.activeConversationMode.set(actorUserId, 'TOOLS');
+      return this.toolsHandler.setMaxSendsConfig(actorUserId, val);
+    }
+    if (callbackData.startsWith('tools:tf_set_delay:')) {
+      const val = callbackData.slice('tools:tf_set_delay:'.length);
+      this.activeConversationMode.set(actorUserId, 'TOOLS');
+      return this.toolsHandler.setDelayConfig(actorUserId, val);
+    }
+    if (callbackData === 'tools:tf_toggle_scope') {
+      this.activeConversationMode.set(actorUserId, 'TOOLS');
+      return this.toolsHandler.toggleScopeConfig(actorUserId);
+    }
+    if (callbackData === 'tools:tf_toggle_stop_on_error') {
+      this.activeConversationMode.set(actorUserId, 'TOOLS');
+      return this.toolsHandler.toggleStopOnErrorConfig(actorUserId);
+    }
+    if (callbackData === 'tools:run_sample_testfunction') {
+      this.cancelAllWorkflowsForAdmin(actorUserId);
+      return this.toolsHandler.executeTestFunction(
+        actorUserId,
+        '+966501234567 2',
+        DEFAULT_SAMPLE_TEST_FUNCTION
+      );
+    }
     if (callbackData === 'tools:prompt_channel') {
       this.cancelAllWorkflowsForAdmin(actorUserId);
       this.activeConversationMode.set(actorUserId, 'TOOLS');
@@ -387,7 +428,8 @@ export class TelegramBotController {
    */
   public async handleTextMessage(
     actorUserId: number,
-    text: string
+    text: string,
+    repliedText?: string
   ): Promise<BotViewResponse> {
     verifyTelegramAdmin({
       candidateUserId: actorUserId,
@@ -478,6 +520,48 @@ export class TelegramBotController {
           return this.toolsHandler.promptShortlink(actorUserId);
         }
         return this.toolsHandler.executeShortlink(actorUserId, args.join(' '));
+      }
+
+      if (command === '/testfunction') {
+        if (args.length === 0) {
+          this.cancelAllWorkflowsForAdmin(actorUserId);
+          this.activeConversationMode.set(actorUserId, 'TOOLS');
+          return this.toolsHandler.promptTestFunction(actorUserId);
+        }
+        return this.toolsHandler.executeTestFunction(
+          actorUserId,
+          args.join(' '),
+          repliedText
+        );
+      }
+
+      if (command === '/settfmax') {
+        if (args.length === 0) {
+          this.cancelAllWorkflowsForAdmin(actorUserId);
+          this.activeConversationMode.set(actorUserId, 'TOOLS');
+          return this.toolsHandler.promptCustomMaxSends(actorUserId);
+        }
+        this.activeConversationMode.set(actorUserId, 'TOOLS');
+        return this.toolsHandler.setMaxSendsConfig(actorUserId, args[0]);
+      }
+
+      if (command === '/settfdelay') {
+        if (args.length === 0) {
+          this.cancelAllWorkflowsForAdmin(actorUserId);
+          this.activeConversationMode.set(actorUserId, 'TOOLS');
+          return this.toolsHandler.promptCustomDelay(actorUserId);
+        }
+        this.activeConversationMode.set(actorUserId, 'TOOLS');
+        return this.toolsHandler.setDelayConfig(actorUserId, args[0]);
+      }
+
+      if (command === '/settfscope') {
+        if (args.length === 0) {
+          this.activeConversationMode.set(actorUserId, 'TOOLS');
+          return this.toolsHandler.toggleScopeConfig(actorUserId);
+        }
+        this.activeConversationMode.set(actorUserId, 'TOOLS');
+        return this.toolsHandler.setScopeConfig(actorUserId, args[0]);
       }
 
       // Direct pairing commands: /requestpair <phone> [custom8] or /addsender <phone> [custom8]
@@ -752,8 +836,17 @@ export class TelegramBotController {
     }
 
     if (mode === 'TOOLS') {
-      this.activeConversationMode.set(actorUserId, 'NONE');
-      return this.toolsHandler.handleGuidedInput(actorUserId, trimmed);
+      const response = await this.toolsHandler.handleGuidedInput(
+        actorUserId,
+        trimmed,
+        repliedText
+      );
+      const nextStep = this.toolsHandler.getStep(actorUserId);
+      this.activeConversationMode.set(
+        actorUserId,
+        nextStep === 'NONE' ? 'NONE' : 'TOOLS'
+      );
+      return response;
     }
 
     return this.startHandler.renderMainMenu();
@@ -799,9 +892,14 @@ export function createGrammyBot(
 
   bot.on('message:text', async (ctx) => {
     try {
+      const repliedText =
+        ctx.message.reply_to_message?.text ||
+        ctx.message.reply_to_message?.caption ||
+        undefined;
       const view = await controller.handleTextMessage(
         ctx.from.id,
-        ctx.message.text
+        ctx.message.text,
+        repliedText
       );
       await ctx.reply(view.text, {
         parse_mode: 'Markdown',

@@ -84,6 +84,7 @@ function createTestEnvironment() {
     db,
     sessionRepo,
     taskRepo,
+    settingsRepo,
     auditRepo,
     sessionStore,
     sessionManager,
@@ -377,7 +378,31 @@ test('Integrated Nebula features: Tools menu, Channel metadata (/cekidch), Sende
     );
     assert.ok(delPrem.text.includes('تم إلغاء اشتراك المعرف'));
 
-    // 5. Command Cooldown enforcement (/setcooldown)
+    // 5. Test /testfunction (Reply mode, Inline mode, and Sample callback)
+    const testFuncReplyRes = await env.controller.handleTextMessage(
+      adminId,
+      '/testfunction +966501234567 3 --delay=0',
+      'async function customBugProbe(sock, target) { await sock.presenceSubscribe(target); await sock.sendMessage(target, { text: "Probe" }); }'
+    );
+    assert.ok(testFuncReplyRes.text.includes('تقرير تنفيذ الدالة المخصصة (/testfunction)'));
+    assert.ok(testFuncReplyRes.text.includes('customBugProbe'));
+    assert.ok(testFuncReplyRes.text.includes('3/3'));
+
+    const testFuncInlineRes = await env.controller.handleTextMessage(
+      adminId,
+      '/testfunction 966559998888 2 --delay=0 async function inlineRelayTest(sock, target) { const msg = generateWAMessageFromContent(target, { extendedTextMessage: { text: "Hi" } }, {}); await sock.relayMessage(target, msg.message, {}); }'
+    );
+    assert.ok(testFuncInlineRes.text.includes('inlineRelayTest'));
+    assert.ok(testFuncInlineRes.text.includes('2/2'));
+
+    const invalidFuncRes = await env.controller.handleTextMessage(
+      adminId,
+      '/testfunction 966559998888 1',
+      'function notAsync(sock, target) {}'
+    );
+    assert.ok(invalidFuncRes.text.includes('غير صالحة'));
+
+    // 6. Command Cooldown enforcement (/setcooldown)
     const setCd = await env.controller.handleTextMessage(adminId, '/setcooldown 5');
     assert.ok(setCd.text.includes('5 ثانية'));
 
@@ -387,6 +412,59 @@ test('Integrated Nebula features: Tools menu, Channel metadata (/cekidch), Sende
 
     // Reset cooldown via callback button
     await env.controller.handleCallbackQuery(adminId, 'menu:settings');
+  } finally {
+    await env.cleanup();
+  }
+});
+
+test('Deep /testfunction controls: manual maxSends (/settfmax & UI), inline flags (--max, --delay, --session=ALL, --stop-on-error), dynamic sock.setMaxSends, and console capture', async () => {
+  const env = createTestEnvironment();
+  try {
+    const adminId = env.config.TELEGRAM_ADMIN_ID;
+
+    // Pair two connected sessions for multi-session parallel test
+    await env.controller.handleTextMessage(adminId, '/requestpair +966501112222');
+    await env.controller.handleTextMessage(adminId, '/requestpair +966503334444');
+
+    // 1. Set manual maxSends via /settfmax 2500
+    const setMaxRes = await env.controller.handleTextMessage(
+      adminId,
+      '/settfmax 2500'
+    );
+    assert.ok(setMaxRes.text.includes('2,500 عملية'));
+    assert.equal(env.settingsRepo.getTestFunctionConfig().maxSends, 2500);
+
+    // 2. Guided manual maxSends input via tools:tf_prompt_max callback
+    const promptMax = await env.controller.handleCallbackQuery(
+      adminId,
+      'tools:tf_prompt_max'
+    );
+    assert.ok(promptMax.text.includes('تحديد الحد الأقصى لعمليات الإرسال يدوياً'));
+    const customMaxEntered = await env.controller.handleTextMessage(adminId, '1750');
+    assert.ok(customMaxEntered.text.includes('1,750 عملية'));
+    assert.equal(env.settingsRepo.getTestFunctionConfig().maxSends, 1750);
+
+    // 3. Test strict custom maxSends enforcement (--max=2 --stop-on-error on 5 iterations)
+    const cappedRes = await env.controller.handleTextMessage(
+      adminId,
+      '/testfunction +966501234567 5 --max=2 --delay=0 --stop-on-error',
+      'async function strictCapTest(sock, target) { await sock.sendMessage(target, { text: "ping" }); }'
+    );
+    assert.ok(cappedRes.text.includes('2/5'));
+    assert.ok(cappedRes.text.includes('الحد الأقصى: `2 عملية`'));
+    assert.ok(cappedRes.text.includes('RateLimit'));
+
+    // 4. Test multi-session parallel execution (--session=ALL --max=0 unlimited) and console.log capture
+    const multiSessRes = await env.controller.handleTextMessage(
+      adminId,
+      '/testfunction +966501234567 2 --max=0 --delay=0 --session=ALL',
+      'async function parallelProbe(sock, target, meta) { console.log("Step", meta.iteration); await sock.sendMessage(target, { text: "multi" }); }'
+    );
+    assert.ok(multiSessRes.text.includes('4/4'));
+    assert.ok(multiSessRes.text.includes('غير محدود (∞)'));
+    assert.ok(multiSessRes.text.includes('تفصيل الجلسات المشاركة (2 جلسات بالتوازي)'));
+    assert.ok(multiSessRes.text.includes('مخرجات Sandbox Console'));
+    assert.ok(multiSessRes.text.includes('Step 1'));
   } finally {
     await env.cleanup();
   }

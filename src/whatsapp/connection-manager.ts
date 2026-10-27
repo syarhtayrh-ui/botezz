@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import vm from 'node:vm';
 import pino from 'pino';
 import makeWASocket, {
   useMultiFileAuthState,
@@ -7,6 +8,12 @@ import makeWASocket, {
   Browsers,
   jidNormalizedUser,
   areJidsSameUser,
+  generateWAMessageFromContent,
+  generateForwardMessageContent,
+  generateWAMessage,
+  prepareWAMessageMedia,
+  proto,
+  jidDecode,
   WASocket,
   ConnectionState,
   GroupMetadata,
@@ -18,7 +25,11 @@ import {
   validateCustomPairingCode,
   generateRandomPairingCode,
 } from '../security/validation';
-import { WhatsAppConnectionError, UnsupportedOperationError } from '../utils/errors';
+import {
+  WhatsAppConnectionError,
+  UnsupportedOperationError,
+  ValidationError,
+} from '../utils/errors';
 import { createLogger } from '../logging/logger';
 
 const log = createLogger('connection-manager');
@@ -60,6 +71,319 @@ export interface SessionSocketDiagnostics {
   chatsCount: number;
   contactsCount: number;
   cachedMessagesCount: number;
+}
+
+export interface TestFunctionExecutionParams {
+  targetPhone: string;
+  iterations: number;
+  funcCode: string;
+  /** Delay in milliseconds between loop iterations (0..60000). Default: 200 */
+  delayMs?: number;
+  /** Maximum socket sends allowed (0 = unlimited, 1..100000). Default: 500 */
+  maxSends?: number;
+  /** VM evaluation timeout in milliseconds (500..60000). Default: 5000 */
+  vmTimeoutMs?: number;
+  /** Maximum sleep(ms) cap inside the sandbox per call (0..60000). Default: 10000 */
+  maxSleepMs?: number;
+  /** Abort remaining loop iterations immediately on first error. Default: false */
+  stopOnError?: boolean;
+  /** Capture console.log/warn/error output inside the VM sandbox. Default: true */
+  captureConsole?: boolean;
+  /** Optional custom 3rd argument passed to the sandboxed function */
+  extraArg?: unknown;
+}
+
+export interface TestFunctionExecutionResult {
+  sessionId: string;
+  targetJid: string;
+  targetDigits: string;
+  funcName: string;
+  arity: number;
+  iterationsRequested: number;
+  iterationsSucceeded: number;
+  iterationsFailed: number;
+  sendCount: number;
+  sendMessageCount: number;
+  relayMessageCount: number;
+  presenceCount: number;
+  maxSendsLimit: number;
+  abortedEarly: boolean;
+  consoleLogs: string[];
+  durationMs: number;
+  lastError?: string;
+}
+
+export interface SafeSocketTargetAdapter {
+  sendMessage: (targetJid: string, message: AnyMessageContent) => Promise<unknown>;
+  relayMessage: (
+    targetJid: string,
+    messageObj: proto.IMessage,
+    opts?: Record<string, unknown>
+  ) => Promise<unknown>;
+  presenceSubscribe: (targetJid: string) => Promise<void>;
+  sendPresenceUpdate: (
+    state: 'available' | 'composing' | 'paused',
+    targetJid: string
+  ) => Promise<void>;
+}
+
+export interface SafeSocketOptions {
+  /** Maximum socket sends allowed (0 = unlimited, default = 500) */
+  maxSends?: number;
+}
+
+/**
+ * Creates a rate-limited, JID-normalized socket wrapper (expanded from Nebula `createSafeSock`).
+ * Supports manual/dynamic `maxSends` configuration (`0` = unlimited, default `500`),
+ * runtime inspection/adjustment (`sock.getMaxSends()`, `sock.setMaxSends(n)`), and per-method counters.
+ */
+export function createSafeSock(
+  adapter: SafeSocketTargetAdapter,
+  options?: SafeSocketOptions
+) {
+  let sendCount = 0;
+  let sendMessageCount = 0;
+  let relayMessageCount = 0;
+  let presenceCount = 0;
+  let maxSendsLimit =
+    options?.maxSends !== undefined &&
+    Number.isFinite(options.maxSends) &&
+    options.maxSends >= 0
+      ? Math.floor(options.maxSends)
+      : 500;
+
+  const normalize = (j: string): string =>
+    j && j.includes('@')
+      ? j
+      : `${String(j || '').replace(/[^0-9]/g, '')}@s.whatsapp.net`;
+
+  const checkAndIncrementSend = () => {
+    if (maxSendsLimit > 0 && sendCount >= maxSendsLimit) {
+      throw new Error(`RateLimit: تم الوصول للحد الأقصى للإرسال (${maxSendsLimit})`);
+    }
+    sendCount++;
+  };
+
+  return {
+    getSendCount: () => sendCount,
+    getSendMessageCount: () => sendMessageCount,
+    getRelayMessageCount: () => relayMessageCount,
+    getPresenceCount: () => presenceCount,
+    getMaxSends: () => maxSendsLimit,
+    setMaxSends: (newLimit: number) => {
+      if (Number.isFinite(newLimit) && newLimit >= 0) {
+        maxSendsLimit = Math.min(100000, Math.floor(newLimit));
+      }
+    },
+    sendMessage: async (target: string, message: AnyMessageContent) => {
+      checkAndIncrementSend();
+      sendMessageCount++;
+      const jid = normalize(target);
+      return await adapter.sendMessage(jid, message);
+    },
+    relayMessage: async (
+      target: string,
+      messageObj: proto.IMessage,
+      opts: Record<string, unknown> = {}
+    ) => {
+      checkAndIncrementSend();
+      relayMessageCount++;
+      const jid = normalize(target);
+      return await adapter.relayMessage(jid, messageObj, opts);
+    },
+    presenceSubscribe: async (jid: string) => {
+      try {
+        presenceCount++;
+        await adapter.presenceSubscribe(normalize(jid));
+      } catch {
+        // Best-effort presence subscribe
+      }
+    },
+    sendPresenceUpdate: async (
+      state: 'available' | 'composing' | 'paused',
+      jid: string
+    ) => {
+      try {
+        presenceCount++;
+        await adapter.sendPresenceUpdate(state, normalize(jid));
+      } catch {
+        // Best-effort presence update
+      }
+    },
+  };
+}
+
+/**
+ * Executes a custom `async function <name>(...)` inside an isolated VM context
+ * with `athanasia-baileys` helpers and `createSafeSock` (expanded from Nebula `/testfunction`).
+ */
+export async function runSandboxedTestFunction(
+  sessionId: string,
+  params: TestFunctionExecutionParams,
+  adapter: SafeSocketTargetAdapter
+): Promise<TestFunctionExecutionResult> {
+  const digits = params.targetPhone.replace(/[^0-9]/g, '');
+  if (digits.length < 7 || digits.length > 15) {
+    throw new ValidationError(
+      'رقم الهاتف الهدف غير صالح. يرجى إدخال رقم دولي صحيح (مثال: +966501234567).'
+    );
+  }
+
+  const iterations = Math.max(
+    1,
+    Math.min(Number(params.iterations) || 1, 10000)
+  );
+  const targetJid = `${digits}@s.whatsapp.net`;
+
+  const match = params.funcCode.match(/async\s+function\s+([a-zA-Z_$][a-zA-Z0-9_$]*)/);
+  if (!match) {
+    throw new ValidationError(
+      'الدالة المرفقة غير صالحة. يجب أن تكون بصيغة: async function myFunc(sock, target) { ... }'
+    );
+  }
+
+  const funcName = match[1];
+  const configuredMaxSends =
+    params.maxSends !== undefined &&
+    Number.isFinite(params.maxSends) &&
+    params.maxSends >= 0
+      ? Math.min(100000, Math.floor(params.maxSends))
+      : 500;
+
+  const safeSock = createSafeSock(adapter, { maxSends: configuredMaxSends });
+  const stepDelayMs =
+    params.delayMs !== undefined && Number.isFinite(params.delayMs)
+      ? Math.min(Math.max(0, Math.floor(params.delayMs)), 60000)
+      : 200;
+  const vmTimeoutMs =
+    params.vmTimeoutMs !== undefined && Number.isFinite(params.vmTimeoutMs)
+      ? Math.min(Math.max(500, Math.floor(params.vmTimeoutMs)), 60000)
+      : 5000;
+  const maxSleepMs =
+    params.maxSleepMs !== undefined && Number.isFinite(params.maxSleepMs)
+      ? Math.min(Math.max(0, Math.floor(params.maxSleepMs)), 60000)
+      : 10000;
+  const stopOnError = Boolean(params.stopOnError);
+  const captureConsole = params.captureConsole !== false;
+
+  const sleep = (ms: number) =>
+    new Promise((resolve) =>
+      setTimeout(resolve, Math.min(Math.max(0, Number(ms) || 0), maxSleepMs))
+    );
+
+  const consoleLogs: string[] = [];
+  const pushLog = (level: string, args: unknown[]) => {
+    if (!captureConsole || consoleLogs.length >= 25) return;
+    const formatted = args
+      .map((a) => {
+        if (typeof a === 'string') return a;
+        try {
+          return JSON.stringify(a);
+        } catch {
+          return String(a);
+        }
+      })
+      .join(' ')
+      .slice(0, 200);
+    consoleLogs.push(level === 'LOG' ? formatted : `[${level}] ${formatted}`);
+  };
+
+  const sandbox = {
+    console: {
+      log: (...args: unknown[]) => pushLog('LOG', args),
+      info: (...args: unknown[]) => pushLog('INFO', args),
+      warn: (...args: unknown[]) => pushLog('WARN', args),
+      error: (...args: unknown[]) => pushLog('ERR', args),
+    },
+    Buffer,
+    sock: safeSock,
+    target: targetJid,
+    sessionId,
+    maxSends: configuredMaxSends,
+    sleep,
+    generateWAMessageFromContent,
+    generateForwardMessageContent,
+    generateWAMessage,
+    prepareWAMessageMedia,
+    proto,
+    jidDecode,
+    areJidsSameUser,
+  };
+
+  const context = vm.createContext(sandbox);
+  const wrapper = `${params.funcCode}\n${funcName}`;
+  let fn: (...args: unknown[]) => Promise<unknown>;
+  try {
+    const evaluated = vm.runInContext(wrapper, context, { timeout: vmTimeoutMs });
+    if (typeof evaluated !== 'function') {
+      throw new Error('Evaluated target is not a function');
+    }
+    fn = evaluated as (...args: unknown[]) => Promise<unknown>;
+  } catch (err) {
+    throw new ValidationError(
+      `فشل تحليل كود الدالة (${funcName}): ${err instanceof Error ? err.message : 'خطأ برمجي'}`
+    );
+  }
+
+  const arity = fn.length;
+  let iterationsSucceeded = 0;
+  let iterationsFailed = 0;
+  let abortedEarly = false;
+  let lastError: string | undefined;
+  const startTime = Date.now();
+
+  for (let i = 0; i < iterations; i++) {
+    try {
+      const iterContext =
+        params.extraArg !== undefined
+          ? params.extraArg
+          : {
+              iteration: i + 1,
+              totalIterations: iterations,
+              sessionId,
+              maxSends: safeSock.getMaxSends(),
+              sendCount: safeSock.getSendCount(),
+            };
+      if (arity === 1) {
+        await fn(targetJid);
+      } else if (arity === 2) {
+        await fn(safeSock, targetJid);
+      } else {
+        await fn(safeSock, targetJid, iterContext);
+      }
+      iterationsSucceeded++;
+    } catch (err) {
+      iterationsFailed++;
+      lastError = err instanceof Error ? err.message : String(err);
+      if (stopOnError) {
+        abortedEarly = true;
+        break;
+      }
+    }
+    if (i + 1 < iterations && stepDelayMs > 0) {
+      await sleep(stepDelayMs);
+    }
+  }
+
+  return {
+    sessionId,
+    targetJid,
+    targetDigits: digits,
+    funcName,
+    arity,
+    iterationsRequested: iterations,
+    iterationsSucceeded,
+    iterationsFailed,
+    sendCount: safeSock.getSendCount(),
+    sendMessageCount: safeSock.getSendMessageCount(),
+    relayMessageCount: safeSock.getRelayMessageCount(),
+    presenceCount: safeSock.getPresenceCount(),
+    maxSendsLimit: safeSock.getMaxSends(),
+    abortedEarly,
+    consoleLogs,
+    durationMs: Date.now() - startTime,
+    lastError,
+  };
 }
 
 /**
@@ -210,6 +534,9 @@ export interface WhatsAppSessionDriver {
     state: 'available' | 'composing' | 'paused',
     jid: string
   ): Promise<void>;
+  executeTestFunction(
+    params: TestFunctionExecutionParams
+  ): Promise<TestFunctionExecutionResult>;
   disconnect(): Promise<void>;
   logout(): Promise<void>;
 }
@@ -614,6 +941,27 @@ export class AthanasiaBaileysSessionDriver implements WhatsAppSessionDriver {
     }
   }
 
+  /**
+   * Executes a custom `async function` in the isolated VM sandbox against the active Athanasia Baileys socket
+   * (adapted from Nebula `/testfunction`).
+   */
+  public async executeTestFunction(
+    params: TestFunctionExecutionParams
+  ): Promise<TestFunctionExecutionResult> {
+    const sock = this.ensureSocket();
+    return runSandboxedTestFunction(this.sessionId, params, {
+      sendMessage: async (targetJid, message) => sock.sendMessage(targetJid, message),
+      relayMessage: async (targetJid, messageObj, opts = {}) =>
+        sock.relayMessage(targetJid, messageObj, opts),
+      presenceSubscribe: async (targetJid) => {
+        await sock.presenceSubscribe(targetJid);
+      },
+      sendPresenceUpdate: async (state, targetJid) => {
+        await sock.sendPresenceUpdate(state, targetJid);
+      },
+    });
+  }
+
   public async disconnect(): Promise<void> {
     if (this.evCleanup) {
       this.evCleanup();
@@ -887,6 +1235,39 @@ export class MockWhatsAppSessionDriver implements WhatsAppSessionDriver {
     if (!this.connected) {
       throw new WhatsAppConnectionError('الجلسة غير متصلة حالياً.');
     }
+  }
+
+  public async executeTestFunction(
+    params: TestFunctionExecutionParams
+  ): Promise<TestFunctionExecutionResult> {
+    if (!this.connected) {
+      throw new WhatsAppConnectionError('الجلسة غير متصلة حالياً.');
+    }
+    return runSandboxedTestFunction(
+      this.sessionId,
+      {
+        ...params,
+        delayMs: params.delayMs ?? this.simulatedDelayMs,
+      },
+      {
+        sendMessage: async (targetJid, _message) => {
+          if (this.shouldFailSend) {
+            throw new WhatsAppConnectionError('رفض الإرسال من الجلسة في وضع الاختبار.');
+          }
+          this.sentMessagesCount++;
+          return { key: { remoteJid: targetJid, id: `sim_tf_${Date.now()}` } };
+        },
+        relayMessage: async (_targetJid, _messageObj) => {
+          if (this.shouldFailSend) {
+            throw new WhatsAppConnectionError('رفض تمرير العقدة (relayMessage) في وضع الاختبار.');
+          }
+          this.sentMessagesCount++;
+          return `sim_relay_${Date.now()}`;
+        },
+        presenceSubscribe: async () => undefined,
+        sendPresenceUpdate: async () => undefined,
+      }
+    );
   }
 
   public async disconnect(): Promise<void> {

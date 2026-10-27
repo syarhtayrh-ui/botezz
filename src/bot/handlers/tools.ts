@@ -17,7 +17,17 @@ export type ToolsInputStep =
   | 'NONE'
   | 'AWAITING_CHANNEL_LINK'
   | 'AWAITING_IP'
-  | 'AWAITING_SHORTLINK';
+  | 'AWAITING_SHORTLINK'
+  | 'AWAITING_TESTFUNCTION'
+  | 'AWAITING_TF_MAX_SENDS'
+  | 'AWAITING_TF_DELAY';
+
+export const DEFAULT_SAMPLE_TEST_FUNCTION = `async function nebulaSocketProbe(sock, target, meta) {
+  console.log('Executing probe iteration', meta?.iteration, 'maxSends=', sock.getMaxSends());
+  await sock.presenceSubscribe(target);
+  await sock.sendPresenceUpdate('composing', target);
+  await sock.sendMessage(target, { text: 'Nebula Function Probe OK' });
+}`;
 
 export class ToolsHandler {
   private readonly inputStates = new Map<number, ToolsInputStep>();
@@ -38,10 +48,15 @@ export class ToolsHandler {
   }
 
   public renderToolsMenu(): BotViewResponse {
+    const tfCfg = this.settingsRepo.getTestFunctionConfig();
+    const maxLabel = tfCfg.maxSends === 0 ? 'غير محدود (∞)' : `${tfCfg.maxSends}`;
     return {
       text:
         `🛠️ *الأدوات والفحص المتقدم (Tools & Diagnostics)*\n\n` +
         `اختر الأداة المطلوبة من الأزرار التفاعلية أدناه أو استخدم الأوامر السريعة مباشرة:\n` +
+        `• \`/testfunction <phone> <count> [--max=N] [--delay=MS] [--session=ALL]\` — تشغيل واختبار دالة غير متزامنة (\`async function\`) مع تحكم كامل بحد الإرسال (\`الحالي: ${maxLabel}\`)\n` +
+        `• \`/settfmax <N|0>\` — تحديد الحد الأقصى للإرسال يدوياً (أو \`0\` لبلا حد)\n` +
+        `• \`/settfdelay <ms>\` — تحديد الفاصل الزمني بين التكرارات يدوياً\n` +
         `• \`/cekidch <link>\` — فحص قناة واتساب واستخراج معرفها وعدد المتابعين\n` +
         `• \`/ceksender\` — فحص مقابس جلسات واتساب والذاكرة المؤقتة (InMemoryStore)\n` +
         `• \`/cekall\` — تقرير شامل (المسؤول + الاشتراكات + الجلسات + موارد الخادم)\n` +
@@ -52,12 +67,22 @@ export class ToolsHandler {
       keyboard: [
         [
           {
+            text: '🧪 مختبر الدوال المتقدم (/testfunction)',
+            callbackData: 'tools:prompt_testfunction',
+          },
+          {
             text: '📡 فحص قناة واتساب (/cekidch)',
             callbackData: 'tools:prompt_channel',
           },
+        ],
+        [
           {
             text: '📱 فحص مقابس الإرسال (/ceksender)',
             callbackData: 'tools:ceksender',
+          },
+          {
+            text: '📊 التقرير الشامل (/cekall)',
+            callbackData: 'tools:cekall',
           },
         ],
         [
@@ -72,25 +97,21 @@ export class ToolsHandler {
         ],
         [
           {
-            text: '📊 التقرير الشامل (/cekall)',
-            callbackData: 'tools:cekall',
-          },
-          {
             text: '🪪 بطاقة الحساب (/info)',
             callbackData: 'tools:info',
           },
-        ],
-        [
           {
             text: '🌋 رصد الزلازل (/gempa)',
             callbackData: 'tools:gempa',
           },
+        ],
+        [
           {
             text: '⭐ إدارة الاشتراكات',
             callbackData: 'settings:view_access',
           },
+          { text: '🔙 القائمة الرئيسية', callbackData: 'menu:main' },
         ],
-        [{ text: '🔙 القائمة الرئيسية', callbackData: 'menu:main' }],
       ],
     };
   }
@@ -125,9 +146,229 @@ export class ToolsHandler {
     };
   }
 
+  public promptTestFunction(adminId: number, noticeBanner?: string): BotViewResponse {
+    this.inputStates.set(adminId, 'AWAITING_TESTFUNCTION');
+    const cfg = this.settingsRepo.getTestFunctionConfig();
+    const maxSendsLabel =
+      cfg.maxSends === 0
+        ? 'غير محدود (∞ بلا سقف)'
+        : `${cfg.maxSends.toLocaleString('en-US')} عملية`;
+    const scopeLabel =
+      cfg.sessionScope === 'ALL'
+        ? 'جميع الجلسات المتصلة بالتوازي (ALL)'
+        : cfg.sessionScope === 'FIRST'
+          ? 'الجلسة المتصلة الأولى (FIRST)'
+          : `جلسة محددة (${cfg.sessionScope})`;
+    const errorPolicyLabel = cfg.stopOnError
+      ? '🛑 إيقاف فوري عند أول خطأ (Stop on Error)'
+      : '🔄 الاستمرار وتجاوز الأخطاء (Continue on Error)';
+
+    return {
+      text:
+        (noticeBanner ? `${noticeBanner}\n━━━━━━━━━━━━━━━━━━\n` : '') +
+        `🧪 *لوحة التحكم العميق في مختبر الدوال (/testfunction)*\n` +
+        `━━━━━━━━━━━━━━━━━━\n` +
+        `⚙️ *إعدادات التنفيذ الحالية (قابلة للتعديل الفوري):*\n` +
+        `• 📤 *الحد الأقصى للإرسال (Max Sends):* \`${maxSendsLabel}\`\n` +
+        `• ⏱️ *التأخير بين التكرارات (Loop Delay):* \`${cfg.delayMs}ms\`\n` +
+        `• 📡 *نطاق الجلسات (Session Scope):* \`${scopeLabel}\`\n` +
+        `• 🛡️ *سياسة الأخطاء (Error Policy):* ${errorPolicyLabel}\n` +
+        `• ⌛ *مهلة Sandbox VM:* \`${cfg.vmTimeoutMs}ms\` | *التقاط Console:* \`${cfg.captureConsole ? 'مفعل' : 'معطل'}\`\n\n` +
+        `📌 *طرق التشغيل والتحكم المتقدم:*\n` +
+        `1️⃣ *بالرد على رسالة كود أو إرسال سطر واحد:*\n` +
+        `\`/testfunction +966501234567 5\`\n` +
+        `2️⃣ *مع خيارات تحكم فورية (Inline Flags) تتجاوز الإعدادات الافتراضية:*\n` +
+        `\`/testfunction +966501234567 10 --max=2500 --delay=100 --session=ALL --stop-on-error\`\n` +
+        `3️⃣ *التحكم من داخل كود الدالة نفسها عبر \`sock\`:*\n` +
+        `يمكن للدالة استدعاء \`sock.setMaxSends(5000)\` أو \`sock.setMaxSends(0)\` (بلا حد) أو \`console.log(...)\` أثناء التشغيل!`,
+      keyboard: [
+        [
+          {
+            text: '⚡ تشغيل دالة فحص تجريبية جاهزة',
+            callbackData: 'tools:run_sample_testfunction',
+          },
+          {
+            text: '🔢 تحديد حد الإرسال يدوياً',
+            callbackData: 'tools:tf_prompt_max',
+          },
+        ],
+        [
+          {
+            text: cfg.maxSends === 100 ? '✅ حد: 100' : 'حد: 100',
+            callbackData: 'tools:tf_set_max:100',
+          },
+          {
+            text: cfg.maxSends === 500 ? '✅ حد: 500' : 'حد: 500',
+            callbackData: 'tools:tf_set_max:500',
+          },
+          {
+            text: cfg.maxSends === 2000 ? '✅ حد: 2000' : 'حد: 2000',
+            callbackData: 'tools:tf_set_max:2000',
+          },
+          {
+            text: cfg.maxSends === 0 ? '✅ حد: ∞ مفتوح' : 'حد: ∞ مفتوح',
+            callbackData: 'tools:tf_set_max:0',
+          },
+        ],
+        [
+          {
+            text: cfg.delayMs === 0 ? '✅ تأخير: 0ms' : 'تأخير: 0ms',
+            callbackData: 'tools:tf_set_delay:0',
+          },
+          {
+            text: cfg.delayMs === 200 ? '✅ تأخير: 200ms' : 'تأخير: 200ms',
+            callbackData: 'tools:tf_set_delay:200',
+          },
+          {
+            text: cfg.delayMs === 1000 ? '✅ تأخير: 1000ms' : 'تأخير: 1000ms',
+            callbackData: 'tools:tf_set_delay:1000',
+          },
+          {
+            text: '⏱️ تأخير يدوي',
+            callbackData: 'tools:tf_prompt_delay',
+          },
+        ],
+        [
+          {
+            text:
+              cfg.sessionScope === 'ALL'
+                ? '📡 النطاق: كل الجلسات (ALL)'
+                : '📡 النطاق: جلسة واحدة (FIRST)',
+            callbackData: 'tools:tf_toggle_scope',
+          },
+          {
+            text: cfg.stopOnError
+              ? '🛑 عند الخطأ: إيقاف فوري'
+              : '🔄 عند الخطأ: استمرار',
+            callbackData: 'tools:tf_toggle_stop_on_error',
+          },
+        ],
+        buildBackCancelRow('menu:tools'),
+      ],
+    };
+  }
+
+  public promptCustomMaxSends(adminId: number): BotViewResponse {
+    this.inputStates.set(adminId, 'AWAITING_TF_MAX_SENDS');
+    const current = this.settingsRepo.getTestFunctionConfig().maxSends;
+    return {
+      text:
+        `🔢 *تحديد الحد الأقصى لعمليات الإرسال يدوياً (Manual Max Sends)*\n\n` +
+        `الحد الحالي: \`${current === 0 ? 'غير محدود (0)' : current}\`\n\n` +
+        `أرسل الآن الرقم المطلوب للحد الأقصى لعمليات المقبس (\`sendMessage\` / \`relayMessage\`) في كل تشغيل:\n` +
+        `• أرسل أي رقم بين \`1\` و \`100000\` (مثلاً: \`1500\` أو \`5000\`)\n` +
+        `• أو أرسل \`0\` لإلغاء الحد الأقصى نهائياً (غير محدود ∞):`,
+      keyboard: [buildBackCancelRow('tools:prompt_testfunction')],
+    };
+  }
+
+  public promptCustomDelay(adminId: number): BotViewResponse {
+    this.inputStates.set(adminId, 'AWAITING_TF_DELAY');
+    const current = this.settingsRepo.getTestFunctionConfig().delayMs;
+    return {
+      text:
+        `⏱️ *تحديد مهلة التأخير بين التكرارات يدوياً (Iteration Delay)*\n\n` +
+        `التأخير الحالي: \`${current}ms\`\n\n` +
+        `أرسل الآن قيمة التأخير بالمللي ثانية بين \`0\` و \`60000\` (مثلاً: \`0\` للتنفيذ الفوري أو \`500\` لنصف ثانية):`,
+      keyboard: [buildBackCancelRow('tools:prompt_testfunction')],
+    };
+  }
+
+  public setMaxSendsConfig(adminId: number, rawValue: string): BotViewResponse {
+    try {
+      const clean = rawValue.trim().toLowerCase();
+      const numeric =
+        clean === 'unlimited' || clean === 'inf' || clean === 'infinity' || clean === '0'
+          ? 0
+          : Number(clean);
+      const updated = this.settingsRepo.updateTestFunctionConfig({
+        maxSends: numeric,
+      });
+      this.auditRepo.record({
+        actorTelegramId: adminId,
+        action: 'TESTFUNCTION_CONFIG_UPDATED',
+        targetId: 'maxSends',
+        outcome: 'SUCCESS',
+        metadata: { maxSends: updated.maxSends },
+      });
+      const label =
+        updated.maxSends === 0
+          ? 'غير محدود (∞ بلا سقف)'
+          : `${updated.maxSends.toLocaleString('en-US')} عملية`;
+      return this.promptTestFunction(
+        adminId,
+        `✅ *تم تحديث الحد الأقصى للإرسال (Max Sends) إلى:* \`${label}\``
+      );
+    } catch (err) {
+      const safeErr = toSafeArabicError(err);
+      return this.promptTestFunction(adminId, `⚠️ ${safeErr.userMessage}`);
+    }
+  }
+
+  public setDelayConfig(adminId: number, rawValue: string): BotViewResponse {
+    try {
+      const numeric = Number(rawValue.trim().replace(/ms$/i, ''));
+      const updated = this.settingsRepo.updateTestFunctionConfig({
+        delayMs: numeric,
+      });
+      this.auditRepo.record({
+        actorTelegramId: adminId,
+        action: 'TESTFUNCTION_CONFIG_UPDATED',
+        targetId: 'delayMs',
+        outcome: 'SUCCESS',
+        metadata: { delayMs: updated.delayMs },
+      });
+      return this.promptTestFunction(
+        adminId,
+        `✅ *تم تحديث التأخير بين التكرارات (Delay) إلى:* \`${updated.delayMs}ms\``
+      );
+    } catch (err) {
+      const safeErr = toSafeArabicError(err);
+      return this.promptTestFunction(adminId, `⚠️ ${safeErr.userMessage}`);
+    }
+  }
+
+  public setScopeConfig(adminId: number, rawScope: string): BotViewResponse {
+    const clean = rawScope.trim();
+    const normalized =
+      clean.toUpperCase() === 'ALL'
+        ? 'ALL'
+        : clean.toUpperCase() === 'FIRST'
+          ? 'FIRST'
+          : clean;
+    const updated = this.settingsRepo.updateTestFunctionConfig({
+      sessionScope: normalized,
+    });
+    return this.promptTestFunction(
+      adminId,
+      `✅ *تم ضبط نطاق جلسات التنفيذ على:* \`${updated.sessionScope}\``
+    );
+  }
+
+  public toggleScopeConfig(adminId: number): BotViewResponse {
+    const current = this.settingsRepo.getTestFunctionConfig();
+    const nextScope = current.sessionScope === 'ALL' ? 'FIRST' : 'ALL';
+    this.settingsRepo.updateTestFunctionConfig({ sessionScope: nextScope });
+    return this.promptTestFunction(
+      adminId,
+      `✅ *تم تبديل نطاق التنفيذ إلى:* \`${nextScope === 'ALL' ? 'جميع الجلسات المتصلة بالتوازي (ALL)' : 'الجلسة الأولى فقط (FIRST)'}\``
+    );
+  }
+
+  public toggleStopOnErrorConfig(adminId: number): BotViewResponse {
+    const current = this.settingsRepo.getTestFunctionConfig();
+    const nextVal = !current.stopOnError;
+    this.settingsRepo.updateTestFunctionConfig({ stopOnError: nextVal });
+    return this.promptTestFunction(
+      adminId,
+      `✅ *تم تحديث سياسة الأخطاء إلى:* ${nextVal ? '🛑 إيقاف فوري عند أول خطأ' : '🔄 الاستمرار وتجاوز الأخطاء'}`
+    );
+  }
+
   public async handleGuidedInput(
     adminId: number,
-    rawText: string
+    rawText: string,
+    repliedText?: string
   ): Promise<BotViewResponse> {
     const step = this.getStep(adminId);
     if (step === 'AWAITING_CHANNEL_LINK') {
@@ -142,7 +383,348 @@ export class ToolsHandler {
       this.cancel(adminId);
       return this.executeShortlink(adminId, rawText);
     }
+    if (step === 'AWAITING_TF_MAX_SENDS') {
+      this.cancel(adminId);
+      return this.setMaxSendsConfig(adminId, rawText);
+    }
+    if (step === 'AWAITING_TF_DELAY') {
+      this.cancel(adminId);
+      return this.setDelayConfig(adminId, rawText);
+    }
+    if (step === 'AWAITING_TESTFUNCTION') {
+      this.cancel(adminId);
+      return this.executeTestFunction(adminId, rawText, repliedText);
+    }
     return this.renderToolsMenu();
+  }
+
+  /**
+   * Implements `/testfunction <phone> <count> [--max=N] [--delay=MS] [--timeout=MS] [--session=ALL|FIRST|id] [--stop-on-error]`
+   * (with reply to `async function` or inline `async function`).
+   * Supports manual/configurable `maxSends`, custom iteration delay, VM timeout, stop-on-error, console capture,
+   * and single-session or multi-session parallel execution.
+   */
+  public async executeTestFunction(
+    adminId: number,
+    rawInput: string,
+    repliedText?: string
+  ): Promise<BotViewResponse> {
+    try {
+      const trimmed = rawInput.trim();
+      const asyncIndex = trimmed.search(/async\s+function\s+/);
+
+      let headerPart = trimmed;
+      let inlineFuncCode = '';
+      if (asyncIndex !== -1) {
+        headerPart = trimmed.slice(0, asyncIndex).trim();
+        inlineFuncCode = trimmed.slice(asyncIndex).trim();
+      }
+
+      const rawTokens = headerPart.split(/\s+/).filter(Boolean);
+      const positionalTokens: string[] = [];
+      const savedConfig = this.settingsRepo.getTestFunctionConfig();
+
+      let effectiveMaxSends = savedConfig.maxSends;
+      let effectiveDelayMs = savedConfig.delayMs;
+      let effectiveVmTimeoutMs = savedConfig.vmTimeoutMs;
+      let effectiveScope = savedConfig.sessionScope;
+      let effectiveStopOnError = savedConfig.stopOnError;
+
+      for (const tok of rawTokens) {
+        if (tok.startsWith('--max=') || tok.startsWith('--max-sends=')) {
+          const valRaw = tok.split('=')[1]?.trim().toLowerCase() || '';
+          if (valRaw === '0' || valRaw === 'unlimited' || valRaw === 'inf') {
+            effectiveMaxSends = 0;
+          } else {
+            const parsedMax = parseInt(valRaw, 10);
+            if (!Number.isNaN(parsedMax) && parsedMax >= 0) {
+              effectiveMaxSends = Math.min(100000, parsedMax);
+            }
+          }
+        } else if (tok.startsWith('--delay=')) {
+          const parsedDelay = parseInt(tok.split('=')[1] || '', 10);
+          if (!Number.isNaN(parsedDelay) && parsedDelay >= 0) {
+            effectiveDelayMs = Math.min(60000, parsedDelay);
+          }
+        } else if (tok.startsWith('--timeout=')) {
+          const parsedTimeout = parseInt(tok.split('=')[1] || '', 10);
+          if (!Number.isNaN(parsedTimeout) && parsedTimeout >= 500) {
+            effectiveVmTimeoutMs = Math.min(60000, parsedTimeout);
+          }
+        } else if (tok.startsWith('--session=') || tok.startsWith('--scope=')) {
+          const scopeVal = (tok.split('=')[1] || '').trim();
+          if (scopeVal) {
+            effectiveScope =
+              scopeVal.toUpperCase() === 'ALL'
+                ? 'ALL'
+                : scopeVal.toUpperCase() === 'FIRST'
+                  ? 'FIRST'
+                  : scopeVal;
+          }
+        } else if (tok === '--stop-on-error') {
+          effectiveStopOnError = true;
+        } else if (tok === '--continue-on-error') {
+          effectiveStopOnError = false;
+        } else {
+          positionalTokens.push(tok);
+        }
+      }
+
+      if (positionalTokens.length < 2) {
+        return {
+          text:
+            `🪧 *صيغة الأمر غير مكتملة (/testfunction)*\n\n` +
+            `الصيغة المطلوبة:\n` +
+            `\`/testfunction 966501234567 5\` (مع الرد على رسالة الدالة \`async function\`)\n` +
+            `أو مع خيارات التحكم المتقدم:\n` +
+            `\`/testfunction 966501234567 10 --max=2000 --delay=100 --session=ALL async function myFunc(sock, target) { ... }\``,
+          keyboard: [
+            [
+              {
+                text: '⚡ تشغيل دالة فحص تجريبية',
+                callbackData: 'tools:run_sample_testfunction',
+              },
+              {
+                text: '⚙️ لوحة إعدادات /testfunction',
+                callbackData: 'tools:prompt_testfunction',
+              },
+            ],
+            [{ text: '🔙 قائمة الأدوات', callbackData: 'menu:tools' }],
+          ],
+        };
+      }
+
+      const targetRaw = positionalTokens[0];
+      const parsedCount = parseInt(positionalTokens[1], 10);
+      if (Number.isNaN(parsedCount) || parsedCount <= 0) {
+        return {
+          text: `❌ *عدد مرات التكرار (Jumlah) يجب أن يكون رقماً صحيحاً أكبر من الصفر.*`,
+          keyboard: [
+            [
+              {
+                text: '🔄 إعادة المحاولة',
+                callbackData: 'tools:prompt_testfunction',
+              },
+              { text: '🔙 قائمة الأدوات', callbackData: 'menu:tools' },
+            ],
+          ],
+        };
+      }
+
+      const iterations = Math.max(1, Math.min(parsedCount, 10000));
+      const funcCode = (repliedText?.trim() || inlineFuncCode).trim();
+
+      if (!funcCode) {
+        return {
+          text:
+            `❌ *لم يتم العثور على كود الدالة (Reply dengan function)*\n\n` +
+            `يرجى الرد (Reply) على رسالة تحتوي على \`async function name(sock, target) { ... }\` أو كتابة كود الدالة مباشرة بعد الرقم وعدد التكرارات.`,
+          keyboard: [
+            [
+              {
+                text: '⚡ تشغيل دالة فحص تجريبية',
+                callbackData: 'tools:run_sample_testfunction',
+              },
+              {
+                text: '🧪 لوحة إعدادات /testfunction',
+                callbackData: 'tools:prompt_testfunction',
+              },
+            ],
+          ],
+        };
+      }
+
+      const connectedSessions = this.sessionManager.listConnectedSessions();
+      if (connectedSessions.length === 0) {
+        return {
+          text:
+            `⚠️ *لا توجد جلسة واتساب متصلة حالياً*\n` +
+            `يتطلب تشغيل \`/testfunction\` وجود جلسة واتساب متصلة واحدة على الأقل لتمرير \`createSafeSock(sock)\`.`,
+          keyboard: [
+            [
+              { text: '📲 ربط حساب واتساب', callbackData: 'menu:link_account' },
+              { text: '🔙 قائمة الأدوات', callbackData: 'menu:tools' },
+            ],
+          ],
+        };
+      }
+
+      // Resolve target sessions according to effectiveScope ('FIRST' | 'ALL' | specific sessionId)
+      const targetSessions =
+        effectiveScope === 'ALL'
+          ? connectedSessions
+          : effectiveScope === 'FIRST'
+            ? [connectedSessions[0]]
+            : connectedSessions.filter((s) => s.id === effectiveScope);
+
+      if (targetSessions.length === 0) {
+        return {
+          text:
+            `⚠️ *الجلسة المحددة (\`${effectiveScope}\`) غير متصلة أو غير موجودة.*\n` +
+            `الجلسات المتصلة المتاحة حالياً: ${connectedSessions.map((s) => `\`${s.id}\``).join('، ')}`,
+          keyboard: [
+            [
+              {
+                text: '⚙️ تعديل إعدادات /testfunction',
+                callbackData: 'tools:prompt_testfunction',
+              },
+              { text: '🔙 قائمة الأدوات', callbackData: 'menu:tools' },
+            ],
+          ],
+        };
+      }
+
+      const overallStart = Date.now();
+      const results = await Promise.all(
+        targetSessions.map(async (sess) => {
+          const driver = this.sessionManager.getDriver(sess.id);
+          const res = await driver.executeTestFunction({
+            targetPhone: targetRaw,
+            iterations,
+            funcCode,
+            maxSends: effectiveMaxSends,
+            delayMs: effectiveDelayMs,
+            vmTimeoutMs: effectiveVmTimeoutMs,
+            stopOnError: effectiveStopOnError,
+            captureConsole: savedConfig.captureConsole,
+          });
+          return { session: sess, res };
+        })
+      );
+      const overallDurationMs = Date.now() - overallStart;
+
+      const primary = results[0].res;
+      const totalSucceeded = results.reduce(
+        (acc, r) => acc + r.res.iterationsSucceeded,
+        0
+      );
+      const totalRequested = results.reduce(
+        (acc, r) => acc + r.res.iterationsRequested,
+        0
+      );
+      const totalFailed = results.reduce((acc, r) => acc + r.res.iterationsFailed, 0);
+      const totalSends = results.reduce((acc, r) => acc + r.res.sendCount, 0);
+      const totalSendMsg = results.reduce(
+        (acc, r) => acc + r.res.sendMessageCount,
+        0
+      );
+      const totalRelayMsg = results.reduce(
+        (acc, r) => acc + r.res.relayMessageCount,
+        0
+      );
+      const totalPresence = results.reduce(
+        (acc, r) => acc + r.res.presenceCount,
+        0
+      );
+      const combinedLogs = results
+        .flatMap((r) =>
+          r.res.consoleLogs.map((line) =>
+            results.length > 1 ? `[${r.session.id}] ${line}` : line
+          )
+        )
+        .slice(0, 10);
+      const lastError = results.find((r) => r.res.lastError)?.res.lastError;
+
+      this.auditRepo.record({
+        actorTelegramId: adminId,
+        action: 'TOOL_TEST_FUNCTION',
+        targetId: primary.targetJid,
+        outcome: totalSucceeded > 0 ? 'SUCCESS' : 'FAILURE',
+        metadata: {
+          sessionScope: effectiveScope,
+          sessionsCount: results.length,
+          funcName: primary.funcName,
+          arity: primary.arity,
+          maxSendsLimit: primary.maxSendsLimit,
+          delayMs: effectiveDelayMs,
+          stopOnError: effectiveStopOnError,
+          iterationsRequested: totalRequested,
+          iterationsSucceeded: totalSucceeded,
+          iterationsFailed: totalFailed,
+          sendCount: totalSends,
+          durationMs: overallDurationMs,
+        },
+      });
+
+      const statusLabel =
+        totalFailed === 0
+          ? '✅ مكتمل بنجاح (Success)'
+          : totalSucceeded > 0
+            ? '⚠️ مكتمل جزئياً (Partial)'
+            : '❌ فشل التنفيذ (Failed)';
+
+      const maxLimitDisplay =
+        primary.maxSendsLimit === 0
+          ? 'غير محدود (∞)'
+          : `${primary.maxSendsLimit.toLocaleString('en-US')} عملية`;
+
+      const sessionBreakdownText =
+        results.length > 1
+          ? `\n📡 *تفصيل الجلسات المشاركة (${results.length} جلسات بالتوازي):*\n` +
+            results
+              .map(
+                (r) =>
+                  `• \`${r.session.id}\`: تكرارات ${r.res.iterationsSucceeded}/${r.res.iterationsRequested} | إرسال=${r.res.sendCount}`
+              )
+              .join('\n')
+          : `\n📱 *الجلسة المنفذة:* \`${results[0].session.id}\` (${results[0].session.label})`;
+
+      const consoleLogsText =
+        combinedLogs.length > 0
+          ? `\n📝 *مخرجات Sandbox Console (${combinedLogs.length}):*\n` +
+            combinedLogs.map((l) => `\`${l}\``).join('\n')
+          : '';
+
+      return {
+        text:
+          `🧪 *تقرير تنفيذ الدالة المخصصة (/testfunction)*\n` +
+          `━━━━━━━━━━━━━━━━━━\n` +
+          `🎯 *الهدف (Target JID):* \`${primary.targetJid}\`\n` +
+          `⚙️ *اسم الدالة (Function):* \`${primary.funcName}\` (المعاملات: \`${primary.arity}\`)\n` +
+          `🔁 *التكرارات المنفذة:* *${totalSucceeded}/${totalRequested}* (فشل: *${totalFailed}*)\n` +
+          `📤 *إجمالي عمليات الإرسال:* *${totalSends}* (الحد الأقصى: \`${maxLimitDisplay}\`)\n` +
+          `   └ \`sendMessage\`: *${totalSendMsg}* | \`relayMessage\`: *${totalRelayMsg}* | \`presence\`: *${totalPresence}*\n` +
+          `⏱️ *زمن التنفيذ:* \`${overallDurationMs}ms\` (تأخير التكرار: \`${effectiveDelayMs}ms\`)\n` +
+          `📊 *الحالة النهائية:* ${statusLabel}` +
+          sessionBreakdownText +
+          consoleLogsText +
+          `\n🔗 *فحص الهدف:* \`https://wa.me/${primary.targetDigits}\`` +
+          (lastError ? `\n⚠️ *آخر خطأ مسجل:* \`${lastError}\`` : ''),
+        keyboard: [
+          [
+            {
+              text: '⚙️ تعديل حد الإرسال والإعدادات',
+              callbackData: 'tools:prompt_testfunction',
+            },
+            {
+              text: '🔢 تغيير الحد الأقصى يدوياً',
+              callbackData: 'tools:tf_prompt_max',
+            },
+          ],
+          [
+            {
+              text: '📱 فحص المقابس (/ceksender)',
+              callbackData: 'tools:ceksender',
+            },
+            { text: '🔙 قائمة الأدوات', callbackData: 'menu:tools' },
+          ],
+        ],
+      };
+    } catch (err) {
+      const safeErr = toSafeArabicError(err);
+      return {
+        text: `⚠️ *تعذر تنفيذ /testfunction:*\n${safeErr.userMessage}`,
+        keyboard: [
+          [
+            {
+              text: '🔄 إعادة المحاولة',
+              callbackData: 'tools:prompt_testfunction',
+            },
+            { text: '🔙 قائمة الأدوات', callbackData: 'menu:tools' },
+          ],
+        ],
+      };
+    }
   }
 
   /**
