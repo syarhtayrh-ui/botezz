@@ -1,6 +1,7 @@
 import { InlineKeyboardRows, toGrammyInlineKeyboard } from './keyboards/main-menu';
 import { BotViewResponse } from './workflows/pairing-workflow';
 import { toSafeArabicError } from '../utils/errors';
+import { stripMarkdown, isMarkdownEntityError } from '../utils/markdown';
 import { createLogger } from '../logging/logger';
 
 const log = createLogger('bot-ui-state');
@@ -443,28 +444,50 @@ export function createGrammyTransport(
 
   return {
     sendNewMessage: async (text, keyboard) => {
-      const sent = await ctx.reply(text, {
-        parse_mode: 'Markdown',
-        reply_markup: toGrammyInlineKeyboard(keyboard),
-      });
-      return { messageId: sent.message_id };
+      try {
+        const sent = await ctx.reply(text, {
+          parse_mode: 'Markdown',
+          reply_markup: toGrammyInlineKeyboard(keyboard),
+        });
+        return { messageId: sent.message_id };
+      } catch (err) {
+        if (isMarkdownEntityError(err)) {
+          const sent = await ctx.reply(stripMarkdown(text), {
+            reply_markup: toGrammyInlineKeyboard(keyboard),
+          });
+          return { messageId: sent.message_id };
+        }
+        throw err;
+      }
     },
     editMessageText: async (messageId, text, keyboard) => {
-      if (ctx.callbackQuery?.message?.message_id === messageId) {
-        await ctx.editMessageText(text, {
-          parse_mode: 'Markdown',
+      const editFn = async (parseMode?: 'Markdown') => {
+        const opts = {
+          ...(parseMode ? { parse_mode: parseMode } : {}),
           reply_markup: toGrammyInlineKeyboard(keyboard),
-        });
-      } else if (ctx.api && chatId !== undefined) {
-        await ctx.api.editMessageText(chatId, messageId, text, {
-          parse_mode: 'Markdown',
-          reply_markup: toGrammyInlineKeyboard(keyboard),
-        });
-      } else {
-        await ctx.editMessageText(text, {
-          parse_mode: 'Markdown',
-          reply_markup: toGrammyInlineKeyboard(keyboard),
-        });
+        };
+        if (ctx.callbackQuery?.message?.message_id === messageId) {
+          await ctx.editMessageText(parseMode ? text : stripMarkdown(text), opts);
+        } else if (ctx.api && chatId !== undefined) {
+          await ctx.api.editMessageText(
+            chatId,
+            messageId,
+            parseMode ? text : stripMarkdown(text),
+            opts
+          );
+        } else {
+          await ctx.editMessageText(parseMode ? text : stripMarkdown(text), opts);
+        }
+      };
+
+      try {
+        await editFn('Markdown');
+      } catch (err) {
+        if (isMarkdownEntityError(err)) {
+          await editFn(undefined);
+          return;
+        }
+        throw err;
       }
     },
     editMessageReplyMarkup: async (messageId, keyboard) => {

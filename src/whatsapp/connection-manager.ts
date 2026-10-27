@@ -29,6 +29,9 @@ import {
   WhatsAppConnectionError,
   UnsupportedOperationError,
   ValidationError,
+  TaskTimeoutError,
+  AppError,
+  toSafeArabicError,
 } from '../utils/errors';
 import { createLogger } from '../logging/logger';
 
@@ -652,7 +655,8 @@ export class AthanasiaBaileysSessionDriver implements WhatsAppSessionDriver {
 
   /**
    * Initiates pairing code generation using `athanasia-baileys`'s `sock.requestPairingCode(phoneNumber, code?)`.
-   * Checks `!sock.authState.creds.registered`, awaits socket readiness, and supports custom 8-char codes.
+   * Checks `!sock.authState.creds.registered`, awaits socket readiness with timeout,
+   * handles transient socket handshake resets with bounded retry, and supports custom 8-char codes.
    */
   public async requestPairingCode(
     phoneDigits: string,
@@ -671,14 +675,87 @@ export class AthanasiaBaileysSessionDriver implements WhatsAppSessionDriver {
       );
     }
 
-    // Ensure WebSocket is open before sending the link_code_companion_reg IQ node
-    await sock.waitForSocketOpen();
+    const cleanDigits = phoneDigits.replace(/\D/g, '');
+    if (!cleanDigits || cleanDigits.length < 8) {
+      throw new ValidationError('رقم الهاتف المطلوب للاقتران غير صالح. يجب أن يحتوي على 8 أرقام على الأقل.');
+    }
+
+    // Ensure WebSocket is open before sending the link_code_companion_reg IQ node (15s bounded timeout)
+    try {
+      await Promise.race([
+        sock.waitForSocketOpen(),
+        new Promise<never>((_, reject) =>
+          setTimeout(
+            () => reject(new TaskTimeoutError('انتهت مهلة فتح اتصال المقبس مع خوادم واتساب (15 ثانية).')),
+            15_000
+          )
+        ),
+      ]);
+    } catch (openErr) {
+      if (openErr instanceof AppError) throw openErr;
+      const safeErr = toSafeArabicError(openErr);
+      throw new WhatsAppConnectionError(
+        `تعذر فتح المقبس للربط: ${safeErr.userMessage}`,
+        safeErr.sanitizedTechnicalMessage
+      );
+    }
 
     const codeToRequest = customCode
       ? validateCustomPairingCode(customCode)
       : generateRandomPairingCode();
 
-    const rawCode = await sock.requestPairingCode(phoneDigits, codeToRequest);
+    const executeRequest = async (): Promise<string> => {
+      const resultPromise = sock.requestPairingCode(cleanDigits, codeToRequest);
+      const timeoutPromise = new Promise<never>((_, reject) =>
+        setTimeout(
+          () =>
+            reject(
+              new TaskTimeoutError(
+                'انتهت مهلة استلام رمز الربط من خوادم واتساب (30 ثانية). يرجى التحقق من الشبكة وإعادة المحاولة.'
+              )
+            ),
+          30_000
+        )
+      );
+      return Promise.race([resultPromise, timeoutPromise]);
+    };
+
+    let rawCode: string;
+    try {
+      rawCode = await executeRequest();
+    } catch (firstErr) {
+      const errMsg = firstErr instanceof Error ? firstErr.message : String(firstErr);
+      if (
+        errMsg.includes('Connection Closed') ||
+        errMsg.includes('WebSocket') ||
+        errMsg.includes('reset')
+      ) {
+        log.warn('Pairing code request encountered transient connection glitch; retrying once', {
+          sessionId: this.sessionId,
+          reason: toSafeArabicError(firstErr).sanitizedTechnicalMessage,
+        });
+        await new Promise((r) => setTimeout(r, 1200));
+        try {
+          await sock.waitForSocketOpen();
+          rawCode = await executeRequest();
+        } catch (retryErr) {
+          if (retryErr instanceof AppError) throw retryErr;
+          const safe = toSafeArabicError(retryErr);
+          throw new WhatsAppConnectionError(
+            `تعذر توليد رمز الربط من واتساب: ${safe.userMessage}`,
+            safe.sanitizedTechnicalMessage
+          );
+        }
+      } else {
+        if (firstErr instanceof AppError) throw firstErr;
+        const safe = toSafeArabicError(firstErr);
+        throw new WhatsAppConnectionError(
+          `تعذر استلام رمز الربط من واتساب: ${safe.userMessage}`,
+          safe.sanitizedTechnicalMessage
+        );
+      }
+    }
+
     if (!rawCode) {
       throw new WhatsAppConnectionError('تعذر استلام رمز الربط من خوادم واتساب.');
     }

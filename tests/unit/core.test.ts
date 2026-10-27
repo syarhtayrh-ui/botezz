@@ -11,6 +11,7 @@ import {
 } from '../../src/security/redaction';
 import {
   normalizePhoneNumber,
+  convertArabicIndicDigits,
   validateCustomPairingCode,
   generateRandomPairingCode,
   validateRecipient,
@@ -26,6 +27,12 @@ import {
   resolveSafeChildPath,
   OperationRateLimiter,
 } from '../../src/security/validation';
+import {
+  escapeMarkdown,
+  stripMarkdown,
+  isMarkdownEntityError,
+} from '../../src/utils/markdown';
+import { toSafeArabicError } from '../../src/utils/errors';
 import { formatRuntime, formatMemory } from '../../src/bot/handlers/start';
 import { SessionMemoryStore } from '../../src/whatsapp/connection-manager';
 import {
@@ -109,9 +116,45 @@ test('Phone number validation and normalization handles valid and invalid inputs
   assert.equal(res.jid, '966501234567@s.whatsapp.net');
   assert.equal(res.masked, '+966*****4567');
 
+  // Arabic-Indic numerals conversion
+  assert.equal(convertArabicIndicDigits('٠١٢٣٤٥٦٧٨٩'), '0123456789');
+  const resArabic = normalizePhoneNumber('+٩٦٦٥٠١٢٣٤٥٦٧');
+  assert.equal(resArabic.e164, '+966501234567');
+  assert.equal(resArabic.digits, '966501234567');
+
+  // 00 international prefix normalization
+  const resDoubleZero = normalizePhoneNumber('00966501234567');
+  assert.equal(resDoubleZero.e164, '+966501234567');
+  assert.equal(resDoubleZero.digits, '966501234567');
+
+  // Invalid numbers
   assert.throws(() => normalizePhoneNumber('0501234567'), /صيغة رقم الهاتف غير صالحة/);
   assert.throws(() => normalizePhoneNumber('123'), /صيغة رقم الهاتف غير صالحة/);
   assert.throws(() => normalizePhoneNumber('abc123456789'), /صيغة رقم الهاتف غير صالحة/);
+});
+
+test('Telegram Markdown safety utilities and error classification', () => {
+  assert.equal(escapeMarkdown('sess_1234_test'), 'sess\\_1234\\_test');
+  assert.equal(escapeMarkdown('*bold [link]*'), '\\*bold \\[link\\]\\*');
+  assert.equal(stripMarkdown('*bold* _italic_ `code`'), 'bold italic code');
+
+  assert.equal(isMarkdownEntityError(new Error("Bad Request: can't parse entities")), true);
+  assert.equal(isMarkdownEntityError(new Error('Connection Closed')), false);
+
+  // Baileys Boom connection error classification
+  const boomConnErr = toSafeArabicError(new Error('Boom: Connection Closed'));
+  assert.equal(boomConnErr.category, 'WHATSAPP_CONNECTION_ERROR');
+  assert.ok(boomConnErr.userMessage.includes('تعذر الاتصال بخوادم واتساب'));
+
+  // Timeout error classification
+  const timeoutErr = toSafeArabicError(new Error('timed out waiting for message'));
+  assert.equal(timeoutErr.category, 'TASK_TIMEOUT');
+  assert.ok(timeoutErr.userMessage.includes('انتهت مهلة استجابة'));
+
+  // Telegram entity error classification
+  const tgErr = toSafeArabicError(new Error("Bad Request: can't parse entities"));
+  assert.equal(tgErr.category, 'TELEGRAM_API_ERROR');
+  assert.ok(tgErr.userMessage.includes('/start'));
 });
 
 test('Athanasia Baileys exports and custom 8-char pairing code validation work accurately', async () => {

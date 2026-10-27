@@ -693,6 +693,42 @@ export class TelegramBotController {
    * Reuses and edits the active menu message whenever practical, and only routes non-command text
    * to a workflow when a workflow state is explicitly active.
    */
+  /**
+   * Dedicated first-class handler for Telegram /start and /menu commands.
+   * Cancels any pending workflows, resets navigation history, and ALWAYS delivers
+   * a fresh, prominent main-menu message at the current scroll position of the chat
+   * (`preferEdit: false`), establishing the new active menu message anchor.
+   */
+  public async handleStartCommand(
+    actorUserId: number,
+    options?: HandleInteractionOptions
+  ): Promise<BotViewResponse> {
+    verifyTelegramAdmin({
+      candidateUserId: actorUserId,
+      configuredAdminId: this.deps.config.TELEGRAM_ADMIN_ID,
+      actionDescription: 'command:start',
+      auditRepo: this.deps.auditRepo,
+    });
+
+    this.cancelAllWorkflowsForAdmin(actorUserId);
+    this.uiState.resetHome(actorUserId);
+
+    const view = this.startHandler.renderMainMenu({ isAdmin: true });
+
+    return this.uiState.deliverView({
+      userId: actorUserId,
+      view,
+      pendingWorkflow: 'NONE',
+      preferEdit: false,
+      transport: options?.transport,
+    });
+  }
+
+  /**
+   * Processes incoming text messages or commands after verifying the numeric Telegram admin ID.
+   * Reuses and edits the active menu message whenever practical, and only routes non-command text
+   * to a workflow when a workflow state is explicitly active.
+   */
   public async handleTextMessage(
     actorUserId: number,
     text: string,
@@ -705,6 +741,12 @@ export class TelegramBotController {
       actionDescription: `text:${text.slice(0, 24)}`,
       auditRepo: this.deps.auditRepo,
     });
+
+    const trimmed = text.trim();
+    // Fast-path /start and /menu commands (with optional @bot and payload)
+    if (/^\/(?:start|menu)(?:@\w+)?(?:\s+.*)?$/i.test(trimmed)) {
+      return this.handleStartCommand(actorUserId, options);
+    }
 
     const view = await this.routeTextMessageInternal(
       actorUserId,
@@ -729,16 +771,21 @@ export class TelegramBotController {
     repliedText?: string
   ): Promise<BotViewResponse> {
     const trimmed = text.trim();
-    if (trimmed === '/start' || trimmed === '/menu') {
+    const parts = trimmed.split(/\s+/);
+    const rawCommand = parts[0].toLowerCase();
+    const command = rawCommand.replace(/@\w+$/, '');
+    const args = parts.slice(1);
+
+    if (command === '/start' || command === '/menu') {
       this.cancelAllWorkflowsForAdmin(actorUserId);
       this.uiState.resetHome(actorUserId);
       return this.startHandler.renderMainMenu({ isAdmin: true });
     }
-    if (trimmed === '/status' || trimmed === '/help') {
+    if (command === '/status' || command === '/help') {
       this.uiState.recordRouteTransition(actorUserId, 'menu:help_status');
       return this.startHandler.renderHelpAndSystemStatus();
     }
-    if (trimmed === '/cancel') {
+    if (command === '/cancel') {
       this.cancelAllWorkflowsForAdmin(actorUserId);
       this.uiState.resetHome(actorUserId);
       return this.startHandler.renderMainMenu({
@@ -749,10 +796,6 @@ export class TelegramBotController {
 
     // Check command cooldown if text starts with '/' (except /setcooldown so admin can always adjust it)
     if (trimmed.startsWith('/')) {
-      const parts = trimmed.split(/\s+/);
-      const command = parts[0].toLowerCase();
-      const args = parts.slice(1);
-
       if (command !== '/setcooldown') {
         try {
           this.deps.settingsRepo.checkUserCooldown(actorUserId);
@@ -1233,6 +1276,7 @@ export function createGrammyBot(
   bot.use(createGrammyAuthorizationMiddleware(config.TELEGRAM_ADMIN_ID, auditRepo));
 
   bot.on('callback_query:data', async (ctx) => {
+    if (!ctx.from) return;
     try {
       const transport = createGrammyTransport(
         ctx as unknown as Parameters<typeof createGrammyTransport>[0],
@@ -1261,7 +1305,46 @@ export function createGrammyBot(
     }
   });
 
+  bot.command('start', async (ctx) => {
+    if (!ctx.from) return;
+    try {
+      const transport = createGrammyTransport(
+        ctx as unknown as Parameters<typeof createGrammyTransport>[0],
+        controller.uiState,
+        ctx.from.id
+      );
+      await controller.handleStartCommand(ctx.from.id, { transport });
+    } catch (err) {
+      const safeErr = toSafeArabicError(err);
+      log.error('Telegram start command error', {
+        category: safeErr.category,
+        error: safeErr.sanitizedTechnicalMessage,
+      });
+      await ctx.reply(safeErr.userMessage);
+    }
+  });
+
+  bot.command('menu', async (ctx) => {
+    if (!ctx.from) return;
+    try {
+      const transport = createGrammyTransport(
+        ctx as unknown as Parameters<typeof createGrammyTransport>[0],
+        controller.uiState,
+        ctx.from.id
+      );
+      await controller.handleStartCommand(ctx.from.id, { transport });
+    } catch (err) {
+      const safeErr = toSafeArabicError(err);
+      log.error('Telegram menu command error', {
+        category: safeErr.category,
+        error: safeErr.sanitizedTechnicalMessage,
+      });
+      await ctx.reply(safeErr.userMessage);
+    }
+  });
+
   bot.on('message:text', async (ctx) => {
+    if (!ctx.from) return;
     try {
       const repliedText =
         ctx.message.reply_to_message?.text ||

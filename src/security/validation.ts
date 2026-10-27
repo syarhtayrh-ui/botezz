@@ -47,29 +47,49 @@ export function generateRandomPairingCode(): string {
   return code;
 }
 
+const ARABIC_INDIC_DIGITS_MAP: Record<string, string> = {
+  '٠': '0', '١': '1', '٢': '2', '٣': '3', '٤': '4',
+  '٥': '5', '٦': '6', '٧': '7', '٨': '8', '٩': '9',
+  '۰': '0', '۱': '1', '۲': '2', '۳': '3', '۴': '4',
+  '۵': '5', '۶': '6', '۷': '7', '۸': '8', '۹': '9',
+};
+
+/**
+ * Converts Arabic-Indic and Eastern Arabic/Persian digits to standard ASCII digits.
+ */
+export function convertArabicIndicDigits(text: string): string {
+  if (!text) return '';
+  return text.replace(/[٠-٩۰-۹]/g, (digit) => ARABIC_INDIC_DIGITS_MAP[digit] ?? digit);
+}
+
 /**
  * Validates and normalizes an international phone number including country code.
  * Also supports optional second token for athanasia-baileys custom pairing code:
- * e.g. "+966501234567" or "+966501234567 MYCODE12"
+ * e.g. "+966501234567", "00966501234567", "+٩٦٦٥٠١٢٣٤٥٦٧", or "+966501234567 MYCODE12"
  */
 export function normalizePhoneNumber(rawInput: string): NormalizedPhoneResult {
   if (!rawInput || typeof rawInput !== 'string') {
     throw new ValidationError('الرجاء إدخال رقم الهاتف مع رمز الدولة (مثال: +966501234567).');
   }
 
-  const trimmed = rawInput.trim();
-  let phonePart = trimmed;
+  const converted = convertArabicIndicDigits(rawInput.trim());
+  let phonePart = converted;
   let customPairingCode: string | undefined;
 
   // Check if user supplied an optional custom 8-char pairing code after space/comma: "+966501234567 CODE1234"
-  const parts = trimmed.split(/\s+/);
+  const parts = converted.split(/\s+/);
   if (parts.length === 2 && /^[A-Za-z][A-Za-z0-9\-]{6,8}$/.test(parts[1])) {
     phonePart = parts[0];
     customPairingCode = validateCustomPairingCode(parts[1]);
   }
 
-  // Strip spaces, dashes, and parentheses from phone part
-  const compact = phonePart.replace(/[\s\-()]/g, '');
+  // Strip spaces, dashes, dots, and parentheses from phone part
+  let compact = phonePart.replace(/[\s\-().]/g, '');
+
+  // Normalize international 00 prefix to + (e.g. 00966... -> +966...)
+  if (compact.startsWith('00')) {
+    compact = '+' + compact.slice(2);
+  }
 
   // Reject characters other than optional leading '+' and digits
   if (!/^\+?[1-9]\d{7,14}$/.test(compact)) {

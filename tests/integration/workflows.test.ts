@@ -733,3 +733,145 @@ test('Application-Like Navigation (Back, Home, Refresh), Anti-Double-Tap Dedupli
   }
 });
 
+test('Issue 2 Verification: /start establishes fresh menu at current position, clears pending input workflows, and supports /start@BotUsername & payloads', async () => {
+  const env = createTestEnvironment();
+  const adminId = env.config.TELEGRAM_ADMIN_ID;
+
+  try {
+    const sentMessages: Array<{ id: number; text: string }> = [];
+    const editedTexts: Array<{ id: number; text: string }> = [];
+    let nextMsgId = 1000;
+
+    const transport = {
+      sendNewMessage: async (text: string) => {
+        nextMsgId += 1;
+        sentMessages.push({ id: nextMsgId, text });
+        return { messageId: nextMsgId };
+      },
+      editMessageText: async (messageId: number, text: string) => {
+        editedTexts.push({ id: messageId, text });
+      },
+      editMessageReplyMarkup: async () => {},
+      answerCallbackQuery: async () => {},
+    };
+
+    // 1. Initial /start delivers fresh message #1001
+    const v1 = await env.controller.handleTextMessage(adminId, '/start', undefined, { transport });
+    assert.equal(sentMessages.length, 1);
+    assert.equal(v1.uiMeta?.deliveryMode, 'NEW_MESSAGE');
+    assert.equal(v1.uiMeta?.activeMessageId, 1001);
+
+    // 2. User navigates through inline buttons (message #1001 is edited in-place)
+    await env.controller.handleCallbackQuery(adminId, 'menu:sessions:page:1', { transport });
+    assert.equal(sentMessages.length, 1);
+    assert.equal(editedTexts.length, 1);
+    assert.equal(editedTexts[0].id, 1001);
+
+    // 3. User enters PAIRING workflow (awaiting phone number)
+    await env.controller.handleCallbackQuery(adminId, 'menu:add_account', { transport });
+    assert.equal(env.controller.getConversationMode(adminId), 'PAIRING');
+    assert.ok(env.controller.pairingWorkflow.getState(adminId));
+
+    // 4. User types /start@MyWhatsAppBot while in PAIRING workflow:
+    // It must NOT be treated as a phone number! It must cancel PAIRING and deliver a FRESH menu message #1002!
+    const v2 = await env.controller.handleTextMessage(adminId, '/start@MyWhatsAppBot', undefined, { transport });
+    assert.equal(sentMessages.length, 2);
+    assert.equal(v2.uiMeta?.deliveryMode, 'NEW_MESSAGE');
+    assert.equal(v2.uiMeta?.activeMessageId, 1002);
+    assert.equal(env.controller.getConversationMode(adminId), 'NONE');
+    assert.equal(env.controller.pairingWorkflow.getState(adminId), undefined);
+    assert.ok(v2.text.includes('لوحة التحكم المركزية'));
+
+    // 5. Subsequent button clicks now edit the NEW menu (#1002)!
+    await env.controller.handleCallbackQuery(adminId, 'menu:tools', { transport, skipDuplicateCheck: true });
+    assert.equal(sentMessages.length, 2);
+    const lastEdit = editedTexts[editedTexts.length - 1];
+    assert.equal(lastEdit.id, 1002);
+
+    // 6. User enters MESSAGE workflow and types /start with deep link payload:
+    await env.controller.handleCallbackQuery(adminId, 'menu:send_text', { transport, skipDuplicateCheck: true });
+    assert.equal(env.controller.getConversationMode(adminId), 'MESSAGE');
+    const v3 = await env.controller.handleTextMessage(adminId, '/start ref_campaign_123', undefined, { transport });
+    assert.equal(sentMessages.length, 3);
+    assert.equal(v3.uiMeta?.deliveryMode, 'NEW_MESSAGE');
+    assert.equal(v3.uiMeta?.activeMessageId, 1003);
+    assert.equal(env.controller.getConversationMode(adminId), 'NONE');
+
+    // 7. Test /menu command variant
+    const v4 = await env.controller.handleTextMessage(adminId, '/menu@MyWhatsAppBot', undefined, { transport });
+    assert.equal(sentMessages.length, 4);
+    assert.equal(v4.uiMeta?.deliveryMode, 'NEW_MESSAGE');
+    assert.equal(v4.uiMeta?.activeMessageId, 1004);
+  } finally {
+    await env.cleanup();
+  }
+});
+
+test('Issue 1 Verification: WhatsApp number pairing supports Arabic numerals, 00-prefix, custom codes, and safe diagnostics', async () => {
+  const env = createTestEnvironment();
+  const adminId = env.config.TELEGRAM_ADMIN_ID;
+
+  try {
+    const transport = {
+      sendNewMessage: async () => ({ messageId: 9999 }),
+      editMessageText: async () => {},
+      editMessageReplyMarkup: async () => {},
+      answerCallbackQuery: async () => {},
+    };
+
+    // 1. Pairing with Arabic-Indic numerals: +٩٦٦٥٠١٢٣٤٥٦٧
+    await env.controller.handleCallbackQuery(adminId, 'menu:add_account', {
+      transport,
+      skipDuplicateCheck: true,
+    });
+    assert.equal(env.controller.getConversationMode(adminId), 'PAIRING');
+    const pairResult1 = await env.controller.handleTextMessage(adminId, '+٩٦٦٥٠١٢٣٤٥٦٧', undefined, { transport });
+    assert.ok(pairResult1.text.includes('تم توليد رمز الربط'));
+    assert.ok(pairResult1.text.includes('+966*****4567'));
+    assert.equal(env.controller.getConversationMode(adminId), 'NONE');
+
+    // 2. Pairing with 00-prefix international format and custom pairing code: 00966501234567 ATHANASA
+    await env.controller.handleCallbackQuery(adminId, 'menu:add_account', {
+      transport,
+      skipDuplicateCheck: true,
+    });
+    assert.equal(env.controller.getConversationMode(adminId), 'PAIRING');
+    const pairResult2 = await env.controller.handleTextMessage(
+      adminId,
+      '00966501234567 ATHANASA',
+      undefined,
+      { transport }
+    );
+    assert.ok(pairResult2.text.includes('تم توليد رمز الربط'));
+    assert.ok(pairResult2.text.includes('ATHA-NASA'));
+    assert.ok(pairResult2.text.includes('+966*****4567'));
+
+    // 3. Invalid phone format: gracefully returns validation error in Arabic without throwing unhandled error
+    await env.controller.handleCallbackQuery(adminId, 'menu:add_account', {
+      transport,
+      skipDuplicateCheck: true,
+    });
+    const invalidResult = await env.controller.handleTextMessage(adminId, 'invalid_number', undefined, { transport });
+    assert.ok(invalidResult.text.includes('تعذر إتمام الربط'));
+    assert.ok(invalidResult.text.includes('صيغة رقم الهاتف غير صالحة'));
+    // User remains in pairing state to retry or cancel
+    assert.equal(env.controller.getConversationMode(adminId), 'PAIRING');
+
+    // 4. Cancel cancels cleanly
+    const cancelResult = await env.controller.handleTextMessage(adminId, '/cancel', undefined, { transport });
+    assert.ok(cancelResult.text.includes('تم إلغاء العملية'));
+    assert.equal(env.controller.getConversationMode(adminId), 'NONE');
+
+    // 5. Verify audit log recorded events without sensitive secrets or raw pairing codes
+    const auditEvents = env.auditRepo.listRecent(50);
+    const pairingAudit = auditEvents.find((e) => e.action === 'SESSION_PAIRING_INITIATED');
+    assert.ok(pairingAudit);
+    assert.ok(pairingAudit.metadata_json);
+    const meta = JSON.parse(pairingAudit.metadata_json);
+    // Pairing code should NOT be stored in audit metadata
+    assert.equal(meta.pairingCode, undefined);
+  } finally {
+    await env.cleanup();
+  }
+});
+

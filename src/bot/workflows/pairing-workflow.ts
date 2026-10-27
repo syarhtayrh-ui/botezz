@@ -6,6 +6,7 @@ import {
 } from '../keyboards/main-menu';
 import { formatSessionStatusArabic } from '../keyboards/session-menu';
 import { toSafeArabicError } from '../../utils/errors';
+import { escapeMarkdown } from '../../utils/markdown';
 import { UiDeliveryMode, UiSessionStats } from '../ui-state';
 
 export interface BotViewResponse {
@@ -93,7 +94,7 @@ export class PairingWorkflow {
     return {
       text:
         `📲 *ربط حساب واتساب جديد (Athanasia Baileys)*\n` +
-        `معرف الجلسة المعزولة: \`${session.id}\` | الاسم: *${session.label}*\n\n` +
+        `معرف الجلسة المعزولة: \`${session.id}\` | الاسم: \`${session.label}\`\n\n` +
         `الرجاء إرسال رقم الهاتف مع رمز الدولة الدولي (مثال: \`+966501234567\`)\n` +
         `💡 _اختياري:_ يمكنك إرفاق رمز ربط مخصص من 8 أحرف/أرقام بعد المسافة (مثال: \`+966501234567 MYCODE12\`).\n` +
         `_ملاحظة أمنية: لن يطلب منك البوت أبداً كلمة مرور أو رمز تحقق SMS._`,
@@ -221,7 +222,7 @@ export class PairingWorkflow {
       return {
         text:
           `✅ *تم توليد رمز الربط وحالة الجلسة الآن:* ${formatSessionStatusArabic(result.session.status)}\n\n` +
-          `🆔 معرف الجلسة: \`${result.session.id}\` (${result.session.label})\n` +
+          `🆔 معرف الجلسة: \`${result.session.id}\` (\`${result.session.label}\`)\n` +
           `📱 الرقم المقترن: \`${result.maskedPhone}\`\n` +
           `🔑 رمز الربط (Pairing Code): \`${result.pairingCode}\`\n\n` +
           `📌 *خطوات الإدخال في تطبيق واتساب:*\n${result.instructionsArabic}\n\n` +
@@ -241,7 +242,7 @@ export class PairingWorkflow {
       const safeErr = toSafeArabicError(err);
       return {
         text:
-          `⚠️ *تعذر إتمام الربط:*\n${safeErr.userMessage}\n\n` +
+          `⚠️ *تعذر إتمام الربط:*\n${escapeMarkdown(safeErr.userMessage)}\n\n` +
           `الرجاء إعادة إرسال رقم هاتف دولي صحيح (مثال: \`+966501234567\`) أو إلغاء العملية:`,
         keyboard: [buildBackCancelRow('menu:sessions:page:1')],
       };

@@ -9,9 +9,16 @@ import {
   MockWhatsAppSessionDriver,
 } from './connection-manager';
 import { normalizePhoneNumber } from '../security/validation';
-import { maskPhoneNumber } from '../security/redaction';
+import {
+  PairingError,
+  WhatsAppConnectionError,
+  ValidationError,
+  TaskTimeoutError,
+  AppError,
+  toSafeArabicError,
+} from '../utils/errors';
+import { redactText, maskPhoneNumber } from '../security/redaction';
 import { calculateBackoffDelay } from '../utils/retry';
-import { PairingError, WhatsAppConnectionError, ValidationError } from '../utils/errors';
 import { createLogger } from '../logging/logger';
 
 const log = createLogger('session-manager');
@@ -153,23 +160,33 @@ export class SessionManager {
           'افتح تطبيق واتساب على هاتفك ⬅️ الأجهزة المرتبطة ⬅️ ربط جهاز ⬅️ الربط برقم الهاتف بدلاً من ذلك، ثم أدخل الرمز أعلاه.',
       };
     } catch (err) {
-      const errorMsg =
-        err instanceof Error ? err.message : 'تعذر إكمال طلب رمز الربط.';
+      const safeErr = toSafeArabicError(err);
+      const sanitizedTechnicalReason = redactText(safeErr.sanitizedTechnicalMessage);
       this.sessionRepo.updateStatus({
         id: sessionId,
         status: 'FAILED',
-        lastError: errorMsg,
+        lastError: safeErr.userMessage,
       });
       this.auditRepo.record({
         actorTelegramId,
         action: 'SESSION_PAIRING_FAILED',
         targetId: sessionId,
         outcome: 'FAILURE',
-        metadata: { reason: errorMsg },
+        metadata: {
+          category: safeErr.category,
+          reason: sanitizedTechnicalReason,
+        },
       });
-      throw err instanceof PairingError || err instanceof ValidationError
-        ? err
-        : new PairingError(`فشل بدء عملية الربط: ${errorMsg}`);
+      log.error('WhatsApp session pairing failed', {
+        sessionId,
+        category: safeErr.category,
+        error: sanitizedTechnicalReason,
+      });
+
+      if (err instanceof AppError) {
+        throw err;
+      }
+      throw new PairingError(`فشل بدء عملية الربط: ${safeErr.userMessage}`, sanitizedTechnicalReason);
     } finally {
       this.activePairingLocks.delete(sessionId);
     }
