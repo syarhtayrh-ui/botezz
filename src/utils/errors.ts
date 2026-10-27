@@ -1,0 +1,130 @@
+import { redactText } from '../security/redaction';
+
+export type ErrorCategory =
+  | 'AUTHORIZATION_ERROR'
+  | 'VALIDATION_ERROR'
+  | 'WHATSAPP_CONNECTION_ERROR'
+  | 'PAIRING_ERROR'
+  | 'AUTHENTICATION_EXPIRED'
+  | 'DATABASE_ERROR'
+  | 'FILESYSTEM_ERROR'
+  | 'UNSUPPORTED_OPERATION'
+  | 'TASK_TIMEOUT'
+  | 'RATE_LIMIT_EXCEEDED'
+  | 'TELEGRAM_API_ERROR'
+  | 'INTERNAL_ERROR';
+
+export class AppError extends Error {
+  public readonly category: ErrorCategory;
+  public readonly arabicUserMessage: string;
+  public readonly isOperational: boolean;
+
+  constructor(
+    category: ErrorCategory,
+    arabicUserMessage: string,
+    technicalMessage?: string,
+    isOperational = true
+  ) {
+    super(redactText(technicalMessage || arabicUserMessage));
+    this.name = this.constructor.name;
+    this.category = category;
+    this.arabicUserMessage = redactText(arabicUserMessage);
+    this.isOperational = isOperational;
+  }
+}
+
+export class AuthorizationError extends AppError {
+  constructor(
+    arabicMessage = '⛔ غير مصرح لك باستخدام هذا البوت. هذه اللوحة مخصصة للمسؤول المعتمد فقط.',
+    technicalMessage?: string
+  ) {
+    super('AUTHORIZATION_ERROR', arabicMessage, technicalMessage);
+  }
+}
+
+export class ValidationError extends AppError {
+  constructor(arabicMessage: string, technicalMessage?: string) {
+    super('VALIDATION_ERROR', arabicMessage, technicalMessage);
+  }
+}
+
+export class WhatsAppConnectionError extends AppError {
+  constructor(arabicMessage: string, technicalMessage?: string) {
+    super('WHATSAPP_CONNECTION_ERROR', arabicMessage, technicalMessage);
+  }
+}
+
+export class PairingError extends AppError {
+  constructor(arabicMessage: string, technicalMessage?: string) {
+    super('PAIRING_ERROR', arabicMessage, technicalMessage);
+  }
+}
+
+export class TaskTimeoutError extends AppError {
+  constructor(
+    arabicMessage = 'انتهت مهلة تنفيذ العملية قبل استلام تأكيد من جلسة واتساب.',
+    technicalMessage?: string
+  ) {
+    super('TASK_TIMEOUT', arabicMessage, technicalMessage);
+  }
+}
+
+export class RateLimitError extends AppError {
+  constructor(arabicMessage: string, technicalMessage?: string) {
+    super('RATE_LIMIT_EXCEEDED', arabicMessage, technicalMessage);
+  }
+}
+
+export class UnsupportedOperationError extends AppError {
+  constructor(
+    arabicMessage = 'هذه العملية غير مدعومة حالياً في البروتوكول أو لا يملك الحساب الصلاحية اللازمة.',
+    technicalMessage?: string
+  ) {
+    super('UNSUPPORTED_OPERATION', arabicMessage, technicalMessage);
+  }
+}
+
+export class DatabaseError extends AppError {
+  constructor(
+    arabicMessage = 'حدث خطأ في قاعدة البيانات أثناء حفظ أو قراءة السجلات.',
+    technicalMessage?: string
+  ) {
+    super('DATABASE_ERROR', arabicMessage, technicalMessage);
+  }
+}
+
+/**
+ * Converts any thrown error into a sanitized Arabic message safe for display in Telegram.
+ */
+export function toSafeArabicError(err: unknown): {
+  category: ErrorCategory;
+  userMessage: string;
+  sanitizedTechnicalMessage: string;
+} {
+  if (
+    err instanceof AppError ||
+    (err !== null &&
+      typeof err === 'object' &&
+      'arabicUserMessage' in err &&
+      'category' in err)
+  ) {
+    const appErr = err as AppError;
+    return {
+      category: appErr.category,
+      userMessage: redactText(appErr.arabicUserMessage),
+      sanitizedTechnicalMessage: redactText(appErr.message || appErr.arabicUserMessage),
+    };
+  }
+  if (err instanceof Error) {
+    return {
+      category: 'INTERNAL_ERROR',
+      userMessage: 'حدث خطأ غير متوقع أثناء تنفيذ العملية. تم تسجيل التفاصيل بأمان في سجل الخادم.',
+      sanitizedTechnicalMessage: redactText(err.message),
+    };
+  }
+  return {
+    category: 'INTERNAL_ERROR',
+    userMessage: 'حدث خطأ غير معروف أثناء تنفيذ العملية.',
+    sanitizedTechnicalMessage: redactText(String(err)),
+  };
+}

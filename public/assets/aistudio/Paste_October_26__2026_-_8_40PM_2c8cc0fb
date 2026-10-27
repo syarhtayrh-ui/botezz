@@ -1,0 +1,825 @@
+MASTER PROJECT SPECIFICATION
+
+WhatsApp Multi-Session Management System Controlled Through Telegram
+
+Act as a senior software architect, expert TypeScript/Node.js engineer, Telegram Bot API developer, and WhatsApp Web integration specialist.
+
+Your task is to DESIGN, IMPLEMENT, TEST, and DOCUMENT a complete, functional, production-oriented application that allows an authorized administrator to manage multiple WhatsApp account sessions through an interactive Telegram bot.
+
+Do not build only a visual mockup. Implement the actual backend, Telegram interactions, session management, persistence, task execution, error handling, and deployment configuration.
+
+Do not claim that a feature works unless it has been implemented and its behavior can be verified.
+
+The application must be modular, maintainable, secure, and extensible.
+
+---
+
+1. PROJECT OBJECTIVE
+
+Build a Telegram bot that serves as a centralized control panel for multiple WhatsApp accounts linked through the Baileys library.
+
+The administrator interacts with Telegram buttons and guided workflows. The backend manages the linked WhatsApp sessions and executes supported operations through the selected sessions.
+
+The application must support:
+
+- Linking multiple WhatsApp accounts.
+- Generating pairing codes when supported.
+- Persisting and restoring authenticated sessions.
+- Monitoring connection status.
+- Selecting one or multiple sessions for an operation.
+- Executing independent tasks concurrently.
+- Sending text messages and supported media or files.
+- Managing groups where the connected account has the necessary permissions.
+- Joining groups when the operation is supported and authorized.
+- Tracking task progress and returning results.
+- Adding future operations without redesigning the entire application.
+
+The bot must NOT use an AI model at runtime. All operations must be handled by explicit application logic, configured commands, and supported APIs.
+
+Google AI Studio is a development tool only, not a runtime dependency.
+
+---
+
+2. REQUIRED TECHNOLOGY STACK
+
+Use the following stack unless a documented technical limitation requires an alternative:
+
+- Node.js: current supported LTS release.
+- TypeScript: strict mode enabled.
+- Telegram interface: grammY or another well-maintained Telegram Bot API framework.
+- WhatsApp integration: Baileys, using a compatible and pinned version.
+- Database: SQLite for the initial implementation, with a repository abstraction to support migration to PostgreSQL later.
+- Schema validation: Zod or an equivalent maintained validation library.
+- Logging: structured logging with Pino or an equivalent library.
+- Testing: Vitest or another appropriate TypeScript testing framework.
+- Configuration: environment variables validated at application startup.
+- Deployment: Linux-compatible Node.js application suitable for AWS EC2 running Ubuntu 24.04 LTS.
+- Process management: systemd for production deployment.
+- Source control: GitHub-compatible project structure.
+
+Check package compatibility before selecting versions. Pin compatible dependency versions and provide a lockfile.
+
+Do not invent library methods or assume undocumented APIs exist. Verify implementation details against the actual installed package types and documentation.
+
+---
+
+3. TELEGRAM BOT USER INTERFACE
+
+Create a professional, organized Telegram interface using inline keyboards.
+
+The interface language must initially be Arabic, with clear Arabic labels and support for right-to-left text where appropriate.
+
+Use pagination for long lists. Every workflow must include suitable Back, Cancel, and Confirm buttons.
+
+Main menu
+
+Create the following menu:
+
+1. 📲 Link WhatsApp Account
+2. ➕ Add Another Account
+3. 📋 Manage Sessions
+4. ✉️ Send Text Message
+5. 📎 Send Media or File
+6. 👥 Group Management
+7. 🔗 Join Group
+8. 📊 Task Monitor
+9. 📜 Activity History
+10. ⚙️ Settings
+11. ℹ️ Help and System Status
+
+Every button must invoke a real implemented handler. If a feature has not yet been implemented, clearly mark it as unavailable instead of displaying a fake success message.
+
+Session management submenu
+
+Provide these actions:
+
+- List all sessions.
+- View session details.
+- Link a new session.
+- Reconnect a disconnected session.
+- Disconnect a session.
+- Remove a session.
+- Select multiple sessions.
+- Refresh connection status.
+
+Display a non-sensitive session identifier, a masked phone number when available, connection status, and the last status update.
+
+Never display authentication keys or complete session credentials in Telegram.
+
+---
+
+4. WHATSAPP ACCOUNT LINKING
+
+Implement an interactive session-linking workflow.
+
+Expected flow:
+
+1. The administrator selects "Link WhatsApp Account".
+2. The bot requests the phone number, including the country code.
+3. Validate the number and normalize its format.
+4. Ask the session manager to initiate the supported pairing procedure.
+5. Generate and display the pairing code only when the library and current WhatsApp protocol support that procedure.
+6. Tell the administrator where to enter the code in the WhatsApp application.
+7. Monitor the connection process.
+8. Confirm success only after receiving an actual authenticated connection state.
+9. Persist the authenticated session.
+10. Register the session in the database.
+11. Return the administrator to the session management menu.
+
+Support multiple independent sessions without mixing authentication data.
+
+Requirements:
+
+- Each session must have a unique internal identifier.
+- Each session must have its own isolated authentication state.
+- A failed pairing attempt must not corrupt existing sessions.
+- Prevent duplicate concurrent pairing workflows for the same session.
+- Handle expired codes, authentication failures, disconnections, and timeouts.
+- Never ask users to submit their WhatsApp passwords or verification codes in Telegram.
+- Do not log pairing codes, authentication tokens, private keys, or raw authentication state.
+- Use only documented, supported pairing flows.
+- Do not bypass WhatsApp security checks or attempt to obtain another person's account without their explicit authorization.
+
+Treat Baileys as an unofficial integration. Document the risks of protocol changes, account restrictions, and service interruptions.
+
+Do not promise that sessions will remain authenticated indefinitely.
+
+---
+
+5. SESSION PERSISTENCE AND RESTORATION
+
+Implement a dedicated SessionManager module.
+
+Responsibilities:
+
+- Create and initialize sessions.
+- Restore previously authenticated sessions after application restart.
+- Track connection state.
+- Handle authentication updates.
+- Detect logout and revoked credentials.
+- Reconnect when appropriate.
+- Apply bounded exponential backoff with jitter.
+- Prevent duplicate reconnect loops.
+- Dispose of event listeners and resources during shutdown.
+- Persist changes safely and atomically where appropriate.
+
+Use separate storage directories or equivalent isolated storage for each account.
+
+Authentication data must be treated as highly sensitive.
+
+Implement these controls:
+
+- Restrict filesystem permissions.
+- Keep authentication directories outside publicly served paths.
+- Never commit authentication data to GitHub.
+- Never send session files through Telegram.
+- Exclude secrets from logs and error reports.
+- Provide documented backup and recovery procedures.
+- Provide a secure session-removal operation.
+- On logout or session revocation, update the database and invalidate local credentials when appropriate.
+
+Do not store authentication credentials directly in ordinary database columns unless they are appropriately protected.
+
+Clearly document any remaining security limitations of local session storage.
+
+---
+
+6. MULTI-SESSION TASK EXECUTION
+
+Implement a TaskManager module that supports running an operation against one or multiple selected sessions.
+
+Each task must have:
+
+- Unique task ID.
+- Operation type.
+- Target information.
+- Selected session IDs.
+- Creation timestamp.
+- Start timestamp.
+- Completion timestamp.
+- Current status.
+- Per-session result.
+- Error details safe for display.
+- Cancellation status where applicable.
+
+Supported task states:
+
+- PENDING
+- RUNNING
+- COMPLETED
+- PARTIALLY_COMPLETED
+- FAILED
+- CANCELLED
+
+Concurrent execution
+
+When the administrator selects multiple sessions, allow their independent operations to run concurrently.
+
+Requirements:
+
+- Use asynchronous execution rather than sequential loops for independent tasks.
+- Apply a configurable concurrency limit.
+- Prevent accidental duplicate execution.
+- Avoid creating unbounded numbers of simultaneous operations.
+- Apply operation-specific timeouts.
+- Handle individual session failures without losing other results.
+- Return a per-session summary.
+- Preserve task state when the process restarts where practical.
+
+Example:
+
+If three selected sessions are available, the TaskManager should schedule the three independent tasks concurrently, subject to the configured limit.
+
+Do not report that all operations succeeded merely because the task was started.
+
+An operation must report its actual outcome or an explicitly unknown outcome.
+
+Implement cancellation where technically possible. If an external operation cannot be safely cancelled after it has started, explain that limitation.
+
+---
+
+7. TEXT MESSAGE WORKFLOW
+
+Implement the following interactive workflow:
+
+1. Administrator selects "Send Text Message".
+2. Bot asks for the recipient.
+3. Validate and normalize the recipient identifier.
+4. Bot asks for the message text.
+5. Administrator selects one or more sessions.
+6. Bot displays a summary.
+7. Administrator confirms or cancels.
+8. TaskManager executes the operation.
+9. Bot reports each session's actual result.
+
+The confirmation screen should include:
+
+- Recipient.
+- Message preview.
+- Selected session count.
+- Selected session identifiers.
+- Confirmation button.
+- Cancel button.
+
+Use safe input validation and the correct recipient format expected by the installed library.
+
+Do not send messages to unverified recipients through an uncontrolled bulk workflow.
+
+Implement configurable rate limits, cooldowns, and duplicate-message protection.
+
+Do not implement spam, unsolicited bulk messaging, or mechanisms intended to evade platform restrictions.
+
+---
+
+8. MEDIA AND FILE SENDING
+
+Implement a guided media/file workflow.
+
+Supported inputs should include the media types that the selected WhatsApp integration actually supports, such as:
+
+- Images.
+- Documents.
+- Video.
+- Audio, where supported.
+- Captions when supported.
+
+The workflow must:
+
+1. Request the recipient.
+2. Request a file upload or a supported file reference.
+3. Validate file type and size.
+4. Store the file temporarily in a controlled directory.
+5. Ask the administrator to select sessions.
+6. Display a confirmation summary.
+7. Execute the task.
+8. Remove temporary files according to a documented cleanup policy.
+9. Return per-session results.
+
+Requirements:
+
+- Enforce a configurable maximum file size.
+- Restrict accepted file types.
+- Prevent path traversal.
+- Never execute uploaded files.
+- Use generated temporary filenames.
+- Avoid keeping unnecessary copies of user-uploaded files.
+- Clearly report when Telegram or WhatsApp file limits prevent an operation.
+
+Never trust a file path supplied directly by a Telegram user.
+
+---
+
+9. GROUP MANAGEMENT
+
+Create a Group Management submenu.
+
+Potential operations include:
+
+- List groups accessible through a selected session, if supported.
+- Display group information.
+- Retrieve group participants where supported and authorized.
+- Generate a group invitation link when the account has permission and the API supports it.
+- Join a group using a supported invitation workflow.
+- Add a participant where the protocol and account permissions allow it.
+- Remove a participant only when the account has the required administrative permission.
+- Promote or demote a participant only when supported and authorized.
+- Leave a group after explicit confirmation.
+
+For destructive or permission-sensitive actions:
+
+- Display the target group.
+- Display the intended action.
+- Require explicit confirmation.
+- Validate session permissions.
+- Verify the action's outcome where possible.
+- Record the result in the audit log.
+
+Do not assume that all group operations are supported by Baileys or available to every account.
+
+Do not implement unauthorized access, account impersonation, privacy bypasses, or methods intended to evade platform safeguards.
+
+If an operation is unavailable, explain the limitation and provide a clear error message.
+
+---
+
+10. JOIN GROUP WORKFLOW
+
+Implement a dedicated "Join Group" workflow.
+
+Expected steps:
+
+1. Request the invitation link or other supported group identifier.
+2. Validate the link and reject unsupported formats.
+3. Ask the administrator to select one or more sessions.
+4. Show the selected sessions and destination.
+5. Require confirmation.
+6. Schedule supported operations.
+7. Return a separate result for each session.
+
+Handle:
+
+- Invalid links.
+- Expired invitations.
+- Already joined groups.
+- Revoked invitations.
+- Connection failures.
+- Rate limits.
+- Permission restrictions.
+- Unsupported link types.
+
+Do not attempt to circumvent group access restrictions or automatically join unrelated groups in bulk.
+
+---
+
+11. TELEGRAM ADMINISTRATOR AUTHORIZATION
+
+This is a private administrative application.
+
+Implement an explicit allowlist using a numeric Telegram user ID supplied through configuration.
+
+Requirements:
+
+- Reject unauthorized users before processing commands or callback queries.
+- Check authorization for every sensitive action, not only /start.
+- Protect against callback-query manipulation.
+- Validate all user-provided input.
+- Do not expose session details to unauthorized users.
+- Do not accept a Telegram username as the sole security credential.
+- Do not hardcode the administrator ID in source code.
+- Provide a clear setup procedure for configuring the authorized ID.
+
+The default configuration must deny access until an administrator ID has been configured.
+
+---
+
+12. SECURITY AND PRIVACY
+
+Treat all session data, phone numbers, messages, and uploaded files as sensitive.
+
+Implement:
+
+- Secret-free source control.
+- Environment variable validation.
+- A ".gitignore" covering secrets, databases, session folders, logs, and temporary files.
+- Least-privilege filesystem permissions.
+- Safe logging with redaction.
+- Input validation.
+- Error sanitization.
+- Per-user and per-operation rate limits.
+- Secure temporary-file handling.
+- Graceful shutdown.
+- Database transactions where appropriate.
+- Audit logging for administrative operations.
+
+Never log:
+
+- Telegram bot tokens.
+- WhatsApp authentication keys.
+- Pairing codes.
+- Raw authentication-state objects.
+- Complete private session files.
+
+Do not create a web server unless required. If an optional administrative API is added, protect it with authentication and avoid exposing it publicly by default.
+
+Do not use SSH credentials, AWS credentials, or other deployment secrets in the application repository.
+
+---
+
+13. DATABASE DESIGN
+
+Create a documented SQLite schema and migrations.
+
+Include appropriate tables for:
+
+- sessions
+- tasks
+- task_results
+- settings
+- audit_logs
+
+Use unique identifiers and timestamps.
+
+Store only the minimum metadata required for management and recovery.
+
+Avoid storing message contents or phone numbers in audit logs unless strictly necessary.
+
+Add indexes for common lookups.
+
+Use transactions for operations that must update multiple related records.
+
+Implement database initialization and migration handling on application startup.
+
+---
+
+14. ERROR HANDLING AND OBSERVABILITY
+
+Use structured logs and meaningful error categories.
+
+Handle at least:
+
+- Telegram API failures.
+- WhatsApp disconnections.
+- Authentication expiration.
+- Pairing failures.
+- Invalid user input.
+- Database failures.
+- Filesystem failures.
+- Unsupported operations.
+- Task timeouts.
+- Rate limits.
+- Partial multi-session failures.
+- Unexpected process shutdown.
+
+Display concise Arabic error messages in Telegram.
+
+Keep technical diagnostics in sanitized server logs.
+
+Implement health information for:
+
+- Application status.
+- Telegram connection status.
+- Session connection counts.
+- Pending task count.
+- Running task count.
+- Last successful operation.
+- Recent errors.
+
+Do not expose secrets in the health status.
+
+---
+
+15. PROJECT STRUCTURE
+
+Use a modular structure similar to the following:
+
+src/
+app.ts
+config/
+env.ts
+bot/
+bot.ts
+middleware/
+authorization.ts
+handlers/
+start.ts
+sessions.ts
+messaging.ts
+media.ts
+groups.ts
+tasks.ts
+settings.ts
+keyboards/
+main-menu.ts
+session-menu.ts
+task-menu.ts
+workflows/
+pairing-workflow.ts
+message-workflow.ts
+media-workflow.ts
+group-workflow.ts
+whatsapp/
+session-manager.ts
+session-store.ts
+connection-manager.ts
+operations/
+send-message.ts
+send-media.ts
+group-operations.ts
+tasks/
+task-manager.ts
+task-runner.ts
+concurrency.ts
+database/
+database.ts
+migrations/
+repositories/
+security/
+redaction.ts
+validation.ts
+logging/
+logger.ts
+utils/
+errors.ts
+retry.ts
+shutdown.ts
+
+tests/
+unit/
+integration/
+
+data/
+.gitkeep
+
+scripts/
+setup.sh
+health-check.sh
+
+docs/
+INSTALLATION.md
+CONFIGURATION.md
+SECURITY.md
+DEPLOYMENT_AWS.md
+TROUBLESHOOTING.md
+
+Also create:
+
+- package.json
+- TypeScript configuration.
+- Dependency lockfile.
+- .env.example
+- .gitignore
+- README.md
+- systemd service example.
+- Database migration scripts.
+- Unit tests.
+- Integration tests using mocks or test doubles.
+
+Adjust the structure where appropriate, but keep the architecture modular.
+
+Do not commit live credentials or real WhatsApp session files.
+
+---
+
+16. CONFIGURATION
+
+Provide an ".env.example" file containing placeholders such as:
+
+NODE_ENV=development
+TELEGRAM_BOT_TOKEN=
+TELEGRAM_ADMIN_ID=
+DATABASE_PATH=./data/app.sqlite
+WHATSAPP_AUTH_DIR=./data/whatsapp-sessions
+TEMP_UPLOAD_DIR=./data/tmp
+LOG_LEVEL=info
+MAX_CONCURRENT_TASKS=3
+TASK_TIMEOUT_MS=120000
+MAX_UPLOAD_SIZE_MB=20
+
+These are examples, not guaranteed production values.
+
+Validate all configuration at startup.
+
+Fail fast with a helpful error message if required variables are missing or malformed.
+
+Never generate fake credentials.
+
+Never require the administrator to paste secret values into the source code.
+
+Document how to configure local environment variables and production environment variables safely.
+
+---
+
+17. TESTING REQUIREMENTS
+
+Implement automated tests for the critical behavior.
+
+At minimum, test:
+
+- Startup configuration validation.
+- Unauthorized Telegram users being rejected.
+- Main menu navigation.
+- Session creation and deletion.
+- Session-state isolation.
+- Session restoration logic.
+- Invalid phone number handling.
+- Pairing workflow state transitions.
+- Database transactions.
+- Task state transitions.
+- Multi-session concurrent execution.
+- Concurrency limits.
+- Partial task failures.
+- Cancellation behavior.
+- Message input validation.
+- File type and size validation.
+- Path traversal protection.
+- Log redaction.
+- Graceful shutdown.
+
+Use mocked WhatsApp connections for automated tests.
+
+Do not require real WhatsApp accounts or real messages to run the default test suite.
+
+Add separate, clearly documented manual integration tests for functionality that requires a real account.
+
+Never claim tests passed unless they were actually executed and the results are available.
+
+---
+
+18. AWS DEPLOYMENT
+
+Prepare the application for deployment to an AWS EC2 instance running Ubuntu 24.04 LTS.
+
+Provide:
+
+- Node.js installation instructions.
+- Git installation instructions.
+- Repository cloning instructions.
+- Dependency installation.
+- Environment configuration.
+- Database initialization.
+- Session directory setup.
+- File permission configuration.
+- Application build.
+- Test execution.
+- systemd service setup.
+- Service startup.
+- Service status checks.
+- Log inspection.
+- Application update procedure.
+- Backup and restore procedure.
+- Safe shutdown instructions.
+
+The service must restart automatically after unexpected application crashes and system reboots.
+
+Do not assume the AWS instance is currently running during development.
+
+Do not require AWS SDK access unless it is genuinely necessary.
+
+Do not hardcode the server's IP address.
+
+Do not expose private credentials in shell history or deployment logs.
+
+Document that the EC2 instance must be running for the bot to be available.
+
+---
+
+19. IMPLEMENTATION STRATEGY
+
+Work in controlled phases.
+
+PHASE 1 — PROJECT FOUNDATION
+
+- Inspect the available Build mode environment and project capabilities.
+- Create the TypeScript project.
+- Configure dependencies and strict compiler settings.
+- Implement environment validation.
+- Implement logging and redaction.
+- Implement the database and migrations.
+- Implement Telegram bot startup and administrator authorization.
+- Implement the main menu and navigation.
+- Add initial automated tests.
+
+PHASE 2 — SESSION MANAGEMENT
+
+- Implement the WhatsApp session abstraction.
+- Implement the Baileys adapter using verified, compatible APIs.
+- Implement session linking.
+- Implement authentication persistence.
+- Implement connection-state monitoring.
+- Implement session restoration and cleanup.
+- Add tests with mocked connections.
+
+PHASE 3 — OPERATIONS
+
+- Implement message sending.
+- Implement media and file sending.
+- Implement multi-session selection.
+- Implement bounded concurrent task execution.
+- Implement per-session results and error reporting.
+- Implement task history and cancellation where possible.
+
+PHASE 4 — GROUP MANAGEMENT
+
+- Implement only operations supported by the selected integration.
+- Add permission checks.
+- Add confirmation steps.
+- Add validation and error handling.
+- Add tests for unsupported and unauthorized operations.
+
+PHASE 5 — HARDENING
+
+- Review authorization.
+- Review session isolation.
+- Review secret handling.
+- Review temporary-file cleanup.
+- Review concurrency and reconnection behavior.
+- Execute automated tests.
+- Fix implementation defects.
+- Verify build and startup.
+
+PHASE 6 — DOCUMENTATION AND DEPLOYMENT
+
+- Complete README and setup documentation.
+- Prepare AWS deployment files.
+- Provide systemd configuration.
+- Document troubleshooting and backup.
+- Produce a final implementation report.
+
+Do not attempt to implement the entire project as one giant unstructured file.
+
+Do not stop after producing a plan or interface mockup. Continue implementing the application within the capabilities of the environment.
+
+If the environment imposes a limit, finish the current phase cleanly, summarize completed work, and specify the exact next implementation step.
+
+---
+
+20. QUALITY GATES
+
+Before declaring the application ready, verify:
+
+1. The project installs successfully.
+2. TypeScript compilation succeeds.
+3. Automated tests execute.
+4. Telegram authorization is enforced.
+5. Main-menu buttons have real handlers.
+6. Session data is isolated per account.
+7. Session restoration is implemented and tested with mocks.
+8. Multi-session tasks respect concurrency limits.
+9. Failures are reported accurately.
+10. Secrets are excluded from source control.
+11. The application shuts down gracefully.
+12. Deployment documentation is complete.
+
+Report any failed check honestly.
+
+Do not mark an unfinished feature as complete.
+
+Do not substitute mock data for real functionality without explicitly identifying it.
+
+---
+
+21. BUILD MODE EXECUTION INSTRUCTIONS
+
+Start by inspecting the current Build mode environment and determining whether it can create a server-side Node.js application with persistent project files.
+
+If it can create the project:
+
+1. Create the actual project files.
+2. Implement Phase 1.
+3. Run the available checks.
+4. Fix errors.
+5. Continue through the phases as far as the environment allows.
+6. Keep all source code in the project workspace.
+7. Provide the actual files rather than merely printing large code snippets in chat.
+
+If Build mode is primarily configured for frontend applications and cannot run a persistent Node.js backend:
+
+- Do not pretend that a frontend preview is a working Telegram bot.
+- Create the complete backend source as project files if supported.
+- Clearly distinguish a local preview from the deployed Telegram service.
+- Document how to install, configure, and run the backend separately.
+
+Do not expose the Telegram bot token, WhatsApp session data, or other secrets in generated frontend code.
+
+---
+
+22. FINAL DELIVERY REPORT
+
+At the end, provide a concise but precise report containing:
+
+- Features implemented.
+- Project structure.
+- Dependency versions.
+- Build results.
+- Actual test results.
+- Features that remain incomplete.
+- Any manual steps required.
+- Required environment variables.
+- Instructions for testing with a real WhatsApp account.
+- Instructions for connecting the project to GitHub.
+- Instructions for deployment to AWS EC2.
+- Known limitations of the unofficial Baileys integration.
+
+Begin with Phase 1 now.
+
+First inspect the environment, then create the project and implement the foundation. Do not ask me to repeat requirements already defined in this specification.

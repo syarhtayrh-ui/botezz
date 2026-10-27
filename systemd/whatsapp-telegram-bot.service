@@ -1,0 +1,29 @@
+[Unit]
+Description=WhatsApp Multi-Session Management Telegram Bot Service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/whatsapp-telegram-bot
+EnvironmentFile=/opt/whatsapp-telegram-bot/.env
+ExecStart=/usr/bin/npm run bot:start
+Restart=always
+RestartSec=5
+KillSignal=SIGTERM
+TimeoutStopSec=30
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=whatsapp-telegram-bot
+
+# Security Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=read-only
+ReadWritePaths=/opt/whatsapp-telegram-bot/data
+
+[Install]
+WantedBy=multi-user.target

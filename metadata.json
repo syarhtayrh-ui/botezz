@@ -1,0 +1,6 @@
+{
+  "name": "WhatsApp Multi-Session Telegram Control System",
+  "description": "Production-grade WhatsApp Multi-Session Management System controlled through an Arabic Telegram Bot using Baileys, grammY, SQLite, and bounded concurrent task execution.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
