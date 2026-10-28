@@ -34,15 +34,16 @@ export function validateCustomPairingCode(rawCode?: string): string | undefined 
 }
 
 /**
- * Generates a cryptographically random 8-character alphanumeric pairing code for athanasia-baileys
+ * Generates a cryptographically random 8-character Crockford Base32 pairing code for athanasia-baileys
  * when the administrator does not specify a custom code.
+ * Matches the 32-character alphabet in `athanasia-baileys/lib/Utils/generics.js` (`bytesToCrockford`).
  */
 export function generateRandomPairingCode(): string {
-  const alphabet = '123456789ABCDEFGHJKLMNPQRSTUVWXYZ';
+  const alphabet = '123456789ABCDEFGHJKLMNPQRSTVWXYZ';
   const bytes = crypto.randomBytes(8);
   let code = '';
   for (let i = 0; i < 8; i++) {
-    code += alphabet[bytes[i] % alphabet.length];
+    code += alphabet[bytes[i] & 31];
   }
   return code;
 }

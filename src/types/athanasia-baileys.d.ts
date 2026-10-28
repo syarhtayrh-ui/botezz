@@ -168,6 +168,8 @@ declare module 'athanasia-baileys' {
     ws?: {
       close(): void;
       isOpen?: boolean;
+      on?(event: string, listener: (...args: any[]) => void): void;
+      off?(event: string, listener: (...args: any[]) => void): void;
     };
     waitForSocketOpen(): Promise<void>;
     requestPairingCode(phoneNumber: string, customPairingCode?: string): Promise<string>;
@@ -236,7 +238,11 @@ declare module 'athanasia-baileys' {
 
   export function fetchLatestBaileysVersion(
     options?: Record<string, unknown>
-  ): Promise<{ version: [number, number, number]; isLatest: boolean }>;
+  ): Promise<{ version: [number, number, number]; isLatest: boolean; error?: unknown }>;
+
+  export function fetchLatestWaWebVersion(
+    options?: Record<string, unknown>
+  ): Promise<{ version: [number, number, number]; isLatest: boolean; error?: unknown }>;
 
   export function jidEncode(
     user: string | number | null | undefined,

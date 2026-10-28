@@ -127,8 +127,18 @@ export function toSafeArabicError(err: unknown): {
 
   const lower = rawMessage.toLowerCase();
 
-  // 1. WhatsApp / Baileys Connection or Disconnect errors
+  const boomStatusCode =
+    err !== null &&
+    typeof err === 'object' &&
+    'output' in err &&
+    typeof (err as { output?: { statusCode?: unknown } }).output?.statusCode === 'number'
+      ? ((err as { output: { statusCode: number } }).output.statusCode)
+      : undefined;
+
+  // 1. WhatsApp / Baileys Connection, Handshake, or Disconnect errors
   if (
+    boomStatusCode === 405 ||
+    lower.includes('connection failure') ||
     lower.includes('connection closed') ||
     lower.includes('connection terminated') ||
     lower.includes('websocket error') ||
@@ -138,11 +148,16 @@ export function toSafeArabicError(err: unknown): {
     lower.includes('enotfound') ||
     lower.includes('ehostunreach')
   ) {
+    const userMessage =
+      boomStatusCode === 405
+        ? 'رفض خادم واتساب مصافحة البروتوكول أو تسجيل الجلسة (رمز 405). يرجى المحاولة مرة أخرى.'
+        : 'تعذر الاتصال بخوادم واتساب أو انقطع اتصال المقبس مؤقتاً. يرجى المحاولة مرة أخرى بعد لحظات.';
     return {
       category: 'WHATSAPP_CONNECTION_ERROR',
-      userMessage:
-        'تعذر الاتصال بخوادم واتساب أو انقطع اتصال المقبس مؤقتاً. يرجى المحاولة مرة أخرى بعد لحظات.',
-      sanitizedTechnicalMessage: redactText(rawMessage),
+      userMessage,
+      sanitizedTechnicalMessage: redactText(
+        boomStatusCode ? `${rawMessage} (statusCode=${boomStatusCode})` : rawMessage
+      ),
     };
   }
 

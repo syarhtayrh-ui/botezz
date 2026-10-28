@@ -7,6 +7,7 @@
     "build": "next build",
     "start": "next start",
     "bot:start": "tsx src/app.ts",
+    "diagnose:wa": "tsx scripts/diagnose-whatsapp-connection.ts",
     "test": "tsx --test tests/unit/*.test.ts tests/integration/*.test.ts",
     "lint": "eslint .",
     "clean": "next clean"

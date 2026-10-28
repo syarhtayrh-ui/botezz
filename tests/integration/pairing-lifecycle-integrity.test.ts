@@ -13,6 +13,8 @@ import { SessionStore } from '../../src/whatsapp/session-store';
 import {
   MockWhatsAppSessionDriver,
   ConnectionEventCallbacks,
+  resolveWhatsAppWebVersion,
+  describeDisconnectReasonArabic,
 } from '../../src/whatsapp/connection-manager';
 import { SessionManager, SessionManagerOptions } from '../../src/whatsapp/session-manager';
 import { SendMessageOperation } from '../../src/whatsapp/operations/send-message';
@@ -59,6 +61,7 @@ function createLifecycleTestHarness(managerOptions?: SessionManagerOptions) {
     shouldFailConnect?: boolean;
     shouldFailPairingRequest?: boolean;
     shouldTimeoutHandshake?: boolean;
+    simulatedCloseStatusCodeBeforeReady?: number | null;
   } = {};
 
   const sessionManager = new SessionManager(
@@ -76,6 +79,10 @@ function createLifecycleTestHarness(managerOptions?: SessionManagerOptions) {
       }
       if (nextDriverConfig.shouldTimeoutHandshake) {
         drv.shouldTimeoutHandshake = true;
+      }
+      if (nextDriverConfig.simulatedCloseStatusCodeBeforeReady !== undefined) {
+        drv.simulatedCloseStatusCodeBeforeReady =
+          nextDriverConfig.simulatedCloseStatusCodeBeforeReady;
       }
 
       const entry = {
@@ -544,3 +551,87 @@ test('Section 17.و & 17.ز: Multi-Session Isolation, Concurrent Pairing Lock, a
     await env.cleanup();
   }
 });
+
+test('Section 17.ح: 405 Protocol Handshake Rejection, Pre-Ready Disconnect (428), and WhatsApp Web Version Resolution Integrity', async () => {
+  const env = createLifecycleTestHarness();
+  try {
+    const adminId = env.config.TELEGRAM_ADMIN_ID;
+
+    // 1. Verify resolveWhatsAppWebVersion resolves a modern revision (> 1030831524)
+    const verInfo = await resolveWhatsAppWebVersion(true);
+    assert.equal(Array.isArray(verInfo.version), true);
+    assert.equal(verInfo.version.length, 3);
+    assert.equal(verInfo.version[0], 2);
+    assert.equal(verInfo.version[1], 3000);
+    assert.ok(
+      verInfo.version[2] > 1030831524,
+      `Expected modern WA Web revision > 1030831524, got ${verInfo.version.join('.')}`
+    );
+
+    // 2. Verify describeDisconnectReasonArabic(405) distinguishes protocol rejection from phone validation
+    const msg405 = describeDisconnectReasonArabic(405, 'Connection Failure', {
+      reason: '405',
+      location: 'vll',
+    });
+    assert.ok(msg405.includes('405'));
+    assert.ok(msg405.includes('مصافحة البروتوكول'));
+    assert.ok(!msg405.includes('رقم الهاتف غير صالح'));
+
+    // 3. Simulate 405 handshake rejection during pairing (`simulatedCloseStatusCodeBeforeReady = 405`):
+    // Must NEVER produce a fake success or mark the session CONNECTED, must NOT blame the phone number,
+    // and must NOT schedule background auto-reconnects.
+    env.setNextDriverConfig({ simulatedCloseStatusCodeBeforeReady: 405 });
+    await assert.rejects(
+      () =>
+        env.sessionManager.initiatePairing({
+          rawPhoneNumber: '+966508881111',
+          actorTelegramId: adminId,
+        }),
+      (err: any) => {
+        assert.equal(err.category, 'WHATSAPP_CONNECTION_ERROR');
+        assert.ok(err.arabicUserMessage.includes('405'));
+        assert.ok(!err.arabicUserMessage.includes('صيغة رقم الهاتف'));
+        return true;
+      }
+    );
+
+    const sessionsAfter405 = env.sessionManager.listSessions();
+    assert.equal(sessionsAfter405.length, 1);
+    const failed405Session = sessionsAfter405[0];
+    assert.equal(failed405Session.status, 'FAILED');
+    assert.notEqual(failed405Session.status, 'CONNECTED');
+    assert.ok(failed405Session.last_error?.includes('405'));
+    const verif405 = env.sessionManager.getLiveVerification(failed405Session.id)!;
+    assert.equal(verif405.hasReconnectTimer, false);
+    assert.equal(verif405.hasActiveDriver, false);
+    assert.equal(verif405.socketDiagnostics.socketActive, false);
+
+    // 4. Simulate pre-ready socket disconnect (`428`) before pairing code generation
+    env.setNextDriverConfig({ simulatedCloseStatusCodeBeforeReady: 428 });
+    await assert.rejects(
+      () =>
+        env.sessionManager.initiatePairing({
+          rawPhoneNumber: '+966508882222',
+          actorTelegramId: adminId,
+        }),
+      (err: any) => {
+        assert.equal(err.category, 'WHATSAPP_CONNECTION_ERROR');
+        assert.ok(err.arabicUserMessage.includes('428'));
+        return true;
+      }
+    );
+
+    const sessionsAfter428 = env.sessionManager.listSessions();
+    const failed428Session = sessionsAfter428.find(
+      (s) => s.id !== failed405Session.id
+    )!;
+    assert.equal(failed428Session.status, 'FAILED');
+    assert.equal(
+      env.sessionManager.getLiveVerification(failed428Session.id)?.hasReconnectTimer,
+      false
+    );
+  } finally {
+    await env.cleanup();
+  }
+});
+

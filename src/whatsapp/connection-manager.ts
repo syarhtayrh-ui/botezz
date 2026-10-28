@@ -5,6 +5,7 @@ import makeWASocket, {
   useMultiFileAuthState as loadMultiFileAuthState,
   DisconnectReason,
   fetchLatestBaileysVersion,
+  fetchLatestWaWebVersion,
   Browsers,
   jidNormalizedUser,
   areJidsSameUser,
@@ -562,6 +563,165 @@ export interface WhatsAppSessionDriver {
  * group metadata caching (`cachedGroupMetadata`), newsletter/channel inspection (`newsletterMetadata`),
  * and LID/PN participant resolution APIs of `github:AthanasiaCMD/athanasia-baileys`.
  */
+/**
+ * Minimum revision threshold above the expired `[2, 3000, 1030831524]` bundled in
+ * `athanasia-baileys/lib/Defaults/baileys-version.json` (which WhatsApp servers reject with `<failure reason="405"/>`).
+ */
+const EXPIRED_BUNDLED_REVISION = 1030831524;
+const VERIFIED_BASELINE_WA_WEB_VERSION: [number, number, number] = [2, 3000, 1052053390];
+const WA_WEB_VERSION_CACHE_TTL_MS = 6 * 60 * 60 * 1000; // 6 hours
+
+let cachedWaWebVersion: {
+  version: [number, number, number];
+  fetchedAt: number;
+  source: 'wa_web_live' | 'baileys_remote';
+} | null = null;
+
+function isModernWaWebVersion(version: unknown): version is [number, number, number] {
+  return (
+    Array.isArray(version) &&
+    version.length === 3 &&
+    typeof version[0] === 'number' &&
+    typeof version[1] === 'number' &&
+    typeof version[2] === 'number' &&
+    version[2] > EXPIRED_BUNDLED_REVISION
+  );
+}
+
+export function invalidateWhatsAppWebVersionCache(): void {
+  cachedWaWebVersion = null;
+}
+
+/**
+ * Resolves a live, compatible WhatsApp Web client version supported by `athanasia-baileys`.
+ *
+ * Root-cause note:
+ * `fetchLatestBaileysVersion()` in `athanasia-baileys` queries
+ * `https://raw.githubusercontent.com/AthanasiaCMD/athanasia-baileys/refs/heads/master/lib/Defaults/baileys-version.json`
+ * which returns HTTP 404 (the repository uses branch `main`, and its static JSON contains `[2, 3000, 1030831524]`).
+ * Because `fetchLatestBaileysVersion()` catches errors internally without throwing, it silently returns
+ * `[2, 3000, 1030831524]`, which WhatsApp servers immediately reject during `validateConnection()` with
+ * `<failure reason="405" location="vll"/>`.
+ *
+ * By contrast, `fetchLatestWaWebVersion()` in `athanasia-baileys` queries `https://web.whatsapp.com/sw.js`
+ * and extracts the active `client_revision`, which passes WhatsApp's handshake and emits `pair-device` (`qr`).
+ */
+export async function resolveWhatsAppWebVersion(forceRefresh = false): Promise<{
+  version: [number, number, number];
+  isLatest: boolean;
+  source: 'wa_web_live' | 'baileys_remote' | 'cached_live' | 'verified_fallback';
+}> {
+  if (
+    !forceRefresh &&
+    cachedWaWebVersion &&
+    Date.now() - cachedWaWebVersion.fetchedAt < WA_WEB_VERSION_CACHE_TTL_MS
+  ) {
+    return {
+      version: cachedWaWebVersion.version,
+      isLatest: true,
+      source: 'cached_live',
+    };
+  }
+
+  try {
+    const waWeb = await fetchLatestWaWebVersion({
+      signal: AbortSignal.timeout(8_000),
+    });
+    if (waWeb?.isLatest && isModernWaWebVersion(waWeb.version)) {
+      cachedWaWebVersion = {
+        version: waWeb.version,
+        fetchedAt: Date.now(),
+        source: 'wa_web_live',
+      };
+      return {
+        version: waWeb.version,
+        isLatest: true,
+        source: 'wa_web_live',
+      };
+    }
+    log.warn('fetchLatestWaWebVersion did not return a modern live version', {
+      isLatest: waWeb?.isLatest ?? false,
+      returnedVersion: Array.isArray(waWeb?.version) ? waWeb.version.join('.') : 'none',
+      error:
+        waWeb?.error instanceof Error
+          ? waWeb.error.message
+          : typeof (waWeb?.error as { message?: string } | undefined)?.message === 'string'
+            ? (waWeb.error as { message: string }).message
+            : undefined,
+    });
+  } catch (err) {
+    log.warn('fetchLatestWaWebVersion threw an exception', {
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+
+  try {
+    const baileysLatest = await fetchLatestBaileysVersion({
+      signal: AbortSignal.timeout(5_000),
+    });
+    if (baileysLatest?.isLatest && isModernWaWebVersion(baileysLatest.version)) {
+      cachedWaWebVersion = {
+        version: baileysLatest.version,
+        fetchedAt: Date.now(),
+        source: 'baileys_remote',
+      };
+      return {
+        version: baileysLatest.version,
+        isLatest: true,
+        source: 'baileys_remote',
+      };
+    }
+  } catch {
+    // Ignore secondary check failure
+  }
+
+  if (cachedWaWebVersion) {
+    return {
+      version: cachedWaWebVersion.version,
+      isLatest: false,
+      source: 'cached_live',
+    };
+  }
+
+  return {
+    version: [...VERIFIED_BASELINE_WA_WEB_VERSION],
+    isLatest: false,
+    source: 'verified_fallback',
+  };
+}
+
+export function describeDisconnectReasonArabic(
+  statusCode?: number,
+  errMsg?: string,
+  errData?: Record<string, unknown>
+): string {
+  const location = typeof errData?.location === 'string' ? ` [${errData.location}]` : '';
+  switch (statusCode) {
+    case 405:
+      return `رفض خادم واتساب مصافحة البروتوكول أو تسجيل الجلسة (رمز 405${location}). تم تحديث إصدار بروتوكول WhatsApp Web؛ يرجى إعادة المحاولة.`;
+    case DisconnectReason.loggedOut: // 401
+      return 'تم تسجيل الخروج من تطبيق واتساب على الهاتف (رمز 401).';
+    case DisconnectReason.forbidden: // 403
+      return 'رفض خادم واتساب الوصول لهذه الجلسة (رمز 403).';
+    case DisconnectReason.timedOut: // 408
+      return 'انتهت مهلة الاتصال بخادم واتساب أو فُقد الاتصال (رمز 408).';
+    case DisconnectReason.multideviceMismatch: // 411
+      return 'عدم توافق وضع الأجهزة المتعددة في الحساب (رمز 411).';
+    case DisconnectReason.connectionClosed: // 428
+      return 'انغلق اتصال مقبس واتساب قبل جاهزية الربط (رمز 428).';
+    case DisconnectReason.connectionReplaced: // 440
+      return 'تم استبدال الاتصال بجلسة أخرى نشطة (رمز 440).';
+    case DisconnectReason.badSession: // 500
+      return 'خطأ في بيانات جلسة واتساب أو استجابة الخادم (رمز 500).';
+    case DisconnectReason.unavailableService: // 503
+      return 'خدمة واتساب غير متاحة مؤقتاً (رمز 503).';
+    case DisconnectReason.restartRequired: // 515
+      return 'يتطلب بروتوكول واتساب إعادة تشغيل الجلسة بعد إتمام الاقتران (رمز 515).';
+    default:
+      return `انقطع اتصال مقبس واتساب قبل جاهزية الربط (${statusCode || errMsg || 'closed'}).`;
+  }
+}
+
 export class AthanasiaBaileysSessionDriver implements WhatsAppSessionDriver {
   public readonly isMock = false;
   private sock: WASocket | null = null;
@@ -571,6 +731,9 @@ export class AthanasiaBaileysSessionDriver implements WhatsAppSessionDriver {
   private credsSaveChain: Promise<void> = Promise.resolve();
   private wsOpen = false;
   private handshakeReady = false;
+  private lastCloseError: WhatsAppConnectionError | null = null;
+  private lastCloseStatusCode: number | undefined;
+  private resolvedWaVersion: [number, number, number] | undefined;
   private connectionState:
     | 'CLOSED'
     | 'CONNECTING'
@@ -605,7 +768,10 @@ export class AthanasiaBaileysSessionDriver implements WhatsAppSessionDriver {
     if (this.handshakeReady && this.wsOpen) {
       return Promise.resolve();
     }
-    if (!this.sock) {
+    if (this.lastCloseError) {
+      return Promise.reject(this.lastCloseError);
+    }
+    if (!this.sock || this.connectionState === 'CLOSED') {
       return Promise.reject(
         new WhatsAppConnectionError('جلسة واتساب غير مهيأة حالياً لبدء المصافحة.')
       );
@@ -642,13 +808,17 @@ export class AthanasiaBaileysSessionDriver implements WhatsAppSessionDriver {
     await this.disconnect();
 
     const { state, saveCreds } = await loadMultiFileAuthState(this.authDir);
-    let version: [number, number, number] | undefined;
-    try {
-      const latest = await fetchLatestBaileysVersion();
-      version = latest.version;
-    } catch {
-      // Fallback to athanasia-baileys bundled default version ([2, 3000, 1030831524])
-    }
+    const resolvedVersionInfo = await resolveWhatsAppWebVersion();
+    const version = resolvedVersionInfo.version;
+    this.resolvedWaVersion = version;
+
+    log.info('Initializing Athanasia Baileys socket', {
+      sessionId: this.sessionId,
+      waVersion: version.join('.'),
+      versionSource: resolvedVersionInfo.source,
+      isLatestVersion: resolvedVersionInfo.isLatest,
+      hasRegisteredCreds: Boolean(state.creds?.registered || state.creds?.account),
+    });
 
     const enqueueSaveCreds = (): Promise<void> => {
       this.credsSaveChain = this.credsSaveChain
@@ -666,9 +836,11 @@ export class AthanasiaBaileysSessionDriver implements WhatsAppSessionDriver {
     this.connectionState = 'CONNECTING';
     this.wsOpen = false;
     this.handshakeReady = false;
+    this.lastCloseError = null;
+    this.lastCloseStatusCode = undefined;
 
     const sock = makeWASocket({
-      ...(version ? { version } : {}),
+      version,
       auth: state,
       printQRInTerminal: false, // Required by athanasia-baileys for pairing code flow
       qrTimeout: 60_000, // Keep companion registration refs alive for 60s each during phone pairing
@@ -696,6 +868,7 @@ export class AthanasiaBaileysSessionDriver implements WhatsAppSessionDriver {
       if (typeof qr === 'string' && qr.length > 0) {
         this.wsOpen = true;
         this.handshakeReady = true;
+        this.lastCloseError = null;
         this.connectionState = 'AWAITING_PAIRING';
         this.resolveHandshakeWaiters();
         callbacks.onStatusChange({
@@ -732,6 +905,7 @@ export class AthanasiaBaileysSessionDriver implements WhatsAppSessionDriver {
       } else if (connection === 'open') {
         this.wsOpen = true;
         this.handshakeReady = true;
+        this.lastCloseError = null;
         this.resolveHandshakeWaiters();
 
         const creds = sock.authState?.creds;
@@ -768,12 +942,36 @@ export class AthanasiaBaileysSessionDriver implements WhatsAppSessionDriver {
 
         const statusCode = lastDisconnect?.error?.output?.statusCode;
         const errMsg = lastDisconnect?.error?.message || 'Connection closed';
-        this.rejectHandshakeWaiters(
-          new WhatsAppConnectionError(
-            `انقطع اتصال مقبس واتساب قبل جاهزية الربط (${statusCode || errMsg}).`,
-            errMsg
-          )
+        const errData = (
+          lastDisconnect?.error as { data?: Record<string, unknown> } | undefined
+        )?.data;
+
+        if (statusCode === 405) {
+          invalidateWhatsAppWebVersionCache();
+        }
+
+        const arabicDisconnectReason = describeDisconnectReasonArabic(
+          statusCode,
+          errMsg,
+          errData
         );
+        const technicalDetail = `${errMsg} (statusCode=${statusCode ?? 'none'}, location=${String(errData?.location ?? 'none')}, waVersion=${this.resolvedWaVersion?.join('.') ?? 'unknown'})`;
+
+        log.warn('WhatsApp socket connection closed', {
+          sessionId: this.sessionId,
+          statusCode,
+          errMsg,
+          location: errData?.location,
+          waVersion: this.resolvedWaVersion?.join('.'),
+        });
+
+        const closeError = new WhatsAppConnectionError(
+          arabicDisconnectReason,
+          technicalDetail
+        );
+        this.lastCloseError = closeError;
+        this.lastCloseStatusCode = statusCode;
+        this.rejectHandshakeWaiters(closeError);
 
         const isRegistered = Boolean(
           sock.authState?.creds?.registered || sock.authState?.creds?.account
@@ -786,22 +984,21 @@ export class AthanasiaBaileysSessionDriver implements WhatsAppSessionDriver {
             callbacks.onStatusChange({
               status: 'LOGGED_OUT',
               statusCode,
-              errorMessage: 'تم تسجيل الخروج من تطبيق واتساب على الهاتف.',
+              errorMessage: arabicDisconnectReason,
               isRegistered: false,
             });
           } else if (statusCode === DisconnectReason.restartRequired) {
             callbacks.onStatusChange({
               status: 'RESTART_REQUIRED',
               statusCode,
-              errorMessage:
-                'يتطلب بروتوكول واتساب إعادة تشغيل الجلسة بعد إتمام الاقتران.',
+              errorMessage: arabicDisconnectReason,
               isRegistered: true,
             });
           } else {
             callbacks.onStatusChange({
               status: 'DISCONNECTED',
               statusCode,
-              errorMessage: errMsg,
+              errorMessage: arabicDisconnectReason,
               isRegistered,
             });
           }
@@ -877,9 +1074,30 @@ export class AthanasiaBaileysSessionDriver implements WhatsAppSessionDriver {
     }
 
     if (!this.sock || this.connectionState === 'CLOSED' || !this.wsOpen) {
+      if (this.lastCloseError) throw this.lastCloseError;
       throw new WhatsAppConnectionError(
         'انغلق مقبس واتساب قبل إرسال طلب رمز الربط.'
       );
+    }
+
+    let iqErrorNode: { code?: string; text?: string } | null = null;
+    const onIqError = (node: {
+      attrs?: Record<string, string>;
+      content?: Array<{ tag?: string; attrs?: Record<string, string> }>;
+    }) => {
+      const errChild = Array.isArray(node?.content)
+        ? node.content.find((c) => c?.tag === 'error')
+        : undefined;
+      iqErrorNode = {
+        code: errChild?.attrs?.code || node?.attrs?.code,
+        text: errChild?.attrs?.text || 'IQ error on companion_hello',
+      };
+    };
+
+    try {
+      sock.ws?.on?.('CB:iq,type:error', onIqError);
+    } catch {
+      // Ignore if ws wrapper does not expose event listener
     }
 
     const executeRequest = async (): Promise<string> => {
@@ -902,6 +1120,8 @@ export class AthanasiaBaileysSessionDriver implements WhatsAppSessionDriver {
     try {
       rawCode = await executeRequest();
       await this.credsSaveChain;
+      // Wait briefly to catch immediate IQ error stanzas or socket disconnects on `companion_hello`
+      await new Promise((r) => setTimeout(r, 150));
     } catch (firstErr) {
       if (firstErr instanceof AppError) throw firstErr;
       const safe = toSafeArabicError(firstErr);
@@ -909,12 +1129,25 @@ export class AthanasiaBaileysSessionDriver implements WhatsAppSessionDriver {
         `تعذر استلام رمز الربط من واتساب: ${safe.userMessage}`,
         safe.sanitizedTechnicalMessage
       );
+    } finally {
+      try {
+        sock.ws?.off?.('CB:iq,type:error', onIqError);
+      } catch {
+        // Ignore cleanup errors
+      }
     }
 
-    // Verify the socket remained open and did not immediately reject the companion_hello stanza
-    await new Promise((r) => setTimeout(r, 150));
+    if (iqErrorNode) {
+      const codeInfo = iqErrorNode as { code?: string; text?: string };
+      throw new WhatsAppConnectionError(
+        `رفض خادم واتساب طلب ربط الجهاز (${codeInfo.code || codeInfo.text || 'خطأ بروتوكول'}).`,
+        `IQ Error: code=${codeInfo.code ?? 'unknown'} text=${codeInfo.text ?? 'none'}`
+      );
+    }
+
     const currentConnectionState: string = this.connectionState;
     if (!this.sock || currentConnectionState === 'CLOSED' || !this.wsOpen) {
+      if (this.lastCloseError) throw this.lastCloseError;
       throw new WhatsAppConnectionError(
         'رفض خادم واتساب طلب الاقتران أو انقطع الاتصال فور إرسال رمز الربط.'
       );
@@ -1282,8 +1515,10 @@ export class MockWhatsAppSessionDriver implements WhatsAppSessionDriver {
   public shouldFailConnect = false;
   public shouldFailPairingRequest = false;
   public shouldTimeoutHandshake = false;
+  public simulatedCloseStatusCodeBeforeReady: number | null = null;
   public pairingCodeRequestCount = 0;
   public lastRequestedPhoneDigits: string | null = null;
+  private lastCloseError: WhatsAppConnectionError | null = null;
 
   constructor(
     public readonly sessionId: string,
@@ -1336,6 +1571,7 @@ export class MockWhatsAppSessionDriver implements WhatsAppSessionDriver {
   }
 
   public async connect(callbacks: ConnectionEventCallbacks): Promise<void> {
+    this.lastCloseError = null;
     if (this.shouldFailConnect) {
       this.socketOpen = false;
       this.handshakeComplete = false;
@@ -1351,6 +1587,29 @@ export class MockWhatsAppSessionDriver implements WhatsAppSessionDriver {
       status: 'CONNECTING',
       isRegistered: this.registered,
     });
+
+    if (this.simulatedCloseStatusCodeBeforeReady !== null) {
+      const code = this.simulatedCloseStatusCodeBeforeReady;
+      this.socketOpen = false;
+      this.handshakeComplete = false;
+      this.connected = false;
+      this.connectionState = 'CLOSED';
+      const arabicMsg = describeDisconnectReasonArabic(code, 'Connection Failure', {
+        reason: String(code),
+        location: 'vll',
+      });
+      this.lastCloseError = new WhatsAppConnectionError(
+        arabicMsg,
+        `Connection Failure (statusCode=${code}, location=vll)`
+      );
+      callbacks.onStatusChange({
+        status: 'DISCONNECTED',
+        statusCode: code,
+        errorMessage: arabicMsg,
+        isRegistered: this.registered,
+      });
+      return;
+    }
 
     if (this.shouldTimeoutHandshake) {
       this.handshakeComplete = false;
@@ -1380,6 +1639,9 @@ export class MockWhatsAppSessionDriver implements WhatsAppSessionDriver {
     phoneDigits: string,
     customCode?: string
   ): Promise<string> {
+    if (this.lastCloseError) {
+      throw this.lastCloseError;
+    }
     if (!this.socketOpen) {
       throw new WhatsAppConnectionError(
         'مقبس واتساب غير مفتوح لطلب رمز الربط.'
