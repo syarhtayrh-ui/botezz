@@ -8,10 +8,13 @@ import {
 const STATUS_BADGE_ARABIC: Record<SessionRecord['status'], string> = {
   CONNECTED: '🟢 متصل',
   AUTHENTICATED: '🟢 موثق',
+  AUTHENTICATING: '🔵 جاري التوثيق',
+  CONNECTING: '🟡 جاري الاتصال',
   PAIRING_PENDING: '🟡 بانتظار رمز الربط',
   INITIALIZING: '🟡 قيد التهيئة',
   RECONNECTING: '🟠 يعيد الاتصال',
   DISCONNECTED: '🔴 غير متصل',
+  STOPPED: '⏹️ متوقف',
   LOGGED_OUT: '⚪ تم تسجيل الخروج',
   FAILED: '❌ فشل الاتصال',
 };

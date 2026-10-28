@@ -38,7 +38,7 @@ export function validateCustomPairingCode(rawCode?: string): string | undefined 
  * when the administrator does not specify a custom code.
  */
 export function generateRandomPairingCode(): string {
-  const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  const alphabet = '123456789ABCDEFGHJKLMNPQRSTUVWXYZ';
   const bytes = crypto.randomBytes(8);
   let code = '';
   for (let i = 0; i < 8; i++) {

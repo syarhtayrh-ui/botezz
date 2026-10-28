@@ -2,13 +2,16 @@ import { AppDatabase } from '../database';
 
 export type SessionStatus =
   | 'INITIALIZING'
+  | 'CONNECTING'
   | 'PAIRING_PENDING'
+  | 'AUTHENTICATING'
   | 'AUTHENTICATED'
   | 'CONNECTED'
   | 'DISCONNECTED'
   | 'RECONNECTING'
   | 'LOGGED_OUT'
-  | 'FAILED';
+  | 'FAILED'
+  | 'STOPPED';
 
 export interface SessionRecord {
   id: string;

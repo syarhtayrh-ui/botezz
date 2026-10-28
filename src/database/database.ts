@@ -2,6 +2,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { INITIAL_MIGRATION_ID, INITIAL_MIGRATION_SQL } from './migrations/001_initial';
+import { MIGRATION_002_ID, MIGRATION_002_SQL } from './migrations/002_session_lifecycle';
 import { DatabaseError } from '../utils/errors';
 import { createLogger } from '../logging/logger';
 
@@ -59,6 +60,23 @@ export class AppDatabase {
         insertStmt.run(INITIAL_MIGRATION_ID, new Date().toISOString());
       });
       log.info('Database migration applied', { migrationId: INITIAL_MIGRATION_ID });
+    }
+
+    const existing002 = checkStmt.get(MIGRATION_002_ID) as { id: string } | undefined;
+    if (!existing002) {
+      this.sqlite.exec('PRAGMA foreign_keys = OFF;');
+      try {
+        this.runInTransaction(() => {
+          this.sqlite.exec(MIGRATION_002_SQL);
+          const insertStmt = this.sqlite.prepare(
+            'INSERT INTO schema_migrations (id, applied_at) VALUES (?, ?)'
+          );
+          insertStmt.run(MIGRATION_002_ID, new Date().toISOString());
+        });
+        log.info('Database migration applied', { migrationId: MIGRATION_002_ID });
+      } finally {
+        this.sqlite.exec('PRAGMA foreign_keys = ON;');
+      }
     }
   }
 

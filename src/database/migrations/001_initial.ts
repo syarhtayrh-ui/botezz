@@ -14,13 +14,16 @@ CREATE TABLE IF NOT EXISTS sessions (
   status TEXT NOT NULL CHECK (
     status IN (
       'INITIALIZING',
+      'CONNECTING',
       'PAIRING_PENDING',
+      'AUTHENTICATING',
       'AUTHENTICATED',
       'CONNECTED',
       'DISCONNECTED',
       'RECONNECTING',
       'LOGGED_OUT',
-      'FAILED'
+      'FAILED',
+      'STOPPED'
     )
   ),
   auth_dir TEXT NOT NULL UNIQUE,

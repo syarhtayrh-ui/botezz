@@ -934,9 +934,7 @@ export class TelegramBotController {
           return this.pairingWorkflow.startNewLinking(actorUserId);
         }
         try {
-          const session = this.deps.sessionManager.createSession(undefined, actorUserId);
           const result = await this.deps.sessionManager.initiatePairing({
-            sessionId: session.id,
             rawPhoneNumber: args.join(' '),
             actorTelegramId: actorUserId,
           });

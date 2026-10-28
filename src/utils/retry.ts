@@ -24,5 +24,6 @@ export function calculateBackoffDelay(
   const exponential = Math.min(maxDelayMs, baseDelayMs * Math.pow(2, safeAttempt));
   const jitterRange = exponential * jitterRatio;
   const randomOffset = (Math.random() * 2 - 1) * jitterRange;
-  return Math.max(200, Math.min(maxDelayMs, Math.round(exponential + randomOffset)));
+  const minFloor = Math.min(200, baseDelayMs);
+  return Math.max(minFloor, Math.min(maxDelayMs, Math.round(exponential + randomOffset)));
 }

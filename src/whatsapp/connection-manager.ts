@@ -68,6 +68,14 @@ export interface WhatsAppChannelMetadata {
 export interface SessionSocketDiagnostics {
   socketActive: boolean;
   registered: boolean;
+  wsOpen?: boolean;
+  handshakeReady?: boolean;
+  connectionState?:
+    | 'CLOSED'
+    | 'CONNECTING'
+    | 'AWAITING_PAIRING'
+    | 'AUTHENTICATING'
+    | 'CONNECTED';
   platform: string;
   device: string;
   meJid?: string;
@@ -496,6 +504,8 @@ export interface ConnectionEventCallbacks {
   onStatusChange: (params: {
     status:
       | 'CONNECTING'
+      | 'AWAITING_PAIRING'
+      | 'AUTHENTICATING'
       | 'CONNECTED'
       | 'AUTHENTICATED'
       | 'DISCONNECTED'
@@ -504,6 +514,7 @@ export interface ConnectionEventCallbacks {
     jid?: string;
     statusCode?: number;
     errorMessage?: string;
+    isRegistered?: boolean;
   }) => void;
 }
 
@@ -547,6 +558,7 @@ export interface WhatsAppSessionDriver {
 /**
  * Production Athanasia Baileys Socket Driver (`athanasia-baileys` v1.0.0).
  * Implements the exact socket, pairing-code (`requestPairingCode(phoneNumber, code)`),
+ * Noise + `pair-device` handshake synchronization, serialized credential persistence,
  * group metadata caching (`cachedGroupMetadata`), newsletter/channel inspection (`newsletterMetadata`),
  * and LID/PN participant resolution APIs of `github:AthanasiaCMD/athanasia-baileys`.
  */
@@ -556,11 +568,75 @@ export class AthanasiaBaileysSessionDriver implements WhatsAppSessionDriver {
   private evCleanup: (() => void) | null = null;
   private readonly groupMetadataCache = new Map<string, GroupMetadata>();
   public readonly memoryStore = new SessionMemoryStore();
+  private credsSaveChain: Promise<void> = Promise.resolve();
+  private wsOpen = false;
+  private handshakeReady = false;
+  private connectionState:
+    | 'CLOSED'
+    | 'CONNECTING'
+    | 'AWAITING_PAIRING'
+    | 'AUTHENTICATING'
+    | 'CONNECTED' = 'CLOSED';
+  private readonly handshakeWaiters = new Set<{
+    resolve: () => void;
+    reject: (err: Error) => void;
+  }>();
 
   constructor(
     public readonly sessionId: string,
     private readonly authDir: string
   ) {}
+
+  private resolveHandshakeWaiters(): void {
+    for (const waiter of this.handshakeWaiters) {
+      waiter.resolve();
+    }
+    this.handshakeWaiters.clear();
+  }
+
+  private rejectHandshakeWaiters(err: Error): void {
+    for (const waiter of this.handshakeWaiters) {
+      waiter.reject(err);
+    }
+    this.handshakeWaiters.clear();
+  }
+
+  private waitForPairingHandshakeReady(timeoutMs = 20_000): Promise<void> {
+    if (this.handshakeReady && this.wsOpen) {
+      return Promise.resolve();
+    }
+    if (!this.sock) {
+      return Promise.reject(
+        new WhatsAppConnectionError('جلسة واتساب غير مهيأة حالياً لبدء المصافحة.')
+      );
+    }
+
+    return new Promise<void>((resolve, reject) => {
+      const waiter = {
+        resolve: () => {
+          clearTimeout(timer);
+          this.handshakeWaiters.delete(waiter);
+          resolve();
+        },
+        reject: (err: Error) => {
+          clearTimeout(timer);
+          this.handshakeWaiters.delete(waiter);
+          reject(err);
+        },
+      };
+
+      const timer = setTimeout(() => {
+        this.handshakeWaiters.delete(waiter);
+        reject(
+          new TaskTimeoutError(
+            'انتهت مهلة إتمام المصافحة المشفرة (Noise Handshake) مع خوادم واتساب قبل طلب رمز الربط.'
+          )
+        );
+      }, timeoutMs);
+
+      this.handshakeWaiters.add(waiter);
+    });
+  }
 
   public async connect(callbacks: ConnectionEventCallbacks): Promise<void> {
     await this.disconnect();
@@ -574,11 +650,28 @@ export class AthanasiaBaileysSessionDriver implements WhatsAppSessionDriver {
       // Fallback to athanasia-baileys bundled default version ([2, 3000, 1030831524])
     }
 
+    const enqueueSaveCreds = (): Promise<void> => {
+      this.credsSaveChain = this.credsSaveChain
+        .then(() => saveCreds())
+        .catch((err) => {
+          log.warn('Failed saving WhatsApp credentials', {
+            sessionId: this.sessionId,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        });
+      return this.credsSaveChain;
+    };
+
     const silentPino = pino({ level: 'silent' });
+    this.connectionState = 'CONNECTING';
+    this.wsOpen = false;
+    this.handshakeReady = false;
+
     const sock = makeWASocket({
       ...(version ? { version } : {}),
       auth: state,
       printQRInTerminal: false, // Required by athanasia-baileys for pairing code flow
+      qrTimeout: 60_000, // Keep companion registration refs alive for 60s each during phone pairing
       logger: silentPino,
       browser: Browsers.ubuntu('Chrome'),
       markOnlineOnConnect: false,
@@ -591,44 +684,128 @@ export class AthanasiaBaileysSessionDriver implements WhatsAppSessionDriver {
     const unbindStore = this.memoryStore.bind(sock.ev);
 
     const credsListener = () => {
-      void saveCreds();
+      void enqueueSaveCreds();
     };
 
     const connectionListener = (update: Partial<ConnectionState>) => {
-      const { connection, lastDisconnect } = update;
+      const { connection, lastDisconnect, qr, isNewLogin } = update;
 
-      if (connection === 'connecting') {
-        callbacks.onStatusChange({ status: 'CONNECTING' });
-      } else if (connection === 'open') {
+      // 1. Companion registration handshake ready (`CB:iq,type:set,pair-device` emitted `qr`):
+      // At this point `validateConnection()` and `noise.finishInit()` are 100% complete,
+      // and WhatsApp server is ready to accept `link_code_companion_reg (stage="companion_hello")`.
+      if (typeof qr === 'string' && qr.length > 0) {
+        this.wsOpen = true;
+        this.handshakeReady = true;
+        this.connectionState = 'AWAITING_PAIRING';
+        this.resolveHandshakeWaiters();
+        callbacks.onStatusChange({
+          status: 'AWAITING_PAIRING',
+          isRegistered: false,
+        });
+      }
+
+      // 2. User entered pairing code on phone and `CB:iq,,pair-success` succeeded (`isNewLogin: true`):
+      if (isNewLogin) {
+        if (sock.authState?.creds) {
+          sock.authState.creds.registered = true;
+        }
+        this.connectionState = 'AUTHENTICATING';
         const rawJid = sock.user?.id || sock.authState?.creds?.me?.id;
         const normalizedJid = rawJid ? jidNormalizedUser(rawJid) : undefined;
+        void enqueueSaveCreds().then(() => {
+          callbacks.onStatusChange({
+            status: 'AUTHENTICATING',
+            jid: normalizedJid,
+            isRegistered: true,
+          });
+        });
+      }
+
+      if (connection === 'connecting') {
+        this.connectionState = 'CONNECTING';
         callbacks.onStatusChange({
-          status: 'CONNECTED',
-          jid: normalizedJid,
+          status: 'CONNECTING',
+          isRegistered: Boolean(
+            sock.authState?.creds?.registered || sock.authState?.creds?.account
+          ),
+        });
+      } else if (connection === 'open') {
+        this.wsOpen = true;
+        this.handshakeReady = true;
+        this.resolveHandshakeWaiters();
+
+        const creds = sock.authState?.creds;
+        const rawJid = sock.user?.id || creds?.me?.id;
+        const normalizedJid = rawJid ? jidNormalizedUser(rawJid) : undefined;
+        const hasValidAuth = Boolean(
+          (creds?.registered || creds?.account) && normalizedJid
+        );
+
+        if (creds && hasValidAuth && !creds.registered) {
+          creds.registered = true;
+        }
+
+        this.connectionState = hasValidAuth ? 'CONNECTED' : 'AWAITING_PAIRING';
+        void enqueueSaveCreds().then(() => {
+          if (hasValidAuth) {
+            callbacks.onStatusChange({
+              status: 'CONNECTED',
+              jid: normalizedJid,
+              isRegistered: true,
+            });
+          } else {
+            callbacks.onStatusChange({
+              status: 'AWAITING_PAIRING',
+              jid: normalizedJid,
+              isRegistered: false,
+            });
+          }
         });
       } else if (connection === 'close') {
+        this.wsOpen = false;
+        this.handshakeReady = false;
+        this.connectionState = 'CLOSED';
+
         const statusCode = lastDisconnect?.error?.output?.statusCode;
         const errMsg = lastDisconnect?.error?.message || 'Connection closed';
+        this.rejectHandshakeWaiters(
+          new WhatsAppConnectionError(
+            `انقطع اتصال مقبس واتساب قبل جاهزية الربط (${statusCode || errMsg}).`,
+            errMsg
+          )
+        );
 
-        if (statusCode === DisconnectReason.loggedOut) {
-          callbacks.onStatusChange({
-            status: 'LOGGED_OUT',
-            statusCode,
-            errorMessage: 'تم تسجيل الخروج من تطبيق واتساب على الهاتف.',
-          });
-        } else if (statusCode === DisconnectReason.restartRequired) {
-          callbacks.onStatusChange({
-            status: 'RESTART_REQUIRED',
-            statusCode,
-            errorMessage: 'يتطلب بروتوكول واتساب إعادة تشغيل الجلسة بعد إتمام الاقتران.',
-          });
-        } else {
-          callbacks.onStatusChange({
-            status: 'DISCONNECTED',
-            statusCode,
-            errorMessage: errMsg,
-          });
-        }
+        const isRegistered = Boolean(
+          sock.authState?.creds?.registered || sock.authState?.creds?.account
+        );
+
+        // Wait for any pending credential writes (such as `pair-success` right before 515 restartRequired)
+        // before notifying SessionManager so the restarted socket reads complete credentials from disk.
+        void this.credsSaveChain.finally(() => {
+          if (statusCode === DisconnectReason.loggedOut) {
+            callbacks.onStatusChange({
+              status: 'LOGGED_OUT',
+              statusCode,
+              errorMessage: 'تم تسجيل الخروج من تطبيق واتساب على الهاتف.',
+              isRegistered: false,
+            });
+          } else if (statusCode === DisconnectReason.restartRequired) {
+            callbacks.onStatusChange({
+              status: 'RESTART_REQUIRED',
+              statusCode,
+              errorMessage:
+                'يتطلب بروتوكول واتساب إعادة تشغيل الجلسة بعد إتمام الاقتران.',
+              isRegistered: true,
+            });
+          } else {
+            callbacks.onStatusChange({
+              status: 'DISCONNECTED',
+              statusCode,
+              errorMessage: errMsg,
+              isRegistered,
+            });
+          }
+        });
       }
     };
 
@@ -655,8 +832,9 @@ export class AthanasiaBaileysSessionDriver implements WhatsAppSessionDriver {
 
   /**
    * Initiates pairing code generation using `athanasia-baileys`'s `sock.requestPairingCode(phoneNumber, code?)`.
-   * Checks `!sock.authState.creds.registered`, awaits socket readiness with timeout,
-   * handles transient socket handshake resets with bounded retry, and supports custom 8-char codes.
+   * Explicitly waits for the Noise handshake (`validateConnection`) and `CB:iq,type:set,pair-device` (`qr` event)
+   * to complete BEFORE calling `sock.requestPairingCode`, preventing premature `creds.me` mutation
+   * and uninitialized Noise frame encryption.
    */
   public async requestPairingCode(
     phoneDigits: string,
@@ -676,33 +854,33 @@ export class AthanasiaBaileysSessionDriver implements WhatsAppSessionDriver {
     }
 
     const cleanDigits = phoneDigits.replace(/\D/g, '');
-    if (!cleanDigits || cleanDigits.length < 8) {
-      throw new ValidationError('رقم الهاتف المطلوب للاقتران غير صالح. يجب أن يحتوي على 8 أرقام على الأقل.');
-    }
-
-    // Ensure WebSocket is open before sending the link_code_companion_reg IQ node (15s bounded timeout)
-    try {
-      await Promise.race([
-        sock.waitForSocketOpen(),
-        new Promise<never>((_, reject) =>
-          setTimeout(
-            () => reject(new TaskTimeoutError('انتهت مهلة فتح اتصال المقبس مع خوادم واتساب (15 ثانية).')),
-            15_000
-          )
-        ),
-      ]);
-    } catch (openErr) {
-      if (openErr instanceof AppError) throw openErr;
-      const safeErr = toSafeArabicError(openErr);
-      throw new WhatsAppConnectionError(
-        `تعذر فتح المقبس للربط: ${safeErr.userMessage}`,
-        safeErr.sanitizedTechnicalMessage
+    if (!cleanDigits || cleanDigits.length < 8 || cleanDigits.length > 15) {
+      throw new ValidationError(
+        'رقم الهاتف المطلوب للاقتران غير صالح. يجب أن يحتوي على 8 إلى 15 رقماً دولياً.'
       );
     }
 
     const codeToRequest = customCode
       ? validateCustomPairingCode(customCode)
       : generateRandomPairingCode();
+
+    // Wait for full Noise handshake + pair-device readiness (not just raw TCP open!)
+    try {
+      await this.waitForPairingHandshakeReady(20_000);
+    } catch (handshakeErr) {
+      if (handshakeErr instanceof AppError) throw handshakeErr;
+      const safeErr = toSafeArabicError(handshakeErr);
+      throw new WhatsAppConnectionError(
+        `تعذر إتمام المصافحة الأولية مع خوادم واتساب لطلب رمز الربط: ${safeErr.userMessage}`,
+        safeErr.sanitizedTechnicalMessage
+      );
+    }
+
+    if (!this.sock || this.connectionState === 'CLOSED' || !this.wsOpen) {
+      throw new WhatsAppConnectionError(
+        'انغلق مقبس واتساب قبل إرسال طلب رمز الربط.'
+      );
+    }
 
     const executeRequest = async (): Promise<string> => {
       const resultPromise = sock.requestPairingCode(cleanDigits, codeToRequest);
@@ -723,43 +901,32 @@ export class AthanasiaBaileysSessionDriver implements WhatsAppSessionDriver {
     let rawCode: string;
     try {
       rawCode = await executeRequest();
+      await this.credsSaveChain;
     } catch (firstErr) {
-      const errMsg = firstErr instanceof Error ? firstErr.message : String(firstErr);
-      if (
-        errMsg.includes('Connection Closed') ||
-        errMsg.includes('WebSocket') ||
-        errMsg.includes('reset')
-      ) {
-        log.warn('Pairing code request encountered transient connection glitch; retrying once', {
-          sessionId: this.sessionId,
-          reason: toSafeArabicError(firstErr).sanitizedTechnicalMessage,
-        });
-        await new Promise((r) => setTimeout(r, 1200));
-        try {
-          await sock.waitForSocketOpen();
-          rawCode = await executeRequest();
-        } catch (retryErr) {
-          if (retryErr instanceof AppError) throw retryErr;
-          const safe = toSafeArabicError(retryErr);
-          throw new WhatsAppConnectionError(
-            `تعذر توليد رمز الربط من واتساب: ${safe.userMessage}`,
-            safe.sanitizedTechnicalMessage
-          );
-        }
-      } else {
-        if (firstErr instanceof AppError) throw firstErr;
-        const safe = toSafeArabicError(firstErr);
-        throw new WhatsAppConnectionError(
-          `تعذر استلام رمز الربط من واتساب: ${safe.userMessage}`,
-          safe.sanitizedTechnicalMessage
-        );
-      }
+      if (firstErr instanceof AppError) throw firstErr;
+      const safe = toSafeArabicError(firstErr);
+      throw new WhatsAppConnectionError(
+        `تعذر استلام رمز الربط من واتساب: ${safe.userMessage}`,
+        safe.sanitizedTechnicalMessage
+      );
     }
 
-    if (!rawCode) {
-      throw new WhatsAppConnectionError('تعذر استلام رمز الربط من خوادم واتساب.');
+    // Verify the socket remained open and did not immediately reject the companion_hello stanza
+    await new Promise((r) => setTimeout(r, 150));
+    const currentConnectionState: string = this.connectionState;
+    if (!this.sock || currentConnectionState === 'CLOSED' || !this.wsOpen) {
+      throw new WhatsAppConnectionError(
+        'رفض خادم واتساب طلب الاقتران أو انقطع الاتصال فور إرسال رمز الربط.'
+      );
     }
-    return rawCode.length === 8 ? `${rawCode.slice(0, 4)}-${rawCode.slice(4)}` : rawCode;
+
+    const cleanedCode = String(rawCode || '').trim().replace(/-/g, '').toUpperCase();
+    if (!cleanedCode || cleanedCode.length !== 8) {
+      throw new WhatsAppConnectionError('تعذر استلام رمز ربط صالح من خوادم واتساب.');
+    }
+
+    this.connectionState = 'AWAITING_PAIRING';
+    return `${cleanedCode.slice(0, 4)}-${cleanedCode.slice(4)}`;
   }
 
   public async sendTextMessage(
@@ -767,6 +934,9 @@ export class AthanasiaBaileysSessionDriver implements WhatsAppSessionDriver {
     text: string
   ): Promise<{ messageId: string }> {
     const sock = this.ensureSocket();
+    if (this.connectionState !== 'CONNECTED' || !this.wsOpen) {
+      throw new WhatsAppConnectionError('الجلسة غير متصلة حالياً لإرسال الرسائل.');
+    }
     const res = await sock.sendMessage(recipientJid, { text });
     return { messageId: res?.key?.id || `msg_${Date.now()}` };
   }
@@ -780,6 +950,9 @@ export class AthanasiaBaileysSessionDriver implements WhatsAppSessionDriver {
     caption?: string;
   }): Promise<{ messageId: string }> {
     const sock = this.ensureSocket();
+    if (this.connectionState !== 'CONNECTED' || !this.wsOpen) {
+      throw new WhatsAppConnectionError('الجلسة غير متصلة حالياً لإرسال الوسائط.');
+    }
     const fileBuffer = fs.readFileSync(params.filePath);
 
     let content: AnyMessageContent;
@@ -982,6 +1155,9 @@ export class AthanasiaBaileysSessionDriver implements WhatsAppSessionDriver {
       return {
         socketActive: false,
         registered: false,
+        wsOpen: false,
+        handshakeReady: false,
+        connectionState: 'CLOSED',
         platform: 'Unavailable',
         device: 'Unavailable',
         ...stats,
@@ -991,10 +1167,14 @@ export class AthanasiaBaileysSessionDriver implements WhatsAppSessionDriver {
     const creds = this.sock.authState?.creds;
     const rawMeId = this.sock.user?.id || creds?.me?.id;
     const meJid = rawMeId ? jidNormalizedUser(rawMeId) : undefined;
+    const isRegistered = Boolean((creds?.registered || creds?.account) && meJid);
 
     return {
-      socketActive: true,
-      registered: Boolean(creds?.registered),
+      socketActive: this.wsOpen && this.connectionState !== 'CLOSED',
+      registered: isRegistered,
+      wsOpen: this.wsOpen,
+      handshakeReady: this.handshakeReady,
+      connectionState: this.connectionState,
       platform: String(creds?.platform || 'Ubuntu / Chrome'),
       device: String(creds?.device || 'Athanasia-Baileys Multi-Device'),
       meJid,
@@ -1040,6 +1220,12 @@ export class AthanasiaBaileysSessionDriver implements WhatsAppSessionDriver {
   }
 
   public async disconnect(): Promise<void> {
+    this.wsOpen = false;
+    this.handshakeReady = false;
+    this.connectionState = 'CLOSED';
+    this.rejectHandshakeWaiters(
+      new WhatsAppConnectionError('تم إغلاق مقبس واتساب.')
+    );
     if (this.evCleanup) {
       this.evCleanup();
       this.evCleanup = null;
@@ -1052,6 +1238,7 @@ export class AthanasiaBaileysSessionDriver implements WhatsAppSessionDriver {
       }
       this.sock = null;
     }
+    await this.credsSaveChain;
   }
 
   public async logout(): Promise<void> {
@@ -1071,16 +1258,32 @@ export { AthanasiaBaileysSessionDriver as BaileysSessionDriver };
 /**
  * Deterministic Mock / Simulation Driver for Automated Testing and Local Web Preview.
  * Never claims to be a live WhatsApp network socket; explicitly marks `isMock = true`.
+ * Accurately models the two-step pairing lifecycle (`AWAITING_PAIRING` -> `AUTHENTICATING` -> `CONNECTED`),
+ * socket readiness, credential registration state, and simulated failure/disconnect modes.
  */
 export class MockWhatsAppSessionDriver implements WhatsAppSessionDriver {
   public readonly isMock = true;
   private callbacks: ConnectionEventCallbacks | null = null;
+  private socketOpen = false;
+  private handshakeComplete = false;
+  private registered = false;
   private connected = false;
+  private connectionState:
+    | 'CLOSED'
+    | 'CONNECTING'
+    | 'AWAITING_PAIRING'
+    | 'AUTHENTICATING'
+    | 'CONNECTED' = 'CLOSED';
   private currentJid = '';
   private simulatedGroups: Map<string, GroupSummary> = new Map();
   private sentMessagesCount = 0;
   public simulatedDelayMs = 40;
   public shouldFailSend = false;
+  public shouldFailConnect = false;
+  public shouldFailPairingRequest = false;
+  public shouldTimeoutHandshake = false;
+  public pairingCodeRequestCount = 0;
+  public lastRequestedPhoneDigits: string | null = null;
 
   constructor(
     public readonly sessionId: string,
@@ -1122,34 +1325,158 @@ export class MockWhatsAppSessionDriver implements WhatsAppSessionDriver {
     });
   }
 
+  /**
+   * Marks this mock driver as pre-registered (used when restoring or reconnecting an authenticated session).
+   */
+  public markRegistered(jid?: string): void {
+    this.registered = true;
+    if (jid) {
+      this.currentJid = jid;
+    }
+  }
+
   public async connect(callbacks: ConnectionEventCallbacks): Promise<void> {
+    if (this.shouldFailConnect) {
+      this.socketOpen = false;
+      this.handshakeComplete = false;
+      this.connected = false;
+      this.connectionState = 'CLOSED';
+      throw new WhatsAppConnectionError('فشل فتح مقبس الاتصال مع خوادم واتساب.');
+    }
+
     this.callbacks = callbacks;
-    this.connected = true;
+    this.socketOpen = true;
+    this.connectionState = 'CONNECTING';
     callbacks.onStatusChange({
-      status: 'CONNECTED',
-      jid: this.currentJid,
+      status: 'CONNECTING',
+      isRegistered: this.registered,
     });
+
+    if (this.shouldTimeoutHandshake) {
+      this.handshakeComplete = false;
+      return;
+    }
+
+    this.handshakeComplete = true;
+    if (this.registered) {
+      this.connected = true;
+      this.connectionState = 'CONNECTED';
+      callbacks.onStatusChange({
+        status: 'CONNECTED',
+        jid: this.currentJid,
+        isRegistered: true,
+      });
+    } else {
+      this.connected = false;
+      this.connectionState = 'AWAITING_PAIRING';
+      callbacks.onStatusChange({
+        status: 'AWAITING_PAIRING',
+        isRegistered: false,
+      });
+    }
   }
 
   public async requestPairingCode(
     phoneDigits: string,
     customCode?: string
   ): Promise<string> {
-    this.currentJid = `${phoneDigits}@s.whatsapp.net`;
+    if (!this.socketOpen) {
+      throw new WhatsAppConnectionError(
+        'مقبس واتساب غير مفتوح لطلب رمز الربط.'
+      );
+    }
+    if (!this.handshakeComplete || this.shouldTimeoutHandshake) {
+      throw new TaskTimeoutError(
+        'انتهت مهلة إتمام المصافحة الأولية مع خادم واتساب قبل توليد رمز الربط.'
+      );
+    }
+    if (this.registered) {
+      throw new WhatsAppConnectionError(
+        'هذه الجلسة مسجلة ومرتبطة بالفعل في بيانات المصادقة.'
+      );
+    }
+
+    const cleanDigits = phoneDigits.replace(/\D/g, '');
+    if (!cleanDigits || cleanDigits.length < 8 || cleanDigits.length > 15) {
+      throw new ValidationError(
+        'رقم الهاتف المطلوب للاقتران غير صالح. يجب أن يحتوي على 8 إلى 15 رقماً.'
+      );
+    }
+
+    if (this.shouldFailPairingRequest) {
+      throw new WhatsAppConnectionError(
+        'تعذر استلام رمز الربط من خوادم واتساب (فشل طلب الاقتران).'
+      );
+    }
+
+    this.pairingCodeRequestCount += 1;
+    this.lastRequestedPhoneDigits = cleanDigits;
+    this.currentJid = `${cleanDigits}@s.whatsapp.net`;
+    this.connectionState = 'AWAITING_PAIRING';
+
     const validCustom = validateCustomPairingCode(customCode);
     if (validCustom) {
       return `${validCustom.slice(0, 4)}-${validCustom.slice(4)}`;
     }
-    const suffix = phoneDigits.slice(-4).padStart(4, '0');
+    const suffix = cleanDigits.slice(-4).padStart(4, '0');
     return `WA96-${suffix}`;
   }
 
+  /**
+   * Simulates the user entering the pairing code on their WhatsApp phone
+   * (`pair-success` -> `AUTHENTICATING` -> `CONNECTED`).
+   */
   public completeSimulatedPairing(): void {
+    this.socketOpen = true;
+    this.handshakeComplete = true;
+    this.registered = true;
+    this.connectionState = 'AUTHENTICATING';
+    this.callbacks?.onStatusChange({
+      status: 'AUTHENTICATING',
+      jid: this.currentJid,
+      isRegistered: true,
+    });
     this.connected = true;
+    this.connectionState = 'CONNECTED';
     this.callbacks?.onStatusChange({
       status: 'CONNECTED',
       jid: this.currentJid,
+      isRegistered: true,
     });
+  }
+
+  /**
+   * Simulates a socket disconnect or stream error during runtime/pairing for testing.
+   */
+  public simulateDisconnect(statusCode = 428, errorMessage = 'Connection lost'): void {
+    this.socketOpen = false;
+    this.handshakeComplete = false;
+    this.connected = false;
+    this.connectionState = 'CLOSED';
+
+    if (statusCode === DisconnectReason.loggedOut) {
+      this.registered = false;
+      this.callbacks?.onStatusChange({
+        status: 'LOGGED_OUT',
+        statusCode,
+        errorMessage,
+        isRegistered: false,
+      });
+    } else if (statusCode === DisconnectReason.restartRequired) {
+      this.callbacks?.onStatusChange({
+        status: 'RESTART_REQUIRED',
+        statusCode,
+        errorMessage,
+        isRegistered: this.registered,
+      });
+    } else {
+      this.callbacks?.onStatusChange({
+        status: 'DISCONNECTED',
+        statusCode,
+        errorMessage,
+        isRegistered: this.registered,
+      });
+    }
   }
 
   public async sendTextMessage(
@@ -1159,7 +1486,7 @@ export class MockWhatsAppSessionDriver implements WhatsAppSessionDriver {
     if (this.simulatedDelayMs > 0) {
       await new Promise((r) => setTimeout(r, this.simulatedDelayMs));
     }
-    if (!this.connected) {
+    if (!this.connected || !this.registered) {
       throw new WhatsAppConnectionError('الجلسة غير متصلة حالياً.');
     }
     if (this.shouldFailSend || text.includes('[FAIL_SIMULATION]')) {
@@ -1185,7 +1512,7 @@ export class MockWhatsAppSessionDriver implements WhatsAppSessionDriver {
     if (this.simulatedDelayMs > 0) {
       await new Promise((r) => setTimeout(r, this.simulatedDelayMs));
     }
-    if (!this.connected) {
+    if (!this.connected || !this.registered) {
       throw new WhatsAppConnectionError('الجلسة غير متصلة حالياً.');
     }
     if (!fs.existsSync(params.filePath)) {
@@ -1196,14 +1523,14 @@ export class MockWhatsAppSessionDriver implements WhatsAppSessionDriver {
   }
 
   public async listParticipatingGroups(): Promise<GroupSummary[]> {
-    if (!this.connected) {
+    if (!this.connected || !this.registered) {
       throw new WhatsAppConnectionError('الجلسة غير متصلة حالياً.');
     }
     return Array.from(this.simulatedGroups.values());
   }
 
   public async getGroupMetadata(groupJid: string): Promise<GroupSummary> {
-    if (!this.connected) {
+    if (!this.connected || !this.registered) {
       throw new WhatsAppConnectionError('الجلسة غير متصلة حالياً.');
     }
     const group = this.simulatedGroups.get(groupJid);
@@ -1224,7 +1551,7 @@ export class MockWhatsAppSessionDriver implements WhatsAppSessionDriver {
   }
 
   public async acceptGroupInvite(inviteCode: string): Promise<string> {
-    if (!this.connected) {
+    if (!this.connected || !this.registered) {
       throw new WhatsAppConnectionError('الجلسة غير متصلة حالياً.');
     }
     if (inviteCode.startsWith('EXPIRED')) {
@@ -1279,7 +1606,7 @@ export class MockWhatsAppSessionDriver implements WhatsAppSessionDriver {
   public async getChannelMetadata(
     inviteCode: string
   ): Promise<WhatsAppChannelMetadata> {
-    if (!this.connected) {
+    if (!this.connected || !this.registered) {
       throw new WhatsAppConnectionError('الجلسة غير متصلة حالياً.');
     }
     return {
@@ -1294,8 +1621,11 @@ export class MockWhatsAppSessionDriver implements WhatsAppSessionDriver {
 
   public getSocketDiagnostics(): SessionSocketDiagnostics {
     return {
-      socketActive: this.connected,
-      registered: this.connected,
+      socketActive: this.socketOpen && this.connectionState !== 'CLOSED',
+      registered: this.registered,
+      wsOpen: this.socketOpen,
+      handshakeReady: this.handshakeComplete,
+      connectionState: this.connectionState,
       platform: 'Ubuntu / Chrome (Simulated)',
       device: 'MockWhatsAppSessionDriver',
       meJid: this.currentJid,
@@ -1309,7 +1639,7 @@ export class MockWhatsAppSessionDriver implements WhatsAppSessionDriver {
     _state: 'available' | 'composing' | 'paused',
     _jid: string
   ): Promise<void> {
-    if (!this.connected) {
+    if (!this.connected || !this.registered) {
       throw new WhatsAppConnectionError('الجلسة غير متصلة حالياً.');
     }
   }
@@ -1317,7 +1647,7 @@ export class MockWhatsAppSessionDriver implements WhatsAppSessionDriver {
   public async executeTestFunction(
     params: TestFunctionExecutionParams
   ): Promise<TestFunctionExecutionResult> {
-    if (!this.connected) {
+    if (!this.connected || !this.registered) {
       throw new WhatsAppConnectionError('الجلسة غير متصلة حالياً.');
     }
     return runSandboxedTestFunction(
@@ -1348,17 +1678,25 @@ export class MockWhatsAppSessionDriver implements WhatsAppSessionDriver {
   }
 
   public async disconnect(): Promise<void> {
+    this.socketOpen = false;
+    this.handshakeComplete = false;
     this.connected = false;
-    this.callbacks?.onStatusChange({ status: 'DISCONNECTED' });
+    this.connectionState = 'CLOSED';
   }
 
   public async logout(): Promise<void> {
+    this.socketOpen = false;
+    this.handshakeComplete = false;
     this.connected = false;
+    this.registered = false;
+    this.connectionState = 'CLOSED';
     this.callbacks?.onStatusChange({
       status: 'LOGGED_OUT',
       errorMessage: 'تم تسجيل الخروج من الجلسة.',
+      isRegistered: false,
     });
   }
 }
 
 export type DriverFactory = (sessionId: string, authDir: string) => WhatsAppSessionDriver;
+

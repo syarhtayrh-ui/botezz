@@ -52,11 +52,16 @@ export class SessionsHandler {
     const connecting = sessions.filter(
       (s) =>
         s.status === 'INITIALIZING' ||
+        s.status === 'CONNECTING' ||
         s.status === 'PAIRING_PENDING' ||
+        s.status === 'AUTHENTICATING' ||
         s.status === 'RECONNECTING'
     );
     const inactive = sessions.filter(
-      (s) => s.status === 'DISCONNECTED' || s.status === 'LOGGED_OUT'
+      (s) =>
+        s.status === 'DISCONNECTED' ||
+        s.status === 'STOPPED' ||
+        s.status === 'LOGGED_OUT'
     );
     const failed = sessions.filter((s) => s.status === 'FAILED');
 
@@ -119,8 +124,8 @@ export class SessionsHandler {
   }
 
   public renderSessionDetail(sessionId: string): BotViewResponse {
-    const sess = this.sessionManager.getSession(sessionId);
-    if (!sess) {
+    const verification = this.sessionManager.getLiveVerification(sessionId);
+    if (!verification) {
       return {
         text: '⚠️ لم يتم العثور على الجلسة المطلوبة.',
         keyboard: [
@@ -133,12 +138,26 @@ export class SessionsHandler {
       };
     }
 
+    const { session: sess, socketDiagnostics, credentialInfo, connectionGeneration } =
+      verification;
+    const liveSocketLabel = socketDiagnostics.socketActive
+      ? '🟢 نشط ومفتوح'
+      : '🔴 مغلق / غير نشط';
+    const authStatusLabel = credentialInfo.registered
+      ? '✅ موثقة ومكتملة'
+      : credentialInfo.corrupted
+        ? '❌ تالفة'
+        : '⏳ غير مكتملة (بانتظار إتمام الربط)';
+
     return {
       text:
         `📱 *تفاصيل الجلسة:* ${sess.label}\n\n` +
         `🆔 المعرف الداخلي: \`${sess.id}\`\n` +
         `📞 رقم الهاتف المقنع: \`${sess.masked_phone || 'غير مقترن بعد'}\`\n` +
         `📡 حالة الاتصال: ${formatSessionStatusArabic(sess.status)}\n` +
+        `🔌 حالة المقبس الحي (WebSocket): ${liveSocketLabel}\n` +
+        `🔐 حالة بيانات المصادقة: ${authStatusLabel}\n` +
+        `🔢 جيل الاتصال (Epoch): \`#${connectionGeneration}\`\n` +
         `🕒 آخر تحديث للحالة: \`${sess.last_status_at}\`\n` +
         `🔁 محاولات إعادة الاتصال: ${sess.reconnect_attempts}\n` +
         `${sess.last_error ? `⚠️ آخر ملاحظة/خطأ: ${sess.last_error}\n` : ''}\n` +
