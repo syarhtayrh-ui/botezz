@@ -87,6 +87,7 @@ import {
 import {
   FunctionRegistry,
   FunctionExecutor,
+  SmartProtocolWrapper,
 } from '../function-lab';
 import {
   MessageNormalizer,
@@ -103,18 +104,20 @@ export interface TestFunctionExecutionParams {
   funcCode: string;
   /** Execution mode: LIVE (default), DRY_RUN, or SIMULATION */
   executionMode?: FunctionExecutionMode;
-  /** Delay in milliseconds between loop iterations (0..60000). Default: 200 */
+  /** Delay in milliseconds between loop iterations (0 = no delay). Default: 200 */
   delayMs?: number;
-  /** Maximum socket sends allowed (0 = unlimited, 1..100000). Default: 500 */
+  /** Maximum socket sends allowed (0 = unlimited). Default: 0 */
   maxSends?: number;
-  /** VM evaluation timeout in milliseconds (500..60000). Default: 5000 */
+  /** VM evaluation timeout in milliseconds (0 = unlimited). Default: 0 */
   vmTimeoutMs?: number;
-  /** Maximum sleep(ms) cap inside the sandbox per call (0..60000). Default: 10000 */
+  /** Maximum sleep(ms) cap inside the sandbox per call (0 = unlimited). Default: 0 */
   maxSleepMs?: number;
   /** Abort remaining loop iterations immediately on first error. Default: false */
   stopOnError?: boolean;
   /** Capture console.log/warn/error output inside the VM sandbox. Default: true */
   captureConsole?: boolean;
+  /** Enable Smart Protocol Delivery Wrapper & Anti-Detection Engine. Default: true */
+  smartWrap?: boolean;
   /** Optional custom 3rd argument passed to the sandboxed function */
   extraArg?: unknown;
   /** Optional AbortSignal for immediate cancellation */
@@ -168,15 +171,17 @@ export interface SafeSocketTargetAdapter {
 }
 
 export interface SafeSocketOptions {
-  /** Maximum socket sends allowed (0 = unlimited, default = 500) */
+  /** Maximum socket sends allowed (0 = unlimited, default = 0) */
   maxSends?: number;
+  /** Enable Smart Protocol Delivery Wrapper (default = true) */
+  smartWrap?: boolean;
 }
 
 /**
  * Creates a rate-limited, JID-normalized socket wrapper (expanded from Nebula `createSafeSock`).
- * Supports manual/dynamic `maxSends` configuration (`0` = unlimited, default `500`),
+ * Supports manual/dynamic `maxSends` configuration (`0` = unlimited, default `0`),
  * runtime inspection/adjustment (`sock.getMaxSends()`, `sock.setMaxSends(n)`), per-method counters,
- * and Proxy-based access to all underlying `athanasia-baileys` socket methods.
+ * SmartProtocolWrapper integration, and Proxy-based access to all underlying `athanasia-baileys` socket methods.
  */
 export function createSafeSock(
   adapter: SafeSocketTargetAdapter,
@@ -191,7 +196,8 @@ export function createSafeSock(
     Number.isFinite(options.maxSends) &&
     options.maxSends >= 0
       ? Math.floor(options.maxSends)
-      : 500;
+      : 0;
+  const smartWrapEnabled = options?.smartWrap ?? true;
 
   const normalize = (j: string): string =>
     j && j.includes('@')
@@ -218,7 +224,7 @@ export function createSafeSock(
     getMaxSends: () => maxSendsLimit,
     setMaxSends: (newLimit: number) => {
       if (Number.isFinite(newLimit) && newLimit >= 0) {
-        maxSendsLimit = Math.min(100000, Math.floor(newLimit));
+        maxSendsLimit = Math.floor(newLimit);
       }
     },
     sendMessage: async (
@@ -229,7 +235,13 @@ export function createSafeSock(
       checkAndIncrementSend();
       sendMessageCount++;
       const jid = normalize(target);
-      return await adapter.sendMessage(jid, message, sendOpts);
+      const effectiveOpts: Record<string, unknown> = { ...(sendOpts || {}) };
+      if (smartWrapEnabled && !effectiveOpts.messageId) {
+        effectiveOpts.messageId = SmartProtocolWrapper.generateStandardMessageId(
+          (rawTarget?.user as { id?: string } | undefined)?.id
+        );
+      }
+      return await adapter.sendMessage(jid, message, effectiveOpts);
     },
     relayMessage: async (
       target: string,
@@ -239,6 +251,15 @@ export function createSafeSock(
       checkAndIncrementSend();
       relayMessageCount++;
       const jid = normalize(target);
+      if (smartWrapEnabled) {
+        const prepared = SmartProtocolWrapper.prepareRelayPayload(
+          jid,
+          messageObj,
+          opts,
+          (rawTarget?.user as { id?: string } | undefined)?.id
+        );
+        return await adapter.relayMessage(jid, prepared.message, prepared.options);
+      }
       return await adapter.relayMessage(jid, messageObj, opts);
     },
     presenceSubscribe: async (jid: string) => {
@@ -327,6 +348,7 @@ export async function runSandboxedTestFunction(
       maxSleepMs: params.maxSleepMs,
       stopOnError: params.stopOnError,
       captureConsole: params.captureConsole,
+      smartWrap: params.smartWrap,
       extraArg: params.extraArg,
       abortSignal: params.abortSignal,
       correlationId: params.correlationId,
@@ -913,6 +935,7 @@ export class AthanasiaBaileysSessionDriver implements WhatsAppSessionDriver {
   private sock: WASocket | null = null;
   private evCleanup: (() => void) | null = null;
   private readonly groupMetadataCache = new Map<string, GroupMetadata>();
+  private readonly verifiedRecipientJids = new Set<string>();
   public readonly memoryStore = new SessionMemoryStore();
   private credsSaveChain: Promise<void> = Promise.resolve();
   private flushAuthWrites: () => Promise<void> = async () => undefined;
@@ -942,6 +965,39 @@ export class AthanasiaBaileysSessionDriver implements WhatsAppSessionDriver {
       optionsOrSender instanceof MessageSender
         ? optionsOrSender
         : optionsOrSender?.messageSender;
+  }
+
+  /**
+   * Warms up and resolves direct user JIDs (`@s.whatsapp.net`) via `sock.onWhatsApp` once per session
+   * so USync device/LID mapping is populated before building Signal sessions.
+   */
+  private async resolveDirectRecipientJid(
+    sock: WASocket,
+    recipientJid: string
+  ): Promise<string> {
+    if (!recipientJid || !recipientJid.endsWith('@s.whatsapp.net')) {
+      return recipientJid;
+    }
+    const normalized = jidNormalizedUser(recipientJid);
+    if (this.verifiedRecipientJids.has(normalized)) {
+      return normalized;
+    }
+    if (typeof sock.onWhatsApp === 'function') {
+      try {
+        const results = await sock.onWhatsApp(normalized);
+        if (Array.isArray(results) && results.length > 0 && results[0]?.jid) {
+          const serverJid = jidNormalizedUser(results[0].jid);
+          this.verifiedRecipientJids.add( normalized );
+          this.verifiedRecipientJids.add(serverJid);
+          await Promise.allSettled([this.credsSaveChain, this.flushAuthWrites()]);
+          return serverJid;
+        }
+      } catch {
+        // Proceed with normalized JID if USync query fails
+      }
+    }
+    this.verifiedRecipientJids.add(normalized);
+    return normalized;
   }
 
   private resolveHandshakeWaiters(): void {
@@ -1060,8 +1116,27 @@ export class AthanasiaBaileysSessionDriver implements WhatsAppSessionDriver {
     this.sock = sock;
     const unbindStore = this.memoryStore.bind(sock.ev);
 
-    const credsListener = () => {
-      void enqueueSaveCreds();
+    const credsListener = (update?: Partial<typeof state.creds>) => {
+      if (update && typeof update === 'object') {
+        Object.assign(state.creds, update);
+      }
+      void enqueueSaveCreds()
+        .then(() => this.flushAuthWrites())
+        .then(() => {
+          // If Baileys finished uploading initial PreKeys and set `registered: true` while socket is open:
+          if (update?.registered === true && this.wsOpen && this.sock === sock) {
+            const rawJid = sock.user?.id || state.creds?.me?.id;
+            const normalizedJid = rawJid ? jidNormalizedUser(rawJid) : undefined;
+            if (normalizedJid && this.connectionState !== 'CONNECTED') {
+              this.connectionState = 'CONNECTED';
+              callbacks.onStatusChange({
+                status: 'CONNECTED',
+                jid: normalizedJid,
+                isRegistered: true,
+              });
+            }
+          }
+        });
     };
 
     const connectionListener = (update: Partial<ConnectionState>) => {
@@ -1083,10 +1158,10 @@ export class AthanasiaBaileysSessionDriver implements WhatsAppSessionDriver {
       }
 
       // 2. User entered pairing code on phone and `CB:iq,,pair-success` succeeded (`isNewLogin: true`):
+      // CRITICAL: Do NOT mutate `creds.registered = true` here! Baileys needs `creds.registered === false`
+      // on the subsequent 515 reconnect (`connection === 'open'`) so `validateConnection` runs
+      // `uploadPreKeysToServerIfRequired()` + `sendPassiveIq('active')` before marking `registered: true`.
       if (isNewLogin) {
-        if (sock.authState?.creds) {
-          sock.authState.creds.registered = true;
-        }
         this.connectionState = 'AUTHENTICATING';
         const rawJid = sock.user?.id || sock.authState?.creds?.me?.id;
         const normalizedJid = rawJid ? jidNormalizedUser(rawJid) : undefined;
@@ -1118,36 +1193,89 @@ export class AthanasiaBaileysSessionDriver implements WhatsAppSessionDriver {
         const creds = sock.authState?.creds;
         const rawJid = sock.user?.id || creds?.me?.id;
         const normalizedJid = rawJid ? jidNormalizedUser(rawJid) : undefined;
-        const hasValidAuth = Boolean(
-          (creds?.registered || creds?.account) && normalizedJid
-        );
 
-        if (creds && hasValidAuth && !creds.registered) {
-          creds.registered = true;
-        }
-
-        this.connectionState = hasValidAuth ? 'CONNECTED' : 'AWAITING_PAIRING';
-        void enqueueSaveCreds()
-          .then(() => this.flushAuthWrites())
-          .then(() => {
-            if (hasValidAuth) {
+        if (creds?.registered === true && normalizedJid) {
+          // Fully registered & PreKeys already uploaded on server
+          this.connectionState = 'CONNECTED';
+          void enqueueSaveCreds()
+            .then(() => this.flushAuthWrites())
+            .then(() => {
               callbacks.onStatusChange({
                 status: 'CONNECTED',
                 jid: normalizedJid,
                 isRegistered: true,
               });
-            } else {
+            });
+        } else if (creds?.account && normalizedJid && !creds.registered) {
+          // Post-pairing 515 reconnect: `creds.account` is present, and Baileys is now finishing
+          // `uploadPreKeysToServerIfRequired()` + `sendPassiveIq('active')`.
+          this.connectionState = 'AUTHENTICATING';
+          callbacks.onStatusChange({
+            status: 'AUTHENTICATING',
+            jid: normalizedJid,
+            isRegistered: true,
+          });
+
+          void (async () => {
+            try {
+              if (typeof sock.uploadPreKeysToServerIfRequired === 'function') {
+                await sock.uploadPreKeysToServerIfRequired();
+              }
+              if (typeof sock.sendPassiveIq === 'function') {
+                await sock.sendPassiveIq('active');
+              }
+            } catch (preKeyErr) {
+              log.warn('Post-pairing PreKey upload or active IQ warning', {
+                sessionId: this.sessionId,
+                error:
+                  preKeyErr instanceof Error ? preKeyErr.message : String(preKeyErr),
+              });
+            }
+
+            // Wait up to 1500ms for Baileys internal `creds.update({ registered: true })`
+            const deadline = Date.now() + 1500;
+            while (
+              Date.now() < deadline &&
+              this.wsOpen &&
+              this.sock === sock &&
+              !sock.authState?.creds?.registered
+            ) {
+              await new Promise((r) => setTimeout(r, 100));
+            }
+
+            if (this.wsOpen && this.sock === sock) {
+              if (sock.authState?.creds && !sock.authState.creds.registered) {
+                sock.authState.creds.registered = true;
+              }
+              await enqueueSaveCreds();
+              await this.flushAuthWrites();
+              if (this.wsOpen && this.sock === sock && this.connectionState !== 'CONNECTED') {
+                this.connectionState = 'CONNECTED';
+                callbacks.onStatusChange({
+                  status: 'CONNECTED',
+                  jid: normalizedJid,
+                  isRegistered: true,
+                });
+              }
+            }
+          })();
+        } else {
+          this.connectionState = 'AWAITING_PAIRING';
+          void enqueueSaveCreds()
+            .then(() => this.flushAuthWrites())
+            .then(() => {
               callbacks.onStatusChange({
                 status: 'AWAITING_PAIRING',
                 jid: normalizedJid,
                 isRegistered: false,
               });
-            }
-          });
+            });
+        }
       } else if (connection === 'close') {
         this.wsOpen = false;
         this.handshakeReady = false;
         this.connectionState = 'CLOSED';
+        this.verifiedRecipientJids.clear();
 
         const statusCode = lastDisconnect?.error?.output?.statusCode;
         const errMsg = lastDisconnect?.error?.message || 'Connection closed';
@@ -1429,12 +1557,13 @@ export class AthanasiaBaileysSessionDriver implements WhatsAppSessionDriver {
     if (this.connectionState !== 'CONNECTED' || !this.wsOpen) {
       throw new WhatsAppConnectionError('الجلسة غير متصلة حالياً لإرسال الرسائل.');
     }
-    const res = await sock.sendMessage(recipientJid, { text });
+    const resolvedJid = await this.resolveDirectRecipientJid(sock, recipientJid);
+    const res = await sock.sendMessage(resolvedJid, { text });
     const msgId = res?.key?.id || `msg_${Date.now()}`;
     if (res?.message) {
-      this.memoryStore.cacheSentMessage(recipientJid, msgId, res.message);
+      this.memoryStore.cacheSentMessage(resolvedJid, msgId, res.message);
     }
-    await this.flushAuthWrites();
+    await Promise.allSettled([this.credsSaveChain, this.flushAuthWrites()]);
     return { messageId: msgId };
   }
 
@@ -1480,12 +1609,16 @@ export class AthanasiaBaileysSessionDriver implements WhatsAppSessionDriver {
       };
     }
 
-    const res = await sock.sendMessage(params.recipientJid, content);
+    const resolvedJid = await this.resolveDirectRecipientJid(
+      sock,
+      params.recipientJid
+    );
+    const res = await sock.sendMessage(resolvedJid, content);
     const msgId = res?.key?.id || `media_${Date.now()}`;
     if (res?.message) {
-      this.memoryStore.cacheSentMessage(params.recipientJid, msgId, res.message);
+      this.memoryStore.cacheSentMessage(resolvedJid, msgId, res.message);
     }
-    await this.flushAuthWrites();
+    await Promise.allSettled([this.credsSaveChain, this.flushAuthWrites()]);
     return { messageId: msgId };
   }
 
@@ -1716,25 +1849,57 @@ export class AthanasiaBaileysSessionDriver implements WhatsAppSessionDriver {
       });
     }
     const sock = this.ensureSocket();
-    return runSandboxedTestFunction(this.sessionId, params, {
-      raw: sock as unknown as Record<string, unknown>,
-      sendMessage: async (targetJid, message, options) =>
-        sock.sendMessage(targetJid, message, options),
-      relayMessage: async (targetJid, messageObj, opts = {}) =>
-        sock.relayMessage(targetJid, messageObj, opts),
-      presenceSubscribe: async (targetJid) => {
-        await sock.presenceSubscribe(targetJid);
-      },
-      sendPresenceUpdate: async (state, targetJid) => {
-        await sock.sendPresenceUpdate(state, targetJid);
-      },
-    });
+    const flushAfterIteration = async () => {
+      await Promise.allSettled([this.credsSaveChain, this.flushAuthWrites()]);
+    };
+
+    try {
+      return await runSandboxedTestFunction(this.sessionId, params, {
+        raw: sock as unknown as Record<string, unknown>,
+        afterIterationFlush: flushAfterIteration,
+        sendMessage: async (targetJid, message, options) => {
+          const resolvedJid = await this.resolveDirectRecipientJid(sock, targetJid);
+          const res = await sock.sendMessage(resolvedJid, message, options);
+          const msgId =
+            res?.key?.id ||
+            (typeof options?.messageId === 'string'
+              ? options.messageId
+              : `flab_${Date.now()}`);
+          if (res?.message) {
+            this.memoryStore.cacheSentMessage(resolvedJid, msgId, res.message);
+          }
+          return res;
+        },
+        relayMessage: async (targetJid, messageObj, opts = {}) => {
+          const resolvedJid = await this.resolveDirectRecipientJid(sock, targetJid);
+          const msgId =
+            typeof opts?.messageId === 'string' && opts.messageId.trim()
+              ? opts.messageId.trim()
+              : SmartProtocolWrapper.generateStandardMessageId(sock.user?.id);
+          const relayOpts = { ...opts, messageId: msgId };
+          // Cache outgoing message BEFORE and AFTER relay so retry receipts (`getMessage`) can always re-encrypt!
+          if (messageObj && typeof messageObj === 'object') {
+            this.memoryStore.cacheSentMessage(resolvedJid, msgId, messageObj);
+          }
+          return await sock.relayMessage(resolvedJid, messageObj, relayOpts);
+        },
+        presenceSubscribe: async (targetJid) => {
+          await sock.presenceSubscribe(targetJid);
+        },
+        sendPresenceUpdate: async (state, targetJid) => {
+          await sock.sendPresenceUpdate(state, targetJid);
+        },
+      });
+    } finally {
+      await flushAfterIteration();
+    }
   }
 
   public async disconnect(): Promise<void> {
     this.wsOpen = false;
     this.handshakeReady = false;
     this.connectionState = 'CLOSED';
+    this.verifiedRecipientJids.clear();
     this.rejectHandshakeWaiters(
       new WhatsAppConnectionError('تم إغلاق مقبس واتساب.')
     );

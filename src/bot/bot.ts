@@ -694,6 +694,10 @@ export class TelegramBotController {
       this.activeConversationMode.set(actorUserId, 'TOOLS');
       return this.toolsHandler.toggleStopOnErrorConfig(actorUserId);
     }
+    if (callbackData === 'tools:tf_toggle_smart_wrap') {
+      this.activeConversationMode.set(actorUserId, 'TOOLS');
+      return this.toolsHandler.toggleSmartWrapConfig(actorUserId);
+    }
     if (callbackData === 'tools:run_sample_testfunction') {
       this.cancelAllWorkflowsForAdmin(actorUserId);
       const fallbackMode =

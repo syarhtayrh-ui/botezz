@@ -1,10 +1,16 @@
 import vm from 'node:vm';
 import crypto from 'node:crypto';
+import * as Baileys from 'athanasia-baileys';
 import {
+  generateMessageIDV2,
+  generateMessageID,
   generateWAMessageFromContent,
   generateForwardMessageContent,
   generateWAMessage,
+  generateWAMessageContent,
   prepareWAMessageMedia,
+  prepareDisappearingMessageSettingContent,
+  encodeWAMessage,
   normalizeMessageContent,
   extractMessageContent,
   getContentType,
@@ -414,9 +420,8 @@ export class FunctionValidator {
 }
 
 /**
- * Built-in catalog of verified WhatsApp protocol & Function Lab functions,
- * including `AewCh` (the exact function referenced in the `/testfunction` failure report),
- * `nebulaSocketProbe`, and specialized message-capability probes.
+ * Built-in catalog is intentionally empty so `📚 دوالي المحفوظة` only lists
+ * custom functions explicitly saved by the admin via `/savefunction` or file upload.
  */
 export const BUILTIN_FUNCTION_DEFINITIONS: Array<{
   functionId: string;
@@ -426,115 +431,7 @@ export const BUILTIN_FUNCTION_DEFINITIONS: Array<{
   sourceCode: string;
   inputSchema: Record<string, unknown>;
   requiredDependencies: string[];
-}> = [
-  {
-    functionId: 'fn_builtin_aewch',
-    name: 'AewCh',
-    category: 'messaging_probe',
-    descriptionAr:
-      'دالة AewCh القياسية لفحص إرسال الرسائل الممتدة ومعاينة القناة/التواجد عبر مقبس واتساب الآمن (createSafeSock).',
-    sourceCode: `async function AewCh(sock, target, meta) {
-  const step = meta?.iteration || 1;
-  console.log('AewCh executing step', step, 'target=', target);
-  await sock.presenceSubscribe(target);
-  await sock.sendPresenceUpdate('composing', target);
-  const res = await sock.sendMessage(target, {
-    text: \`[AewCh Probe #\${step}] فحص جاهزية مقبس واتساب والقناة بنجاح\`
-  });
-  await sock.sendPresenceUpdate('paused', target);
-  return { ok: true, step, messageId: res?.key?.id || 'sent' };
-}`,
-    inputSchema: {
-      targetPhone: 'string (8..15 digits)',
-      iterations: 'number (1..10000)',
-    },
-    requiredDependencies: ['athanasia-baileys', 'createSafeSock'],
-  },
-  {
-    functionId: 'fn_builtin_nebula_probe',
-    name: 'nebulaSocketProbe',
-    category: 'diagnostics',
-    descriptionAr:
-      'دالة فحص المقبس الأساسية (Nebula Socket Probe) لاختبار التواجد وإرسال نص قياسي مع تتبع عداد الإرسال.',
-    sourceCode: `async function nebulaSocketProbe(sock, target, meta) {
-  console.log('Executing probe iteration', meta?.iteration, 'maxSends=', sock.getMaxSends());
-  await sock.presenceSubscribe(target);
-  await sock.sendPresenceUpdate('composing', target);
-  await sock.sendMessage(target, { text: 'Nebula Function Probe OK' });
-}`,
-    inputSchema: {
-      targetPhone: 'string (8..15 digits)',
-      iterations: 'number (1..10000)',
-    },
-    requiredDependencies: ['athanasia-baileys', 'createSafeSock'],
-  },
-  {
-    functionId: 'fn_builtin_sticker_probe',
-    name: 'stickerCapabilityProbe',
-    category: 'stickers',
-    descriptionAr:
-      'فحص قدرة بناء وإرسال ملصق WebP قياسي والتحقق من ترويسة RIFF/WEBP عبر المقبس.',
-    sourceCode: `async function stickerCapabilityProbe(sock, target, meta) {
-  console.log('Sticker probe on iteration', meta?.iteration);
-  const minimalWebpHeader = Buffer.from(
-    '524946462400000057454250565038580a00000000000000000000000000',
-    'hex'
-  );
-  const res = await sock.sendMessage(target, {
-    sticker: minimalWebpHeader,
-    mimetype: 'image/webp'
-  });
-  return { stickerSent: true, messageId: res?.key?.id };
-}`,
-    inputSchema: {
-      targetPhone: 'string',
-      iterations: 'number',
-    },
-    requiredDependencies: ['athanasia-baileys', 'Buffer'],
-  },
-  {
-    functionId: 'fn_builtin_status_story_probe',
-    name: 'statusStoryCapabilityProbe',
-    category: 'status_stories',
-    descriptionAr:
-      'فحص قدرة التعامل مع حالات واتساب (status@broadcast) والرد المقتبس عليها بأمان.',
-    sourceCode: `async function statusStoryCapabilityProbe(sock, target, meta) {
-  console.log('Status capability probe step', meta?.iteration, 'STORIES_JID=', STORIES_JID);
-  const res = await sock.sendMessage(target, {
-    text: 'Status & Story Capability Probe Verified'
-  });
-  return { statusBroadcastJid: STORIES_JID, verified: true, messageId: res?.key?.id };
-}`,
-    inputSchema: {
-      targetPhone: 'string',
-      iterations: 'number',
-    },
-    requiredDependencies: ['athanasia-baileys', 'STORIES_JID'],
-  },
-  {
-    functionId: 'fn_builtin_poll_reaction_probe',
-    name: 'pollAndReactionProbe',
-    category: 'interactive',
-    descriptionAr:
-      'فحص إرسال استطلاع رأي (Poll V3) وتفاعل رمز تعبيري (Reaction) عبر المقبس.',
-    sourceCode: `async function pollAndReactionProbe(sock, target, meta) {
-  console.log('Poll & Reaction probe iteration', meta?.iteration);
-  const pollRes = await sock.sendMessage(target, {
-    poll: {
-      name: 'استطلاع فحص قدرات البروتوكول',
-      values: ['ممتاز', 'جيد جداً'],
-      selectableCount: 1
-    }
-  });
-  return { pollSent: true, messageId: pollRes?.key?.id };
-}`,
-    inputSchema: {
-      targetPhone: 'string',
-      iterations: 'number',
-    },
-    requiredDependencies: ['athanasia-baileys'],
-  },
-];
+}> = [];
 
 /**
  * Discovers, registers, validates, and searches available Function Lab functions
@@ -876,6 +773,7 @@ export interface FunctionSandboxAdapter {
     state: 'available' | 'composing' | 'paused',
     targetJid: string
   ) => Promise<void>;
+  afterIterationFlush?: () => Promise<void>;
   raw?: Partial<WASocket> | Record<string, unknown>;
   [key: string]: unknown;
 }
@@ -892,6 +790,7 @@ export interface FunctionExecutorRequest {
   maxSleepMs?: number;
   stopOnError?: boolean;
   captureConsole?: boolean;
+  smartWrap?: boolean;
   extraArg?: unknown;
   abortSignal?: AbortSignal;
   correlationId?: string;
@@ -914,6 +813,7 @@ export interface FunctionExecutorResult {
   relayMessageCount: number;
   presenceCount: number;
   maxSendsLimit: number;
+  smartWrapEnabled?: boolean;
   abortedEarly: boolean;
   consoleLogs: string[];
   returnValuesPreview: string[];
@@ -923,10 +823,549 @@ export interface FunctionExecutorResult {
 }
 
 /**
+ * Smart Protocol Delivery Wrapper & Anti-Detection Engine (`SmartProtocolWrapper`).
+ * Automatically enriches outgoing `relayMessage` and `sendMessage` payloads with:
+ * 1. Genuine WhatsApp Web v2 Message IDs (`generateMessageIDV2` / `3EB0...`)
+ * 2. Automatic `messageContextInfo` (`deviceListMetadata`, `deviceListMetadataVersion: 2`, 32-byte `messageSecret`)
+ * 3. Automatic `<biz><interactive .../></biz>` binary node decoration for `interactiveMessage`, `buttonsMessage`, and `listMessage`
+ */
+export class SmartProtocolWrapper {
+  public static generateStandardMessageId(userId?: string): string {
+    try {
+      if (typeof generateMessageIDV2 === 'function') {
+        const id = generateMessageIDV2(userId);
+        if (typeof id === 'string' && id.length >= 16) {
+          return id;
+        }
+      }
+    } catch {
+      // Fallback below
+    }
+    return '3EB0' + crypto.randomBytes(18).toString('hex').toUpperCase();
+  }
+
+  public static unwrapInnerMessage(
+    messageObj: proto.IMessage | undefined | null
+  ): proto.IMessage | undefined {
+    if (!messageObj || typeof messageObj !== 'object') return undefined;
+    let current: Record<string, unknown> = messageObj as Record<string, unknown>;
+    const wrappers = [
+      'viewOnceMessage',
+      'viewOnceMessageV2',
+      'viewOnceMessageV2Extension',
+      'ephemeralMessage',
+      'documentWithCaptionMessage',
+    ];
+    for (let depth = 0; depth < 5; depth++) {
+      let unwrapped = false;
+      for (const w of wrappers) {
+        const nested = current[w] as { message?: Record<string, unknown> } | undefined;
+        if (nested && typeof nested === 'object' && nested.message) {
+          current = nested.message;
+          unwrapped = true;
+          break;
+        }
+      }
+      if (!unwrapped) break;
+    }
+    return current as proto.IMessage;
+  }
+
+  public static prepareRelayPayload(
+    targetJid: string,
+    messageObj: proto.IMessage,
+    opts?: Record<string, unknown>,
+    userId?: string
+  ): { message: proto.IMessage; options: Record<string, unknown>; messageId: string } {
+    const options: Record<string, unknown> = { ...(opts || {}) };
+    const messageId =
+      typeof options.messageId === 'string' && options.messageId.trim()
+        ? options.messageId.trim()
+        : SmartProtocolWrapper.generateStandardMessageId(userId);
+    options.messageId = messageId;
+
+    const message: proto.IMessage =
+      messageObj && typeof messageObj === 'object'
+        ? { ...messageObj }
+        : ({} as proto.IMessage);
+
+    const isDirectUser =
+      targetJid.endsWith('@s.whatsapp.net') || targetJid.endsWith('@lid');
+
+    if (isDirectUser) {
+      const existingCtx =
+        message.messageContextInfo && typeof message.messageContextInfo === 'object'
+          ? (message.messageContextInfo as Record<string, unknown>)
+          : {};
+      message.messageContextInfo = {
+        deviceListMetadata: existingCtx.deviceListMetadata ?? {},
+        deviceListMetadataVersion: existingCtx.deviceListMetadataVersion ?? 2,
+        messageSecret: existingCtx.messageSecret ?? crypto.randomBytes(32),
+        ...existingCtx,
+      };
+    }
+
+    if (!options.additionalNodes) {
+      const inner = SmartProtocolWrapper.unwrapInnerMessage(message) || message;
+      const interactiveMsg = inner.interactiveMessage as
+        | {
+            nativeFlowMessage?: {
+              buttons?: Array<{ name?: string }>;
+            };
+            carouselMessage?: Record<string, unknown>;
+          }
+        | undefined;
+
+      if (interactiveMsg) {
+        const buttons = interactiveMsg.nativeFlowMessage?.buttons || [];
+        const hasPaymentFlow = buttons.some(
+          (b) =>
+            b?.name === 'payment_info' ||
+            b?.name === 'review_and_pay' ||
+            b?.name === 'payment_status'
+        );
+        const flowName = hasPaymentFlow ? 'payment_info' : 'mixed';
+        options.additionalNodes = [
+          {
+            tag: 'biz',
+            attrs: {},
+            content: [
+              {
+                tag: 'interactive',
+                attrs: { type: 'native_flow', v: '1' },
+                content: [
+                  {
+                    tag: 'native_flow',
+                    attrs: { v: '9', name: flowName },
+                  },
+                ],
+              },
+            ],
+          },
+        ];
+      } else if (inner.buttonsMessage) {
+        options.additionalNodes = [
+          {
+            tag: 'biz',
+            attrs: {},
+            content: [
+              {
+                tag: 'interactive',
+                attrs: { type: 'native_flow', v: '1' },
+                content: [
+                  {
+                    tag: 'native_flow',
+                    attrs: { v: '9', name: 'mixed' },
+                  },
+                ],
+              },
+            ],
+          },
+        ];
+      } else if (inner.listMessage) {
+        options.additionalNodes = [
+          {
+            tag: 'biz',
+            attrs: {},
+            content: [
+              {
+                tag: 'list',
+                attrs: { v: '2', type: 'product_list' },
+              },
+            ],
+          },
+        ];
+      }
+    }
+
+    return { message, options, messageId };
+  }
+}
+
+/**
+ * High-level protocol builders for Payment, Commerce, Stickers, Interactive, Carousel, List, Buttons & View-Once messages.
+ * Exposed both under `builders.*` and as top-level sandbox functions in Function Lab.
+ */
+export function createProtocolBuilders(params: {
+  defaultTargetJid: string;
+  normalizeJid: (j: string) => string;
+  sendMessageFn: (
+    target: string,
+    content: AnyMessageContent,
+    opts?: Record<string, unknown>
+  ) => Promise<unknown>;
+  relayMessageFn: (
+    target: string,
+    messageObj: proto.IMessage,
+    opts?: Record<string, unknown>
+  ) => Promise<unknown>;
+}) {
+  const { defaultTargetJid, normalizeJid, sendMessageFn, relayMessageFn } = params;
+
+  const buildPaymentRequest = (opts?: {
+    amount1000?: number;
+    currency?: string;
+    noteText?: string;
+    requestFrom?: string;
+    expiryTimestamp?: number;
+    background?: Record<string, unknown>;
+  }): proto.IMessage => {
+    const currency = opts?.currency || 'USD';
+    const amount1000 = opts?.amount1000 ?? 10000;
+    return {
+      requestPaymentMessage: {
+        currencyCodeIso4217: currency,
+        amount1000,
+        requestFrom: opts?.requestFrom
+          ? normalizeJid(opts.requestFrom)
+          : defaultTargetJid,
+        noteMessage: {
+          extendedTextMessage: {
+            text: opts?.noteText || 'Payment Request',
+          },
+        },
+        expiryTimestamp:
+          opts?.expiryTimestamp ?? Math.floor(Date.now() / 1000) + 86400,
+        amount: {
+          value: amount1000,
+          offset: 1000,
+          currencyCode: currency,
+        },
+        ...(opts?.background ? { background: opts.background } : {}),
+      },
+    };
+  };
+
+  const buildPaymentInvite = (opts?: {
+    serviceType?: number;
+    expiryTimestamp?: number;
+  }): proto.IMessage => ({
+    paymentInviteMessage: {
+      serviceType: opts?.serviceType ?? 1,
+      expiryTimestamp:
+        opts?.expiryTimestamp ?? Math.floor(Date.now() / 1000) + 86400,
+    },
+  });
+
+  const buildSendPayment = (opts?: {
+    noteText?: string;
+    requestMessageKey?: Record<string, unknown>;
+    background?: Record<string, unknown>;
+  }): proto.IMessage => ({
+    sendPaymentMessage: {
+      noteMessage: {
+        extendedTextMessage: {
+          text: opts?.noteText || 'Payment Confirmed',
+        },
+      },
+      requestMessageKey: opts?.requestMessageKey || {
+        remoteJid: defaultTargetJid,
+        fromMe: false,
+        id: SmartProtocolWrapper.generateStandardMessageId(),
+      },
+      ...(opts?.background ? { background: opts.background } : {}),
+    },
+  });
+
+  const buildOrderMessage = (opts?: {
+    orderId?: string;
+    itemCount?: number;
+    status?: number;
+    surface?: number;
+    message?: string;
+    orderTitle?: string;
+    sellerJid?: string;
+    token?: string;
+    totalAmount1000?: number;
+    totalCurrencyCode?: string;
+    thumbnail?: Uint8Array | Buffer;
+  }): proto.IMessage => ({
+    orderMessage: {
+      orderId: opts?.orderId || String(Date.now()),
+      itemCount: opts?.itemCount ?? 1,
+      status: opts?.status ?? 1,
+      surface: opts?.surface ?? 1,
+      message: opts?.message || 'Order Summary',
+      orderTitle: opts?.orderTitle || 'Order',
+      sellerJid: opts?.sellerJid
+        ? normalizeJid(opts.sellerJid)
+        : defaultTargetJid,
+      token: opts?.token || crypto.randomBytes(16).toString('base64'),
+      totalAmount1000: opts?.totalAmount1000 ?? 10000,
+      totalCurrencyCode: opts?.totalCurrencyCode || 'USD',
+      ...(opts?.thumbnail ? { thumbnail: opts.thumbnail } : {}),
+    },
+  });
+
+  const buildNativeFlowPayment = (opts?: {
+    titleText?: string;
+    bodyText?: string;
+    footerText?: string;
+    methodName?: string;
+    paramsJson?: string | Record<string, unknown>;
+    buttons?: Array<{
+      name: string;
+      buttonParamsJson: string | Record<string, unknown>;
+    }>;
+  }): proto.IMessage => {
+    const defaultParams = {
+      reference_id: crypto.randomBytes(6).toString('hex').toUpperCase(),
+      type: 'physical-goods',
+      payment_configuration: 'merchant_categorization_code',
+      currency: 'USD',
+      total_amount: { value: 10000, offset: 1000 },
+      order: {
+        status: 'pending',
+        items: [
+          {
+            retailer_id: 'item_01',
+            name: opts?.titleText || 'Order Item',
+            amount: { value: 10000, offset: 1000 },
+            quantity: 1,
+          },
+        ],
+        subtotal: { value: 10000, offset: 1000 },
+      },
+    };
+    const rawButtons = opts?.buttons || [
+      {
+        name: opts?.methodName || 'payment_info',
+        buttonParamsJson: opts?.paramsJson || defaultParams,
+      },
+    ];
+    return {
+      interactiveMessage: {
+        header: {
+          title: opts?.titleText || 'Payment Invoice',
+          hasMediaAttachment: false,
+        },
+        body: { text: opts?.bodyText || 'Complete your payment details below.' },
+        footer: { text: opts?.footerText || 'WhatsApp Pay' },
+        nativeFlowMessage: {
+          buttons: rawButtons.map((b) => ({
+            name: b.name,
+            buttonParamsJson:
+              typeof b.buttonParamsJson === 'string'
+                ? b.buttonParamsJson
+                : JSON.stringify(b.buttonParamsJson || {}),
+          })),
+        },
+      },
+    };
+  };
+
+  const buildStickerMessage = (
+    webpBufferOrUrl: Buffer | Uint8Array | string,
+    opts?: { isAnimated?: boolean; mimetype?: string; [key: string]: unknown }
+  ): AnyMessageContent => {
+    const defaultWebp = Buffer.from(
+      '524946462400000057454250565038580a00000000000000000000000000',
+      'hex'
+    );
+    const payload = webpBufferOrUrl || defaultWebp;
+    const stickerSource =
+      typeof payload === 'string' ? { url: payload } : Buffer.from(payload);
+    return {
+      sticker: stickerSource,
+      mimetype: opts?.mimetype || 'image/webp',
+      isAnimated: opts?.isAnimated ?? false,
+      ...(opts || {}),
+    } as AnyMessageContent;
+  };
+
+  const buildStickerPackMessage = (opts?: {
+    name?: string;
+    publisher?: string;
+    stickerPackId?: string;
+    packDescription?: string;
+    stickers?: Array<Record<string, unknown>>;
+    fileLength?: number;
+    mediaKey?: Uint8Array;
+    directPath?: string;
+    fileSha256?: Uint8Array;
+    fileEncSha256?: Uint8Array;
+    trayIconFileName?: string;
+  }): proto.IMessage => ({
+    stickerPackMessage: {
+      stickerPackId: opts?.stickerPackId || crypto.randomUUID(),
+      name: opts?.name || 'Botezz Sticker Pack',
+      publisher: opts?.publisher || 'Botezz',
+      packDescription: opts?.packDescription || '',
+      stickers: opts?.stickers || [
+        {
+          fileName: '1.webp',
+          isAnimated: false,
+          emojis: ['🔥'],
+          accessibilityLabel: 'sticker',
+          isLottie: false,
+          mimetype: 'image/webp',
+        },
+      ],
+      fileLength: opts?.fileLength ?? 4096,
+      mediaKey: opts?.mediaKey || crypto.randomBytes(32),
+      directPath:
+        opts?.directPath ||
+        '/v/t62.15575-24/10000000_000000000000000_0000000000000000000_n.enc',
+      fileSha256: opts?.fileSha256 || crypto.randomBytes(32),
+      fileEncSha256: opts?.fileEncSha256 || crypto.randomBytes(32),
+      trayIconFileName: opts?.trayIconFileName || 'tray.png',
+    },
+  });
+
+  const sendSticker = async (
+    target: string,
+    webpBufferOrUrl: Buffer | Uint8Array | string,
+    opts?: { isAnimated?: boolean; mimetype?: string; [key: string]: unknown }
+  ) => {
+    const content = buildStickerMessage(webpBufferOrUrl, opts);
+    return await sendMessageFn(target || defaultTargetJid, content);
+  };
+
+  const sendStickerPack = async (
+    target: string,
+    packOpts?: Parameters<typeof buildStickerPackMessage>[0],
+    relayOpts?: Record<string, unknown>
+  ) => {
+    const msg = buildStickerPackMessage(packOpts);
+    return await relayMessageFn(target || defaultTargetJid, msg, relayOpts || {});
+  };
+
+  const buildInteractiveMessage = (opts?: {
+    title?: string;
+    subtitle?: string;
+    body?: string;
+    footer?: string;
+    hasMediaAttachment?: boolean;
+    buttons?: Array<{
+      name: string;
+      buttonParamsJson: string | Record<string, unknown>;
+    }>;
+    messageParamsJson?: string | Record<string, unknown>;
+    contextInfo?: Record<string, unknown>;
+  }): proto.IMessage => ({
+    interactiveMessage: {
+      header: {
+        title: opts?.title || '',
+        subtitle: opts?.subtitle || '',
+        hasMediaAttachment: Boolean(opts?.hasMediaAttachment),
+      },
+      body: { text: opts?.body || '' },
+      footer: { text: opts?.footer || '' },
+      nativeFlowMessage: {
+        buttons: (opts?.buttons || []).map((b) => ({
+          name: b.name,
+          buttonParamsJson:
+            typeof b.buttonParamsJson === 'string'
+              ? b.buttonParamsJson
+              : JSON.stringify(b.buttonParamsJson || {}),
+        })),
+        messageParamsJson:
+          typeof opts?.messageParamsJson === 'string'
+            ? opts.messageParamsJson
+            : opts?.messageParamsJson
+              ? JSON.stringify(opts.messageParamsJson)
+              : '',
+      },
+      ...(opts?.contextInfo ? { contextInfo: opts.contextInfo } : {}),
+    },
+  });
+
+  const buildCarouselMessage = (opts?: {
+    body?: string;
+    footer?: string;
+    cards?: Array<Record<string, unknown>>;
+    messageVersion?: number;
+  }): proto.IMessage => ({
+    interactiveMessage: {
+      body: { text: opts?.body || '' },
+      footer: { text: opts?.footer || '' },
+      carouselMessage: {
+        cards: opts?.cards || [],
+        messageVersion: opts?.messageVersion ?? 1,
+      },
+    },
+  });
+
+  const buildListMessage = (opts?: {
+    title?: string;
+    description?: string;
+    buttonText?: string;
+    footerText?: string;
+    listType?: number;
+    sections?: Array<Record<string, unknown>>;
+  }): proto.IMessage => ({
+    listMessage: {
+      title: opts?.title || '',
+      description: opts?.description || '',
+      buttonText: opts?.buttonText || 'Menu',
+      footerText: opts?.footerText || '',
+      listType: opts?.listType ?? 1,
+      sections: opts?.sections || [],
+    },
+  });
+
+  const buildButtonsMessage = (opts?: {
+    contentText?: string;
+    footerText?: string;
+    headerType?: number;
+    buttons?: Array<{
+      buttonId?: string;
+      buttonText?: { displayText: string } | string;
+      type?: number;
+    }>;
+  }): proto.IMessage => ({
+    buttonsMessage: {
+      contentText: opts?.contentText || '',
+      footerText: opts?.footerText || '',
+      headerType: opts?.headerType ?? 1,
+      buttons: (opts?.buttons || []).map((b, idx) => ({
+        buttonId: b.buttonId || `btn_${idx + 1}`,
+        buttonText:
+          typeof b.buttonText === 'string'
+            ? { displayText: b.buttonText }
+            : b.buttonText || { displayText: `Button ${idx + 1}` },
+        type: b.type ?? 1,
+      })),
+    },
+  });
+
+  const buildViewOnceMessage = (
+    innerMessage: proto.IMessage,
+    version: 'v1' | 'v2' | 'v2Ext' = 'v2'
+  ): proto.IMessage => {
+    if (version === 'v1') {
+      return { viewOnceMessage: { message: innerMessage } };
+    }
+    if (version === 'v2Ext') {
+      return { viewOnceMessageV2Extension: { message: innerMessage } };
+    }
+    return { viewOnceMessageV2: { message: innerMessage } };
+  };
+
+  return {
+    buildPaymentRequest,
+    buildPaymentInvite,
+    buildSendPayment,
+    buildOrderMessage,
+    buildNativeFlowPayment,
+    buildStickerMessage,
+    buildStickerPackMessage,
+    sendSticker,
+    sendStickerPack,
+    buildInteractiveMessage,
+    buildCarouselMessage,
+    buildListMessage,
+    buildButtonsMessage,
+    buildViewOnceMessage,
+  };
+}
+
+/**
  * Isolated VM Function Executor (`FunctionExecutor`).
  * Never uses unrestricted `eval` or `new Function` in the host realm.
- * Uses `FunctionValidator` + `vm.Script` + `vm.createContext` with frozen/isolated globals,
- * strict timeouts, cancellation support, dry-run/simulation interception, and cross-realm error classification.
+ * Uses `FunctionValidator` + `vm.Script` + `vm.createContext` with full `athanasia-baileys` capabilities,
+ * `SmartProtocolWrapper` anti-detection & delivery enrichment, `builders` toolkit,
+ * cancellation support, dry-run/simulation interception, and cross-realm error classification.
  */
 export class FunctionExecutor {
   private readonly validator = new FunctionValidator();
@@ -941,6 +1380,7 @@ export class FunctionExecutor {
       request.correlationId ||
       `flab_${Date.now().toString(36)}_${crypto.randomBytes(3).toString('hex')}`;
     const executionMode: FunctionExecutionMode = request.executionMode || 'LIVE';
+    const smartWrap = request.smartWrap !== false;
 
     const digits = String(request.targetPhone || '').replace(/[^0-9]/g, '');
     if (digits.length < 7 || digits.length > 15) {
@@ -949,13 +1389,10 @@ export class FunctionExecutor {
       );
     }
 
-    const iterations = Math.max(
-      1,
-      Math.min(Number(request.iterations) || 1, 10000)
-    );
+    const iterations = Math.max(1, Math.floor(Number(request.iterations) || 1));
     const targetJid = `${digits}@s.whatsapp.net`;
 
-    // Resolve by function name in registry if user passed a registered name (e.g., `AewCh`)
+    // Resolve by function name in registry if user passed a registered name
     let rawSource = (request.funcCodeOrName || '').trim();
     let functionVersion = 1;
     if (this.registry) {
@@ -979,8 +1416,8 @@ export class FunctionExecutor {
       request.maxSends !== undefined &&
       Number.isFinite(request.maxSends) &&
       request.maxSends >= 0
-        ? Math.min(100000, Math.floor(request.maxSends))
-        : 500;
+        ? Math.floor(request.maxSends)
+        : 0;
 
     let sendCount = 0;
     let sendMessageCount = 0;
@@ -1021,7 +1458,7 @@ export class FunctionExecutor {
     const effectiveAdapter: FunctionSandboxAdapter =
       executionMode === 'DRY_RUN' || executionMode === 'SIMULATION' || !liveAdapter
         ? {
-            sendMessage: async (jid, content) => {
+            sendMessage: async (jid, content, opts) => {
               const keys = Object.keys(content || {}).join(',');
               pushLog(
                 executionMode === 'DRY_RUN' ? 'DRY_RUN' : 'SIM',
@@ -1031,17 +1468,22 @@ export class FunctionExecutor {
                 key: {
                   remoteJid: jid,
                   fromMe: true,
-                  id: `${executionMode.toLowerCase()}_msg_${Date.now()}_${sendMessageCount}`,
+                  id:
+                    typeof opts?.messageId === 'string'
+                      ? opts.messageId
+                      : SmartProtocolWrapper.generateStandardMessageId(),
                 },
                 status: 1,
               };
             },
-            relayMessage: async (jid, _msgObj) => {
+            relayMessage: async (jid, _msgObj, opts) => {
               pushLog(
                 executionMode === 'DRY_RUN' ? 'DRY_RUN' : 'SIM',
                 [`relayMessage -> ${maskPhoneNumber(jid)}`]
               );
-              return `${executionMode.toLowerCase()}_relay_${Date.now()}_${relayMessageCount}`;
+              return typeof opts?.messageId === 'string'
+                ? opts.messageId
+                : SmartProtocolWrapper.generateStandardMessageId();
             },
             presenceSubscribe: async () => undefined,
             sendPresenceUpdate: async () => undefined,
@@ -1051,6 +1493,60 @@ export class FunctionExecutor {
     const rawSocketTarget =
       (effectiveAdapter.raw as Record<string, unknown> | undefined) ||
       (effectiveAdapter as unknown as Record<string, unknown>);
+    const socketUserId = (rawSocketTarget?.user as { id?: string } | undefined)?.id;
+
+    let lastSendTimestamp = 0;
+    const warmedPresenceJids = new Set<string>();
+
+    const applySmartPacingAndPresence = async (jid: string) => {
+      if (!smartWrap || executionMode !== 'LIVE') return;
+      if (jid.endsWith('@s.whatsapp.net') && !warmedPresenceJids.has(jid)) {
+        warmedPresenceJids.add(jid);
+        if (presenceCount === 0) {
+          void effectiveAdapter.presenceSubscribe(jid).catch(() => undefined);
+          void effectiveAdapter
+            .sendPresenceUpdate('composing', jid)
+            .catch(() => undefined);
+        }
+      }
+      const now = Date.now();
+      if (lastSendTimestamp > 0 && now - lastSendTimestamp < 20) {
+        const jitterMs = 25 + Math.floor(Math.random() * 41);
+        await new Promise((r) => setTimeout(r, jitterMs));
+      }
+      lastSendTimestamp = Date.now();
+    };
+
+    const uploadMediaHelper = async (
+      mediaContent: AnyMessageContent,
+      options: Record<string, unknown> = {}
+    ): Promise<proto.IMessage> => {
+      const realUpload =
+        typeof rawSocketTarget?.waUploadToServer === 'function'
+          ? rawSocketTarget.waUploadToServer.bind(rawSocketTarget)
+          : undefined;
+      const fallbackUpload = async () => ({
+        mediaUrl: `https://mmg.whatsapp.net/v/t62.7118-24/${crypto.randomBytes(8).toString('hex')}.enc`,
+        directPath: `/v/t62.7118-24/${crypto.randomBytes(12).toString('hex')}.enc`,
+        handle: crypto.randomBytes(8).toString('hex'),
+      });
+      try {
+        return await prepareWAMessageMedia(mediaContent, {
+          upload:
+            executionMode === 'DRY_RUN' ||
+            executionMode === 'SIMULATION' ||
+            !realUpload
+              ? fallbackUpload
+              : realUpload,
+          ...options,
+        });
+      } catch {
+        return await prepareWAMessageMedia(mediaContent, {
+          upload: fallbackUpload,
+          ...options,
+        });
+      }
+    };
 
     const baseSafeSock: Record<string, unknown> = {
       raw: rawSocketTarget,
@@ -1061,9 +1557,11 @@ export class FunctionExecutor {
       getMaxSends: () => maxSendsLimit,
       setMaxSends: (newLimit: number) => {
         if (Number.isFinite(newLimit) && newLimit >= 0) {
-          maxSendsLimit = Math.min(100000, Math.floor(newLimit));
+          maxSendsLimit = Math.floor(newLimit);
         }
       },
+      uploadMedia: uploadMediaHelper,
+      prepareMessageMedia: uploadMediaHelper,
       sendMessage: async (
         target: string,
         message: AnyMessageContent,
@@ -1072,7 +1570,12 @@ export class FunctionExecutor {
         checkAndIncrementSend();
         sendMessageCount++;
         const jid = normalizeJid(target);
-        return await effectiveAdapter.sendMessage(jid, message, options);
+        await applySmartPacingAndPresence(jid);
+        const sendOpts: Record<string, unknown> = { ...(options || {}) };
+        if (smartWrap && !sendOpts.messageId) {
+          sendOpts.messageId = SmartProtocolWrapper.generateStandardMessageId(socketUserId);
+        }
+        return await effectiveAdapter.sendMessage(jid, message, sendOpts);
       },
       relayMessage: async (
         target: string,
@@ -1082,11 +1585,26 @@ export class FunctionExecutor {
         checkAndIncrementSend();
         relayMessageCount++;
         const jid = normalizeJid(target);
+        await applySmartPacingAndPresence(jid);
+        if (smartWrap) {
+          const wrapped = SmartProtocolWrapper.prepareRelayPayload(
+            jid,
+            messageObj,
+            opts,
+            socketUserId
+          );
+          return await effectiveAdapter.relayMessage(
+            jid,
+            wrapped.message,
+            wrapped.options
+          );
+        }
         return await effectiveAdapter.relayMessage(jid, messageObj, opts);
       },
       presenceSubscribe: async (jid: string) => {
         try {
           presenceCount++;
+          warmedPresenceJids.add(normalizeJid(jid));
           await effectiveAdapter.presenceSubscribe(normalizeJid(jid));
         } catch {
           // Best-effort presence
@@ -1098,6 +1616,7 @@ export class FunctionExecutor {
       ) => {
         try {
           presenceCount++;
+          warmedPresenceJids.add(normalizeJid(jid));
           await effectiveAdapter.sendPresenceUpdate(state, normalizeJid(jid));
         } catch {
           // Best-effort presence
@@ -1138,6 +1657,7 @@ export class FunctionExecutor {
       getPresenceCount: () => number;
       getMaxSends: () => number;
       setMaxSends: (newLimit: number) => void;
+      uploadMedia: typeof uploadMediaHelper;
       sendMessage: (
         target: string,
         message: AnyMessageContent,
@@ -1157,25 +1677,42 @@ export class FunctionExecutor {
     };
 
     const stepDelayMs =
-      request.delayMs !== undefined && Number.isFinite(request.delayMs)
-        ? Math.min(Math.max(0, Math.floor(request.delayMs)), 60000)
+      request.delayMs !== undefined &&
+      Number.isFinite(request.delayMs) &&
+      request.delayMs >= 0
+        ? Math.floor(request.delayMs)
         : 200;
     const vmTimeoutMs =
-      request.vmTimeoutMs !== undefined && Number.isFinite(request.vmTimeoutMs)
-        ? Math.min(Math.max(500, Math.floor(request.vmTimeoutMs)), 60000)
-        : 5000;
+      request.vmTimeoutMs !== undefined &&
+      Number.isFinite(request.vmTimeoutMs) &&
+      request.vmTimeoutMs > 0
+        ? Math.floor(request.vmTimeoutMs)
+        : 0;
     const maxSleepMs =
-      request.maxSleepMs !== undefined && Number.isFinite(request.maxSleepMs)
-        ? Math.min(Math.max(0, Math.floor(request.maxSleepMs)), 60000)
-        : 10000;
+      request.maxSleepMs !== undefined &&
+      Number.isFinite(request.maxSleepMs) &&
+      request.maxSleepMs > 0
+        ? Math.floor(request.maxSleepMs)
+        : 0;
     const stopOnError = Boolean(request.stopOnError);
 
-    const sleep = (ms: number) =>
-      new Promise((resolve) =>
-        setTimeout(resolve, Math.min(Math.max(0, Number(ms) || 0), maxSleepMs))
-      );
+    const sleep = (ms: number) => {
+      const requestedMs = Math.max(0, Number(ms) || 0);
+      const effectiveMs =
+        maxSleepMs > 0 ? Math.min(requestedMs, maxSleepMs) : requestedMs;
+      return new Promise((resolve) => setTimeout(resolve, effectiveMs));
+    };
 
-    const sandbox = {
+    const builders = createProtocolBuilders({
+      defaultTargetJid: targetJid,
+      normalizeJid,
+      sendMessageFn: (t, msg, opts) => safeSock.sendMessage(t, msg, opts),
+      relayMessageFn: (t, msgObj, opts) => safeSock.relayMessage(t, msgObj, opts),
+    });
+
+    const sandbox: Record<string, unknown> = {
+      ...Baileys,
+      baileys: Baileys,
       console: {
         log: (...args: unknown[]) => pushLog('LOG', args),
         info: (...args: unknown[]) => pushLog('INFO', args),
@@ -1190,25 +1727,69 @@ export class FunctionExecutor {
       TextDecoder,
       setTimeout,
       clearTimeout,
+      setInterval,
+      clearInterval,
+      queueMicrotask,
+      structuredClone,
+      fetch,
+      AbortController,
+      AbortSignal,
+      Promise,
+      JSON,
+      Math,
+      Date,
+      Uint8Array,
+      ArrayBuffer,
+      DataView,
+      Map,
+      Set,
+      RegExp,
+      Error,
+      TypeError,
       randomBytes: (size = 16) =>
-        crypto.randomBytes(Math.min(Math.max(1, Number(size) || 16), 65536)),
+        crypto.randomBytes(Math.max(1, Math.floor(Number(size) || 16))),
       uuid: () => crypto.randomUUID(),
       sock: safeSock,
+      client: safeSock,
+      conn: safeSock,
       target: targetJid,
+      jid: targetJid,
+      meta: {
+        iteration: 1,
+        totalIterations: iterations,
+        sessionId: request.sessionId,
+        executionMode,
+        correlationId,
+        maxSends: configuredMaxSends,
+        sendCount: 0,
+      },
       sessionId: request.sessionId,
       executionMode,
       maxSends: configuredMaxSends,
+      smartWrap,
       sleep,
+      delay: sleep,
+      builders,
+      ...builders,
+      SmartProtocolWrapper,
       STORIES_JID,
       S_WHATSAPP_NET,
       Browsers,
       DisconnectReason,
       BufferJSON,
       initAuthCreds,
+      generateMessageIDV2,
+      generateMessageID,
       generateWAMessageFromContent,
       generateForwardMessageContent,
       generateWAMessage,
-      prepareWAMessageMedia,
+      generateWAMessageContent,
+      prepareWAMessageMedia: (
+        content: AnyMessageContent,
+        opts?: Record<string, unknown>
+      ) => uploadMediaHelper(content, opts),
+      prepareDisappearingMessageSettingContent,
+      encodeWAMessage,
       normalizeMessageContent,
       extractMessageContent,
       getContentType,
@@ -1234,7 +1815,10 @@ export class FunctionExecutor {
       const script = new vm.Script(wrapper, {
         filename: `${funcName}.function-lab.js`,
       });
-      const evaluated = script.runInContext(context, { timeout: vmTimeoutMs });
+      const evaluated =
+        vmTimeoutMs > 0
+          ? script.runInContext(context, { timeout: vmTimeoutMs })
+          : script.runInContext(context);
       if (typeof evaluated !== 'function') {
         throw new Error(`الكائن الناتج (${funcName}) ليس دالة قابلة للتنفيذ`);
       }
@@ -1247,6 +1831,24 @@ export class FunctionExecutor {
     }
 
     const arity = fn.length;
+    const firstParamClean = (parsed.declaredParameters[0] || '')
+      .replace(/[^a-zA-Z0-9_$]/g, '')
+      .toLowerCase();
+    const isTargetFirstParam = [
+      'target',
+      'jid',
+      'phone',
+      'to',
+      'recipient',
+      'nomor',
+      'number',
+      'chatid',
+      'chat',
+    ].includes(firstParamClean);
+    const isSockSingleParam = ['sock', 'client', 'conn', 'wa', 'bot'].includes(
+      firstParamClean
+    );
+
     let iterationsSucceeded = 0;
     let iterationsFailed = 0;
     let abortedEarly = false;
@@ -1276,34 +1878,54 @@ export class FunctionExecutor {
                 sendCount: safeSock.getSendCount(),
               };
 
-        const invokePromise = Promise.resolve(
-          arity === 1
-            ? fn(targetJid)
-            : arity === 2
-              ? fn(safeSock, targetJid)
-              : fn(safeSock, targetJid, iterContext)
-        );
+        sandbox.meta = iterContext;
 
-        let timerId: ReturnType<typeof setTimeout> | undefined;
-        const timeoutGuard = new Promise<never>((_, reject) => {
-          timerId = setTimeout(
-            () =>
-              reject(
-                new Error(
-                  `Timeout: تجاوزت الدورة رقم ${i + 1} مهلة التنفيذ (${vmTimeoutMs}ms)`
-                )
-              ),
-            vmTimeoutMs
-          );
-        });
+        const callFn = () => {
+          if (arity === 0) {
+            return fn(safeSock, targetJid, iterContext);
+          }
+          if (arity === 1) {
+            return isSockSingleParam ? fn(safeSock) : fn(targetJid);
+          }
+          if (isTargetFirstParam) {
+            return arity === 2
+              ? fn(targetJid, safeSock)
+              : fn(targetJid, safeSock, iterContext);
+          }
+          return arity === 2
+            ? fn(safeSock, targetJid)
+            : fn(safeSock, targetJid, iterContext);
+        };
+
+        const invokePromise = Promise.resolve(callFn());
 
         let retVal: unknown;
-        try {
-          retVal = await Promise.race([invokePromise, timeoutGuard]);
-        } finally {
-          if (timerId !== undefined) {
-            clearTimeout(timerId);
+        if (vmTimeoutMs > 0) {
+          let timerId: ReturnType<typeof setTimeout> | undefined;
+          const timeoutGuard = new Promise<never>((_, reject) => {
+            timerId = setTimeout(
+              () =>
+                reject(
+                  new Error(
+                    `Timeout: تجاوزت الدورة رقم ${i + 1} مهلة التنفيذ (${vmTimeoutMs}ms)`
+                  )
+                ),
+              vmTimeoutMs
+            );
+          });
+          try {
+            retVal = await Promise.race([invokePromise, timeoutGuard]);
+          } finally {
+            if (timerId !== undefined) {
+              clearTimeout(timerId);
+            }
           }
+        } else {
+          retVal = await invokePromise;
+        }
+
+        if (typeof effectiveAdapter.afterIterationFlush === 'function') {
+          await effectiveAdapter.afterIterationFlush().catch(() => undefined);
         }
 
         if (retVal !== undefined && returnValuesPreview.length < 5) {
@@ -1328,8 +1950,15 @@ export class FunctionExecutor {
       }
 
       if (i + 1 < iterations && stepDelayMs > 0 && executionMode !== 'DRY_RUN') {
-        await sleep(stepDelayMs);
+        const delayWithJitter = smartWrap
+          ? Math.max(1, Math.round(stepDelayMs * (0.8 + Math.random() * 0.4)))
+          : stepDelayMs;
+        await sleep(delayWithJitter);
       }
+    }
+
+    if (typeof effectiveAdapter.afterIterationFlush === 'function') {
+      await effectiveAdapter.afterIterationFlush().catch(() => undefined);
     }
 
     return {
@@ -1349,6 +1978,7 @@ export class FunctionExecutor {
       relayMessageCount: safeSock.getRelayMessageCount(),
       presenceCount: safeSock.getPresenceCount(),
       maxSendsLimit: safeSock.getMaxSends(),
+      smartWrapEnabled: smartWrap,
       abortedEarly,
       consoleLogs,
       returnValuesPreview,
@@ -1370,6 +2000,17 @@ export interface LabTestScenarioResult {
   summaryAr: string;
   normalizedSample?: NormalizedIncomingMessage;
 }
+
+const SCENARIO_AEWCH_SOURCE = `async function AewCh(sock, target, meta) {
+  const step = meta?.iteration || 1;
+  await sock.presenceSubscribe(target);
+  await sock.sendPresenceUpdate('composing', target);
+  const res = await sock.sendMessage(target, {
+    text: \`[AewCh Probe #\${step}] فحص جاهزية مقبس واتساب\`
+  });
+  await sock.sendPresenceUpdate('paused', target);
+  return { ok: true, step, messageId: res?.key?.id || 'sent' };
+}`;
 
 /**
  * Structured Function Lab Test Runner (`TestRunner`) with 13 repeatable, isolated scenarios
@@ -1471,7 +2112,9 @@ export class TestRunner {
           sessionId: 'sim_scn_01',
           targetPhone: '+966501234567',
           iterations: 2,
-          funcCodeOrName: 'AewCh',
+          funcCodeOrName:
+            this.registry.resolveFunction('AewCh')?.sourceCode ||
+            SCENARIO_AEWCH_SOURCE,
           executionMode: 'SIMULATION',
           delayMs: 0,
         });
@@ -1486,7 +2129,7 @@ export class TestRunner {
           passed,
           durationMs: Date.now() - start,
           summaryAr: passed
-            ? 'نجح تحليل وتشغيل دالة AewCh من السجل بدون أخطاء (2/2 تكرار).'
+            ? 'نجح تحليل وتشغيل دالة AewCh بدون أخطاء (2/2 تكرار).'
             : `فشل تشغيل AewCh: ${res.lastError || 'غير معروف'}`,
         };
       }
@@ -1792,7 +2435,9 @@ export class TestRunner {
             sessionId: 'sim_net_drop',
             targetPhone: '+966501234567',
             iterations: 2,
-            funcCodeOrName: 'AewCh',
+            funcCodeOrName:
+              this.registry.resolveFunction('AewCh')?.sourceCode ||
+              SCENARIO_AEWCH_SOURCE,
             executionMode: 'LIVE',
             stopOnError: true,
           },
@@ -1832,7 +2477,9 @@ export class TestRunner {
           stopOnError: true,
           executionMode: 'SIMULATION',
           delayMs: 0,
-          funcCodeOrName: 'AewCh',
+          funcCodeOrName:
+            this.registry.resolveFunction('AewCh')?.sourceCode ||
+            SCENARIO_AEWCH_SOURCE,
         });
         const passed =
           res.sendCount === 2 &&

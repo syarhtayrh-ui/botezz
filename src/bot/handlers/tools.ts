@@ -137,17 +137,22 @@ export class ToolsHandler {
       category: categoryFilter,
       onlyEnabled: true,
     });
-    const currentSelected = this.selectedFunctionByAdmin.get(adminId) || 'AewCh';
+    const currentSelected = this.selectedFunctionByAdmin.get(adminId);
     const recentExecs = this.functionLabRepo.listRecentExecutions({ limit: 5 });
 
-    const fnLines = functions.map((fn, idx) => {
-      const isSelected = fn.name.toLowerCase() === currentSelected.toLowerCase();
-      return (
-        `${idx + 1}. ${isSelected ? '🟢' : '🔹'} *${fn.name}* (\`v${fn.version}\` | \`${fn.category}\`)\n` +
-        `   📝 ${fn.descriptionAr}\n` +
-        `   📦 الاعتماديات: \`${fn.requiredDependencies.join(', ') || 'قياسي'}\``
-      );
-    });
+    const fnLines =
+      functions.length > 0
+        ? functions.map((fn, idx) => {
+            const isSelected =
+              currentSelected && fn.name.toLowerCase() === currentSelected.toLowerCase();
+            return (
+              `${idx + 1}. ${isSelected ? '🟢' : '🔹'} *${fn.name}* (\`v${fn.version}\` | \`${fn.category}\`)\n` +
+              `   📝 ${fn.descriptionAr}`
+            );
+          })
+        : [
+            'ℹ️ *لا توجد دوال محفوظة بعد.* يمكنك حفظ أي دالة مخصصة عبر `/savefunction <name>` بالرد على كود الدالة أو عبر زر **💾 حفظ آخر دالة** بعد التشغيل.',
+          ];
 
     const historyLines =
       recentExecs.length > 0
@@ -161,11 +166,12 @@ export class ToolsHandler {
         : '';
 
     const rows: InlineKeyboardRows = [];
-    for (const fn of functions.slice(0, 6)) {
-      const isSelected = fn.name.toLowerCase() === currentSelected.toLowerCase();
+    for (const fn of functions.slice(0, 8)) {
+      const isSelected =
+        currentSelected && fn.name.toLowerCase() === currentSelected.toLowerCase();
       rows.push([
         {
-          text: `${isSelected ? '✅ مختارة: ' : '📌 اختيار: '}${fn.name} (${fn.category})`,
+          text: `${isSelected ? '✅ مختارة: ' : '📌 اختيار: '}${fn.name}`,
           callbackData: `tools:flab_select:${fn.name}`,
         },
         {
@@ -177,15 +183,9 @@ export class ToolsHandler {
 
     rows.push([
       {
-        text: '🧬 تشغيل سيناريوهات الاختبار (13 سيناريو)',
-        callbackData: 'tools:flab_run_scenarios',
+        text: '💾 حفظ آخر دالة',
+        callbackData: 'tools:flab_prompt_save',
       },
-      {
-        text: '📋 مصفوفة قدرات واتساب',
-        callbackData: 'tools:flab_capabilities',
-      },
-    ]);
-    rows.push([
       {
         text: '🔙 العودة للوحة /testfunction',
         callbackData: 'tools:prompt_testfunction',
@@ -194,14 +194,14 @@ export class ToolsHandler {
 
     return {
       text:
-        `📚 *مكتبة وسجل دوال الاختبار (Function Lab Registry)*\n` +
+        `📚 *دوالي المحفوظة (Saved Custom Functions)*\n` +
         `━━━━━━━━━━━━━━━━━━\n` +
-        `الدالة المختارة حالياً: \`${currentSelected}\`\n` +
-        `إجمالي الدوال المسجلة والصالحة: *${functions.length}*\n\n` +
+        `الدالة المختارة حالياً: \`${currentSelected || 'غير محددة'}\`\n` +
+        `إجمالي الدوال المحفوظة: *${functions.length}*\n\n` +
         fnLines.join('\n\n') +
         historyLines,
       keyboard: rows,
-      toastText: '📚 مكتبة دوال المختبر',
+      toastText: '📚 دوالي المحفوظة',
       route: 'tools:flab_catalog',
     };
   }
@@ -305,9 +305,9 @@ export class ToolsHandler {
       text:
         `🛠️ *الأدوات والفحص المتقدم (Tools & Diagnostics)*\n\n` +
         `اختر الأداة المطلوبة من الأزرار التفاعلية أدناه أو استخدم الأوامر السريعة مباشرة:\n` +
-        `• \`/testfunction <phone> <count> [funcName] [--max=N] [--delay=MS] [--dry-run|--sim]\` — تشغيل واختبار دالة غير متزامنة (\`async function\`) مع تحكم كامل بحد الإرسال (\`الحالي: ${maxLabel}\`)\n` +
-        `• \`/settfmax <N|0>\` — تحديد الحد الأقصى للإرسال يدوياً (أو \`0\` لبلا حد)\n` +
-        `• \`/settfdelay <ms>\` — تحديد الفاصل الزمني بين التكرارات يدوياً\n` +
+        `• \`/testfunction <phone> <count> [funcName]\` — محرك تنفيذ الدوال المخصصة (\`async function\`) بدون قيود (\`الحالي: ${maxLabel}\`)\n` +
+        `• \`/savefunction <name>\` — حفظ دالة مخصصة في مكتبتك الخاصة\n` +
+        `• \`/stopfunction\` — إيقاف فوري لأي دالة قيد التشغيل\n` +
         `• \`/cekidch <link>\` — فحص قناة واتساب واستخراج معرفها وعدد المتابعين\n` +
         `• \`/ceksender\` — فحص مقابس جلسات واتساب والذاكرة المؤقتة (InMemoryStore)\n` +
         `• \`/cekall\` — تقرير شامل (المسؤول + الاشتراكات + الجلسات + موارد الخادم)\n` +
@@ -318,59 +318,55 @@ export class ToolsHandler {
       keyboard: [
         [
           {
-            text: '🧪 مختبر الدوال المتقدم (/testfunction)',
+            text: '🧪 مختبر الدوال (/testfunction)',
             callbackData: 'tools:prompt_testfunction',
           },
           {
-            text: '📚 مكتبة الدوال والسيناريوهات',
+            text: '📚 دوالي المحفوظة',
             callbackData: 'tools:flab_catalog',
           },
         ],
         [
           {
-            text: '🧬 فحص قدرات الرسائل (13 سيناريو)',
-            callbackData: 'tools:flab_run_scenarios',
-          },
-          {
             text: '📡 فحص قناة واتساب (/cekidch)',
             callbackData: 'tools:prompt_channel',
           },
-        ],
-        [
           {
             text: '📱 فحص مقابس الإرسال (/ceksender)',
             callbackData: 'tools:ceksender',
           },
+        ],
+        [
           {
             text: '📊 التقرير الشامل (/cekall)',
             callbackData: 'tools:cekall',
           },
-        ],
-        [
           {
             text: '🌍 تتبع عنوان IP (/trackip)',
             callbackData: 'tools:prompt_ip',
           },
+        ],
+        [
           {
             text: '🔗 اختصار رابط (/shortlink)',
             callbackData: 'tools:prompt_shortlink',
           },
-        ],
-        [
           {
             text: '🪪 بطاقة الحساب (/info)',
             callbackData: 'tools:info',
           },
+        ],
+        [
           {
             text: '🌋 رصد الزلازل (/gempa)',
             callbackData: 'tools:gempa',
           },
-        ],
-        [
           {
             text: '⭐ إدارة الاشتراكات',
             callbackData: 'menu:subscriptions:page:1',
           },
+        ],
+        [
           {
             text: '🛡️ لوحة تحكم المشرف',
             callbackData: 'menu:admin',
@@ -420,146 +416,74 @@ export class ToolsHandler {
     this.inputStates.set(adminId, 'AWAITING_TESTFUNCTION');
     const cfg = this.settingsRepo.getTestFunctionConfig();
     const selectedFn = this.selectedFunctionByAdmin.get(adminId);
-    const selectedMode = this.selectedModeByAdmin.get(adminId) || 'LIVE';
     const maxSendsLabel =
       cfg.maxSends === 0
         ? 'غير محدود (∞ بلا سقف)'
         : `${cfg.maxSends.toLocaleString('en-US')} عملية`;
     const scopeLabel =
       cfg.sessionScope === 'ALL'
-        ? 'جميع الجلسات المتصلة بالتوازي (ALL)'
+        ? 'كل الجلسات (ALL)'
         : cfg.sessionScope === 'FIRST'
-          ? 'الجلسة المتصلة الأولى (FIRST)'
+          ? 'جلسة واحدة (FIRST)'
           : `جلسة محددة (${cfg.sessionScope})`;
-    const errorPolicyLabel = cfg.stopOnError
-      ? '🛑 إيقاف فوري عند أول خطأ (Stop on Error)'
-      : '🔄 الاستمرار وتجاوز الأخطاء (Continue on Error)';
-    const modeLabel =
-      selectedMode === 'DRY_RUN'
-        ? '🧪 فحص جاف (DRY_RUN)'
-        : selectedMode === 'SIMULATION'
-          ? '🔬 محاكاة معزولة (SIMULATION)'
-          : '📡 تنفيذ حي (LIVE)';
 
     return {
       text:
         (noticeBanner ? `${noticeBanner}\n━━━━━━━━━━━━━━━━━━\n` : '') +
-        `🧪 *لوحة التحكم العميق في مختبر الدوال (/testfunction)*\n` +
+        `🧪 *مختبر الدوال المخصصة (/testfunction)*\n` +
         `━━━━━━━━━━━━━━━━━━\n` +
-        `⚙️ *إعدادات التنفيذ الحالية (قابلة للتعديل الفوري):*\n` +
-        `• 🧩 *الدالة المختارة من المكتبة:* \`${selectedFn || 'تلقائي (بالرد أو بالاسم مثل AewCh)'}\`\n` +
-        `• 🎛️ *وضع التشغيل (Execution Mode):* ${modeLabel}\n` +
-        `• 📤 *الحد الأقصى للإرسال (Max Sends):* \`${maxSendsLabel}\`\n` +
-        `• ⏱️ *التأخير بين التكرارات (Loop Delay):* \`${cfg.delayMs}ms\`\n` +
-        `• 📡 *نطاق الجلسات (Session Scope):* \`${scopeLabel}\`\n` +
-        `• 🛡️ *سياسة الأخطاء (Error Policy):* ${errorPolicyLabel}\n` +
-        `• ⌛ *مهلة Sandbox VM:* \`${cfg.vmTimeoutMs}ms\` | *التقاط Console:* \`${cfg.captureConsole ? 'مفعل' : 'معطل'}\`\n\n` +
-        `📌 *طرق التشغيل والتحكم المتقدم:*\n` +
-        `1️⃣ *بتحديد اسم الدالة المسجلة مباشرة (مثل \`AewCh\`):*\n` +
-        `\`/testfunction +966501234567 5 AewCh\`\n` +
-        `2️⃣ *بالرد على رسالة كود أو إرسال كود أو رفع ملف (\`.js\` / \`.txt\`):*\n` +
-        `\`/testfunction +966501234567 10 --max=2500 --delay=100 --session=ALL --stop-on-error\`\n` +
-        `3️⃣ *لحفظ دالة مخصصة في المكتبة أو إيقاف دالة جارية:*\n` +
-        `\`/savefunction MyFunc\` (بالرد على الكود) | \`/stopfunction\`\n` +
-        `4️⃣ *وضع الفحص الجاف أو المحاكاة بدون إرسال حقيقي:*\n` +
-        `\`/testfunction +966501234567 3 AewCh --dry-run\` أو \`--sim\``,
+        `⚙️ *الحالة الحالية:*\n` +
+        `• 🧩 *الدالة المختارة:* \`${selectedFn || 'تلقائي (بالرد أو الإرسال المباشر)'}\`\n` +
+        `• 🛡️ *التغليف الذكي (Smart Protocol Wrapper):* \`${cfg.smartWrap ? 'مفعل ✅' : 'معطل ❌'}\`\n` +
+        `• 📤 *حد الإرسال:* \`${maxSendsLabel}\` | ⏱️ *الفاصل:* \`${cfg.delayMs}ms\`\n` +
+        `• 📡 *النطاق:* \`${scopeLabel}\` | 🔄 *عند الخطأ:* \`${cfg.stopOnError ? 'إيقاف' : 'استمرار'}\`\n\n` +
+        `📌 *طرق تشغيل دالتك المخصصة مباشرة:*\n` +
+        `1️⃣ *بالرد (Reply) على كود الدالة:* \`/testfunction <phone> <count>\`\n` +
+        `2️⃣ *بإرسال الكود مباشرة أو رفع ملف (\`.js\` / \`.txt\`):*\n` +
+        `\`/testfunction +966501234567 5 async function myFn(sock, target) { ... }\`\n` +
+        `3️⃣ *بتشغيل دالة محفوظة بالاسم:* \`/testfunction <phone> <count> <SavedName>\`\n` +
+        `4️⃣ *لحفظ دالتك أو إيقاف التنفيذ:* \`/savefunction <name>\` | \`/stopfunction\``,
       keyboard: [
         [
           {
-            text: '⚡ تشغيل دالة فحص تجريبية جاهزة',
-            callbackData: 'tools:run_sample_testfunction',
-          },
-          {
-            text: '🚀 فحص دالة AewCh (Dry-Run)',
-            callbackData: 'tools:flab_dryrun:AewCh',
-          },
-        ],
-        [
-          {
-            text: '📚 مكتبة الدوال المسجلة (Catalog)',
+            text: '📚 دوالي المحفوظة (Saved Functions)',
             callbackData: 'tools:flab_catalog',
           },
           {
-            text: '🔢 تحديد حد الإرسال يدوياً',
-            callbackData: 'tools:tf_prompt_max',
-          },
-        ],
-        [
-          {
-            text: '💾 حفظ آخر دالة في المكتبة',
+            text: '💾 حفظ آخر دالة',
             callbackData: 'tools:flab_prompt_save',
           },
+        ],
+        [
           {
-            text: '🛑 إيقاف الدالة الجارية',
+            text: '🛑 إيقاف التنفيذ الجاري',
             callbackData: 'tools:flab_stop',
           },
-        ],
-        [
           {
-            text: selectedMode === 'LIVE' ? '✅ وضع: LIVE' : 'وضع: LIVE',
-            callbackData: 'tools:flab_mode:LIVE',
-          },
-          {
-            text: selectedMode === 'DRY_RUN' ? '✅ وضع: DRY_RUN' : 'وضع: DRY_RUN',
-            callbackData: 'tools:flab_mode:DRY_RUN',
-          },
-          {
-            text: selectedMode === 'SIMULATION' ? '✅ وضع: SIM' : 'وضع: SIM',
-            callbackData: 'tools:flab_mode:SIMULATION',
+            text: `🛡️ التغليف الذكي: ${cfg.smartWrap ? 'مفعل' : 'معطل'}`,
+            callbackData: 'tools:tf_toggle_smart_wrap',
           },
         ],
         [
           {
-            text: cfg.maxSends === 100 ? '✅ حد: 100' : 'حد: 100',
-            callbackData: 'tools:tf_set_max:100',
-          },
-          {
-            text: cfg.maxSends === 500 ? '✅ حد: 500' : 'حد: 500',
-            callbackData: 'tools:tf_set_max:500',
-          },
-          {
-            text: cfg.maxSends === 2000 ? '✅ حد: 2000' : 'حد: 2000',
-            callbackData: 'tools:tf_set_max:2000',
-          },
-          {
-            text: cfg.maxSends === 0 ? '✅ حد: ∞ مفتوح' : 'حد: ∞ مفتوح',
-            callbackData: 'tools:tf_set_max:0',
-          },
-        ],
-        [
-          {
-            text: cfg.delayMs === 0 ? '✅ تأخير: 0ms' : 'تأخير: 0ms',
-            callbackData: 'tools:tf_set_delay:0',
-          },
-          {
-            text: cfg.delayMs === 200 ? '✅ تأخير: 200ms' : 'تأخير: 200ms',
-            callbackData: 'tools:tf_set_delay:200',
-          },
-          {
-            text: cfg.delayMs === 1000 ? '✅ تأخير: 1000ms' : 'تأخير: 1000ms',
-            callbackData: 'tools:tf_set_delay:1000',
-          },
-          {
-            text: '⏱️ تأخير يدوي',
+            text: `⏱️ الفاصل الزمني (${cfg.delayMs}ms)`,
             callbackData: 'tools:tf_prompt_delay',
           },
+          {
+            text: `📡 النطاق: ${cfg.sessionScope === 'ALL' ? 'كل الجلسات (ALL)' : 'جلسة واحدة (FIRST)'}`,
+            callbackData: 'tools:tf_toggle_scope',
+          },
         ],
         [
           {
-            text:
-              cfg.sessionScope === 'ALL'
-                ? '📡 النطاق: كل الجلسات (ALL)'
-                : '📡 النطاق: جلسة واحدة (FIRST)',
-            callbackData: 'tools:tf_toggle_scope',
-          },
-          {
-            text: cfg.stopOnError
-              ? '🛑 عند الخطأ: إيقاف فوري'
-              : '🔄 عند الخطأ: استمرار',
+            text: `🔄 عند الخطأ: ${cfg.stopOnError ? 'إيقاف' : 'استمرار'}`,
             callbackData: 'tools:tf_toggle_stop_on_error',
           },
+          {
+            text: '🔙 رجوع للأدوات',
+            callbackData: 'menu:tools',
+          },
         ],
-        buildBackCancelRow('menu:tools'),
       ],
     };
   }
@@ -572,7 +496,7 @@ export class ToolsHandler {
         `🔢 *تحديد الحد الأقصى لعمليات الإرسال يدوياً (Manual Max Sends)*\n\n` +
         `الحد الحالي: \`${current === 0 ? 'غير محدود (0)' : current}\`\n\n` +
         `أرسل الآن الرقم المطلوب للحد الأقصى لعمليات المقبس (\`sendMessage\` / \`relayMessage\`) في كل تشغيل:\n` +
-        `• أرسل أي رقم بين \`1\` و \`100000\` (مثلاً: \`1500\` أو \`5000\`)\n` +
+        `• أرسل أي رقم موجب (مثلاً: \`1500\` أو \`500000\`)\n` +
         `• أو أرسل \`0\` لإلغاء الحد الأقصى نهائياً (غير محدود ∞):`,
       keyboard: [buildBackCancelRow('tools:prompt_testfunction')],
     };
@@ -585,7 +509,7 @@ export class ToolsHandler {
       text:
         `⏱️ *تحديد مهلة التأخير بين التكرارات يدوياً (Iteration Delay)*\n\n` +
         `التأخير الحالي: \`${current}ms\`\n\n` +
-        `أرسل الآن قيمة التأخير بالمللي ثانية بين \`0\` و \`60000\` (مثلاً: \`0\` للتنفيذ الفوري أو \`500\` لنصف ثانية):`,
+        `أرسل الآن قيمة التأخير بالمللي ثانية (\`0\` للتنفيذ الفوري أو أي رقم موجب مثل \`500\`):`,
       keyboard: [buildBackCancelRow('tools:prompt_testfunction')],
     };
   }
@@ -678,6 +602,23 @@ export class ToolsHandler {
     return this.promptTestFunction(
       adminId,
       `✅ *تم تحديث سياسة الأخطاء إلى:* ${nextVal ? '🛑 إيقاف فوري عند أول خطأ' : '🔄 الاستمرار وتجاوز الأخطاء'}`
+    );
+  }
+
+  public toggleSmartWrapConfig(adminId: number): BotViewResponse {
+    const current = this.settingsRepo.getTestFunctionConfig();
+    const nextVal = !current.smartWrap;
+    this.settingsRepo.updateTestFunctionConfig({ smartWrap: nextVal });
+    this.auditRepo.record({
+      actorTelegramId: adminId,
+      action: 'TESTFUNCTION_CONFIG_UPDATED',
+      targetId: 'smartWrap',
+      outcome: 'SUCCESS',
+      metadata: { smartWrap: nextVal },
+    });
+    return this.promptTestFunction(
+      adminId,
+      `✅ *تم ${nextVal ? 'تفعيل 🛡️' : 'تعطيل ⚠️'} التغليف الذكي للبروتوكول (Smart Protocol Wrapper).*`
     );
   }
 
@@ -940,6 +881,7 @@ export class ToolsHandler {
       let effectiveVmTimeoutMs = savedConfig.vmTimeoutMs;
       let effectiveScope = savedConfig.sessionScope;
       let effectiveStopOnError = savedConfig.stopOnError;
+      let effectiveSmartWrap = savedConfig.smartWrap ?? true;
       let effectiveMode: FunctionExecutionMode =
         this.selectedModeByAdmin.get(adminId) || 'LIVE';
 
@@ -951,19 +893,23 @@ export class ToolsHandler {
           } else {
             const parsedMax = parseInt(valRaw, 10);
             if (!Number.isNaN(parsedMax) && parsedMax >= 0) {
-              effectiveMaxSends = Math.min(100000, parsedMax);
+              effectiveMaxSends = parsedMax;
             }
           }
         } else if (tok.startsWith('--delay=')) {
           const parsedDelay = parseInt(tok.split('=')[1] || '', 10);
           if (!Number.isNaN(parsedDelay) && parsedDelay >= 0) {
-            effectiveDelayMs = Math.min(60000, parsedDelay);
+            effectiveDelayMs = parsedDelay;
           }
         } else if (tok.startsWith('--timeout=')) {
           const parsedTimeout = parseInt(tok.split('=')[1] || '', 10);
-          if (!Number.isNaN(parsedTimeout) && parsedTimeout >= 500) {
-            effectiveVmTimeoutMs = Math.min(60000, parsedTimeout);
+          if (!Number.isNaN(parsedTimeout) && parsedTimeout >= 0) {
+            effectiveVmTimeoutMs = parsedTimeout;
           }
+        } else if (tok === '--smart-wrap') {
+          effectiveSmartWrap = true;
+        } else if (tok === '--no-smart-wrap') {
+          effectiveSmartWrap = false;
         } else if (tok.startsWith('--session=') || tok.startsWith('--scope=')) {
           const scopeVal = (tok.split('=')[1] || '').trim();
           if (scopeVal) {
@@ -994,7 +940,7 @@ export class ToolsHandler {
         }
       }
 
-      // Support single-argument function selection: `/testfunction AewCh`
+      // Support single-argument function selection: `/testfunction SavedFn`
       if (positionalTokens.length === 1 && !repliedText && !inlineFuncCode) {
         const candidateFn = this.functionRegistry.resolveFunction(positionalTokens[0]);
         if (candidateFn) {
@@ -1035,28 +981,22 @@ export class ToolsHandler {
           text:
             `🪧 *صيغة الأمر غير مكتملة (/testfunction)*\n\n` +
             `الصيغة المطلوبة:\n` +
-            `• \`/testfunction +966501234567 5 AewCh\` (لتشغيل دالة مسجلة بالاسم)\n` +
-            `• \`/testfunction 966501234567 5\` (مع الرد على رسالة الدالة \`async function\`)\n` +
+            `• \`/testfunction +966501234567 5\` (مع الرد على رسالة الدالة \`async function\`)\n` +
+            `• \`/testfunction +966501234567 5 SavedFunc\` (لتشغيل دالة محفوظة بالاسم)\n` +
             `• أو مع خيارات التحكم المتقدم:\n` +
-            `\`/testfunction 966501234567 10 --max=2000 --delay=100 --session=ALL --dry-run async function myFunc(sock, target) { ... }\``,
+            `\`/testfunction 966501234567 10 --delay=100 --session=ALL async function myFunc(sock, target) { ... }\``,
           keyboard: [
             [
               {
-                text: '⚡ تشغيل دالة فحص تجريبية',
-                callbackData: 'tools:run_sample_testfunction',
-              },
-              {
-                text: '📚 مكتبة الدوال (AewCh)',
+                text: '📚 دوالي المحفوظة',
                 callbackData: 'tools:flab_catalog',
               },
-            ],
-            [
               {
                 text: '⚙️ لوحة إعدادات /testfunction',
                 callbackData: 'tools:prompt_testfunction',
               },
-              { text: '🔙 قائمة الأدوات', callbackData: 'menu:tools' },
             ],
+            [{ text: '🔙 قائمة الأدوات', callbackData: 'menu:tools' }],
           ],
         };
       }
@@ -1078,7 +1018,7 @@ export class ToolsHandler {
         };
       }
 
-      const iterations = Math.max(1, Math.min(parsedCount, 10000));
+      const iterations = Math.max(1, Math.floor(parsedCount));
       const namedFuncToken = positionalTokens[2];
       const adminSelectedFn = this.selectedFunctionByAdmin.get(adminId);
 
@@ -1248,8 +1188,10 @@ export class ToolsHandler {
                 maxSends: effectiveMaxSends,
                 delayMs: effectiveDelayMs,
                 vmTimeoutMs: effectiveVmTimeoutMs,
+                maxSleepMs: savedConfig.maxSleepMs,
                 stopOnError: effectiveStopOnError,
                 captureConsole: savedConfig.captureConsole,
+                smartWrap: effectiveSmartWrap,
                 correlationId,
                 abortSignal: abortController.signal,
               });
@@ -1265,8 +1207,10 @@ export class ToolsHandler {
               maxSends: effectiveMaxSends,
               delayMs: effectiveDelayMs,
               vmTimeoutMs: effectiveVmTimeoutMs,
+              maxSleepMs: savedConfig.maxSleepMs,
               stopOnError: effectiveStopOnError,
               captureConsole: savedConfig.captureConsole,
+              smartWrap: effectiveSmartWrap,
               correlationId,
               abortSignal: abortController.signal,
             });

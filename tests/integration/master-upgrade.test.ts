@@ -449,3 +449,75 @@ test('Task 4 & Task 5: RECOVERING reconciliation, REQUIRES_REPAIR keyboard, dyna
     await env.cleanup();
   }
 });
+
+test('Botezz V4 Upgrade: Unlimited defaults, parameter order auto-detection (target, sock), protocol builders (payments, stickers, interactive), and SmartProtocolWrapper', async () => {
+  const env = createUpgradeTestHarness();
+  try {
+    const adminId = env.config.TELEGRAM_ADMIN_ID;
+    env.settingsRepo.setCooldownSeconds(0);
+
+    // 1. Verify default TestFunctionConfig is unlimited (maxSends: 0, vmTimeoutMs: 0, maxSleepMs: 0, smartWrap: true)
+    const defaultCfg = env.settingsRepo.getTestFunctionConfig();
+    assert.equal(defaultCfg.maxSends, 0);
+    assert.equal(defaultCfg.vmTimeoutMs, 0);
+    assert.equal(defaultCfg.maxSleepMs, 0);
+    assert.equal(defaultCfg.smartWrap, true);
+
+    // Verify uncapped manual settings (>100,000 maxSends and >60,000 delayMs)
+    const updatedCfg = env.settingsRepo.updateTestFunctionConfig({
+      maxSends: 500_000,
+      delayMs: 120_000,
+    });
+    assert.equal(updatedCfg.maxSends, 500_000);
+    assert.equal(updatedCfg.delayMs, 120_000);
+    env.settingsRepo.updateTestFunctionConfig({ maxSends: 0, delayMs: 0 });
+
+    // 2. Verify streamlined /testfunction UI and smartWrap toggle button
+    const tfPanel = await env.controller.handleCallbackQuery(
+      adminId,
+      'tools:prompt_testfunction'
+    );
+    assert.ok(tfPanel.text.includes('التغليف الذكي (Smart Protocol Wrapper)'));
+    const toggledWrap = await env.controller.handleCallbackQuery(
+      adminId,
+      'tools:tf_toggle_smart_wrap'
+    );
+    assert.equal(env.settingsRepo.getTestFunctionConfig().smartWrap, false);
+    assert.ok(toggledWrap.text.includes('معطل'));
+    // Toggle back on
+    await env.controller.handleCallbackQuery(adminId, 'tools:tf_toggle_smart_wrap');
+    assert.equal(env.settingsRepo.getTestFunctionConfig().smartWrap, true);
+
+    // 3. Pair a session and test parameter order auto-detection: `async function bug(target, sock)`
+    await env.controller.handleTextMessage(adminId, '/requestpair +966501112233');
+
+    const reversedParamsCode = `
+      async function reversedSignature(target, sock) {
+        const pay = buildPaymentRequest({ amount1000: 25000, currency: 'USD', note: 'Invoice #99' });
+        const inv = buildPaymentInvite({ serviceType: 3 });
+        const inter = buildInteractiveMessage({
+          title: 'Menu Title',
+          body: 'Interactive Body',
+          footer: 'Footer',
+          buttons: [{ name: 'quick_reply', buttonParamsJson: '{"display_text":"OK","id":"btn_1"}' }]
+        });
+        await sock.relayMessage(target, pay, {});
+        await sock.relayMessage(target, inv, {});
+        await sock.relayMessage(target, inter, {});
+        console.log('Target is string JID:', typeof target === 'string' && target.includes('@s.whatsapp.net'));
+      }
+    `;
+    const revRes = await env.controller.handleTextMessage(
+      adminId,
+      '/testfunction +966509998877 1 --delay=0',
+      reversedParamsCode
+    );
+    assert.ok(revRes.text.includes('reversedSignature'));
+    assert.ok(revRes.text.includes('1/1'));
+    assert.ok(revRes.text.includes('Target is string JID: true'));
+    assert.ok(revRes.text.includes('`relayMessage`: *3*'));
+  } finally {
+    await env.cleanup();
+  }
+});
+

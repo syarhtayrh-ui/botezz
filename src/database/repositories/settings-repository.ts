@@ -22,13 +22,13 @@ export interface ClaimGroupEntry {
 }
 
 export interface TestFunctionConfig {
-  /** Maximum socket sends per execution (0 = unlimited, 1..100000). Default: 500 */
+  /** Maximum socket sends per execution (0 = unlimited). Default: 0 */
   maxSends: number;
-  /** Delay in milliseconds between loop iterations (0..60000). Default: 200 */
+  /** Delay in milliseconds between loop iterations (0 = immediate). Default: 200 */
   delayMs: number;
-  /** VM sandbox timeout in milliseconds (500..60000). Default: 5000 */
+  /** VM sandbox timeout in milliseconds (0 = no timeout). Default: 0 */
   vmTimeoutMs: number;
-  /** Maximum sleep(ms) allowed inside sandbox per call (0..60000). Default: 10000 */
+  /** Maximum sleep(ms) allowed inside sandbox per call (0 = no cap). Default: 0 */
   maxSleepMs: number;
   /** Session execution scope: 'FIRST' (first connected), 'ALL' (all connected in parallel), or specific sessionId */
   sessionScope: 'FIRST' | 'ALL' | string;
@@ -36,16 +36,19 @@ export interface TestFunctionConfig {
   stopOnError: boolean;
   /** Whether to capture console.log/warn/error output inside the VM sandbox */
   captureConsole: boolean;
+  /** Whether Smart Protocol Delivery Wrapper & Anti-Detection Engine is enabled (default: true) */
+  smartWrap: boolean;
 }
 
 export const DEFAULT_TEST_FUNCTION_CONFIG: TestFunctionConfig = {
-  maxSends: 500,
+  maxSends: 0,
   delayMs: 200,
-  vmTimeoutMs: 5000,
-  maxSleepMs: 10000,
+  vmTimeoutMs: 0,
+  maxSleepMs: 0,
   sessionScope: 'FIRST',
   stopOnError: false,
   captureConsole: true,
+  smartWrap: true,
 };
 
 const PREMIUM_SUBSCRIPTIONS_KEY = 'nebula_premium_subscriptions_json';
@@ -98,25 +101,25 @@ export class SettingsRepository {
           typeof parsed.maxSends === 'number' &&
           Number.isFinite(parsed.maxSends) &&
           parsed.maxSends >= 0
-            ? Math.min(100000, Math.floor(parsed.maxSends))
+            ? Math.floor(parsed.maxSends)
             : DEFAULT_TEST_FUNCTION_CONFIG.maxSends,
         delayMs:
           typeof parsed.delayMs === 'number' &&
           Number.isFinite(parsed.delayMs) &&
           parsed.delayMs >= 0
-            ? Math.min(60000, Math.floor(parsed.delayMs))
+            ? Math.floor(parsed.delayMs)
             : DEFAULT_TEST_FUNCTION_CONFIG.delayMs,
         vmTimeoutMs:
           typeof parsed.vmTimeoutMs === 'number' &&
           Number.isFinite(parsed.vmTimeoutMs) &&
-          parsed.vmTimeoutMs >= 500
-            ? Math.min(60000, Math.floor(parsed.vmTimeoutMs))
+          parsed.vmTimeoutMs >= 0
+            ? Math.floor(parsed.vmTimeoutMs)
             : DEFAULT_TEST_FUNCTION_CONFIG.vmTimeoutMs,
         maxSleepMs:
           typeof parsed.maxSleepMs === 'number' &&
           Number.isFinite(parsed.maxSleepMs) &&
           parsed.maxSleepMs >= 0
-            ? Math.min(60000, Math.floor(parsed.maxSleepMs))
+            ? Math.floor(parsed.maxSleepMs)
             : DEFAULT_TEST_FUNCTION_CONFIG.maxSleepMs,
         sessionScope:
           typeof parsed.sessionScope === 'string' && parsed.sessionScope.trim()
@@ -130,6 +133,10 @@ export class SettingsRepository {
           typeof parsed.captureConsole === 'boolean'
             ? parsed.captureConsole
             : DEFAULT_TEST_FUNCTION_CONFIG.captureConsole,
+        smartWrap:
+          typeof parsed.smartWrap === 'boolean'
+            ? parsed.smartWrap
+            : DEFAULT_TEST_FUNCTION_CONFIG.smartWrap,
       };
     } catch {
       return { ...DEFAULT_TEST_FUNCTION_CONFIG };
@@ -145,30 +152,33 @@ export class SettingsRepository {
       ...partial,
     };
 
-    if (!Number.isFinite(next.maxSends) || next.maxSends < 0 || next.maxSends > 100000) {
+    if (!Number.isFinite(next.maxSends) || next.maxSends < 0) {
       throw new ValidationError(
-        'الحد الأقصى للإرسال (maxSends) يجب أن يكون رقماً بين 1 و 100000 (أو 0 لإلغاء الحد الأقصى).'
+        'الحد الأقصى للإرسال (maxSends) يجب أن يكون 0 (بلا حد) أو رقماً موجباً.'
       );
     }
     next.maxSends = Math.floor(next.maxSends);
 
-    if (!Number.isFinite(next.delayMs) || next.delayMs < 0 || next.delayMs > 60000) {
+    if (!Number.isFinite(next.delayMs) || next.delayMs < 0) {
       throw new ValidationError(
-        'مهلة التأخير بين التكرارات (delayMs) يجب أن تكون بين 0 و 60000 مللي ثانية.'
+        'مهلة التأخير بين التكرارات (delayMs) يجب أن تكون 0 أو رقماً موجباً بالمللي ثانية.'
       );
     }
     next.delayMs = Math.floor(next.delayMs);
 
-    if (
-      !Number.isFinite(next.vmTimeoutMs) ||
-      next.vmTimeoutMs < 500 ||
-      next.vmTimeoutMs > 60000
-    ) {
+    if (!Number.isFinite(next.vmTimeoutMs) || next.vmTimeoutMs < 0) {
       throw new ValidationError(
-        'مهلة تقييم الدالة (vmTimeoutMs) يجب أن تكون بين 500 و 60000 مللي ثانية.'
+        'مهلة تقييم الدالة (vmTimeoutMs) يجب أن تكون 0 (بلا مهلة) أو رقماً موجباً بالمللي ثانية.'
       );
     }
     next.vmTimeoutMs = Math.floor(next.vmTimeoutMs);
+
+    if (!Number.isFinite(next.maxSleepMs) || next.maxSleepMs < 0) {
+      throw new ValidationError(
+        'الحد الأقصى لدالة sleep داخل البيئة المعزولة يجب أن يكون 0 (بلا سقف) أو رقماً موجباً.'
+      );
+    }
+    next.maxSleepMs = Math.floor(next.maxSleepMs);
 
     this.set(TEST_FUNCTION_CONFIG_KEY, JSON.stringify(next));
     return next;

@@ -317,6 +317,15 @@ declare module 'athanasia-baileys' {
     fetchStatus?(...jids: string[]): Promise<unknown>;
     profilePictureUrl?(jid: string, type?: 'preview' | 'image', timeoutMs?: number): Promise<string | undefined>;
     updateProfileStatus?(status: string): Promise<void>;
+    uploadPreKeysToServerIfRequired?(): Promise<void>;
+    sendPassiveIq?(tag: string): Promise<void>;
+    sendNode?(frame: Record<string, unknown>): Promise<void>;
+    query?(node: Record<string, unknown>, timeoutMs?: number): Promise<Record<string, unknown>>;
+    waUploadToServer?: (
+      filePath: string,
+      opts: { mediaType: string; fileEncSha256B64: string; timeoutMs?: number }
+    ) => Promise<{ mediaUrl: string; directPath: string; handle?: string }>;
+    generateMessageTag?(): string;
     end(error?: Error): void;
     logout(msg?: string): Promise<void>;
     [key: string]: unknown;
@@ -368,6 +377,9 @@ declare module 'athanasia-baileys' {
   export function fetchLatestWaWebVersion(
     options?: Record<string, unknown>
   ): Promise<{ version: [number, number, number]; isLatest: boolean; error?: unknown }>;
+
+  export function generateMessageIDV2(userId?: string): string;
+  export function generateMessageID(): string;
 
   export function jidEncode(
     user: string | number | null | undefined,
@@ -431,10 +443,21 @@ declare module 'athanasia-baileys' {
     options?: Record<string, unknown>
   ): Promise<WAMessage>;
 
+  export function generateWAMessageContent(
+    message: AnyMessageContent,
+    options?: Record<string, unknown>
+  ): Promise<proto.IMessage>;
+
   export function prepareWAMessageMedia(
     message: AnyMessageContent,
     options?: Record<string, unknown>
   ): Promise<proto.IMessage>;
+
+  export function prepareDisappearingMessageSettingContent(
+    ephemeralExpiration?: number
+  ): proto.IMessage;
+
+  export function encodeWAMessage(message: proto.IMessage): Uint8Array;
 
   export function makeWASocket(config: UserFacingSocketConfig): WASocket;
   export default makeWASocket;

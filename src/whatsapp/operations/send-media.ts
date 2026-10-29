@@ -77,7 +77,7 @@ export class SendMediaOperation {
         sessionId: input.sessionId,
         targetJid,
         content: capPayload,
-        maxRetries: 1,
+        maxRetries: 0,
       },
       {
         isConnected: () => true,

@@ -42,7 +42,7 @@ export class SendMessageOperation {
         sessionId: input.sessionId,
         targetJid,
         content: { text: validText },
-        maxRetries: 1,
+        maxRetries: 0,
       },
       {
         isConnected: () => true,

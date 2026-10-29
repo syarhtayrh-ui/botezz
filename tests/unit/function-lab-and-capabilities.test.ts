@@ -129,6 +129,13 @@ test('Regression: AewCh Function Lab failure root causes (cross-realm VM errors,
     const drv = sessionManager.getDriver(sessions[0].id) as MockWhatsAppSessionDriver;
     drv.completeSimulatedPairing();
 
+    // Save `AewCh` as a custom function first (since built-in demo functions are empty by design)
+    await controller.handleTextMessage(
+      adminId,
+      '/savefunction AewCh',
+      'async function AewCh(sock, target, meta) { await sock.sendMessage(target, { text: "AewCh saved probe" }); }'
+    );
+
     // Workflow A: User opens Function Lab catalog, selects `AewCh`, and sends `/testfunction`
     const catalogView = await controller.handleCallbackQuery(
       adminId,
@@ -194,6 +201,10 @@ test('Function Lab TestRunner executes all 13 scenarios with 100% pass rate and 
     assert.equal(suiteReport.failed, 0);
 
     // Verify duplicate registration guard when allowUpdateExisting = false
+    registry.registerFunction({
+      name: 'AewCh',
+      sourceCode: 'async function AewCh(sock, target) {}',
+    });
     assert.throws(
       () =>
         registry.registerFunction({
@@ -484,6 +495,10 @@ test('SQLite Migration 003 supports safe rollback and re-application without aff
     db.runMigrations();
     const repo = new FunctionLabRepository(db);
     const registry = new FunctionRegistry(repo);
+    registry.registerFunction({
+      name: 'AewCh',
+      sourceCode: 'async function AewCh(sock, target) { await sock.sendMessage(target, { text: "ok" }); }',
+    });
     assert.ok(registry.resolveFunction('AewCh'));
   } finally {
     db.close();
