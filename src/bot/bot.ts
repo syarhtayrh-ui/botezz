@@ -654,11 +654,50 @@ export class TelegramBotController {
     }
     if (callbackData === 'tools:run_sample_testfunction') {
       this.cancelAllWorkflowsForAdmin(actorUserId);
+      const fallbackMode =
+        this.deps.sessionManager.listConnectedSessions().length === 0
+          ? '--mode=SIMULATION'
+          : '';
       return this.toolsHandler.executeTestFunction(
         actorUserId,
-        '+966501234567 2',
+        `+966501234567 2 ${fallbackMode}`.trim(),
         DEFAULT_SAMPLE_TEST_FUNCTION
       );
+    }
+    if (callbackData === 'tools:flab_catalog') {
+      this.cancelAllWorkflowsForAdmin(actorUserId);
+      return this.toolsHandler.renderFunctionCatalog(actorUserId);
+    }
+    if (callbackData.startsWith('tools:flab_select:')) {
+      const fnName = callbackData.slice('tools:flab_select:'.length);
+      this.activeConversationMode.set(actorUserId, 'TOOLS');
+      return this.toolsHandler.selectFunctionForAdmin(actorUserId, fnName);
+    }
+    if (callbackData.startsWith('tools:flab_dryrun:')) {
+      const fnName = callbackData.slice('tools:flab_dryrun:'.length);
+      this.cancelAllWorkflowsForAdmin(actorUserId);
+      return this.toolsHandler.executeTestFunction(
+        actorUserId,
+        `+966501234567 1 ${fnName} --dry-run`
+      );
+    }
+    if (callbackData.startsWith('tools:flab_mode:')) {
+      const modeVal = callbackData
+        .slice('tools:flab_mode:'.length)
+        .toUpperCase() as 'LIVE' | 'DRY_RUN' | 'SIMULATION';
+      this.activeConversationMode.set(actorUserId, 'TOOLS');
+      return this.toolsHandler.setExecutionModeForAdmin(actorUserId, modeVal);
+    }
+    if (
+      callbackData === 'tools:flab_run_scenarios' ||
+      callbackData === 'tools:flab_scenarios'
+    ) {
+      this.cancelAllWorkflowsForAdmin(actorUserId);
+      return this.toolsHandler.renderScenarioSuiteReport(actorUserId);
+    }
+    if (callbackData === 'tools:flab_capabilities') {
+      this.cancelAllWorkflowsForAdmin(actorUserId);
+      return this.toolsHandler.renderCapabilitiesMatrix();
     }
     if (callbackData === 'tools:prompt_channel') {
       this.cancelAllWorkflowsForAdmin(actorUserId);
@@ -885,14 +924,22 @@ export class TelegramBotController {
       }
 
       if (command === '/testfunction') {
-        if (args.length === 0) {
+        const rawArgsAfterCommand = trimmed.replace(/^\/\S+\s*/, '');
+        if (!rawArgsAfterCommand) {
+          if (repliedText || this.toolsHandler.getSelectedFunction(actorUserId)) {
+            return this.toolsHandler.executeTestFunction(
+              actorUserId,
+              '',
+              repliedText
+            );
+          }
           this.cancelAllWorkflowsForAdmin(actorUserId);
           this.activeConversationMode.set(actorUserId, 'TOOLS');
           return this.toolsHandler.promptTestFunction(actorUserId);
         }
         return this.toolsHandler.executeTestFunction(
           actorUserId,
-          args.join(' '),
+          rawArgsAfterCommand,
           repliedText
         );
       }

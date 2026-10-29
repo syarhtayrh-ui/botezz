@@ -3,6 +3,16 @@ import path from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 import { INITIAL_MIGRATION_ID, INITIAL_MIGRATION_SQL } from './migrations/001_initial';
 import { MIGRATION_002_ID, MIGRATION_002_SQL } from './migrations/002_session_lifecycle';
+import {
+  MIGRATION_003_ID,
+  MIGRATION_003_UP_SQL,
+  MIGRATION_003_DOWN_SQL,
+} from './migrations/003_function_lab_and_message_capabilities';
+import {
+  MIGRATION_004_ID,
+  MIGRATION_004_UP_SQL,
+  MIGRATION_004_DOWN_SQL,
+} from './migrations/004_session_lifecycle_hardening';
 import { DatabaseError } from '../utils/errors';
 import { createLogger } from '../logging/logger';
 
@@ -78,6 +88,78 @@ export class AppDatabase {
         this.sqlite.exec('PRAGMA foreign_keys = ON;');
       }
     }
+
+    const existing003 = checkStmt.get(MIGRATION_003_ID) as { id: string } | undefined;
+    if (!existing003) {
+      this.runInTransaction(() => {
+        this.sqlite.exec(MIGRATION_003_UP_SQL);
+        const insertStmt = this.sqlite.prepare(
+          'INSERT INTO schema_migrations (id, applied_at) VALUES (?, ?)'
+        );
+        insertStmt.run(MIGRATION_003_ID, new Date().toISOString());
+      });
+      log.info('Database migration applied', { migrationId: MIGRATION_003_ID });
+    }
+
+    const existing004 = checkStmt.get(MIGRATION_004_ID) as { id: string } | undefined;
+    if (!existing004) {
+      this.sqlite.exec('PRAGMA foreign_keys = OFF;');
+      try {
+        this.runInTransaction(() => {
+          this.sqlite.exec(MIGRATION_004_UP_SQL);
+          const insertStmt = this.sqlite.prepare(
+            'INSERT INTO schema_migrations (id, applied_at) VALUES (?, ?)'
+          );
+          insertStmt.run(MIGRATION_004_ID, new Date().toISOString());
+        });
+        log.info('Database migration applied', { migrationId: MIGRATION_004_ID });
+      } finally {
+        this.sqlite.exec('PRAGMA foreign_keys = ON;');
+      }
+    }
+  }
+
+  public hasMigration(migrationId: string): boolean {
+    const checkStmt = this.sqlite.prepare(
+      'SELECT id FROM schema_migrations WHERE id = ?'
+    );
+    const existing = checkStmt.get(migrationId) as { id: string } | undefined;
+    return Boolean(existing);
+  }
+
+  /**
+   * Safely rolls back a reversible migration (003 or 004)
+   * without losing core session or settings rows.
+   */
+  public rollbackMigration(migrationId: string): boolean {
+    if (migrationId !== MIGRATION_003_ID && migrationId !== MIGRATION_004_ID) {
+      throw new DatabaseError(
+        `الترحيل (${migrationId}) غير قابل للتراجع التلقائي حفاظاً على الجلسات الأساسية.`
+      );
+    }
+    const checkStmt = this.sqlite.prepare(
+      'SELECT id FROM schema_migrations WHERE id = ?'
+    );
+    const existing = checkStmt.get(migrationId) as { id: string } | undefined;
+    if (!existing) return false;
+
+    const downSql =
+      migrationId === MIGRATION_004_ID ? MIGRATION_004_DOWN_SQL : MIGRATION_003_DOWN_SQL;
+
+    this.sqlite.exec('PRAGMA foreign_keys = OFF;');
+    try {
+      this.runInTransaction(() => {
+        this.sqlite.exec(downSql);
+        const delStmt = this.sqlite.prepare(
+          'DELETE FROM schema_migrations WHERE id = ?'
+        );
+        delStmt.run(migrationId);
+      });
+    } finally {
+      this.sqlite.exec('PRAGMA foreign_keys = ON;');
+    }
+    log.info('Database migration rolled back', { migrationId });
+    return true;
   }
 
   /**

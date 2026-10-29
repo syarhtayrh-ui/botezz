@@ -51,19 +51,25 @@ export class SessionsHandler {
     );
     const connecting = sessions.filter(
       (s) =>
+        s.status === 'CREATED' ||
         s.status === 'INITIALIZING' ||
         s.status === 'CONNECTING' ||
+        s.status === 'WAITING_FOR_PAIRING' ||
         s.status === 'PAIRING_PENDING' ||
         s.status === 'AUTHENTICATING' ||
+        s.status === 'RECOVERING' ||
         s.status === 'RECONNECTING'
     );
     const inactive = sessions.filter(
       (s) =>
         s.status === 'DISCONNECTED' ||
+        s.status === 'STOPPING' ||
         s.status === 'STOPPED' ||
         s.status === 'LOGGED_OUT'
     );
-    const failed = sessions.filter((s) => s.status === 'FAILED');
+    const failed = sessions.filter(
+      (s) => s.status === 'FAILED' || s.status === 'REQUIRES_REPAIR'
+    );
 
     const statusLines =
       sessions.length === 0
@@ -114,7 +120,7 @@ export class SessionsHandler {
         `🟢 *متصلة ونشطة (Active):* \`${active.length}\`\n` +
         `🟡 *قيد الربط / إعادة الاتصال (Connecting):* \`${connecting.length}\`\n` +
         `🔴 *غير متصلة (Inactive):* \`${inactive.length}\`\n` +
-        `❌ *فشل الاتصال (Failed):* \`${failed.length}\`\n` +
+        `❌ *فشل / يتطلب إصلاح (Failed/Repair):* \`${failed.length}\`\n` +
         `📊 *إجمالي الجلسات:* \`${sessions.length}\`\n\n` +
         `*تفصيل الحالات:*\n${statusLines}`,
       keyboard: rows,
@@ -138,16 +144,31 @@ export class SessionsHandler {
       };
     }
 
-    const { session: sess, socketDiagnostics, credentialInfo, connectionGeneration } =
-      verification;
+    const {
+      session: sess,
+      socketDiagnostics,
+      credentialInfo,
+      connectionGeneration,
+      health,
+    } = verification;
     const liveSocketLabel = socketDiagnostics.socketActive
       ? '🟢 نشط ومفتوح'
       : '🔴 مغلق / غير نشط';
     const authStatusLabel = credentialInfo.registered
-      ? '✅ موثقة ومكتملة'
+      ? credentialInfo.backupExists
+        ? '✅ موثقة ومحمية بنسخة احتياطية'
+        : '✅ موثقة ومكتملة'
       : credentialInfo.corrupted
         ? '❌ تالفة'
         : '⏳ غير مكتملة (بانتظار إتمام الربط)';
+    const healthLabel =
+      health.status === 'HEALTHY'
+        ? `🟢 سليمة (${health.score}/100)`
+        : health.status === 'DEGRADED'
+          ? `🟠 متدهورة (${health.score}/100)`
+          : health.status === 'UNHEALTHY'
+            ? `🔴 غير سليمة (${health.score}/100)`
+            : `⚪ غير محددة (${health.score}/100)`;
 
     return {
       text:
@@ -155,11 +176,13 @@ export class SessionsHandler {
         `🆔 المعرف الداخلي: \`${sess.id}\`\n` +
         `📞 رقم الهاتف المقنع: \`${sess.masked_phone || 'غير مقترن بعد'}\`\n` +
         `📡 حالة الاتصال: ${formatSessionStatusArabic(sess.status)}\n` +
+        `🩺 صحة الجلسة: ${healthLabel}\n` +
         `🔌 حالة المقبس الحي (WebSocket): ${liveSocketLabel}\n` +
         `🔐 حالة بيانات المصادقة: ${authStatusLabel}\n` +
         `🔢 جيل الاتصال (Epoch): \`#${connectionGeneration}\`\n` +
         `🕒 آخر تحديث للحالة: \`${sess.last_status_at}\`\n` +
         `🔁 محاولات إعادة الاتصال: ${sess.reconnect_attempts}\n` +
+        `${sess.last_disconnect_code ? `📟 آخر كود انقطاع: \`${sess.last_disconnect_code}\` (${sess.last_disconnect_reason || 'غير محدد'})\n` : ''}` +
         `${sess.last_error ? `⚠️ آخر ملاحظة/خطأ: ${sess.last_error}\n` : ''}\n` +
         `_بيانات المصادقة محفوظة في مجلد معزول ومحمية ولا تُعرض في تيليجرام._`,
       keyboard: buildSessionDetailKeyboard(sess),

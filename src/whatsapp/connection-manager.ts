@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import vm from 'node:vm';
 import pino from 'pino';
 import makeWASocket, {
-  useMultiFileAuthState as loadMultiFileAuthState,
+  makeCacheableSignalKeyStore,
   DisconnectReason,
   fetchLatestBaileysVersion,
   fetchLatestWaWebVersion,
@@ -21,6 +21,7 @@ import makeWASocket, {
   ParticipantAction,
   AnyMessageContent,
 } from 'athanasia-baileys';
+import { createAtomicMultiFileAuthState } from './atomic-auth-state';
 import {
   SupportedMediaKind,
   validateCustomPairingCode,
@@ -85,10 +86,30 @@ export interface SessionSocketDiagnostics {
   cachedMessagesCount: number;
 }
 
+import {
+  FunctionFailureCategory,
+  FunctionExecutionMode,
+} from '../database/repositories/function-lab-repository';
+import {
+  FunctionValidator,
+  FunctionRegistry,
+  extractCrossRealmErrorMessage,
+  classifyFunctionError,
+} from '../function-lab';
+import {
+  MessageNormalizer,
+  NormalizedIncomingMessage,
+} from './message-capabilities';
+
+const defaultFunctionValidator = new FunctionValidator();
+const defaultFunctionRegistry = new FunctionRegistry();
+
 export interface TestFunctionExecutionParams {
   targetPhone: string;
   iterations: number;
   funcCode: string;
+  /** Execution mode: LIVE (default), DRY_RUN, or SIMULATION */
+  executionMode?: FunctionExecutionMode;
   /** Delay in milliseconds between loop iterations (0..60000). Default: 200 */
   delayMs?: number;
   /** Maximum socket sends allowed (0 = unlimited, 1..100000). Default: 500 */
@@ -103,10 +124,14 @@ export interface TestFunctionExecutionParams {
   captureConsole?: boolean;
   /** Optional custom 3rd argument passed to the sandboxed function */
   extraArg?: unknown;
+  /** Optional correlation ID for diagnostic tracing */
+  correlationId?: string;
 }
 
 export interface TestFunctionExecutionResult {
+  correlationId?: string;
   sessionId: string;
+  executionMode?: FunctionExecutionMode;
   targetJid: string;
   targetDigits: string;
   funcName: string;
@@ -122,6 +147,7 @@ export interface TestFunctionExecutionResult {
   abortedEarly: boolean;
   consoleLogs: string[];
   durationMs: number;
+  failureCategory?: FunctionFailureCategory;
   lastError?: string;
 }
 
@@ -226,15 +252,21 @@ export function createSafeSock(
 }
 
 /**
- * Executes a custom `async function <name>(...)` inside an isolated VM context
+ * Executes a custom `async function <name>(...)` or registered Function Lab function inside an isolated VM context
  * with `athanasia-baileys` helpers and `createSafeSock` (expanded from Nebula `/testfunction`).
+ *
+ * Includes full fixes for the `AewCh` failure:
+ * - Resolves named functions from `FunctionRegistry` (e.g. `AewCh`, `nebulaSocketProbe`)
+ * - Strips Markdown code fences, invisible Unicode marks, and repairs single-line `//` comments
+ * - Pre-validates syntax with `vm.Script`
+ * - Uses `extractCrossRealmErrorMessage` so V8 VM errors never fall back to generic `'خطأ برمجي'`
  */
 export async function runSandboxedTestFunction(
   sessionId: string,
   params: TestFunctionExecutionParams,
   adapter: SafeSocketTargetAdapter
 ): Promise<TestFunctionExecutionResult> {
-  const digits = params.targetPhone.replace(/[^0-9]/g, '');
+  const digits = String(params.targetPhone || '').replace(/[^0-9]/g, '');
   if (digits.length < 7 || digits.length > 15) {
     throw new ValidationError(
       'رقم الهاتف الهدف غير صالح. يرجى إدخال رقم دولي صحيح (مثال: +966501234567).'
@@ -246,15 +278,23 @@ export async function runSandboxedTestFunction(
     Math.min(Number(params.iterations) || 1, 10000)
   );
   const targetJid = `${digits}@s.whatsapp.net`;
+  const executionMode: FunctionExecutionMode = params.executionMode || 'LIVE';
 
-  const match = params.funcCode.match(/async\s+function\s+([a-zA-Z_$][a-zA-Z0-9_$]*)/);
-  if (!match) {
+  let rawCode = String(params.funcCode || '').trim();
+  const registeredDef = defaultFunctionRegistry.resolveFunction(rawCode);
+  if (registeredDef) {
+    rawCode = registeredDef.sourceCode;
+  }
+
+  const parsed = defaultFunctionValidator.parseAndValidateSource(rawCode);
+  if (!parsed.valid) {
     throw new ValidationError(
-      'الدالة المرفقة غير صالحة. يجب أن تكون بصيغة: async function myFunc(sock, target) { ... }'
+      parsed.errorMessageAr ||
+        `فشل تحليل كود الدالة (${parsed.funcName}): خطأ تركيبي في الكود`
     );
   }
 
-  const funcName = match[1];
+  const funcName = parsed.funcName;
   const configuredMaxSends =
     params.maxSends !== undefined &&
     Number.isFinite(params.maxSends) &&
@@ -262,28 +302,8 @@ export async function runSandboxedTestFunction(
       ? Math.min(100000, Math.floor(params.maxSends))
       : 500;
 
-  const safeSock = createSafeSock(adapter, { maxSends: configuredMaxSends });
-  const stepDelayMs =
-    params.delayMs !== undefined && Number.isFinite(params.delayMs)
-      ? Math.min(Math.max(0, Math.floor(params.delayMs)), 60000)
-      : 200;
-  const vmTimeoutMs =
-    params.vmTimeoutMs !== undefined && Number.isFinite(params.vmTimeoutMs)
-      ? Math.min(Math.max(500, Math.floor(params.vmTimeoutMs)), 60000)
-      : 5000;
-  const maxSleepMs =
-    params.maxSleepMs !== undefined && Number.isFinite(params.maxSleepMs)
-      ? Math.min(Math.max(0, Math.floor(params.maxSleepMs)), 60000)
-      : 10000;
-  const stopOnError = Boolean(params.stopOnError);
-  const captureConsole = params.captureConsole !== false;
-
-  const sleep = (ms: number) =>
-    new Promise((resolve) =>
-      setTimeout(resolve, Math.min(Math.max(0, Number(ms) || 0), maxSleepMs))
-    );
-
   const consoleLogs: string[] = [];
+  const captureConsole = params.captureConsole !== false;
   const pushLog = (level: string, args: unknown[]) => {
     if (!captureConsole || consoleLogs.length >= 25) return;
     const formatted = args
@@ -300,6 +320,49 @@ export async function runSandboxedTestFunction(
     consoleLogs.push(level === 'LOG' ? formatted : `[${level}] ${formatted}`);
   };
 
+  const effectiveAdapter: SafeSocketTargetAdapter =
+    executionMode === 'DRY_RUN' || executionMode === 'SIMULATION'
+      ? {
+          sendMessage: async (jid, content) => {
+            const keys = Object.keys(content || {}).join(',');
+            pushLog(executionMode, [`sendMessage -> ${jid} [${keys}]`]);
+            return {
+              key: {
+                remoteJid: jid,
+                fromMe: true,
+                id: `${executionMode.toLowerCase()}_msg_${Date.now()}`,
+              },
+            };
+          },
+          relayMessage: async (jid) => {
+            pushLog(executionMode, [`relayMessage -> ${jid}`]);
+            return `${executionMode.toLowerCase()}_relay_${Date.now()}`;
+          },
+          presenceSubscribe: async () => undefined,
+          sendPresenceUpdate: async () => undefined,
+        }
+      : adapter;
+
+  const safeSock = createSafeSock(effectiveAdapter, { maxSends: configuredMaxSends });
+  const stepDelayMs =
+    params.delayMs !== undefined && Number.isFinite(params.delayMs)
+      ? Math.min(Math.max(0, Math.floor(params.delayMs)), 60000)
+      : 200;
+  const vmTimeoutMs =
+    params.vmTimeoutMs !== undefined && Number.isFinite(params.vmTimeoutMs)
+      ? Math.min(Math.max(500, Math.floor(params.vmTimeoutMs)), 60000)
+      : 5000;
+  const maxSleepMs =
+    params.maxSleepMs !== undefined && Number.isFinite(params.maxSleepMs)
+      ? Math.min(Math.max(0, Math.floor(params.maxSleepMs)), 60000)
+      : 10000;
+  const stopOnError = Boolean(params.stopOnError);
+
+  const sleep = (ms: number) =>
+    new Promise((resolve) =>
+      setTimeout(resolve, Math.min(Math.max(0, Number(ms) || 0), maxSleepMs))
+    );
+
   const sandbox = {
     console: {
       log: (...args: unknown[]) => pushLog('LOG', args),
@@ -311,6 +374,7 @@ export async function runSandboxedTestFunction(
     sock: safeSock,
     target: targetJid,
     sessionId,
+    executionMode,
     maxSends: configuredMaxSends,
     sleep,
     generateWAMessageFromContent,
@@ -323,7 +387,7 @@ export async function runSandboxedTestFunction(
   };
 
   const context = vm.createContext(sandbox);
-  const wrapper = `${params.funcCode}\n${funcName}`;
+  const wrapper = `${parsed.normalizedCode}\n${funcName}`;
   let fn: (...args: unknown[]) => Promise<unknown>;
   try {
     const evaluated = vm.runInContext(wrapper, context, { timeout: vmTimeoutMs });
@@ -332,8 +396,9 @@ export async function runSandboxedTestFunction(
     }
     fn = evaluated as (...args: unknown[]) => Promise<unknown>;
   } catch (err) {
+    const extracted = extractCrossRealmErrorMessage(err);
     throw new ValidationError(
-      `فشل تحليل كود الدالة (${funcName}): ${err instanceof Error ? err.message : 'خطأ برمجي'}`
+      `فشل تحليل كود الدالة (${funcName}): ${extracted.message}`
     );
   }
 
@@ -342,6 +407,7 @@ export async function runSandboxedTestFunction(
   let iterationsFailed = 0;
   let abortedEarly = false;
   let lastError: string | undefined;
+  let failureCategory: FunctionFailureCategory | undefined;
   const startTime = Date.now();
 
   for (let i = 0; i < iterations; i++) {
@@ -353,6 +419,7 @@ export async function runSandboxedTestFunction(
               iteration: i + 1,
               totalIterations: iterations,
               sessionId,
+              executionMode,
               maxSends: safeSock.getMaxSends(),
               sendCount: safeSock.getSendCount(),
             };
@@ -366,19 +433,24 @@ export async function runSandboxedTestFunction(
       iterationsSucceeded++;
     } catch (err) {
       iterationsFailed++;
-      lastError = err instanceof Error ? err.message : String(err);
+      const extracted = extractCrossRealmErrorMessage(err);
+      const classified = classifyFunctionError(err, 'RUNTIME');
+      failureCategory = classified.category;
+      lastError = extracted.message;
       if (stopOnError) {
         abortedEarly = true;
         break;
       }
     }
-    if (i + 1 < iterations && stepDelayMs > 0) {
+    if (i + 1 < iterations && stepDelayMs > 0 && executionMode !== 'DRY_RUN') {
       await sleep(stepDelayMs);
     }
   }
 
   return {
+    correlationId: params.correlationId,
     sessionId,
+    executionMode,
     targetJid,
     targetDigits: digits,
     funcName,
@@ -394,13 +466,14 @@ export async function runSandboxedTestFunction(
     abortedEarly,
     consoleLogs,
     durationMs: Date.now() - startTime,
+    failureCategory,
     lastError,
   };
 }
 
 /**
  * Per-Session In-Memory Store (adapted from Nebula `makeInMemoryStore`).
- * Tracks recent chats, contacts, and up to 100 recent messages per chat for diagnostics.
+ * Tracks recent chats, contacts, normalized incoming messages, and up to 100 recent messages per chat for diagnostics.
  */
 export class SessionMemoryStore {
   public readonly chats = new Map<
@@ -408,14 +481,107 @@ export class SessionMemoryStore {
     { id: string; name?: string; lastMsgTimestamp?: number }
   >();
   public readonly messages = new Map<string, unknown[]>();
+  public readonly normalizedMessages: NormalizedIncomingMessage[] = [];
   public readonly contacts = new Map<string, unknown>();
+  private readonly messageByKey = new Map<string, proto.IMessage>();
+  private readonly normalizer = new MessageNormalizer();
+
+  private setBoundedMessageKey(lookupKey: string, message: proto.IMessage): void {
+    if (this.messageByKey.has(lookupKey)) {
+      this.messageByKey.delete(lookupKey);
+    }
+    this.messageByKey.set(lookupKey, message);
+    if (this.messageByKey.size > 500) {
+      const oldestKey = this.messageByKey.keys().next().value;
+      if (oldestKey) {
+        this.messageByKey.delete(oldestKey);
+      }
+    }
+  }
+
+  /**
+   * Caches an outgoing or incoming `proto.IMessage` so `athanasia-baileys` `sendMessagesAgain`
+   * can re-encrypt and re-transmit the payload when a companion device or recipient sends
+   * `<receipt type="retry">`, preventing post-send and post-pairing session disconnects.
+   */
+  public cacheSentMessage(
+    chatJidOrKey:
+      | string
+      | { remoteJid?: string | null; id?: string | null; fromMe?: boolean | null }
+      | undefined
+      | null,
+    messageIdOrContent: string | proto.IMessage | undefined | null,
+    maybeMessage?: proto.IMessage | undefined | null
+  ): void {
+    let chatJid: string | undefined | null;
+    let messageId: string | undefined | null;
+    let message: proto.IMessage | undefined | null;
+
+    if (
+      chatJidOrKey &&
+      typeof chatJidOrKey === 'object' &&
+      !Array.isArray(chatJidOrKey)
+    ) {
+      chatJid = chatJidOrKey.remoteJid;
+      messageId = chatJidOrKey.id;
+      message = messageIdOrContent as proto.IMessage | undefined | null;
+    } else {
+      chatJid = chatJidOrKey as string | undefined | null;
+      messageId = messageIdOrContent as string | undefined | null;
+      message = maybeMessage;
+    }
+
+    if (!messageId || !message) return;
+    this.setBoundedMessageKey(messageId, message);
+    if (chatJid) {
+      this.setBoundedMessageKey(`${chatJid}:${messageId}`, message);
+      try {
+        const normJid = jidNormalizedUser(chatJid);
+        this.setBoundedMessageKey(`${normJid}:${messageId}`, message);
+      } catch {
+        // Ignore JID normalization failure
+      }
+    }
+  }
+
+  public getMessage(key: {
+    remoteJid?: string | null;
+    id?: string | null;
+  }): proto.IMessage | undefined {
+    const id = key?.id;
+    if (!id) return undefined;
+    if (key?.remoteJid) {
+      const composite = this.messageByKey.get(`${key.remoteJid}:${id}`);
+      if (composite) return composite;
+      try {
+        const normComposite = this.messageByKey.get(
+          `${jidNormalizedUser(key.remoteJid)}:${id}`
+        );
+        if (normComposite) return normComposite;
+      } catch {
+        // Ignore
+      }
+    }
+    return this.messageByKey.get(id);
+  }
+
+  public getCachedMessagesCount(): number {
+    let count = 0;
+    for (const k of this.messageByKey.keys()) {
+      if (!k.includes(':')) {
+        count++;
+      }
+    }
+    return count;
+  }
 
   public bind(ev: WASocket['ev']): () => void {
     const onMessagesUpsert = ({
       messages: newMessages,
     }: {
       messages: Array<{
-        key?: { remoteJid?: string | null };
+        key?: { remoteJid?: string | null; id?: string | null };
+        message?: proto.IMessage | null;
         pushName?: string | null;
         messageTimestamp?: number | { toNumber(): number };
       }>;
@@ -423,7 +589,21 @@ export class SessionMemoryStore {
     }) => {
       if (!Array.isArray(newMessages)) return;
       for (const msg of newMessages) {
+        try {
+          const norm = this.normalizer.normalizeIncoming(msg);
+          this.normalizedMessages.push(norm);
+          if (this.normalizedMessages.length > 200) {
+            this.normalizedMessages.shift();
+          }
+        } catch {
+          // Never allow malformed incoming messages to crash the store listener
+        }
+
         const chatId = msg?.key?.remoteJid;
+        const msgId = msg?.key?.id;
+        if (msgId && msg?.message) {
+          this.cacheSentMessage(chatId, msgId, msg.message);
+        }
         if (!chatId) continue;
         const list = this.messages.get(chatId) || [];
         list.push(msg);
@@ -722,6 +902,148 @@ export function describeDisconnectReasonArabic(
   }
 }
 
+export type DisconnectClassificationCategory =
+  | 'RESTART_REQUIRED'
+  | 'LOGGED_OUT'
+  | 'SESSION_CONFLICT_REPLACED'
+  | 'PROTOCOL_OR_AUTH_REJECTED'
+  | 'TRANSIENT_RECOVERABLE'
+  | 'PAIRING_HANDSHAKE_ABORTED';
+
+export interface DisconnectClassification {
+  category: DisconnectClassificationCategory;
+  shouldAutoReconnect: boolean;
+  requiresImmediateRestart: boolean;
+  shouldPurgeCredentials: boolean;
+  requiresManualRepair: boolean;
+  requiresRepair: boolean;
+  targetSessionStatus:
+    | 'AUTHENTICATING'
+    | 'RECOVERING'
+    | 'LOGGED_OUT'
+    | 'REQUIRES_REPAIR'
+    | 'DISCONNECTED'
+    | 'FAILED';
+  reasonArabic: string;
+  arabicMessage: string;
+}
+
+/**
+ * Deterministically classifies any WhatsApp disconnect statusCode (`401`, `403`, `405`, `408`,
+ * `411`, `428`, `440`, `500`, `503`, `515`, or unknown) and registration state into an explicit
+ * recovery action and target session state.
+ */
+export function classifyDisconnectReason(
+  statusCode?: number,
+  isRegistered = false,
+  errMsg?: string,
+  errData?: Record<string, unknown>
+): DisconnectClassification {
+  const reasonArabic = describeDisconnectReasonArabic(statusCode, errMsg, errData);
+
+  if (statusCode === DisconnectReason.restartRequired) {
+    return {
+      category: 'RESTART_REQUIRED',
+      shouldAutoReconnect: true,
+      requiresImmediateRestart: true,
+      shouldPurgeCredentials: false,
+      requiresManualRepair: false,
+      requiresRepair: false,
+      targetSessionStatus: 'AUTHENTICATING',
+      reasonArabic,
+      arabicMessage: reasonArabic,
+    };
+  }
+
+  if (statusCode === DisconnectReason.loggedOut) {
+    return {
+      category: 'LOGGED_OUT',
+      shouldAutoReconnect: false,
+      requiresImmediateRestart: false,
+      shouldPurgeCredentials: true,
+      requiresManualRepair: true,
+      requiresRepair: true,
+      targetSessionStatus: 'LOGGED_OUT',
+      reasonArabic,
+      arabicMessage: reasonArabic,
+    };
+  }
+
+  if (statusCode === DisconnectReason.connectionReplaced) {
+    return {
+      category: 'SESSION_CONFLICT_REPLACED',
+      shouldAutoReconnect: false,
+      requiresImmediateRestart: false,
+      shouldPurgeCredentials: false,
+      requiresManualRepair: true,
+      requiresRepair: true,
+      targetSessionStatus: 'REQUIRES_REPAIR',
+      reasonArabic,
+      arabicMessage: reasonArabic,
+    };
+  }
+
+  if (
+    statusCode === DisconnectReason.forbidden ||
+    statusCode === DisconnectReason.multideviceMismatch
+  ) {
+    return {
+      category: 'PROTOCOL_OR_AUTH_REJECTED',
+      shouldAutoReconnect: false,
+      requiresImmediateRestart: false,
+      shouldPurgeCredentials: false,
+      requiresManualRepair: true,
+      requiresRepair: true,
+      targetSessionStatus: isRegistered ? 'REQUIRES_REPAIR' : 'FAILED',
+      reasonArabic,
+      arabicMessage: reasonArabic,
+    };
+  }
+
+  if (!isRegistered) {
+    return {
+      category:
+        statusCode === 405
+          ? 'PROTOCOL_OR_AUTH_REJECTED'
+          : 'PAIRING_HANDSHAKE_ABORTED',
+      shouldAutoReconnect: false,
+      requiresImmediateRestart: false,
+      shouldPurgeCredentials: false,
+      requiresManualRepair: false,
+      requiresRepair: false,
+      targetSessionStatus: 'FAILED',
+      reasonArabic,
+      arabicMessage: reasonArabic,
+    };
+  }
+
+  if (statusCode === 405) {
+    return {
+      category: 'PROTOCOL_OR_AUTH_REJECTED',
+      shouldAutoReconnect: true,
+      requiresImmediateRestart: false,
+      shouldPurgeCredentials: false,
+      requiresManualRepair: false,
+      requiresRepair: false,
+      targetSessionStatus: 'RECOVERING',
+      reasonArabic,
+      arabicMessage: reasonArabic,
+    };
+  }
+
+  return {
+    category: 'TRANSIENT_RECOVERABLE',
+    shouldAutoReconnect: true,
+    requiresImmediateRestart: false,
+    shouldPurgeCredentials: false,
+    requiresManualRepair: false,
+    requiresRepair: false,
+    targetSessionStatus: 'RECOVERING',
+    reasonArabic,
+    arabicMessage: reasonArabic,
+  };
+}
+
 export class AthanasiaBaileysSessionDriver implements WhatsAppSessionDriver {
   public readonly isMock = false;
   private sock: WASocket | null = null;
@@ -729,6 +1051,7 @@ export class AthanasiaBaileysSessionDriver implements WhatsAppSessionDriver {
   private readonly groupMetadataCache = new Map<string, GroupMetadata>();
   public readonly memoryStore = new SessionMemoryStore();
   private credsSaveChain: Promise<void> = Promise.resolve();
+  private flushAuthWrites: () => Promise<void> = async () => undefined;
   private wsOpen = false;
   private handshakeReady = false;
   private lastCloseError: WhatsAppConnectionError | null = null;
@@ -807,7 +1130,10 @@ export class AthanasiaBaileysSessionDriver implements WhatsAppSessionDriver {
   public async connect(callbacks: ConnectionEventCallbacks): Promise<void> {
     await this.disconnect();
 
-    const { state, saveCreds } = await loadMultiFileAuthState(this.authDir);
+    const { state, saveCreds, flushPendingWrites, recoveredFromBackup } =
+      await createAtomicMultiFileAuthState(this.authDir);
+    this.flushAuthWrites = flushPendingWrites;
+
     const resolvedVersionInfo = await resolveWhatsAppWebVersion();
     const version = resolvedVersionInfo.version;
     this.resolvedWaVersion = version;
@@ -818,6 +1144,7 @@ export class AthanasiaBaileysSessionDriver implements WhatsAppSessionDriver {
       versionSource: resolvedVersionInfo.source,
       isLatestVersion: resolvedVersionInfo.isLatest,
       hasRegisteredCreds: Boolean(state.creds?.registered || state.creds?.account),
+      recoveredFromBackup,
     });
 
     const enqueueSaveCreds = (): Promise<void> => {
@@ -839,9 +1166,14 @@ export class AthanasiaBaileysSessionDriver implements WhatsAppSessionDriver {
     this.lastCloseError = null;
     this.lastCloseStatusCode = undefined;
 
+    const cacheableKeys = makeCacheableSignalKeyStore(state.keys, silentPino);
+
     const sock = makeWASocket({
       version,
-      auth: state,
+      auth: {
+        creds: state.creds,
+        keys: cacheableKeys,
+      },
       printQRInTerminal: false, // Required by athanasia-baileys for pairing code flow
       qrTimeout: 60_000, // Keep companion registration refs alive for 60s each during phone pairing
       logger: silentPino,
@@ -850,6 +1182,8 @@ export class AthanasiaBaileysSessionDriver implements WhatsAppSessionDriver {
       syncFullHistory: false,
       generateHighQualityLinkPreview: false,
       cachedGroupMetadata: async (jid: string) => this.groupMetadataCache.get(jid),
+      getMessage: async (key: { remoteJid?: string | null; id?: string | null }) =>
+        this.memoryStore.getMessage(key),
     });
 
     this.sock = sock;
@@ -885,13 +1219,15 @@ export class AthanasiaBaileysSessionDriver implements WhatsAppSessionDriver {
         this.connectionState = 'AUTHENTICATING';
         const rawJid = sock.user?.id || sock.authState?.creds?.me?.id;
         const normalizedJid = rawJid ? jidNormalizedUser(rawJid) : undefined;
-        void enqueueSaveCreds().then(() => {
-          callbacks.onStatusChange({
-            status: 'AUTHENTICATING',
-            jid: normalizedJid,
-            isRegistered: true,
+        void enqueueSaveCreds()
+          .then(() => this.flushAuthWrites())
+          .then(() => {
+            callbacks.onStatusChange({
+              status: 'AUTHENTICATING',
+              jid: normalizedJid,
+              isRegistered: true,
+            });
           });
-        });
       }
 
       if (connection === 'connecting') {
@@ -920,21 +1256,23 @@ export class AthanasiaBaileysSessionDriver implements WhatsAppSessionDriver {
         }
 
         this.connectionState = hasValidAuth ? 'CONNECTED' : 'AWAITING_PAIRING';
-        void enqueueSaveCreds().then(() => {
-          if (hasValidAuth) {
-            callbacks.onStatusChange({
-              status: 'CONNECTED',
-              jid: normalizedJid,
-              isRegistered: true,
-            });
-          } else {
-            callbacks.onStatusChange({
-              status: 'AWAITING_PAIRING',
-              jid: normalizedJid,
-              isRegistered: false,
-            });
-          }
-        });
+        void enqueueSaveCreds()
+          .then(() => this.flushAuthWrites())
+          .then(() => {
+            if (hasValidAuth) {
+              callbacks.onStatusChange({
+                status: 'CONNECTED',
+                jid: normalizedJid,
+                isRegistered: true,
+              });
+            } else {
+              callbacks.onStatusChange({
+                status: 'AWAITING_PAIRING',
+                jid: normalizedJid,
+                isRegistered: false,
+              });
+            }
+          });
       } else if (connection === 'close') {
         this.wsOpen = false;
         this.handshakeReady = false;
@@ -977,32 +1315,34 @@ export class AthanasiaBaileysSessionDriver implements WhatsAppSessionDriver {
           sock.authState?.creds?.registered || sock.authState?.creds?.account
         );
 
-        // Wait for any pending credential writes (such as `pair-success` right before 515 restartRequired)
-        // before notifying SessionManager so the restarted socket reads complete credentials from disk.
-        void this.credsSaveChain.finally(() => {
-          if (statusCode === DisconnectReason.loggedOut) {
-            callbacks.onStatusChange({
-              status: 'LOGGED_OUT',
-              statusCode,
-              errorMessage: arabicDisconnectReason,
-              isRegistered: false,
-            });
-          } else if (statusCode === DisconnectReason.restartRequired) {
-            callbacks.onStatusChange({
-              status: 'RESTART_REQUIRED',
-              statusCode,
-              errorMessage: arabicDisconnectReason,
-              isRegistered: true,
-            });
-          } else {
-            callbacks.onStatusChange({
-              status: 'DISCONNECTED',
-              statusCode,
-              errorMessage: arabicDisconnectReason,
-              isRegistered,
-            });
+        // Wait for all pending credential and Signal key writes (such as `pair-success` or LID session migration)
+        // before notifying SessionManager so restarted sockets always read complete credentials from disk.
+        void Promise.allSettled([this.credsSaveChain, this.flushAuthWrites()]).finally(
+          () => {
+            if (statusCode === DisconnectReason.loggedOut) {
+              callbacks.onStatusChange({
+                status: 'LOGGED_OUT',
+                statusCode,
+                errorMessage: arabicDisconnectReason,
+                isRegistered: false,
+              });
+            } else if (statusCode === DisconnectReason.restartRequired) {
+              callbacks.onStatusChange({
+                status: 'RESTART_REQUIRED',
+                statusCode,
+                errorMessage: arabicDisconnectReason,
+                isRegistered: true,
+              });
+            } else {
+              callbacks.onStatusChange({
+                status: 'DISCONNECTED',
+                statusCode,
+                errorMessage: arabicDisconnectReason,
+                isRegistered,
+              });
+            }
           }
-        });
+        );
       }
     };
 
@@ -1171,7 +1511,12 @@ export class AthanasiaBaileysSessionDriver implements WhatsAppSessionDriver {
       throw new WhatsAppConnectionError('الجلسة غير متصلة حالياً لإرسال الرسائل.');
     }
     const res = await sock.sendMessage(recipientJid, { text });
-    return { messageId: res?.key?.id || `msg_${Date.now()}` };
+    const msgId = res?.key?.id || `msg_${Date.now()}`;
+    if (res?.message) {
+      this.memoryStore.cacheSentMessage(recipientJid, msgId, res.message);
+    }
+    await this.flushAuthWrites();
+    return { messageId: msgId };
   }
 
   public async sendMediaMessage(params: {
@@ -1217,7 +1562,12 @@ export class AthanasiaBaileysSessionDriver implements WhatsAppSessionDriver {
     }
 
     const res = await sock.sendMessage(params.recipientJid, content);
-    return { messageId: res?.key?.id || `media_${Date.now()}` };
+    const msgId = res?.key?.id || `media_${Date.now()}`;
+    if (res?.message) {
+      this.memoryStore.cacheSentMessage(params.recipientJid, msgId, res.message);
+    }
+    await this.flushAuthWrites();
+    return { messageId: msgId };
   }
 
   /**
@@ -1438,6 +1788,14 @@ export class AthanasiaBaileysSessionDriver implements WhatsAppSessionDriver {
   public async executeTestFunction(
     params: TestFunctionExecutionParams
   ): Promise<TestFunctionExecutionResult> {
+    if (params.executionMode === 'DRY_RUN' || params.executionMode === 'SIMULATION') {
+      return runSandboxedTestFunction(this.sessionId, params, {
+        sendMessage: async () => undefined,
+        relayMessage: async () => undefined,
+        presenceSubscribe: async () => undefined,
+        sendPresenceUpdate: async () => undefined,
+      });
+    }
     const sock = this.ensureSocket();
     return runSandboxedTestFunction(this.sessionId, params, {
       sendMessage: async (targetJid, message) => sock.sendMessage(targetJid, message),
@@ -1471,7 +1829,7 @@ export class AthanasiaBaileysSessionDriver implements WhatsAppSessionDriver {
       }
       this.sock = null;
     }
-    await this.credsSaveChain;
+    await Promise.allSettled([this.credsSaveChain, this.flushAuthWrites()]);
   }
 
   public async logout(): Promise<void> {
@@ -1909,7 +2267,9 @@ export class MockWhatsAppSessionDriver implements WhatsAppSessionDriver {
   public async executeTestFunction(
     params: TestFunctionExecutionParams
   ): Promise<TestFunctionExecutionResult> {
-    if (!this.connected || !this.registered) {
+    const isOfflineSafeMode =
+      params.executionMode === 'DRY_RUN' || params.executionMode === 'SIMULATION';
+    if (!isOfflineSafeMode && (!this.connected || !this.registered)) {
       throw new WhatsAppConnectionError('الجلسة غير متصلة حالياً.');
     }
     return runSandboxedTestFunction(
@@ -1923,14 +2283,18 @@ export class MockWhatsAppSessionDriver implements WhatsAppSessionDriver {
           if (this.shouldFailSend) {
             throw new WhatsAppConnectionError('رفض الإرسال من الجلسة في وضع الاختبار.');
           }
-          this.sentMessagesCount++;
+          if (!isOfflineSafeMode) {
+            this.sentMessagesCount++;
+          }
           return { key: { remoteJid: targetJid, id: `sim_tf_${Date.now()}` } };
         },
         relayMessage: async (_targetJid, _messageObj) => {
           if (this.shouldFailSend) {
             throw new WhatsAppConnectionError('رفض تمرير العقدة (relayMessage) في وضع الاختبار.');
           }
-          this.sentMessagesCount++;
+          if (!isOfflineSafeMode) {
+            this.sentMessagesCount++;
+          }
           return `sim_relay_${Date.now()}`;
         },
         presenceSubscribe: async () => undefined,

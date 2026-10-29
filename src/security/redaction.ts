@@ -52,6 +52,8 @@ export function redactText(input: string): string {
     .replace(PAIRING_CODE_FORMAT_REGEX, '[REDACTED_PAIRING_CODE]');
 }
 
+export { redactText as redactString };
+
 /**
  * Deeply clones and redacts sensitive fields from objects before logging or serializing.
  */

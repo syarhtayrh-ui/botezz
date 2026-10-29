@@ -1,0 +1,1041 @@
+MASTER ENGINEERING DIRECTIVE
+
+Botezz WhatsApp Session Infrastructure — Complete Audit, Architecture, Hardening, Repair, and Verification
+
+1. ROLE AND OBJECTIVE
+
+Act as a principal software architect, senior TypeScript/Node.js engineer, WhatsApp Web protocol integration specialist, Baileys library maintainer, reliability engineer, database engineer, and software testing specialist.
+
+Your mission is to perform a complete, evidence-driven audit and engineering overhaul of the WhatsApp connection, pairing, authentication, session persistence, recovery, messaging, and lifecycle management systems in the existing Botezz project.
+
+This is a repository-level engineering task, not a request for generic recommendations or an isolated bug fix.
+
+You must inspect the actual implementation, establish the real causes of existing and potential failures, design a complete lifecycle architecture, implement justified improvements, and verify them through automated tests.
+
+Do not assume that successful pairing means a session is healthy, persistent, or reliable.
+
+Do not assume that the currently reported disconnection is the only problem.
+
+Do not assume that every potential weakness is an existing defect.
+
+Distinguish verified defects, probable risks, unverified hypotheses, and environmental limitations.
+
+The objective is a robust, recoverable, observable, maintainable, multi-session WhatsApp system with deterministic lifecycle management and strong failure isolation.
+
+Do not use artificial human-behavior simulation, random activity, or artificial online/offline cycling as a substitute for reliable engineering.
+
+Do not integrate an AI model or AI-based decision-making into the session manager in this phase.
+
+All critical session operations must be controlled by deterministic program logic, explicit state transitions, validation, and tested recovery policies.
+
+---
+
+2. EXISTING PROJECT CONTEXT
+
+Repository:
+
+https://github.com/syarhtayrh-ui/botezz.git
+
+Known environment:
+
+- Ubuntu 24.04 on AWS EC2.
+- Node.js 22.
+- TypeScript.
+- grammY Telegram bot.
+- SQLite database.
+- Next.js management interface.
+- WhatsApp integration using athanasia-baileys.
+- systemd service named botezz-bot.
+- Main project directory on the server: /home/ubuntu/botezz.
+
+Relevant application entry point previously identified:
+
+src/app.ts
+
+Previously observed behavior:
+
+- A WhatsApp number can complete pairing.
+- The session appears to work initially.
+- After some time or after an operation such as sending a message, the connection may disconnect.
+- The account may still appear online in the WhatsApp mobile application while the bot's session state changes.
+- Earlier startup logs showed restoredCount: 0 and skippedCount: 23.
+- The exact causes of these observations have not yet been established.
+- The project has previously experienced a WhatsApp socket disconnection with code 405.
+- The project uses a third-party package named athanasia-baileys, whose exact implementation and installed version must be inspected rather than assumed.
+
+Treat all these observations as investigation leads, not proven diagnoses.
+
+Preserve the existing project architecture wherever practical.
+
+---
+
+3. NON-NEGOTIABLE SAFETY AND REPOSITORY RULES
+
+Before making changes, inspect the repository, its current working state, dependency versions, and existing local modifications.
+
+You must preserve:
+
+- .env and all environment-specific configuration.
+- Existing WhatsApp authentication data.
+- Existing session directories and files.
+- Existing SQLite databases and records.
+- User data.
+- Deployment configuration.
+- Unrelated source changes.
+- Existing Git history and branches.
+
+Never print secret values, authentication tokens, phone credentials, encryption keys, or complete private session contents.
+
+Never use destructive shortcuts such as:
+
+- git reset --hard
+- Unnecessary deletion of session directories.
+- Dropping or recreating the production database.
+- Removing all authentication credentials to force pairing.
+- Overwriting existing local modifications without inspecting them.
+- Broad filesystem deletion commands.
+- Unreviewed bulk database migrations.
+
+Do not modify production authentication data during offline tests.
+
+Do not claim a test passed unless it was actually executed and its result was observed.
+
+Do not claim that an operation or message type is supported unless the implementation and installed library have been verified.
+
+Do not blindly upgrade, replace, or reinstall the WhatsApp library.
+
+Before introducing a potentially breaking change, explain its necessity, compatibility implications, migration requirements, and rollback path in the audit report.
+
+If the environment lacks access to the repository, required dependencies, or test infrastructure, explicitly identify the limitation and do not fabricate repository findings.
+
+---
+
+PHASE 1 — REPOSITORY DISCOVERY AND BASELINE ESTABLISHMENT
+
+Do not begin by editing files.
+
+First, map the real repository structure and identify all components involved in WhatsApp operations.
+
+Inspect:
+
+1. package.json and package-lock.json.
+2. The exact installed version of athanasia-baileys.
+3. The actual package entry points, exported APIs, TypeScript definitions, and relevant source code.
+4. Socket creation and initialization.
+5. Pairing-code and QR-code workflows.
+6. Authentication state and key storage.
+7. Session manager implementation.
+8. Connection-event handlers.
+9. Message-send and message-receive pipelines.
+10. Session restoration and startup initialization.
+11. SQLite schema and data-access layer.
+12. Telegram commands and callbacks that control sessions.
+13. Web management interfaces that can create, disconnect, or delete sessions.
+14. Retry, timeout, queue, and background-job implementations.
+15. systemd service configuration and shutdown behavior.
+16. Existing tests, logging, error handling, and monitoring.
+17. Any code paths that independently create sockets or modify session state.
+
+Search the complete repository, not only src/app.ts.
+
+Trace every entry point that can create, replace, close, or restore a WhatsApp socket.
+
+Determine whether session lifecycle logic is centralized or duplicated across multiple modules.
+
+Establish a baseline before editing:
+
+- Git working-tree status.
+- Current commit and branch.
+- Installed dependency versions.
+- Existing test results.
+- Existing type-checking and lint results.
+- Current build status.
+- Relevant configuration without exposing secrets.
+
+Separate pre-existing failures from failures introduced by future changes.
+
+Deliverable: a repository architecture map identifying the actual files, modules, functions, database tables, and event flows responsible for WhatsApp session management.
+
+---
+
+PHASE 2 — COMPLETE LIFECYCLE MODEL
+
+Design an explicit state machine for each WhatsApp session.
+
+Adapt the state names to the existing implementation, but ensure that distinct operational states are represented clearly.
+
+The model should consider states such as:
+
+- CREATED
+- INITIALIZING
+- CONNECTING
+- WAITING_FOR_PAIRING
+- AUTHENTICATING
+- CONNECTED
+- RECOVERING
+- DISCONNECTED
+- LOGGED_OUT
+- REQUIRES_REPAIR
+- STOPPING
+- STOPPED
+- FAILED
+
+Do not introduce states that cannot be meaningfully distinguished or observed.
+
+Define valid state transitions and the events that trigger them.
+
+For every transition, specify:
+
+1. The previous state.
+2. The triggering event.
+3. Required validation.
+4. The resulting state.
+5. Persistent database changes, if any.
+6. Required logging.
+7. Whether a reconnect is permitted.
+8. Whether user intervention is required.
+9. Expected cleanup.
+10. Recovery behavior if the transition fails.
+
+Enforce these invariants:
+
+- A session cannot be marked connected merely because a pairing code was generated.
+- A session cannot be marked healthy solely because a socket object exists.
+- A session cannot be marked disconnected solely because a message-send request failed.
+- Only the lifecycle manager may perform authoritative session-state transitions.
+- A stale event from an obsolete socket must not overwrite the state of its replacement.
+- A session must not have multiple independently managed active sockets unless the architecture explicitly supports that arrangement.
+- A permanent authentication failure must not trigger endless reconnect attempts.
+- A transient network error must not automatically delete authentication data.
+- A failed session must not bring down unrelated sessions.
+- Repeated events must not cause duplicate state transitions or duplicate recovery jobs.
+
+Implement a documented transition table and enforce it in code.
+
+---
+
+PHASE 3 — AUTHENTICATION AND PAIRING AUDIT
+
+Trace the complete pairing process.
+
+Investigate:
+
+- Phone-number validation and normalization.
+- Pairing-code generation.
+- QR-code generation if supported.
+- Pairing request timing.
+- Socket readiness requirements.
+- Authentication completion.
+- Credential updates during pairing.
+- The exact event that confirms the connection.
+- Database updates before, during, and after pairing.
+- Cleanup after pairing failures.
+- Repeated pairing requests.
+- Cancellation and timeout behavior.
+- Concurrent pairing requests for the same session.
+- Re-pairing an already authenticated session.
+
+Determine whether the application reports success too early.
+
+Ensure the Telegram interface accurately distinguishes:
+
+- Pairing requested.
+- Waiting for user action.
+- Authentication in progress.
+- Authentication completed.
+- Connection established.
+- Session ready.
+- Pairing failed.
+- Manual intervention required.
+
+Never report that pairing succeeded merely because a code was returned.
+
+Do not repeatedly request new pairing codes when an existing valid authentication flow is still active.
+
+Do not destroy an existing authenticated session merely to initiate a new pairing attempt.
+
+Implement safe cleanup for failed or abandoned pairing attempts.
+
+Test all supported pairing workflows.
+
+---
+
+PHASE 4 — AUTHENTICATION PERSISTENCE AND RESTORATION
+
+Treat credential persistence as a critical subsystem.
+
+Inspect the actual authentication implementation used by the installed athanasia-baileys version.
+
+Verify that:
+
+- Credential updates are handled correctly.
+- Required cryptographic key updates are persisted.
+- Updates cannot be silently lost.
+- Concurrent writes cannot overwrite newer state with older state.
+- Authentication data remains isolated between sessions.
+- Database or filesystem errors are detected and reported.
+- Partial writes and interrupted writes are handled safely.
+- Session restoration uses the correct account and storage location.
+- Restored credentials are not accidentally replaced by empty or stale state.
+- Session data is not logged.
+- Shutdown behavior preserves the latest successfully persisted state.
+
+If the library requires a particular authentication-state interface or update event, use the actual API of the installed version.
+
+Do not assume that a generic JSON file containing credentials is sufficient for every Baileys implementation.
+
+If custom authentication storage is used, evaluate atomic writes, transactions, locking, versioning, corruption detection, and recovery.
+
+If SQLite stores authentication information, inspect transaction boundaries, concurrency behavior, and database connection management.
+
+If filesystem storage is used, inspect permissions, partial writes, file replacement behavior, and concurrent access.
+
+Add safe integrity checks and migrations where necessary.
+
+Do not silently discard corrupted authentication data.
+
+Do not automatically wipe or regenerate credentials when restoration fails.
+
+When a session cannot be restored, preserve its data and report the specific recovery requirements.
+
+Investigate the previously observed startup values:
+
+restoredCount: 0
+skippedCount: 23
+
+Find the actual code responsible for incrementing these counters.
+
+Determine why each session was skipped, using safe diagnostics that do not reveal secrets.
+
+Distinguish missing credentials, invalid metadata, unsupported formats, deliberate exclusions, temporary failures, and permanent authentication failures.
+
+Deliverable: a verified persistence and restoration design, including failure handling and backward-compatible migration requirements.
+
+---
+
+PHASE 5 — SOCKET OWNERSHIP AND CONNECTION LIFECYCLE
+
+Audit socket creation, replacement, event subscription, and closure.
+
+Investigate:
+
+- Multiple sockets for the same session.
+- Concurrent initialization.
+- Duplicate connection listeners.
+- Stale event handlers.
+- Race conditions during reconnect.
+- Reconnection while an old socket is still closing.
+- Incorrect handling of connection.update.
+- Incorrect handling of lastDisconnect.
+- Unhandled promise rejections.
+- Exceptions inside event callbacks.
+- Socket closure triggered by unrelated operations.
+- Session shutdown and restart.
+- Resource leaks and listener accumulation.
+
+Introduce a centralized session lifecycle manager if the current architecture lacks one.
+
+Use per-session ownership and concurrency controls.
+
+A reconnect operation should be idempotent: repeated requests for the same recovery operation must not create competing sockets.
+
+Use a generation identifier, ownership token, or equivalent mechanism to ensure that stale events cannot modify the state of a newer socket.
+
+Manage event listeners explicitly.
+
+Do not rely on arbitrary sleep durations to conceal race conditions.
+
+Define the correct cleanup behavior for each kind of socket termination.
+
+Do not close or replace a healthy connection merely because an unrelated command was executed.
+
+Add tests for concurrent reconnect requests, delayed events, repeated disconnect notifications, and socket replacement.
+
+---
+
+PHASE 6 — DISCONNECTION CLASSIFICATION AND RECOVERY ENGINE
+
+Create a deterministic recovery policy based on actual disconnect causes.
+
+Inspect the exact disconnect types and error structures available in the installed library.
+
+Do not blindly copy disconnect codes or assumptions from another Baileys fork.
+
+Classify observed failures into categories such as:
+
+- Temporary network failure.
+- Connection timeout.
+- Server-initiated disconnect.
+- Restart-required condition.
+- Authentication failure.
+- Explicit logout.
+- Device unlinked.
+- Session conflict.
+- Unsupported protocol behavior.
+- Local application error.
+- Persistence failure.
+- Unknown failure.
+
+Map actual library error values to these categories only after verifying their meaning.
+
+For each category, define:
+
+- Whether automatic reconnection is appropriate.
+- Whether a retry limit applies.
+- Whether a cooldown applies.
+- Whether user intervention is needed.
+- Whether credentials must be preserved.
+- Whether the application should enter a degraded state.
+- What diagnostic evidence must be recorded.
+
+Implement bounded exponential backoff with jitter for appropriate transient failures.
+
+Use configurable minimum and maximum delays.
+
+Prevent infinite rapid reconnect loops.
+
+Prevent concurrent reconnect attempts for the same session.
+
+Reset retry counters only after a meaningful recovery milestone.
+
+Distinguish the state of the WhatsApp socket from the state of the local application and database.
+
+Do not automatically log out, unlink, or delete credentials as a generic recovery action.
+
+Do not attempt to bypass WhatsApp authentication, access controls, or protocol restrictions.
+
+---
+
+PHASE 7 — SESSION HEALTH AND RELIABILITY MONITORING
+
+Build a session health subsystem that uses observable evidence.
+
+Track available indicators such as:
+
+- Current lifecycle state.
+- Socket generation or connection identifier.
+- Last successful connection.
+- Last disconnection.
+- Last successful send operation.
+- Last observed inbound event.
+- Last persistence update.
+- Recent reconnect count.
+- Current retry state.
+- Time spent disconnected.
+- Last meaningful error category.
+- Pending operation count.
+- Recent processing failures.
+
+Do not interpret a lack of incoming messages as proof that a session is dead.
+
+Do not send artificial traffic solely to make the account appear active.
+
+Use actual library events and supported health checks.
+
+If the library does not expose a reliable heartbeat or health signal, document that limitation instead of inventing one.
+
+Define a health model that can distinguish:
+
+- Connected.
+- Connected but degraded.
+- Recovering.
+- Disconnected.
+- Authentication invalid.
+- Persistence unhealthy.
+- Requires manual intervention.
+
+A socket being open is not sufficient evidence of full application health.
+
+A successful message-send call is not sufficient evidence that the message was delivered or read.
+
+Expose accurate health information through existing Telegram and web management interfaces where appropriate.
+
+---
+
+PHASE 8 — OUTGOING MESSAGES AND OPERATIONAL CONSISTENCY
+
+Audit every outgoing message path.
+
+Investigate whether message operations can trigger or coincide with session disconnects.
+
+Check:
+
+- Connection readiness checks.
+- Payload construction.
+- Socket references used by send handlers.
+- Error propagation.
+- Message acknowledgement events.
+- Concurrent sends.
+- Media uploads.
+- Timeout handling.
+- Queue behavior.
+- Retry policies.
+- Database status updates.
+- Session state mutations performed by send handlers.
+
+A message-send operation must not independently create or replace a session socket.
+
+A failed send must not automatically cause a session to be marked permanently disconnected unless actual connection evidence supports that transition.
+
+Classify failures as transient, permanent, protocol-related, local, or unknown where evidence permits.
+
+Do not blindly retry a message when the original send may already have succeeded.
+
+Distinguish:
+
+- Queued.
+- Submitted.
+- Acknowledged by the protocol, when available.
+- Delivered, when explicitly confirmed.
+- Read, when explicitly confirmed.
+- Failed.
+- Outcome unknown.
+
+Use idempotency or duplicate protection where feasible.
+
+If the outcome of a send is uncertain, do not claim success or failure without evidence.
+
+Ensure that sending a message does not corrupt authentication data or interfere with connection recovery.
+
+---
+
+PHASE 9 — MULTI-SESSION ISOLATION AND CONCURRENCY
+
+The project supports multiple WhatsApp sessions.
+
+Audit all shared resources and concurrency boundaries.
+
+Ensure that:
+
+- Every socket belongs to one explicit session.
+- Every operation resolves the intended session.
+- Session-specific state cannot leak between users.
+- One session's disconnect does not affect another.
+- One session's database write cannot overwrite another session's credentials.
+- Concurrent session restoration is controlled.
+- Per-session reconnect operations are serialized.
+- Database contention is handled safely.
+- Global queues cannot be blocked indefinitely by one session.
+- Rate limits and resource limits are configurable.
+- Shutdown and restart procedures handle multiple sessions correctly.
+
+Determine whether the existing architecture uses one Node.js process, multiple workers, or multiple application instances.
+
+If more than one process can manage the same session, define a reliable ownership or lease mechanism appropriate to the actual deployment.
+
+Do not introduce distributed coordination infrastructure without demonstrating that it is necessary.
+
+Test concurrent session creation, restoration, sending, disconnection, and reconnection.
+
+---
+
+PHASE 10 — LIBRARY AUDIT AND PERMITTED DEVELOPMENT
+
+You are authorized to inspect and develop athanasia-baileys if evidence shows that changes inside the library are necessary.
+
+However, first establish where the defect belongs.
+
+Classify each problem as one of:
+
+A. Application integration defect.
+B. Session-manager architecture defect.
+C. Authentication storage defect.
+D. Library defect.
+E. Version compatibility issue.
+F. WhatsApp server or protocol behavior.
+G. Deployment or environment issue.
+H. Unresolved hypothesis.
+
+Do not modify the library when the defect is actually in Botezz.
+
+Inspect the exact installed package version and source code.
+
+Verify actual APIs, types, error behavior, event ordering, and compatibility.
+
+If a library defect is confirmed:
+
+1. Reproduce it with a minimal isolated test.
+2. Identify the exact failing code path.
+3. Determine whether a narrow application-level workaround is safe.
+4. If a library change is necessary, make the smallest justified patch.
+5. Add regression tests.
+6. Document behavioral and compatibility implications.
+7. Preserve the patch in a reproducible source-controlled form.
+8. Pin the exact dependency revision or package version.
+9. Verify that clean installation reproduces the patched behavior.
+10. Document a rollback procedure.
+
+Do not edit node_modules as the sole permanent solution.
+
+Prefer a maintained fork, reproducible patch mechanism, or versioned package source, depending on the project structure.
+
+Do not switch to a different Baileys fork without a documented compatibility analysis and explicit evidence that the change is justified.
+
+Do not claim that the library has been fixed if only application-level workarounds were implemented.
+
+---
+
+PHASE 11 — DATABASE, STORAGE, AND MIGRATION SAFETY
+
+Inspect the existing SQLite schema, data-access layer, transaction boundaries, and connection lifecycle.
+
+Determine how session metadata, authentication data, and operational states are stored.
+
+Requirements:
+
+- Preserve existing records.
+- Avoid destructive schema changes.
+- Use explicit migrations for schema modifications.
+- Keep migrations backward-compatible where practical.
+- Handle interrupted migrations safely.
+- Avoid duplicate session records.
+- Maintain consistent relationships between session records and authentication data.
+- Add indexes only when justified.
+- Ensure failed writes are surfaced.
+- Prevent concurrent updates from overwriting newer session state.
+- Define how interrupted operations are reconciled after startup.
+
+If an authentication update and a session-state update must remain consistent, design the required transaction or recovery protocol carefully.
+
+Do not assume that filesystem operations and SQLite transactions can be made atomic together without a specific design.
+
+Use reconciliation and integrity checks where cross-resource atomicity is unavailable.
+
+Provide a backup and rollback plan before any migration that could affect production data.
+
+---
+
+PHASE 12 — GRACEFUL SHUTDOWN AND PROCESS RESTART
+
+Inspect the current systemd service and application shutdown hooks.
+
+Implement a controlled shutdown lifecycle.
+
+The system should:
+
+1. Stop accepting new session-management operations.
+2. Mark the application as stopping.
+3. Prevent new reconnect jobs from being scheduled unnecessarily.
+4. Allow bounded completion of safe in-flight operations.
+5. Persist pending authentication updates where supported.
+6. Clean up timers and event listeners.
+7. Close sockets according to the installed library's documented behavior.
+8. Close database resources safely.
+9. Exit within a configured shutdown deadline.
+
+Handle SIGTERM and SIGINT appropriately.
+
+Avoid abrupt termination where safe graceful shutdown is possible.
+
+Do not assume that every socket should always be closed identically; inspect the library and the intended shutdown/restart semantics.
+
+Test graceful shutdown with multiple active sessions and pending operations.
+
+Ensure that the next startup can restore sessions without creating conflicting sockets.
+
+---
+
+PHASE 13 — OBSERVABILITY AND DIAGNOSTICS
+
+Implement structured, privacy-conscious logging.
+
+Each significant lifecycle event should include relevant fields such as:
+
+- Timestamp.
+- Session identifier or safe internal ID.
+- State before transition.
+- State after transition.
+- Event type.
+- Socket generation.
+- Disconnect category.
+- Retry attempt.
+- Correlation ID.
+- Operation name.
+- Duration.
+- Persistence result.
+- Error classification.
+
+Avoid logging full phone numbers unless strictly necessary and explicitly permitted by existing security policy.
+
+Never log:
+
+- Authentication tokens.
+- Pairing secrets.
+- Encryption keys.
+- Full authentication objects.
+- Environment secrets.
+- Private message contents unless explicitly necessary and safely redacted.
+
+Provide enough diagnostic detail to identify which stage failed.
+
+Make it possible to answer:
+
+- Why did this session disconnect?
+- Which socket generation emitted the event?
+- Was the authentication update persisted?
+- Was a reconnect scheduled?
+- Why was a session skipped during restoration?
+- Did a send operation fail before submission or after an uncertain outcome?
+- Is the current problem isolated to one session or systemic?
+
+Avoid excessive logging that could exhaust storage.
+
+Implement log rotation or retention only in a way compatible with the deployment.
+
+---
+
+PHASE 14 — TESTING STRATEGY
+
+Create a test plan before implementation.
+
+Use the existing test runner and conventions wherever practical.
+
+Separate unit tests, integration tests, fault-injection tests, and optional live WhatsApp tests.
+
+Do not require production credentials for ordinary automated tests.
+
+Build mocks or adapters around external WhatsApp behavior where appropriate.
+
+Test at least the following scenarios:
+
+Pairing
+
+- Pairing request succeeds.
+- Pairing code generation succeeds but connection does not complete.
+- Pairing expires.
+- Pairing fails.
+- Pairing is requested twice.
+- A session is already authenticated.
+- A stale pairing event arrives after a replacement socket exists.
+
+Persistence
+
+- Credentials update successfully.
+- Key update succeeds.
+- Storage write fails.
+- Process exits during a write.
+- Concurrent writes occur.
+- Session metadata and authentication data become inconsistent.
+- Existing sessions are restored.
+- Missing authentication data is detected.
+- Corrupted data is preserved for diagnosis rather than silently erased.
+
+Connection lifecycle
+
+- Initial connection succeeds.
+- Temporary disconnection occurs.
+- Network becomes unavailable.
+- Network returns.
+- The socket closes unexpectedly.
+- Multiple disconnect events arrive.
+- Reconnect attempts overlap.
+- An old socket emits an event after replacement.
+- Authentication becomes invalid.
+- Explicit logout occurs.
+- A restart-required condition occurs.
+
+Messaging
+
+- Text send succeeds.
+- Media send fails.
+- Send timeout occurs.
+- The connection closes during sending.
+- A message may have been submitted but acknowledgement is missing.
+- Concurrent messages are sent.
+- Retry logic is invoked.
+- Duplicate sends are prevented where feasible.
+- Delivery acknowledgements arrive late or out of order.
+
+Multi-session operation
+
+- Multiple sessions connect independently.
+- One session fails while others remain healthy.
+- Sessions restore concurrently.
+- Concurrent operations target different sessions.
+- Two operations target the same session.
+- A session is deleted or disconnected while an operation is pending.
+
+Process lifecycle
+
+- Graceful shutdown.
+- Unexpected process termination.
+- Service restart.
+- Startup with existing sessions.
+- Database temporarily unavailable during startup.
+- Shutdown while a reconnect is scheduled.
+
+Reliability and regression
+
+- Repeated reconnect cycles.
+- Repeated start and stop operations.
+- Event-listener accumulation.
+- Resource cleanup.
+- Database integrity.
+- Existing command compatibility.
+- Previously observed disconnect code 405, with its exact meaning verified against the installed library.
+- Previously observed restoredCount: 0 and skippedCount: 23, with regression tests for the actual cause once identified.
+
+Tests must assert actual state transitions and persistence outcomes, not merely that functions did not throw.
+
+Use deterministic fake clocks or controlled timers where useful.
+
+Do not run destructive tests against live sessions or production databases.
+
+---
+
+PHASE 15 — FAULT INJECTION AND RECOVERY VERIFICATION
+
+In addition to ordinary unit tests, design controlled fault-injection tests.
+
+Simulate:
+
+- Network interruption.
+- Delayed connection events.
+- Persistence failures.
+- Process restart.
+- Stale socket events.
+- Database contention.
+- Missing credentials.
+- Invalid authentication state.
+- Repeated send failures.
+- Reconnect storms.
+- Multiple sessions failing simultaneously.
+
+For every test, verify:
+
+1. The correct failure is detected.
+2. The state transition is valid.
+3. Sensitive data remains intact.
+4. The recovery policy is appropriate.
+5. No duplicate sockets are created.
+6. No infinite retry loop begins.
+7. Other sessions remain unaffected.
+8. The result is visible in diagnostics.
+9. Recovery reaches a stable state or reports a clear need for manual intervention.
+
+Where a full fault cannot be reproduced in the current environment, document the test limitation rather than inventing a successful result.
+
+---
+
+PHASE 16 — IMPLEMENTATION PLAN AND CHANGE CONTROL
+
+After completing the initial audit, produce a prioritized remediation plan.
+
+For each finding, record:
+
+- Finding ID.
+- Affected component and file.
+- Evidence.
+- Classification: confirmed defect, probable risk, or unverified hypothesis.
+- Severity.
+- Likely impact.
+- Root cause, if proven.
+- Recommended fix.
+- Dependencies.
+- Regression risk.
+- Required tests.
+- Rollback strategy.
+
+Prioritize issues that can cause:
+
+1. Authentication loss.
+2. Session corruption.
+3. Duplicate or conflicting sockets.
+4. Persistent disconnection.
+5. Cross-session interference.
+6. Incorrect message delivery status.
+7. Data corruption.
+8. Resource leaks.
+9. Poor diagnostics.
+10. Noncritical performance degradation.
+
+Do not spend time polishing low-priority features while core persistence and lifecycle invariants remain unverified.
+
+Implement changes in small, reviewable steps.
+
+After each significant change:
+
+- Run relevant tests.
+- Review the diff.
+- Confirm that existing behavior remains compatible.
+- Update the findings register.
+- Record any newly discovered issues.
+
+Do not make unrelated changes merely because you are already editing the project.
+
+If a major architectural rewrite is proposed, explain why incremental changes are insufficient and document the migration plan before proceeding.
+
+---
+
+PHASE 17 — PRODUCTION READINESS AND DEPLOYMENT
+
+After implementation, verify the actual repository's supported checks.
+
+Run the available versions of:
+
+- TypeScript type checking.
+- ESLint.
+- Unit tests.
+- Integration tests.
+- Fault-injection tests.
+- Build.
+- Dependency consistency checks.
+- Relevant database migration tests.
+
+Review the final diff for:
+
+- Accidental secret exposure.
+- Unintended authentication deletion.
+- Unintended database changes.
+- Unnecessary dependency upgrades.
+- Duplicate lifecycle logic.
+- Unhandled asynchronous failures.
+- Incorrect state transitions.
+- Missing test coverage.
+
+Prepare a deployment procedure suitable for the existing AWS Ubuntu server.
+
+The procedure must:
+
+1. Preserve the existing .env file.
+2. Preserve existing authentication data.
+3. Back up the database safely.
+4. Avoid overwriting unrelated local modifications.
+5. Use a controlled service shutdown.
+6. Deploy the verified version.
+7. Install dependencies consistently with the lockfile.
+8. Apply only required migrations.
+9. Restart the service.
+10. Verify startup and session restoration.
+11. Verify health and diagnostics.
+12. Define rollback steps.
+
+Do not assume that git pull will succeed if local changes exist.
+
+Do not assume that npm ci is safe to run without first preserving local changes and checking the lockfile.
+
+Do not deploy untested library modifications.
+
+Do not delete authentication data to make the first startup appear successful.
+
+---
+
+PHASE 18 — FINAL ACCEPTANCE CRITERIA
+
+The project is not considered complete merely because the initial pairing or sending bug disappears.
+
+Completion requires evidence that:
+
+- Pairing status reflects real lifecycle events.
+- Session state transitions are explicit and validated.
+- Authentication updates are persisted correctly.
+- Restoration failures are diagnosable.
+- Duplicate sockets are prevented.
+- Reconnect operations are idempotent.
+- Retry policies are bounded and cause-aware.
+- Stale events cannot corrupt current state.
+- Sending operations do not independently corrupt lifecycle state.
+- Session failures are isolated.
+- Graceful shutdown is implemented and tested.
+- Database changes preserve existing records.
+- Important failure modes have regression tests.
+- The library integration is based on verified APIs.
+- Library modifications, if necessary, are reproducible.
+- Diagnostics are useful without leaking secrets.
+- Existing application features continue to work.
+- Tests and builds have actual recorded results.
+- Deployment and rollback procedures are documented.
+
+If any criterion cannot be verified, explicitly report it as incomplete.
+
+Do not promise that no future errors are possible.
+
+The engineering objective is to minimize defects, make failures detectable, protect existing sessions, and provide reliable recovery for the failure modes that can be anticipated and tested.
+
+---
+
+REQUIRED FINAL REPORT
+
+Produce a comprehensive report with the following sections:
+
+A. Architecture
+
+Describe the actual session-management architecture and lifecycle before and after the changes.
+
+B. Findings
+
+List every confirmed defect and significant risk discovered, including file paths and relevant code locations.
+
+Clearly distinguish confirmed root causes from hypotheses.
+
+C. Persistence
+
+Explain how authentication credentials and cryptographic keys are saved, restored, validated, and protected against interrupted writes.
+
+D. Connection Lifecycle
+
+Explain socket ownership, connection-state transitions, disconnect classification, reconnect policy, and stale-event protection.
+
+E. Multi-Session Safety
+
+Explain isolation, concurrency control, and how one session is prevented from disrupting another.
+
+F. Library Findings
+
+Explain whether athanasia-baileys required modification, what was changed, why it was necessary, and how the change is maintained.
+
+G. Tests
+
+List each important test suite and its actual result.
+
+Include failures and limitations honestly.
+
+H. Files Changed
+
+List every modified and newly created file, with a concise explanation.
+
+I. Remaining Risks
+
+List unsupported scenarios, unresolved hypotheses, environmental limitations, and any acceptance criteria not yet met.
+
+J. Deployment
+
+Provide exact, non-destructive deployment commands suitable for the actual repository and AWS environment.
+
+K. Rollback
+
+Provide a recovery plan that preserves authentication data and SQLite contents.
+
+L. Operational Runbook
+
+Provide clear procedures for diagnosing:
+
+- A disconnected session.
+- A session that cannot be restored.
+- Repeated reconnect attempts.
+- A session conflict.
+- A persistence failure.
+- A message-send failure.
+- A session requiring manual re-pairing.
+
+---
+
+EXECUTION DIRECTIVE
+
+Begin with repository discovery and baseline testing.
+
+Do not modify files during the initial audit.
+
+Produce the architecture map, lifecycle model, findings register, and prioritized remediation plan first.
+
+Then proceed with implementation in controlled phases, validating each phase with tests.
+
+If repository access or execution capabilities are limited, report the limitation and complete only the work that can be verified.
+
+Do not stop after writing a plan if the environment allows implementation.
+
+Do not hide defects, fabricate test results, or claim full compatibility without evidence.
+
+Preserve existing production data throughout the process.
+
+The ultimate goal is to transform Botezz's WhatsApp integration from a system that merely connects into a dependable multi-session infrastructure with correct authentication persistence, deterministic lifecycle control, safe recovery, strong diagnostics, and verifiable reliability.

@@ -56,7 +56,7 @@ const TEST_FUNCTION_CONFIG_KEY = 'nebula_testfunction_config_json';
 export class SettingsRepository {
   private readonly userCooldownTimestamps = new Map<number, number>();
 
-  constructor(private readonly db: AppDatabase) {}
+  constructor(public readonly db: AppDatabase) {}
 
   public get(key: string, defaultValue?: string): string | undefined {
     const row = this.db.sqlite

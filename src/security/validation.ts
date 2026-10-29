@@ -418,6 +418,13 @@ export function resolveSafeChildPath(baseDir: string, childSegment: string): str
 }
 
 /**
+ * Sanitizes an arbitrary filename by stripping directory components and unsafe characters.
+ */
+export function sanitizeFileName(rawName: string): string {
+  return path.basename(rawName || 'file.bin').replace(/[^a-zA-Z0-9._-]/g, '_');
+}
+
+/**
  * Per-user and per-operation rate limiter + duplicate message cooldown protection.
  */
 export class OperationRateLimiter {

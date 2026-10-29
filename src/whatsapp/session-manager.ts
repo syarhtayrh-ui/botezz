@@ -2,6 +2,7 @@ import crypto from 'node:crypto';
 import {
   SessionRepository,
   SessionRecord,
+  SessionHealthStatus,
 } from '../database/repositories/session-repository';
 import { AuditRepository } from '../database/repositories/audit-repository';
 import { SessionStore, CredentialInspectionResult } from './session-store';
@@ -11,6 +12,7 @@ import {
   AthanasiaBaileysSessionDriver,
   MockWhatsAppSessionDriver,
   SessionSocketDiagnostics,
+  classifyDisconnectReason,
 } from './connection-manager';
 import { normalizePhoneNumber } from '../security/validation';
 import {
@@ -43,6 +45,22 @@ export interface SessionManagerOptions {
   defaultAutoCompleteInMock?: boolean;
 }
 
+export interface SessionHealthReport {
+  status: SessionHealthStatus;
+  score: number;
+  issues: string[];
+  lastActivityAt: string | null;
+}
+
+export interface StartupRestorationSummary {
+  restoredCount: number;
+  skippedCount: number;
+  repairedFromBackupCount: number;
+  unregisteredSkippedCount: number;
+  corruptedCount: number;
+  stoppedOrLoggedOutSkippedCount: number;
+}
+
 export interface LiveSessionVerification {
   session: SessionRecord;
   isLiveConnected: boolean;
@@ -52,6 +70,7 @@ export interface LiveSessionVerification {
   hasPairingTimer: boolean;
   socketDiagnostics: SessionSocketDiagnostics;
   credentialInfo: CredentialInspectionResult;
+  health: SessionHealthReport;
 }
 
 export class SessionManager {
@@ -147,7 +166,9 @@ export class SessionManager {
       const current = this.sessionRepo.findById(sessionId);
       if (
         !current ||
-        (current.status !== 'PAIRING_PENDING' && current.status !== 'CONNECTING')
+        (current.status !== 'PAIRING_PENDING' &&
+          current.status !== 'WAITING_FOR_PAIRING' &&
+          current.status !== 'CONNECTING')
       ) {
         return;
       }
@@ -162,6 +183,8 @@ export class SessionManager {
         this.sessionRepo.updateStatus({
           id: sessionId,
           status: 'FAILED',
+          healthStatus: 'UNHEALTHY',
+          lastDisconnectReason: 'PAIRING_TIMEOUT',
           lastError:
             'انتهت مهلة انتظار إدخال رمز الربط في تطبيق واتساب دون إتمام المقارنة على الهاتف.',
         });
@@ -272,6 +295,9 @@ export class SessionManager {
         maskedPhone: normalized.masked,
         jid: normalized.jid,
         reconnectAttempts: 0,
+        lastDisconnectCode: null,
+        lastDisconnectReason: null,
+        healthStatus: 'UNKNOWN',
         lastError: null,
       });
 
@@ -343,6 +369,7 @@ export class SessionManager {
       this.sessionRepo.updateStatus({
         id: sessionId,
         status: 'FAILED',
+        healthStatus: 'UNHEALTHY',
         lastError: safeErr.userMessage,
       });
       this.auditRepo.record({
@@ -412,6 +439,7 @@ export class SessionManager {
     if (evt.status === 'CONNECTING') {
       if (
         current.status !== 'PAIRING_PENDING' &&
+        current.status !== 'WAITING_FOR_PAIRING' &&
         current.status !== 'RECONNECTING' &&
         current.status !== 'AUTHENTICATING'
       ) {
@@ -491,6 +519,10 @@ export class SessionManager {
         jid: evt.jid ?? current.jid,
         maskedPhone: masked,
         reconnectAttempts: 0,
+        lastDisconnectCode: null,
+        lastDisconnectReason: null,
+        healthStatus: 'HEALTHY',
+        lastActivityAt: new Date().toISOString(),
         lastError: null,
       });
       log.info('Session connected and authenticated', { sessionId, generation });
@@ -505,6 +537,8 @@ export class SessionManager {
       this.sessionRepo.updateStatus({
         id: sessionId,
         status: 'AUTHENTICATING',
+        lastDisconnectCode: evt.statusCode ?? 515,
+        lastDisconnectReason: 'RESTART_REQUIRED',
         lastError: null,
       });
       void this.restartAfterPairing(sessionId).catch((err) => {
@@ -529,6 +563,9 @@ export class SessionManager {
         id: sessionId,
         status: 'LOGGED_OUT',
         reconnectAttempts: 0,
+        lastDisconnectCode: evt.statusCode ?? 401,
+        lastDisconnectReason: 'LOGGED_OUT',
+        healthStatus: 'UNHEALTHY',
         lastError: evt.errorMessage || 'تم تسجيل الخروج أو إلغاء صلاحية الجلسة.',
       });
       log.warn('Session logged out and local credentials purged', {
@@ -544,10 +581,19 @@ export class SessionManager {
       const hasRegisteredCreds =
         Boolean(evt.isRegistered) ||
         this.sessionStore.hasRegisteredCredentials(sessionId);
+      const classification = classifyDisconnectReason(
+        evt.statusCode,
+        hasRegisteredCreds,
+        evt.errorMessage
+      );
 
       // CRITICAL: If the session was in PAIRING_PENDING (or never completed pairing/authentication),
       // DO NOT schedule background reconnects! Clean up and mark FAILED.
-      if (current.status === 'PAIRING_PENDING' || !hasRegisteredCreds) {
+      if (
+        current.status === 'PAIRING_PENDING' ||
+        current.status === 'WAITING_FOR_PAIRING' ||
+        !hasRegisteredCreds
+      ) {
         const driver = this.drivers.get(sessionId);
         this.drivers.delete(sessionId);
         if (driver) {
@@ -558,12 +604,17 @@ export class SessionManager {
           id: sessionId,
           status:
             current.status === 'PAIRING_PENDING' ||
+            current.status === 'WAITING_FOR_PAIRING' ||
             current.status === 'AUTHENTICATING' ||
             current.status === 'CONNECTING'
               ? 'FAILED'
               : 'DISCONNECTED',
+          lastDisconnectCode: evt.statusCode ?? null,
+          lastDisconnectReason: classification.category,
+          healthStatus: 'UNHEALTHY',
           lastError:
             evt.errorMessage ||
+            classification.arabicMessage ||
             'انقطع اتصال مقبس واتساب قبل إتمام عملية الربط والمصادقة.',
         });
         log.warn('Unauthenticated session disconnected; skipping auto-reconnect', {
@@ -571,6 +622,34 @@ export class SessionManager {
           generation,
           previousStatus: current.status,
           statusCode: evt.statusCode,
+          category: classification.category,
+        });
+        return;
+      }
+
+      // If an already-registered session encounters a conflict/replacement (440),
+      // forbidden (403), or multidevice mismatch (411), transition to REQUIRES_REPAIR
+      // and DO NOT auto-reconnect in a loop (prevents ping-pong hijack loops).
+      if (classification.requiresRepair) {
+        const driver = this.drivers.get(sessionId);
+        this.drivers.delete(sessionId);
+        if (driver) {
+          void driver.disconnect().catch(() => undefined);
+        }
+        this.clearReconnectTimer(sessionId);
+        this.sessionRepo.updateStatus({
+          id: sessionId,
+          status: 'REQUIRES_REPAIR',
+          lastDisconnectCode: evt.statusCode ?? null,
+          lastDisconnectReason: classification.category,
+          healthStatus: 'UNHEALTHY',
+          lastError: evt.errorMessage || classification.arabicMessage,
+        });
+        log.warn('Registered session requires manual repair; auto-reconnect disabled', {
+          sessionId,
+          generation,
+          statusCode: evt.statusCode,
+          category: classification.category,
         });
         return;
       }
@@ -578,7 +657,10 @@ export class SessionManager {
       this.sessionRepo.updateStatus({
         id: sessionId,
         status: 'DISCONNECTED',
-        lastError: evt.errorMessage || 'انقطع الاتصال مؤقتاً.',
+        lastDisconnectCode: evt.statusCode ?? null,
+        lastDisconnectReason: classification.category,
+        healthStatus: 'DEGRADED',
+        lastError: evt.errorMessage || classification.arabicMessage || 'انقطع الاتصال مؤقتاً.',
       });
       this.scheduleBoundedReconnect(sessionId);
     }
@@ -619,7 +701,10 @@ export class SessionManager {
       !session ||
       session.status === 'LOGGED_OUT' ||
       session.status === 'STOPPED' ||
-      session.status === 'PAIRING_PENDING'
+      session.status === 'STOPPING' ||
+      session.status === 'REQUIRES_REPAIR' ||
+      session.status === 'PAIRING_PENDING' ||
+      session.status === 'WAITING_FOR_PAIRING'
     ) {
       return;
     }
@@ -633,6 +718,7 @@ export class SessionManager {
       this.sessionRepo.updateStatus({
         id: sessionId,
         status: 'FAILED',
+        healthStatus: 'DEGRADED',
         lastError: `تم تجاوز الحد الأقصى لمحاولات إعادة الاتصال (${this.maxReconnectAttempts}).`,
       });
       return;
@@ -646,6 +732,7 @@ export class SessionManager {
     this.sessionRepo.updateStatus({
       id: sessionId,
       status: 'RECONNECTING',
+      healthStatus: 'DEGRADED',
       reconnectAttempts: nextAttempt,
     });
 
@@ -671,30 +758,43 @@ export class SessionManager {
    * Never marks a session `CONNECTED` merely from loading SQLite rows; status only becomes
    * `CONNECTED` when the driver emits `CONNECTED` after verifying live authentication.
    */
-  public async restoreSessionsOnStartup(): Promise<{
-    restoredCount: number;
-    skippedCount: number;
-  }> {
+  public async restoreSessionsOnStartup(): Promise<StartupRestorationSummary> {
     const allSessions = this.sessionRepo.listAll();
     let restoredCount = 0;
     let skippedCount = 0;
+    let repairedFromBackupCount = 0;
+    let unregisteredSkippedCount = 0;
+    let corruptedCount = 0;
+    let stoppedOrLoggedOutSkippedCount = 0;
 
     for (const session of allSessions) {
-      if (session.status === 'LOGGED_OUT' || session.status === 'STOPPED') {
+      if (
+        session.status === 'LOGGED_OUT' ||
+        session.status === 'STOPPED' ||
+        session.status === 'REQUIRES_REPAIR'
+      ) {
         skippedCount++;
+        stoppedOrLoggedOutSkippedCount++;
         continue;
       }
 
       const credInfo = this.sessionStore.inspectCredentials(session.id);
+      if (credInfo.recoveredFromBackup) {
+        repairedFromBackupCount++;
+      }
+
       if (credInfo.corrupted) {
         this.sessionRepo.updateStatus({
           id: session.id,
           status: 'FAILED',
+          healthStatus: 'UNHEALTHY',
+          lastDisconnectReason: 'CORRUPTED_CREDENTIALS',
           lastError:
             credInfo.errorReason ||
             'ملف بيانات المصادقة المحفوظ تالف ولا يمكن استعادته.',
         });
         skippedCount++;
+        corruptedCount++;
         continue;
       }
 
@@ -702,12 +802,15 @@ export class SessionManager {
         this.sessionRepo.updateStatus({
           id: session.id,
           status: 'DISCONNECTED',
+          healthStatus: 'UNKNOWN',
           lastError:
-            session.status === 'PAIRING_PENDING'
+            session.status === 'PAIRING_PENDING' ||
+            session.status === 'WAITING_FOR_PAIRING'
               ? 'انتهت عملية الربط السابقة قبل اكتمال المصادقة.'
               : 'لم يتم العثور على بيانات مصادقة مكتملة عند بدء التشغيل.',
         });
         skippedCount++;
+        unregisteredSkippedCount++;
         continue;
       }
 
@@ -716,7 +819,8 @@ export class SessionManager {
         const generation = this.nextGeneration(session.id);
         this.sessionRepo.updateStatus({
           id: session.id,
-          status: 'CONNECTING',
+          status: 'RECOVERING',
+          healthStatus: 'DEGRADED',
           reconnectAttempts: 0,
           lastError: null,
         });
@@ -736,6 +840,7 @@ export class SessionManager {
         this.sessionRepo.updateStatus({
           id: session.id,
           status: 'DISCONNECTED',
+          healthStatus: 'DEGRADED',
           lastError:
             err instanceof Error ? err.message : 'فشلت استعادة الجلسة تلقائياً.',
         });
@@ -746,8 +851,19 @@ export class SessionManager {
     log.info('Completed startup session restoration', {
       restoredCount,
       skippedCount,
+      repairedFromBackupCount,
+      unregisteredSkippedCount,
+      corruptedCount,
+      stoppedOrLoggedOutSkippedCount,
     });
-    return { restoredCount, skippedCount };
+    return {
+      restoredCount,
+      skippedCount,
+      repairedFromBackupCount,
+      unregisteredSkippedCount,
+      corruptedCount,
+      stoppedOrLoggedOutSkippedCount,
+    };
   }
 
   /**
@@ -771,6 +887,8 @@ export class SessionManager {
       this.sessionRepo.updateStatus({
         id: sessionId,
         status: 'FAILED',
+        healthStatus: 'UNHEALTHY',
+        lastDisconnectReason: 'CORRUPTED_CREDENTIALS',
         lastError:
           credInfo.errorReason || 'ملف بيانات المصادقة تالف. يرجى إعادة ربط الجلسة.',
       });
@@ -783,6 +901,7 @@ export class SessionManager {
       this.sessionRepo.updateStatus({
         id: sessionId,
         status: 'DISCONNECTED',
+        healthStatus: 'UNKNOWN',
         lastError:
           'لا توجد بيانات مصادقة مكتملة لهذه الجلسة. يرجى استخدام خيار "إعادة الربط برقم هاتف".',
       });
@@ -800,6 +919,7 @@ export class SessionManager {
     this.sessionRepo.updateStatus({
       id: sessionId,
       status: 'RECONNECTING',
+      healthStatus: 'DEGRADED',
       lastError: null,
     });
 
@@ -820,6 +940,7 @@ export class SessionManager {
       this.sessionRepo.updateStatus({
         id: sessionId,
         status: 'DISCONNECTED',
+        healthStatus: 'DEGRADED',
         lastError: safeErr.userMessage,
       });
       this.scheduleBoundedReconnect(sessionId);
@@ -856,6 +977,7 @@ export class SessionManager {
       id: sessionId,
       status: 'DISCONNECTED',
       reconnectAttempts: 0,
+      healthStatus: 'UNKNOWN',
       lastError: 'تم قطع الاتصال يدوياً بواسطة المسؤول.',
     });
 
@@ -904,6 +1026,87 @@ export class SessionManager {
   }
 
   /**
+   * Evaluates multidimensional health of a session combining socket state,
+   * credential integrity, reconnect attempts, and disconnect history.
+   */
+  public evaluateSessionHealth(
+    session: SessionRecord,
+    socketDiagnostics: SessionSocketDiagnostics,
+    credentialInfo: CredentialInspectionResult
+  ): SessionHealthReport {
+    const issues: string[] = [];
+    let score = 100;
+
+    if (credentialInfo.corrupted) {
+      issues.push('ملف بيانات المصادقة تالف');
+      score -= 80;
+    } else if (!credentialInfo.registered) {
+      issues.push('لم تكتمل مصادقة الجهاز بعد');
+      score -= 40;
+    }
+
+    if (session.status === 'REQUIRES_REPAIR') {
+      issues.push('الجلسة تتطلب إعادة ربط يدوي بسبب تعارض أو رفض بروتوكول');
+      score -= 70;
+    } else if (session.status === 'LOGGED_OUT') {
+      issues.push('تم تسجيل الخروج من الهاتف');
+      score -= 80;
+    } else if (session.status === 'FAILED') {
+      issues.push('فشل آخر محاولة اتصال أو ربط');
+      score -= 60;
+    } else if (
+      session.status === 'CONNECTED' ||
+      session.status === 'AUTHENTICATED'
+    ) {
+      if (!socketDiagnostics.socketActive || !socketDiagnostics.wsOpen) {
+        issues.push('مقبس WebSocket غير نشط رغم حالة الاتصال');
+        score -= 50;
+      }
+    } else if (
+      session.status === 'RECONNECTING' ||
+      session.status === 'RECOVERING'
+    ) {
+      issues.push(`جاري استعادة الاتصال (محاولة ${session.reconnect_attempts})`);
+      score -= 25;
+    } else if (session.status === 'DISCONNECTED') {
+      issues.push('الجلسة غير متصلة حالياً');
+      score -= 30;
+    }
+
+    if (session.reconnect_attempts > 0) {
+      score -= Math.min(20, session.reconnect_attempts * 5);
+    }
+
+    score = Math.max(0, Math.min(100, score));
+
+    let status: SessionHealthStatus = 'UNKNOWN';
+    if (
+      (session.status === 'CONNECTED' || session.status === 'AUTHENTICATED') &&
+      socketDiagnostics.socketActive &&
+      credentialInfo.registered &&
+      score >= 80
+    ) {
+      status = 'HEALTHY';
+    } else if (
+      session.status === 'REQUIRES_REPAIR' ||
+      session.status === 'LOGGED_OUT' ||
+      session.status === 'FAILED' ||
+      credentialInfo.corrupted
+    ) {
+      status = 'UNHEALTHY';
+    } else if (credentialInfo.registered) {
+      status = 'DEGRADED';
+    }
+
+    return {
+      status,
+      score,
+      issues,
+      lastActivityAt: session.last_activity_at ?? null,
+    };
+  }
+
+  /**
    * Pure read-only reconciliation between persisted SQLite metadata and live in-memory socket state.
    * Never creates a socket, never initiates a connection, and never schedules reconnect timers.
    * Prevents stale SQLite statuses (`CONNECTED`, `PAIRING_PENDING`, `RECONNECTING`) from being
@@ -923,6 +1126,7 @@ export class SessionManager {
         const reconciled = this.sessionRepo.updateStatus({
           id: record.id,
           status: hasReconnectTimer ? 'RECONNECTING' : 'DISCONNECTED',
+          healthStatus: 'DEGRADED',
           lastError:
             record.last_error ||
             'لا يوجد اتصال مقبس حي نشط حالياً لهذه الجلسة.',
@@ -934,8 +1138,10 @@ export class SessionManager {
 
     if (
       record.status === 'PAIRING_PENDING' ||
+      record.status === 'WAITING_FOR_PAIRING' ||
       record.status === 'CONNECTING' ||
-      record.status === 'AUTHENTICATING'
+      record.status === 'AUTHENTICATING' ||
+      record.status === 'RECOVERING'
     ) {
       const isHandshakeOrPairingAlive = Boolean(
         (driver && diag?.socketActive) ||
@@ -1006,6 +1212,11 @@ export class SessionManager {
         socketDiagnostics.socketActive &&
         socketDiagnostics.registered
     );
+    const health = this.evaluateSessionHealth(
+      session,
+      socketDiagnostics,
+      credentialInfo
+    );
 
     return {
       session,
@@ -1016,6 +1227,7 @@ export class SessionManager {
       hasPairingTimer: this.pairingTimers.has(sessionId),
       socketDiagnostics,
       credentialInfo,
+      health,
     };
   }
 
@@ -1038,6 +1250,7 @@ export class SessionManager {
         `لم يتم العثور على قناة اتصال نشطة للجلسة (${session.label}). يرجى إعادة الاتصال أولاً.`
       );
     }
+    this.sessionRepo.recordActivity(sessionId);
     return driver;
   }
 

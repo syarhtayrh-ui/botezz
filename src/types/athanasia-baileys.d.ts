@@ -98,17 +98,69 @@ declare module 'athanasia-baileys' {
     [key: string]: unknown;
   }
 
-  export interface AuthenticationState {
-    creds: AuthenticationCreds;
-    keys: unknown;
+  export type SignalDataTypeMap = {
+    'pre-key': unknown;
+    session: unknown;
+    'sender-key': unknown;
+    'sender-key-memory': unknown;
+    'app-state-sync-key': unknown;
+    'app-state-sync-version': unknown;
+    'lid-mapping': unknown;
+    'device-list': unknown;
+    tctoken: unknown;
+    [key: string]: unknown;
+  };
+
+  export interface SignalKeyStore {
+    get<T extends keyof SignalDataTypeMap>(
+      type: T,
+      ids: string[]
+    ): Promise<{ [id: string]: SignalDataTypeMap[T] }>;
+    set(data: {
+      [C in keyof SignalDataTypeMap]?: { [id: string]: SignalDataTypeMap[C] | null | undefined };
+    }): Promise<void>;
+    clear?(): Promise<void>;
   }
 
+  export interface AuthenticationState {
+    creds: AuthenticationCreds;
+    keys: SignalKeyStore;
+  }
+
+  export const BufferJSON: {
+    replacer(key: string, value: unknown): unknown;
+    reviver(key: string, value: unknown): unknown;
+  };
+
+  export function initAuthCreds(): AuthenticationCreds;
+
+  export function makeCacheableSignalKeyStore(
+    store: SignalKeyStore,
+    logger?: Logger,
+    cache?: unknown
+  ): SignalKeyStore;
+
   export type AnyMessageContent =
-    | { text: string }
-    | { image: Buffer; mimetype?: string; caption?: string }
-    | { video: Buffer; mimetype?: string; caption?: string }
-    | { audio: Buffer; mimetype?: string; ptt?: boolean }
+    | { text: string; mentions?: string[]; viewOnce?: boolean }
+    | { image: Buffer; mimetype?: string; caption?: string; viewOnce?: boolean }
+    | {
+        video: Buffer;
+        mimetype?: string;
+        caption?: string;
+        gifPlayback?: boolean;
+        ptv?: boolean;
+        viewOnce?: boolean;
+      }
+    | { audio: Buffer; mimetype?: string; ptt?: boolean; seconds?: number; viewOnce?: boolean }
     | { document: Buffer; mimetype: string; fileName?: string; caption?: string }
+    | { sticker: Buffer; mimetype?: string; isAnimated?: boolean }
+    | { stickerPack: Record<string, unknown> }
+    | { contacts: { displayName?: string; contacts?: Array<{ vcard: string; displayName?: string }> } }
+    | { location: { degreesLatitude: number; degreesLongitude: number; name?: string; address?: string } }
+    | { poll: { name: string; values: string[]; selectableCount?: number } }
+    | { react: { text: string; key: WAMessageKey } }
+    | { edit: WAMessageKey; text: string }
+    | { delete: WAMessageKey }
     | Record<string, unknown>;
 
   export interface WAMessageKey {
@@ -122,7 +174,41 @@ declare module 'athanasia-baileys' {
     key: WAMessageKey;
     messageTimestamp?: number | Long;
     pushName?: string | null;
+    participant?: string | null;
     message?: Record<string, unknown> | null;
+    status?: number;
+    userReceipt?: Array<{
+      userJid: string;
+      receiptTimestamp?: number | Long;
+      readTimestamp?: number | Long;
+      playedTimestamp?: number | Long;
+    }>;
+    reactions?: Array<{
+      key: WAMessageKey;
+      text?: string | null;
+      senderTimestampMs?: number | Long;
+    }>;
+    pollUpdates?: Array<{
+      pollUpdateMessageKey: WAMessageKey;
+      vote?: { selectedOptions?: Uint8Array[] };
+    }>;
+    messageStubType?: number;
+    messageStubParameters?: string[];
+  }
+
+  export interface WAMessageUpdate {
+    key: WAMessageKey;
+    update: Partial<WAMessage>;
+  }
+
+  export interface MessageUserReceiptUpdate {
+    key: WAMessageKey;
+    receipt: {
+      userJid: string;
+      receiptTimestamp?: number | Long;
+      readTimestamp?: number | Long;
+      playedTimestamp?: number | Long;
+    };
   }
 
   type Long = { toNumber(): number } | number;
@@ -145,6 +231,18 @@ declare module 'athanasia-baileys' {
     on(
       event: 'messages.upsert',
       listener: (payload: { messages: WAMessage[]; type: string }) => void
+    ): void;
+    on(
+      event: 'messages.update',
+      listener: (updates: WAMessageUpdate[]) => void
+    ): void;
+    on(
+      event: 'message-receipt.update',
+      listener: (updates: MessageUserReceiptUpdate[]) => void
+    ): void;
+    on(
+      event: 'messages.reaction',
+      listener: (reactions: Array<{ key: WAMessageKey; reaction: { key: WAMessageKey; text?: string | null } }>) => void
     ): void;
     on(
       event: 'chats.set',
@@ -177,12 +275,24 @@ declare module 'athanasia-baileys' {
       jid: string,
       content: AnyMessageContent,
       options?: Record<string, unknown>
-    ): Promise<{ key?: WAMessageKey } | undefined>;
+    ): Promise<{ key?: WAMessageKey; message?: proto.IMessage } | undefined>;
+    sendStatusMentions?(
+      content: Record<string, unknown>,
+      jids?: string[]
+    ): Promise<WAMessage>;
     relayMessage(
       jid: string,
       message: proto.IMessage,
       options?: Record<string, unknown>
     ): Promise<string>;
+    readMessages?(keys: WAMessageKey[]): Promise<void>;
+    sendReceipt?(
+      jid: string,
+      participant: string | undefined,
+      messageIds: string[],
+      type?: string
+    ): Promise<void>;
+    updateMediaMessage?(message: WAMessage): Promise<WAMessage>;
     presenceSubscribe(toJid: string): Promise<void>;
     sendPresenceUpdate(
       type: 'unavailable' | 'available' | 'composing' | 'recording' | 'paused',
@@ -198,6 +308,7 @@ declare module 'athanasia-baileys' {
       action: ParticipantAction
     ): Promise<Array<{ status: string; jid: string }>>;
     groupLeave(id: string): Promise<void>;
+    groupToggleEphemeral?(jid: string, ephemeralExpiration: number): Promise<void>;
     newsletterMetadata(
       type: 'invite' | 'jid' | 'INVITE' | 'JID',
       key: string
@@ -208,7 +319,12 @@ declare module 'athanasia-baileys' {
 
   export namespace proto {
     export type IMessage = Record<string, unknown>;
-    export const Message: Record<string, unknown>;
+    export const Message: {
+      AppStateSyncKeyData: {
+        fromObject(obj: unknown): unknown;
+      };
+      [key: string]: unknown;
+    };
     export const WebMessageInfo: Record<string, unknown>;
   }
 
@@ -222,6 +338,7 @@ declare module 'athanasia-baileys' {
     syncFullHistory?: boolean;
     generateHighQualityLinkPreview?: boolean;
     cachedGroupMetadata?: (jid: string) => Promise<GroupMetadata | undefined>;
+    getMessage?: (key: WAMessageKey) => Promise<proto.IMessage | undefined>;
     [key: string]: unknown;
   }
 
@@ -231,6 +348,9 @@ declare module 'athanasia-baileys' {
     windows(browser: string): [string, string, string];
     appropriate(browser: string): [string, string, string];
   };
+
+  export const STORIES_JID: string;
+  export const S_WHATSAPP_NET: string;
 
   export function useMultiFileAuthState(
     folder: string
@@ -257,7 +377,37 @@ declare module 'athanasia-baileys' {
 
   export function jidNormalizedUser(jid: string | undefined): string;
   export function isJidGroup(jid: string | undefined): boolean | undefined;
+  export function isJidStatusBroadcast(jid: string | undefined): boolean;
+  export function isJidNewsletter(jid: string | undefined): boolean | undefined;
+  export function isJidBroadcast(jid: string | undefined): boolean | undefined;
+  export function isLidUser(jid: string | undefined): boolean | undefined;
+  export function isPnUser(jid: string | undefined): boolean | undefined;
   export function areJidsSameUser(jid1: string | undefined, jid2: string | undefined): boolean;
+
+  export function getContentType(
+    content: Record<string, unknown> | null | undefined
+  ): string | undefined;
+
+  export function normalizeMessageContent(
+    content: Record<string, unknown> | null | undefined
+  ): Record<string, unknown> | undefined;
+
+  export function extractMessageContent(
+    content: Record<string, unknown> | null | undefined
+  ): Record<string, unknown> | undefined;
+
+  export function downloadMediaMessage(
+    message: WAMessage | { key?: WAMessageKey; message?: Record<string, unknown> | null },
+    type: 'buffer' | 'stream',
+    options?: Record<string, unknown>,
+    ctx?: Record<string, unknown>
+  ): Promise<Buffer | NodeJS.ReadableStream>;
+
+  export function downloadContentFromMessage(
+    downloadable: { mediaKey?: Uint8Array | string | null; directPath?: string | null; url?: string | null },
+    type: string,
+    opts?: Record<string, unknown>
+  ): Promise<AsyncIterable<Buffer>>;
 
   export function generateWAMessageFromContent(
     jid: string,

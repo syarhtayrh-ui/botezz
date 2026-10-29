@@ -6,16 +6,21 @@ import {
 } from './main-menu';
 
 const STATUS_BADGE_ARABIC: Record<SessionRecord['status'], string> = {
-  CONNECTED: '🟢 متصل',
-  AUTHENTICATED: '🟢 موثق',
-  AUTHENTICATING: '🔵 جاري التوثيق',
-  CONNECTING: '🟡 جاري الاتصال',
-  PAIRING_PENDING: '🟡 بانتظار رمز الربط',
+  CREATED: '🆕 منشأة حديثاً',
   INITIALIZING: '🟡 قيد التهيئة',
+  CONNECTING: '🟡 جاري الاتصال',
+  WAITING_FOR_PAIRING: '🟡 جاهز لإصدار رمز الربط',
+  PAIRING_PENDING: '🟡 بانتظار رمز الربط',
+  AUTHENTICATING: '🔵 جاري التوثيق',
+  AUTHENTICATED: '🟢 موثق',
+  CONNECTED: '🟢 متصل',
+  RECOVERING: '🟠 جاري استعادة الجلسة',
   RECONNECTING: '🟠 يعيد الاتصال',
   DISCONNECTED: '🔴 غير متصل',
-  STOPPED: '⏹️ متوقف',
   LOGGED_OUT: '⚪ تم تسجيل الخروج',
+  REQUIRES_REPAIR: '🛠️ يتطلب إعادة ربط',
+  STOPPING: '⏹️ جاري الإيقاف',
+  STOPPED: '⏹️ متوقف',
   FAILED: '❌ فشل الاتصال',
 };
 
