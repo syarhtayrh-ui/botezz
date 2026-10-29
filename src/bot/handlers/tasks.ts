@@ -15,8 +15,12 @@ export class TasksHandler {
     private readonly auditRepo: AuditRepository
   ) {}
 
-  public renderTaskMonitor(page = 1): BotViewResponse {
-    const tasks = this.taskManager.listRecentTasks(30);
+  public renderTaskMonitor(
+    page = 1,
+    actorUserId?: number,
+    isOwner = true
+  ): BotViewResponse {
+    const tasks = this.taskManager.listRecentTasks(30, actorUserId, isOwner);
     const { rows, currentPage, totalPages } = buildTaskListKeyboard({
       tasks,
       page,
@@ -40,11 +44,15 @@ export class TasksHandler {
     };
   }
 
-  public renderTaskDetail(taskId: string): BotViewResponse {
-    const task = this.taskManager.getTask(taskId);
+  public renderTaskDetail(
+    taskId: string,
+    actorUserId?: number,
+    isOwner = true
+  ): BotViewResponse {
+    const task = this.taskManager.getTask(taskId, actorUserId, isOwner);
     if (!task) {
       return {
-        text: '⚠️ لم يتم العثور على المهمة المطلوبة.',
+        text: '⚠️ لم يتم العثور على المهمة المطلوبة أو غير مصرح لك بالوصول إليها.',
         keyboard: [[{ text: '🔙 رجوع لقائمة المهام', callbackData: 'menu:tasks:page:1' }]],
       };
     }
@@ -79,9 +87,13 @@ export class TasksHandler {
     };
   }
 
-  public handleCancelTask(taskId: string, adminId: number): BotViewResponse {
+  public handleCancelTask(
+    taskId: string,
+    adminId: number,
+    isOwner = true
+  ): BotViewResponse {
     try {
-      const res = this.taskManager.cancelTask(taskId, adminId);
+      const res = this.taskManager.cancelTask(taskId, adminId, isOwner);
       return {
         text: `🛑 *طلب إلغاء المهمة (\`${taskId}\`):*\n${res.messageArabic}`,
         keyboard: [

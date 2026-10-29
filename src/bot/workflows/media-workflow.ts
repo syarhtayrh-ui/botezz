@@ -140,8 +140,7 @@ export class MediaWorkflow {
       state.caption = params.caption;
       state.step = 'SELECTING_SESSIONS';
       state.selectedSessionIds = this.sessionManager
-        .listSessions()
-        .filter((s) => s.status === 'CONNECTED' || s.status === 'AUTHENTICATED')
+        .listConnectedSessions(adminId)
         .map((s) => s.id);
 
       return this.renderSessionSelection(adminId);
@@ -158,6 +157,10 @@ export class MediaWorkflow {
     const state = this.states.get(adminId);
     if (!state) return this.start(adminId);
 
+    if (!this.sessionManager.getSession(sessionId, adminId)) {
+      return this.renderSessionSelection(adminId);
+    }
+
     const idx = state.selectedSessionIds.indexOf(sessionId);
     if (idx === -1) {
       state.selectedSessionIds.push(sessionId);
@@ -172,8 +175,7 @@ export class MediaWorkflow {
     if (!state) return this.start(adminId);
 
     state.selectedSessionIds = this.sessionManager
-      .listSessions()
-      .filter((s) => s.status === 'CONNECTED' || s.status === 'AUTHENTICATED')
+      .listConnectedSessions(adminId)
       .map((s) => s.id);
     return this.renderSessionSelection(adminId);
   }
@@ -197,7 +199,7 @@ export class MediaWorkflow {
         `الملف: \`${state.mediaFile.safeOriginalName}\` (${state.mediaFile.kind})\n\n` +
         `الخطوة 3 من 4: حدد الجلسات المطلوبة:`,
       keyboard: buildMultiSessionSelectorKeyboard({
-        sessions: this.sessionManager.listSessions(),
+        sessions: this.sessionManager.listSessions(adminId),
         selectedIds: state.selectedSessionIds,
         workflowPrefix: 'wf_media',
       }),
@@ -214,7 +216,7 @@ export class MediaWorkflow {
       return {
         text: '⚠️ الرجاء اختيار جلسة واحدة على الأقل.',
         keyboard: buildMultiSessionSelectorKeyboard({
-          sessions: this.sessionManager.listSessions(),
+          sessions: this.sessionManager.listSessions(adminId),
           selectedIds: state.selectedSessionIds,
           workflowPrefix: 'wf_media',
         }),

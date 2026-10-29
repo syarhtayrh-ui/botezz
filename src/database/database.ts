@@ -13,6 +13,11 @@ import {
   MIGRATION_004_UP_SQL,
   MIGRATION_004_DOWN_SQL,
 } from './migrations/004_session_lifecycle_hardening';
+import {
+  MIGRATION_005_ID,
+  MIGRATION_005_UP_SQL,
+  MIGRATION_005_DOWN_SQL,
+} from './migrations/005_multi_tenant_isolation';
 import { DatabaseError } from '../utils/errors';
 import { createLogger } from '../logging/logger';
 
@@ -117,6 +122,43 @@ export class AppDatabase {
         this.sqlite.exec('PRAGMA foreign_keys = ON;');
       }
     }
+
+    const existing005 = checkStmt.get(MIGRATION_005_ID) as { id: string } | undefined;
+    if (!existing005) {
+      this.runInTransaction(() => {
+        this.ensureMultiTenantColumns();
+        this.sqlite.exec(MIGRATION_005_UP_SQL);
+        const insertStmt = this.sqlite.prepare(
+          'INSERT INTO schema_migrations (id, applied_at) VALUES (?, ?)'
+        );
+        insertStmt.run(MIGRATION_005_ID, new Date().toISOString());
+      });
+      log.info('Database migration applied', { migrationId: MIGRATION_005_ID });
+    } else {
+      this.ensureMultiTenantColumns();
+    }
+  }
+
+  private ensureMultiTenantColumns(): void {
+    const sessCols = this.sqlite
+      .prepare('PRAGMA table_info(sessions)')
+      .all() as Array<{ name: string }>;
+    const sessColNames = new Set(sessCols.map((c) => c.name));
+    if (!sessColNames.has('owner_telegram_id')) {
+      this.sqlite.exec(
+        'ALTER TABLE sessions ADD COLUMN owner_telegram_id INTEGER NOT NULL DEFAULT 0'
+      );
+    }
+
+    const taskCols = this.sqlite
+      .prepare('PRAGMA table_info(tasks)')
+      .all() as Array<{ name: string }>;
+    const taskColNames = new Set(taskCols.map((c) => c.name));
+    if (!taskColNames.has('owner_telegram_id')) {
+      this.sqlite.exec(
+        'ALTER TABLE tasks ADD COLUMN owner_telegram_id INTEGER NOT NULL DEFAULT 0'
+      );
+    }
   }
 
   public hasMigration(migrationId: string): boolean {
@@ -128,11 +170,15 @@ export class AppDatabase {
   }
 
   /**
-   * Safely rolls back a reversible migration (003 or 004)
+   * Safely rolls back a reversible migration (003, 004, or 005)
    * without losing core session or settings rows.
    */
   public rollbackMigration(migrationId: string): boolean {
-    if (migrationId !== MIGRATION_003_ID && migrationId !== MIGRATION_004_ID) {
+    if (
+      migrationId !== MIGRATION_003_ID &&
+      migrationId !== MIGRATION_004_ID &&
+      migrationId !== MIGRATION_005_ID
+    ) {
       throw new DatabaseError(
         `الترحيل (${migrationId}) غير قابل للتراجع التلقائي حفاظاً على الجلسات الأساسية.`
       );
@@ -144,7 +190,11 @@ export class AppDatabase {
     if (!existing) return false;
 
     const downSql =
-      migrationId === MIGRATION_004_ID ? MIGRATION_004_DOWN_SQL : MIGRATION_003_DOWN_SQL;
+      migrationId === MIGRATION_005_ID
+        ? MIGRATION_005_DOWN_SQL
+        : migrationId === MIGRATION_004_ID
+          ? MIGRATION_004_DOWN_SQL
+          : MIGRATION_003_DOWN_SQL;
 
     this.sqlite.exec('PRAGMA foreign_keys = OFF;');
     try {

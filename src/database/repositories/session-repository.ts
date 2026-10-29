@@ -27,6 +27,7 @@ export interface SessionRecord {
   jid: string | null;
   status: SessionStatus;
   auth_dir: string;
+  owner_telegram_id?: number;
   reconnect_attempts: number;
   last_connected_at: string | null;
   last_status_at: string;
@@ -49,15 +50,16 @@ export class SessionRepository {
     jid?: string | null;
     status: SessionStatus;
     authDir: string;
+    ownerTelegramId?: number;
   }): SessionRecord {
     const now = new Date().toISOString();
     const stmt = this.db.sqlite.prepare(`
       INSERT INTO sessions (
-        id, label, masked_phone, jid, status, auth_dir,
+        id, label, masked_phone, jid, status, auth_dir, owner_telegram_id,
         reconnect_attempts, last_connected_at, last_status_at, last_error,
         last_disconnect_code, last_disconnect_reason, health_status, last_activity_at,
         created_at, updated_at
-      ) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, NULL, NULL, NULL, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, 0, ?, ?, NULL, NULL, NULL, ?, ?, ?, ?)
     `);
 
     const isConnected =
@@ -72,6 +74,7 @@ export class SessionRepository {
       params.jid ?? null,
       params.status,
       params.authDir,
+      params.ownerTelegramId ?? 0,
       lastConnected,
       now,
       initialHealth,
@@ -92,14 +95,28 @@ export class SessionRepository {
     return stmt.get(id) as SessionRecord | undefined;
   }
 
-  public listAll(): SessionRecord[] {
+  public listAll(ownerTelegramId?: number): SessionRecord[] {
+    if (ownerTelegramId !== undefined && ownerTelegramId > 0) {
+      const stmt = this.db.sqlite.prepare(
+        'SELECT * FROM sessions WHERE owner_telegram_id = ? ORDER BY created_at ASC'
+      );
+      return stmt.all(ownerTelegramId) as unknown as SessionRecord[];
+    }
     const stmt = this.db.sqlite.prepare(
       'SELECT * FROM sessions ORDER BY created_at ASC'
     );
     return stmt.all() as unknown as SessionRecord[];
   }
 
-  public listConnected(): SessionRecord[] {
+  public listConnected(ownerTelegramId?: number): SessionRecord[] {
+    if (ownerTelegramId !== undefined && ownerTelegramId > 0) {
+      const stmt = this.db.sqlite.prepare(`
+        SELECT * FROM sessions
+        WHERE status IN ('CONNECTED', 'AUTHENTICATED') AND owner_telegram_id = ?
+        ORDER BY created_at ASC
+      `);
+      return stmt.all(ownerTelegramId) as unknown as SessionRecord[];
+    }
     const stmt = this.db.sqlite.prepare(`
       SELECT * FROM sessions
       WHERE status IN ('CONNECTED', 'AUTHENTICATED')

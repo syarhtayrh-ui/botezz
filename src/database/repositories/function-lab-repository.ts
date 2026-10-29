@@ -461,6 +461,7 @@ export class FunctionLabRepository {
   public listRecentExecutions(options?: {
     functionId?: string;
     functionName?: string;
+    telegramUserId?: number;
     limit?: number;
   }): StoredFunctionExecution[] {
     const limit = Math.max(1, Math.min(options?.limit ?? 15, 100));
@@ -480,6 +481,16 @@ export class FunctionLabRepository {
       );
       const rows = stmt.all(
         options.functionName,
+        limit
+      ) as unknown as RawFunctionExecutionRow[];
+      return rows.map((r) => this.mapExecutionRow(r));
+    }
+    if (options?.telegramUserId !== undefined && options.telegramUserId > 0) {
+      const stmt = this.db.sqlite.prepare(
+        'SELECT * FROM function_executions WHERE telegram_user_id = ? ORDER BY created_at DESC LIMIT ?'
+      );
+      const rows = stmt.all(
+        options.telegramUserId,
         limit
       ) as unknown as RawFunctionExecutionRow[];
       return rows.map((r) => this.mapExecutionRow(r));

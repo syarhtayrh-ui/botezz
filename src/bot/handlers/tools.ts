@@ -133,12 +133,19 @@ export class ToolsHandler {
   }
 
   public renderFunctionCatalog(adminId: number, categoryFilter?: string): BotViewResponse {
-    const functions = this.functionRegistry.listFunctions({
+    const isOwner = this.sessionManager.isOwner(adminId);
+    const allFunctions = this.functionRegistry.listFunctions({
       category: categoryFilter,
       onlyEnabled: true,
     });
+    const functions = isOwner
+      ? allFunctions
+      : allFunctions.filter((fn) => fn.createdBy === adminId);
     const currentSelected = this.selectedFunctionByAdmin.get(adminId);
-    const recentExecs = this.functionLabRepo.listRecentExecutions({ limit: 5 });
+    const recentExecs = this.functionLabRepo.listRecentExecutions({
+      limit: 5,
+      telegramUserId: isOwner ? undefined : adminId,
+    });
 
     const fnLines =
       functions.length > 0
@@ -298,9 +305,89 @@ export class ToolsHandler {
     };
   }
 
-  public renderToolsMenu(): BotViewResponse {
+  public renderToolsMenu(isAdmin = true): BotViewResponse {
     const tfCfg = this.settingsRepo.getTestFunctionConfig();
     const maxLabel = tfCfg.maxSends === 0 ? 'غير محدود (∞)' : `${tfCfg.maxSends}`;
+    const rows: InlineKeyboardRows = [
+      [
+        {
+          text: '🧪 مختبر الدوال (/testfunction)',
+          callbackData: 'tools:prompt_testfunction',
+        },
+        {
+          text: '📚 دوالي المحفوظة',
+          callbackData: 'tools:flab_catalog',
+        },
+      ],
+      [
+        {
+          text: '📡 فحص قناة واتساب (/cekidch)',
+          callbackData: 'tools:prompt_channel',
+        },
+        {
+          text: '📱 فحص مقابس الإرسال (/ceksender)',
+          callbackData: 'tools:ceksender',
+        },
+      ],
+      isAdmin
+        ? [
+            {
+              text: '📊 التقرير الشامل (/cekall)',
+              callbackData: 'tools:cekall',
+            },
+            {
+              text: '🌍 تتبع عنوان IP (/trackip)',
+              callbackData: 'tools:prompt_ip',
+            },
+          ]
+        : [
+            {
+              text: '🌍 تتبع عنوان IP (/trackip)',
+              callbackData: 'tools:prompt_ip',
+            },
+            {
+              text: '🌋 رصد الزلازل (/gempa)',
+              callbackData: 'tools:gempa',
+            },
+          ],
+      [
+        {
+          text: '🔗 اختصار رابط (/shortlink)',
+          callbackData: 'tools:prompt_shortlink',
+        },
+        {
+          text: '🪪 بطاقة الحساب (/info)',
+          callbackData: 'tools:info',
+        },
+      ],
+    ];
+
+    if (isAdmin) {
+      rows.push([
+        {
+          text: '🌋 رصد الزلازل (/gempa)',
+          callbackData: 'tools:gempa',
+        },
+        {
+          text: '⭐ إدارة الاشتراكات',
+          callbackData: 'menu:subscriptions:page:1',
+        },
+      ]);
+      rows.push([
+        {
+          text: '🛡️ لوحة تحكم المشرف',
+          callbackData: 'menu:admin',
+        },
+      ]);
+    }
+
+    rows.push(
+      buildAppNavigationRow({
+        backCallback: 'nav:back',
+        refreshCallback: 'menu:tools',
+      })
+    );
+
     return {
       text:
         `🛠️ *الأدوات والفحص المتقدم (Tools & Diagnostics)*\n\n` +
@@ -310,73 +397,14 @@ export class ToolsHandler {
         `• \`/stopfunction\` — إيقاف فوري لأي دالة قيد التشغيل\n` +
         `• \`/cekidch <link>\` — فحص قناة واتساب واستخراج معرفها وعدد المتابعين\n` +
         `• \`/ceksender\` — فحص مقابس جلسات واتساب والذاكرة المؤقتة (InMemoryStore)\n` +
-        `• \`/cekall\` — تقرير شامل (المسؤول + الاشتراكات + الجلسات + موارد الخادم)\n` +
+        (isAdmin
+          ? `• \`/cekall\` — تقرير شامل (المسؤول + الاشتراكات + الجلسات + موارد الخادم)\n`
+          : '') +
         `• \`/trackip <ip>\` — تتبع الموقع الجغرافي ومزود الخدمة لعنوان IPv4/IPv6\n` +
         `• \`/shortlink <url>\` — اختصار الروابط الطويلة عبر TinyURL\n` +
         `• \`/gempa\` — آخر نشرة رصد زلزالي (BMKG)\n` +
         `• \`/info\` — بطاقة معلومات الحساب والصلاحيات`,
-      keyboard: [
-        [
-          {
-            text: '🧪 مختبر الدوال (/testfunction)',
-            callbackData: 'tools:prompt_testfunction',
-          },
-          {
-            text: '📚 دوالي المحفوظة',
-            callbackData: 'tools:flab_catalog',
-          },
-        ],
-        [
-          {
-            text: '📡 فحص قناة واتساب (/cekidch)',
-            callbackData: 'tools:prompt_channel',
-          },
-          {
-            text: '📱 فحص مقابس الإرسال (/ceksender)',
-            callbackData: 'tools:ceksender',
-          },
-        ],
-        [
-          {
-            text: '📊 التقرير الشامل (/cekall)',
-            callbackData: 'tools:cekall',
-          },
-          {
-            text: '🌍 تتبع عنوان IP (/trackip)',
-            callbackData: 'tools:prompt_ip',
-          },
-        ],
-        [
-          {
-            text: '🔗 اختصار رابط (/shortlink)',
-            callbackData: 'tools:prompt_shortlink',
-          },
-          {
-            text: '🪪 بطاقة الحساب (/info)',
-            callbackData: 'tools:info',
-          },
-        ],
-        [
-          {
-            text: '🌋 رصد الزلازل (/gempa)',
-            callbackData: 'tools:gempa',
-          },
-          {
-            text: '⭐ إدارة الاشتراكات',
-            callbackData: 'menu:subscriptions:page:1',
-          },
-        ],
-        [
-          {
-            text: '🛡️ لوحة تحكم المشرف',
-            callbackData: 'menu:admin',
-          },
-        ],
-        buildAppNavigationRow({
-          backCallback: 'nav:back',
-          refreshCallback: 'menu:tools',
-        }),
-      ],
+      keyboard: rows,
       toastText: '🛠️ قائمة الأدوات والفحص المتقدم',
       route: 'menu:tools',
     };
@@ -656,7 +684,7 @@ export class ToolsHandler {
       this.cancel(adminId);
       return this.executeTestFunction(adminId, rawText, repliedText);
     }
-    return this.renderToolsMenu();
+    return this.renderToolsMenu(this.sessionManager.isOwner(adminId));
   }
 
   public promptSaveLastFunction(adminId: number): BotViewResponse {
@@ -943,10 +971,15 @@ export class ToolsHandler {
       // Support single-argument function selection: `/testfunction SavedFn`
       if (positionalTokens.length === 1 && !repliedText && !inlineFuncCode) {
         const candidateFn = this.functionRegistry.resolveFunction(positionalTokens[0]);
-        if (candidateFn) {
+        if (
+          candidateFn &&
+          (this.sessionManager.isOwner(adminId) ||
+            !candidateFn.createdBy ||
+            candidateFn.createdBy === adminId)
+        ) {
           this.selectedFunctionByAdmin.set(adminId, candidateFn.name);
           const fallbackMode =
-            this.sessionManager.listConnectedSessions().length === 0 &&
+            this.sessionManager.listConnectedSessions(adminId).length === 0 &&
             effectiveMode === 'LIVE'
               ? 'SIMULATION'
               : effectiveMode;
@@ -969,7 +1002,7 @@ export class ToolsHandler {
       ) {
         positionalTokens.push('+966501234567', '1');
         if (
-          this.sessionManager.listConnectedSessions().length === 0 &&
+          this.sessionManager.listConnectedSessions(adminId).length === 0 &&
           effectiveMode === 'LIVE'
         ) {
           effectiveMode = 'SIMULATION';
@@ -1122,7 +1155,7 @@ export class ToolsHandler {
       }
 
       // Resolve target sessions via SessionResolver (supports DRY_RUN / SIMULATION offline safety)
-      const connectedSessions = this.sessionManager.listConnectedSessions();
+      const connectedSessions = this.sessionManager.listConnectedSessions(adminId);
       const sessionResolution = this.sessionResolver.resolveTargetSessions({
         connectedSessions,
         requestedScope: effectiveScope,
@@ -1198,7 +1231,7 @@ export class ToolsHandler {
               return { session: sess, res: execRes };
             }
 
-            const driver = this.sessionManager.getDriver(sess.id);
+            const driver = this.sessionManager.getDriver(sess.id, adminId);
             const res = await driver.executeTestFunction({
               targetPhone: targetRaw,
               iterations,
@@ -1464,7 +1497,7 @@ export class ToolsHandler {
   ): Promise<BotViewResponse> {
     try {
       const { inviteCode, normalizedUrl } = validateWhatsAppChannelLink(rawLink);
-      const connectedSessions = this.sessionManager.listConnectedSessions();
+      const connectedSessions = this.sessionManager.listConnectedSessions(adminId);
       if (connectedSessions.length === 0) {
         return {
           text:
@@ -1480,7 +1513,7 @@ export class ToolsHandler {
       }
 
       const activeSession = connectedSessions[0];
-      const driver = this.sessionManager.getDriver(activeSession.id);
+      const driver = this.sessionManager.getDriver(activeSession.id, adminId);
       const meta = await driver.getChannelMetadata(inviteCode);
 
       this.auditRepo.record({
@@ -1528,8 +1561,8 @@ export class ToolsHandler {
    * Implements `/ceksender` & Sender Management (`menu:senders:page:<n>`) —
    * paginated inspection of all sessions, sockets, and InMemoryStore stats.
    */
-  public renderSenderDiagnostics(page = 1): BotViewResponse {
-    const sessions = this.sessionManager.listSessions();
+  public renderSenderDiagnostics(page = 1, actorUserId?: number): BotViewResponse {
+    const sessions = this.sessionManager.listSessions(actorUserId);
     if (sessions.length === 0) {
       return {
         text:
@@ -1556,7 +1589,7 @@ export class ToolsHandler {
     const lines = slice.map((sess, idx) => {
       let socketSummary = '⚪ المقبس غير نشط في الذاكرة';
       try {
-        const drv = this.sessionManager.getDriver(sess.id);
+        const drv = this.sessionManager.getDriver(sess.id, actorUserId);
         const diag = drv.getSocketDiagnostics();
         socketSummary =
           `🔌 المقبس: ${diag.socketActive ? '✅ نشط' : '❌ متوقف'} | مسجل: ${diag.registered ? 'نعم' : 'لا'}\n` +
@@ -1677,26 +1710,41 @@ export class ToolsHandler {
   /**
    * Implements `/info` — displays Telegram profile & subscription card.
    */
-  public renderUserInfo(actorUserId: number): BotViewResponse {
+  public renderUserInfo(actorUserId: number, isAdmin = true): BotViewResponse {
     const prem = this.settingsRepo.getPremiumStatus(actorUserId);
     const cooldownSec = this.settingsRepo.getCooldownSeconds();
+
+    const keyboard: InlineKeyboardRows = [];
+    if (isAdmin) {
+      keyboard.push([{ text: '📊 التقرير الشامل (/cekall)', callbackData: 'tools:cekall' }]);
+    }
+    keyboard.push(
+      buildAppNavigationRow({
+        backCallback: 'menu:tools',
+        refreshCallback: 'tools:info',
+      })
+    );
 
     return {
       text:
         `🪪 *بطاقة معلومات الحساب (/info & /cekprem)*\n` +
         `━━━━━━━━━━━━━━━━━━\n` +
         `🆔 *المعرف الرقمي (Telegram ID):* \`${actorUserId}\`\n` +
-        `🛡️ *مستوى الوصول:* مسؤول النظام المعتمد (Authorized Admin)\n` +
-        `⭐ *حالة الاشتراك الإضافي:* ${prem.isPremium ? `✅ مفعل (متبقي ${prem.remainingDays} يوم)` : 'مسؤول رئيسي (صلاحية كاملة)'}\n` +
+        `🛡️ *مستوى الوصول:* ${
+          isAdmin
+            ? 'مسؤول النظام المعتمد (Authorized Admin)'
+            : 'مشترك مفعل (Premium Subscriber)'
+        }\n` +
+        `⭐ *حالة الاشتراك الإضافي:* ${
+          prem.isPremium
+            ? `✅ مفعل (متبقي ${prem.remainingDays} يوم)`
+            : isAdmin
+              ? 'مسؤول رئيسي (صلاحية كاملة)'
+              : 'غير مفعل'
+        }\n` +
         `📅 *تاريخ انتهاء الاشتراك:* \`${prem.formattedExpiry}\`\n` +
         `⏳ *مهلة التهدئة الحالية:* \`${cooldownSec} ثانية\``,
-      keyboard: [
-        [{ text: '📊 التقرير الشامل (/cekall)', callbackData: 'tools:cekall' }],
-        buildAppNavigationRow({
-          backCallback: 'menu:tools',
-          refreshCallback: 'tools:info',
-        }),
-      ],
+      keyboard,
       toastText: '🪪 بطاقة معلومات الحساب',
       route: 'tools:info',
     };

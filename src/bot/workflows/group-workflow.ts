@@ -137,8 +137,7 @@ export class GroupWorkflow {
     try {
       const validated = validateGroupInviteLink(rawLink);
       const connectedIds = this.sessionManager
-        .listSessions()
-        .filter((s) => s.status === 'CONNECTED' || s.status === 'AUTHENTICATED')
+        .listConnectedSessions(adminId)
         .map((s) => s.id);
 
       this.states.set(adminId, {
@@ -163,6 +162,10 @@ export class GroupWorkflow {
     const state = this.states.get(adminId);
     if (!state || state.mode !== 'JOIN_GROUP') return this.startJoinGroup(adminId);
 
+    if (!this.sessionManager.getSession(sessionId, adminId)) {
+      return this.renderJoinSessionSelection(adminId);
+    }
+
     const idx = state.selectedSessionIds.indexOf(sessionId);
     if (idx === -1) {
       state.selectedSessionIds.push(sessionId);
@@ -177,8 +180,7 @@ export class GroupWorkflow {
     if (!state || state.mode !== 'JOIN_GROUP') return this.startJoinGroup(adminId);
 
     state.selectedSessionIds = this.sessionManager
-      .listSessions()
-      .filter((s) => s.status === 'CONNECTED' || s.status === 'AUTHENTICATED')
+      .listConnectedSessions(adminId)
       .map((s) => s.id);
     return this.renderJoinSessionSelection(adminId);
   }
@@ -201,7 +203,7 @@ export class GroupWorkflow {
         `الرابط: \`${state.inviteLink}\`\n\n` +
         `الخطوة 2 من 3: اختر الجلسات التي تريد ضمها للمجموعة:`,
       keyboard: buildMultiSessionSelectorKeyboard({
-        sessions: this.sessionManager.listSessions(),
+        sessions: this.sessionManager.listSessions(adminId),
         selectedIds: state.selectedSessionIds,
         workflowPrefix: 'wf_join',
       }),
@@ -218,7 +220,7 @@ export class GroupWorkflow {
       return {
         text: '⚠️ الرجاء اختيار جلسة واحدة على الأقل.',
         keyboard: buildMultiSessionSelectorKeyboard({
-          sessions: this.sessionManager.listSessions(),
+          sessions: this.sessionManager.listSessions(adminId),
           selectedIds: state.selectedSessionIds,
           workflowPrefix: 'wf_join',
         }),
@@ -295,6 +297,7 @@ export class GroupWorkflow {
     adminId?: number
   ): Promise<BotViewResponse> {
     try {
+      this.sessionManager.assertSessionAccess(sessionId, adminId);
       const group = await this.groupOps.getGroupDetails(sessionId, groupJid);
       const shortId = this.registerGroupRef(sessionId, groupJid);
       const activeEntry = { sessionId, groupJid, shortId };
@@ -383,6 +386,7 @@ export class GroupWorkflow {
   }): Promise<BotViewResponse> {
     const { adminId, sessionId, groupJid, action } = params;
     try {
+      this.sessionManager.assertSessionAccess(sessionId, adminId);
       const group = await this.groupOps.getGroupDetails(sessionId, groupJid);
       const shortId = this.registerGroupRef(sessionId, groupJid);
       this.activeGroupByAdmin.set(adminId, { sessionId, groupJid, shortId });

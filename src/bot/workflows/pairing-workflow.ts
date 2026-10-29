@@ -57,7 +57,7 @@ export class PairingWorkflow {
 
   public startNewLinking(adminId: number, existingSessionId?: string): BotViewResponse {
     if (existingSessionId && existingSessionId !== 'NEW') {
-      const sess = this.sessionManager.getSession(existingSessionId);
+      const sess = this.sessionManager.getSession(existingSessionId, adminId);
       if (sess) {
         this.states.set(adminId, {
           step: 'AWAITING_PHONE',
@@ -135,7 +135,7 @@ export class PairingWorkflow {
       };
     }
 
-    const sess = this.sessionManager.getSession(sessionId);
+    const sess = this.sessionManager.getSession(sessionId, adminId);
     if (!sess) {
       return this.startNewLinking(adminId);
     }

@@ -29,6 +29,7 @@ export interface TaskRecord {
   target_summary: string;
   selected_session_ids_json: string;
   status: TaskStatus;
+  owner_telegram_id?: number;
   created_at: string;
   started_at: string | null;
   completed_at: string | null;
@@ -60,6 +61,7 @@ export class TaskRepository {
     operationType: TaskOperationType;
     targetSummary: string;
     selectedSessionIds: string[];
+    ownerTelegramId?: number;
   }): TaskWithResults {
     const now = new Date().toISOString();
 
@@ -67,8 +69,8 @@ export class TaskRepository {
       const insertTask = this.db.sqlite.prepare(`
         INSERT INTO tasks (
           id, operation_type, target_summary, selected_session_ids_json,
-          status, created_at, started_at, completed_at, cancelled_at, error_summary
-        ) VALUES (?, ?, ?, ?, 'PENDING', ?, NULL, NULL, NULL, NULL)
+          status, owner_telegram_id, created_at, started_at, completed_at, cancelled_at, error_summary
+        ) VALUES (?, ?, ?, ?, 'PENDING', ?, ?, NULL, NULL, NULL, NULL)
       `);
 
       insertTask.run(
@@ -76,6 +78,7 @@ export class TaskRepository {
         params.operationType,
         params.targetSummary,
         JSON.stringify(params.selectedSessionIds),
+        params.ownerTelegramId ?? 0,
         now
       );
 
@@ -187,10 +190,17 @@ export class TaskRepository {
     };
   }
 
-  public listRecent(limit = 20): TaskWithResults[] {
-    const tasks = this.db.sqlite
-      .prepare('SELECT * FROM tasks ORDER BY created_at DESC LIMIT ?')
-      .all(limit) as unknown as TaskRecord[];
+  public listRecent(limit = 20, ownerTelegramId?: number): TaskWithResults[] {
+    const tasks =
+      ownerTelegramId !== undefined && ownerTelegramId > 0
+        ? (this.db.sqlite
+            .prepare(
+              'SELECT * FROM tasks WHERE owner_telegram_id = ? ORDER BY created_at DESC LIMIT ?'
+            )
+            .all(ownerTelegramId, limit) as unknown as TaskRecord[])
+        : (this.db.sqlite
+            .prepare('SELECT * FROM tasks ORDER BY created_at DESC LIMIT ?')
+            .all(limit) as unknown as TaskRecord[]);
 
     return tasks
       .map((t) => this.findByIdWithResults(t.id))

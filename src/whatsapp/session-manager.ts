@@ -19,6 +19,7 @@ import {
   PairingError,
   WhatsAppConnectionError,
   ValidationError,
+  AuthorizationError,
   AppError,
   toSafeArabicError,
 } from '../utils/errors';
@@ -43,6 +44,7 @@ export interface SessionManagerOptions {
   reconnectBaseDelayMs?: number;
   reconnectMaxDelayMs?: number;
   defaultAutoCompleteInMock?: boolean;
+  configuredAdminId?: number;
   onDisconnectAlert?: (params: {
     session: SessionRecord;
     newStatus: SessionRecord['status'];
@@ -90,6 +92,7 @@ export class SessionManager {
   private readonly reconnectBaseDelayMs: number;
   private readonly reconnectMaxDelayMs: number;
   public defaultAutoCompleteInMock: boolean;
+  private configuredAdminId: number;
   private onDisconnectAlert?: SessionManagerOptions['onDisconnectAlert'];
   private isShuttingDown = false;
 
@@ -106,7 +109,39 @@ export class SessionManager {
     this.reconnectBaseDelayMs = options?.reconnectBaseDelayMs ?? 1_000;
     this.reconnectMaxDelayMs = options?.reconnectMaxDelayMs ?? 15_000;
     this.defaultAutoCompleteInMock = options?.defaultAutoCompleteInMock ?? true;
+    this.configuredAdminId = options?.configuredAdminId ?? 0;
     this.onDisconnectAlert = options?.onDisconnectAlert;
+  }
+
+  public setConfiguredAdminId(adminId: number): void {
+    this.configuredAdminId = adminId;
+  }
+
+  public isOwner(actorTelegramId?: number): boolean {
+    if (actorTelegramId === undefined || actorTelegramId === 0) return true;
+    return this.configuredAdminId > 0 && actorTelegramId === this.configuredAdminId;
+  }
+
+  public canAccessSession(
+    session: SessionRecord,
+    actorTelegramId?: number
+  ): boolean {
+    if (this.isOwner(actorTelegramId)) return true;
+    return (session.owner_telegram_id ?? 0) === actorTelegramId;
+  }
+
+  public assertSessionAccess(
+    sessionId: string,
+    actorTelegramId?: number
+  ): SessionRecord {
+    const session = this.sessionRepo.findById(sessionId);
+    if (!session) {
+      throw new ValidationError('الجلسة المحددة غير موجودة.');
+    }
+    if (!this.canAccessSession(session, actorTelegramId)) {
+      throw new AuthorizationError('⛔ غير مصرح لك بالوصول إلى هذه الجلسة أو إدارتها.');
+    }
+    return session;
   }
 
   public setDisconnectAlertHandler(
@@ -223,6 +258,7 @@ export class SessionManager {
       label: cleanLabel,
       status: 'INITIALIZING',
       authDir,
+      ownerTelegramId: actorTelegramId,
     });
 
     this.auditRepo.record({
@@ -230,7 +266,7 @@ export class SessionManager {
       action: 'SESSION_CREATED',
       targetId: id,
       outcome: 'SUCCESS',
-      metadata: { label: cleanLabel },
+      metadata: { label: cleanLabel, ownerTelegramId: actorTelegramId },
     });
 
     return record;
@@ -278,10 +314,7 @@ export class SessionManager {
           'توجد عملية ربط جارية بالفعل لهذه الجلسة. يرجى الانتظار حتى تكتمل أو تنتهي مهلتها.'
         );
       }
-      session = this.sessionRepo.findById(sessionId);
-      if (!session) {
-        throw new ValidationError('الجلسة المحددة غير موجودة.');
-      }
+      session = this.assertSessionAccess(sessionId, actorTelegramId);
     } else {
       session = this.createSession(params.label, actorTelegramId);
       sessionId = session.id;
@@ -912,10 +945,7 @@ export class SessionManager {
     sessionId: string,
     actorTelegramId = 0
   ): Promise<SessionRecord> {
-    const session = this.sessionRepo.findById(sessionId);
-    if (!session) {
-      throw new ValidationError('الجلسة غير موجودة.');
-    }
+    const session = this.assertSessionAccess(sessionId, actorTelegramId);
 
     this.clearReconnectTimer(sessionId);
     this.clearPairingTimer(sessionId);
@@ -1002,10 +1032,7 @@ export class SessionManager {
     sessionId: string,
     actorTelegramId = 0
   ): Promise<SessionRecord> {
-    const session = this.sessionRepo.findById(sessionId);
-    if (!session) {
-      throw new ValidationError('الجلسة غير موجودة.');
-    }
+    this.assertSessionAccess(sessionId, actorTelegramId);
 
     this.clearReconnectTimer(sessionId);
     this.clearPairingTimer(sessionId);
@@ -1032,10 +1059,7 @@ export class SessionManager {
   }
 
   public async removeSession(sessionId: string, actorTelegramId = 0): Promise<void> {
-    const session = this.sessionRepo.findById(sessionId);
-    if (!session) {
-      throw new ValidationError('الجلسة غير موجودة.');
-    }
+    this.assertSessionAccess(sessionId, actorTelegramId);
 
     this.clearReconnectTimer(sessionId);
     this.clearPairingTimer(sessionId);
@@ -1222,10 +1246,14 @@ export class SessionManager {
    * live socket state, credential inspection, and timer states without any side effects.
    */
   public getLiveVerification(
-    sessionId: string
+    sessionId: string,
+    actorTelegramId?: number
   ): LiveSessionVerification | undefined {
     const raw = this.sessionRepo.findById(sessionId);
     if (!raw) return undefined;
+    if (!this.canAccessSession(raw, actorTelegramId)) {
+      return undefined;
+    }
 
     const session = this.reconcileSessionRecord(raw);
     const driver = this.drivers.get(sessionId);
@@ -1269,9 +1297,13 @@ export class SessionManager {
     };
   }
 
-  public getDriver(sessionId: string): WhatsAppSessionDriver {
-    const verification = this.getLiveVerification(sessionId);
+  public getDriver(sessionId: string, actorTelegramId?: number): WhatsAppSessionDriver {
+    const verification = this.getLiveVerification(sessionId, actorTelegramId);
     if (!verification) {
+      const raw = this.sessionRepo.findById(sessionId);
+      if (raw && !this.canAccessSession(raw, actorTelegramId)) {
+        throw new AuthorizationError('⛔ غير مصرح لك بالوصول إلى هذه الجلسة أو إدارتها.');
+      }
       throw new WhatsAppConnectionError(
         `الجلسة (${sessionId}) غير مسجلة في النظام.`
       );
@@ -1292,21 +1324,28 @@ export class SessionManager {
     return driver;
   }
 
-  public listSessions(): SessionRecord[] {
-    return this.sessionRepo
+  public listSessions(actorTelegramId?: number): SessionRecord[] {
+    const all = this.sessionRepo
       .listAll()
       .map((record) => this.reconcileSessionRecord(record));
+    if (this.isOwner(actorTelegramId)) {
+      return all;
+    }
+    return all.filter((s) => (s.owner_telegram_id ?? 0) === actorTelegramId);
   }
 
-  public listConnectedSessions(): SessionRecord[] {
-    return this.listSessions().filter(
+  public listConnectedSessions(actorTelegramId?: number): SessionRecord[] {
+    return this.listSessions(actorTelegramId).filter(
       (s) => s.status === 'CONNECTED' || s.status === 'AUTHENTICATED'
     );
   }
 
-  public getSession(sessionId: string): SessionRecord | undefined {
+  public getSession(sessionId: string, actorTelegramId?: number): SessionRecord | undefined {
     const raw = this.sessionRepo.findById(sessionId);
     if (!raw) return undefined;
+    if (!this.canAccessSession(raw, actorTelegramId)) {
+      return undefined;
+    }
     return this.reconcileSessionRecord(raw);
   }
 
@@ -1315,6 +1354,7 @@ export class SessionManager {
     newLabel: string,
     actorTelegramId: number
   ): SessionRecord {
+    this.assertSessionAccess(sessionId, actorTelegramId);
     const clean = newLabel.trim();
     if (!clean || clean.length < 2 || clean.length > 50) {
       throw new ValidationError('اسم الجلسة يجب أن يكون بين حرفين و 50 حرفاً.');

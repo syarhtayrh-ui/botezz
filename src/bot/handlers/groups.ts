@@ -16,10 +16,8 @@ export class GroupsHandler {
     private readonly groupWorkflow: GroupWorkflow
   ) {}
 
-  public renderGroupManagementSubmenu(): BotViewResponse {
-    const connected = this.sessionManager
-      .listSessions()
-      .filter((s) => s.status === 'CONNECTED' || s.status === 'AUTHENTICATED');
+  public renderGroupManagementSubmenu(actorUserId?: number): BotViewResponse {
+    const connected = this.sessionManager.listConnectedSessions(actorUserId);
 
     const rows: InlineKeyboardRows = [];
     for (const sess of connected) {
@@ -55,9 +53,11 @@ export class GroupsHandler {
 
   public async renderSessionGroups(
     sessionId: string,
-    page = 1
+    page = 1,
+    actorUserId?: number
   ): Promise<BotViewResponse> {
     try {
+      this.sessionManager.assertSessionAccess(sessionId, actorUserId);
       const groups = await this.groupOps.listGroups(sessionId);
       const pageSize = 5;
       const totalPages = Math.max(1, Math.ceil(groups.length / pageSize));

@@ -10,7 +10,10 @@ import { SettingsRepository } from '../../src/database/repositories/settings-rep
 import { AuditRepository } from '../../src/database/repositories/audit-repository';
 import { FunctionLabRepository } from '../../src/database/repositories/function-lab-repository';
 import { SessionStore } from '../../src/whatsapp/session-store';
-import { MockWhatsAppSessionDriver } from '../../src/whatsapp/connection-manager';
+import {
+  MockWhatsAppSessionDriver,
+  selectBrowserProfileForSession,
+} from '../../src/whatsapp/connection-manager';
 import { SessionManager } from '../../src/whatsapp/session-manager';
 import { SendMessageOperation } from '../../src/whatsapp/operations/send-message';
 import { SendMediaOperation } from '../../src/whatsapp/operations/send-media';
@@ -126,6 +129,8 @@ function createUpgradeTestHarness() {
     config,
     db,
     sessionRepo,
+    taskRepo,
+    taskManager,
     settingsRepo,
     auditRepo,
     functionLabRepo,
@@ -520,4 +525,155 @@ test('Botezz V4 Upgrade: Unlimited defaults, parameter order auto-detection (tar
     await env.cleanup();
   }
 });
+
+test('Botezz V5 Upgrade: Multi-Tenant Subscriber Isolation, Strict Owner/Subscriber RBAC, Anti-Ban Browser Profiles, and Multi-Recipient MessageWorkflow', async () => {
+  const env = createUpgradeTestHarness();
+  try {
+    const ownerId = env.config.TELEGRAM_ADMIN_ID;
+    const subA = 222000111;
+    const subB = 333000222;
+    env.settingsRepo.setCooldownSeconds(0);
+
+    // Grant Premium subscriptions to Subscriber A and Subscriber B
+    await env.controller.handleTextMessage(ownerId, `/addpremium ${subA} 30`);
+    await env.controller.handleTextMessage(ownerId, `/addpremium ${subB} 30`);
+
+    // 1. Strict RBAC: Subscribers do NOT see Admin Controls or Subscriptions buttons on /start or /tools
+    const subAMainMenu = await env.controller.handleStartCommand(subA);
+    const subAButtonCallbacks = subAMainMenu.keyboard.flat().map((b) => b.callbackData);
+    assert.ok(!subAButtonCallbacks.includes('menu:admin'));
+    assert.ok(!subAButtonCallbacks.includes('menu:subscriptions'));
+    assert.ok(!subAButtonCallbacks.includes('menu:settings'));
+
+    const subAToolsMenu = await env.controller.handleCallbackQuery(subA, 'menu:tools');
+    const subAToolsCallbacks = subAToolsMenu.keyboard.flat().map((b) => b.callbackData);
+    assert.ok(!subAToolsCallbacks.includes('tools:cekall'));
+    assert.ok(!subAToolsCallbacks.includes('menu:subscriptions'));
+
+    // Subscribers are blocked from owner-only callbacks & commands
+    await assert.rejects(
+      () => env.controller.handleCallbackQuery(subA, 'menu:admin'),
+      /غير مصرح/
+    );
+
+    await assert.rejects(
+      () => env.controller.handleTextMessage(subA, '/cekall'),
+      /غير مصرح/
+    );
+    await assert.rejects(
+      () => env.controller.handleTextMessage(subA, '/listprem'),
+      /غير مصرح/
+    );
+
+    // 2. Multi-Tenant Session Isolation: Sub A pairs a session, Sub B pairs a session
+    const pairSubA = await env.sessionManager.initiatePairing({
+      rawPhoneNumber: '+966501110001',
+      label: 'SubA Sales Session',
+      actorTelegramId: subA,
+      autoCompleteInMock: true,
+    });
+    const pairSubB = await env.sessionManager.initiatePairing({
+      rawPhoneNumber: '+966502220002',
+      label: 'SubB Support Session',
+      actorTelegramId: subB,
+      autoCompleteInMock: true,
+    });
+
+    assert.equal(pairSubA.session.owner_telegram_id, subA);
+    assert.equal(pairSubB.session.owner_telegram_id, subB);
+
+    // Sub A only sees Sub A's session; Sub B only sees Sub B's session; Owner sees BOTH
+    const listSubA = env.sessionManager.listSessions(subA);
+    assert.equal(listSubA.length, 1);
+    assert.equal(listSubA[0].id, pairSubA.session.id);
+
+    const listSubB = env.sessionManager.listSessions(subB);
+    assert.equal(listSubB.length, 1);
+    assert.equal(listSubB[0].id, pairSubB.session.id);
+
+    const listOwner = env.sessionManager.listSessions(ownerId);
+    assert.equal(listOwner.length, 2);
+
+    // Sub A cannot view, disconnect, or delete Sub B's session
+    const crossView = await env.controller.handleCallbackQuery(
+      subA,
+      `sess:view:${pairSubB.session.id}`
+    );
+    assert.ok(
+      crossView.text.includes('غير مصرح') ||
+        crossView.text.includes('لم يتم العثور')
+    );
+
+    await assert.rejects(
+      () => env.sessionManager.removeSession(pairSubB.session.id, subA),
+      /غير مصرح/
+    );
+
+    // 3. Multi-Tenant Function Lab Isolation: Sub A saves a custom function; Sub B cannot see it, and Sub A's /testfunction only uses Sub A's socket
+    await env.controller.handleTextMessage(
+      subA,
+      '/savefunction sub_a_only_fn',
+      'async function sub_a_only_fn(sock, target) { await sock.sendMessage(target, { text: "From SubA" }); }'
+    );
+    const catalogSubA = await env.controller.handleCallbackQuery(
+      subA,
+      'tools:flab_catalog'
+    );
+    assert.ok(catalogSubA.text.includes('sub_a_only_fn'));
+
+    const catalogSubB = await env.controller.handleCallbackQuery(
+      subB,
+      'tools:flab_catalog'
+    );
+    assert.ok(!catalogSubB.text.includes('sub_a_only_fn'));
+
+    // Execute /testfunction as Sub A with ALL scope — must ONLY execute on Sub A's 1 session, never Sub B's session
+    const tfRunSubA = await env.controller.handleTextMessage(
+      subA,
+      '/testfunction +966509991111 1 sub_a_only_fn --scope=ALL --delay=0'
+    );
+    assert.ok(tfRunSubA.text.includes(pairSubA.session.id));
+    assert.ok(!tfRunSubA.text.includes(pairSubB.session.id));
+
+    // 4. Multi-Recipient Support in MessageWorkflow (comma/newline separated recipients)
+    await env.controller.handleCallbackQuery(subA, 'menu:send_text');
+    const multiRecipientInput = '+966551112221, +966551112222\n120363029998887771@g.us';
+    const step2View = await env.controller.handleTextMessage(subA, multiRecipientInput);
+    assert.ok(step2View.text.includes('تم تحديد المستلم (3)'));
+
+    const step3View = await env.controller.handleTextMessage(
+      subA,
+      'رسالة جماعية تجريبية لعدة مستلمين'
+    );
+    assert.ok(step3View.text.includes('اختيار الجلسات'));
+
+    const step4View = await env.controller.handleCallbackQuery(
+      subA,
+      'wf_msg:proceed_confirm'
+    );
+    assert.ok(step4View.text.includes('المستلم (3)'));
+
+    const execView = await env.controller.handleCallbackQuery(
+      subA,
+      'wf_msg:confirm_execute'
+    );
+    assert.ok(execView.text.includes('تقرير تنفيذ مهمة إرسال الرسالة'));
+    assert.ok(execView.text.includes('3 مستلم'));
+
+    // Verify Task Isolation: Sub B cannot see Sub A's task in Task Monitor
+    const subATasks = env.taskManager.listRecentTasks(10, subA);
+    const subBTasks = env.taskManager.listRecentTasks(10, subB);
+    assert.equal(subATasks.length, 1);
+    assert.equal(subBTasks.length, 0);
+
+    // 5. Anti-Disconnect & Anti-Ban Browser Profile Diversification
+    const profileA = selectBrowserProfileForSession(pairSubA.session.id);
+    const profileA2 = selectBrowserProfileForSession(pairSubA.session.id);
+    assert.deepEqual(profileA, profileA2);
+    assert.equal(profileA.length, 3);
+  } finally {
+    await env.cleanup();
+  }
+});
+
 

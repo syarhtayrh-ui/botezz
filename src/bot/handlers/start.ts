@@ -34,10 +34,11 @@ export class StartHandler {
 
   public renderMainMenu(options?: {
     isAdmin?: boolean;
+    actorUserId?: number;
     noticeBanner?: string;
   }): BotViewResponse {
     const isAdmin = options?.isAdmin ?? true;
-    const sessions = this.sessionManager.listSessions();
+    const sessions = this.sessionManager.listSessions(options?.actorUserId);
     const connectedCount = sessions.filter(
       (s) => s.status === 'CONNECTED' || s.status === 'AUTHENTICATED'
     ).length;
@@ -106,8 +107,12 @@ export class StartHandler {
     };
   }
 
-  public renderHelpAndSystemStatus(): BotViewResponse {
-    const sessions = this.sessionManager.listSessions();
+  public renderHelpAndSystemStatus(options?: {
+    isAdmin?: boolean;
+    actorUserId?: number;
+  }): BotViewResponse {
+    const isAdmin = options?.isAdmin ?? true;
+    const sessions = this.sessionManager.listSessions(options?.actorUserId);
     const connectedCount = sessions.filter(
       (s) => s.status === 'CONNECTED' || s.status === 'AUTHENTICATED'
     ).length;
@@ -115,6 +120,13 @@ export class StartHandler {
     const stats = this.taskManager.getRunnerStats();
     const lastSuccess =
       this.taskManager.getLastSuccessfulOperationAt() || 'لم تسجل عمليات بعد';
+
+    const topRow = [
+      { text: '🔌 إدارة المرسلين (/ceksender)', callbackData: 'menu:senders:page:1' },
+      ...(isAdmin
+        ? [{ text: '📊 التقرير الشامل (/cekall)', callbackData: 'tools:cekall' }]
+        : []),
+    ];
 
     return {
       text:
@@ -130,10 +142,7 @@ export class StartHandler {
         `⚠️ *تنبيه تقني هام:*\n` +
         `تعتمد هذه المنصة على مكتبة Athanasia Baileys (\`athanasia-baileys@1.0.0\`) كبروتوكول غير رسمي لواتساب ويب. قد تخضع الحسابات لقيود المنصة أو انتهاء صلاحية الجلسات عند تغيير البروتوكول.`,
       keyboard: [
-        [
-          { text: '🔌 إدارة المرسلين (/ceksender)', callbackData: 'menu:senders:page:1' },
-          { text: '📊 التقرير الشامل (/cekall)', callbackData: 'tools:cekall' },
-        ],
+        topRow,
         buildAppNavigationRow({
           backCallback: 'nav:back',
           refreshCallback: 'menu:help_status',

@@ -101,6 +101,7 @@ export class TelegramBotController {
   private activeConversationMode = new Map<number, ConversationMode>();
 
   constructor(private readonly deps: TelegramControllerDeps) {
+    deps.sessionManager.setConfiguredAdminId(deps.config.TELEGRAM_ADMIN_ID);
     this.uiState = new BotUiStateManager({
       duplicateTapWindowMs: deps.duplicateTapWindowMs ?? 75,
       callbackTimeoutMs: deps.callbackTimeoutMs ?? 12_000,
@@ -146,6 +147,10 @@ export class TelegramBotController {
       deps.settingsRepo,
       deps.auditRepo
     );
+  }
+
+  public isOwnerUser(userId: number): boolean {
+    return userId === this.deps.config.TELEGRAM_ADMIN_ID;
   }
 
   public getConversationMode(adminId: number): ConversationMode {
@@ -211,7 +216,11 @@ export class TelegramBotController {
         }
         const sess = this.uiState.getOrCreateSession(actorUserId);
         const fallbackView =
-          sess.lastView || this.startHandler.renderMainMenu({ isAdmin: true });
+          sess.lastView ||
+          this.startHandler.renderMainMenu({
+            isAdmin: this.isOwnerUser(actorUserId),
+            actorUserId,
+          });
         return {
           ...fallbackView,
           toastText: '⏳ تم تجاهل النقرة المكررة',
@@ -293,6 +302,8 @@ export class TelegramBotController {
     actorUserId: number,
     callbackData: string
   ): Promise<BotViewResponse> {
+    const isOwner = this.isOwnerUser(actorUserId);
+
     // Handle universal application navigation actions: Home, Cancel, Back, Refresh
     if (
       callbackData === 'menu:main' ||
@@ -301,7 +312,10 @@ export class TelegramBotController {
     ) {
       this.cancelAllWorkflowsForAdmin(actorUserId);
       this.uiState.resetHome(actorUserId);
-      return this.startHandler.renderMainMenu({ isAdmin: true });
+      return this.startHandler.renderMainMenu({
+        isAdmin: isOwner,
+        actorUserId,
+      });
     }
 
     if (callbackData === 'workflow:cancel' || callbackData === 'nav:cancel') {
@@ -309,7 +323,8 @@ export class TelegramBotController {
       this.cancelAllWorkflowsForAdmin(actorUserId);
       this.uiState.resetHome(actorUserId);
       const view = this.startHandler.renderMainMenu({
-        isAdmin: true,
+        isAdmin: isOwner,
+        actorUserId,
         noticeBanner: wasActive
           ? '✅ *تم إلغاء العملية الحالية وإعادة ضبط حالة الإدخال.*'
           : undefined,
@@ -369,18 +384,18 @@ export class TelegramBotController {
 
     // 3: Manage Sessions & Session Status
     if (callbackData === 'menu:sessions') {
-      return this.sessionsHandler.renderSessionsList(1);
+      return this.sessionsHandler.renderSessionsList(1, actorUserId);
     }
     if (callbackData.startsWith('menu:sessions:page:')) {
       const page = Number(callbackData.split(':').pop() || '1');
-      return this.sessionsHandler.renderSessionsList(page);
+      return this.sessionsHandler.renderSessionsList(page, actorUserId);
     }
     if (callbackData === 'menu:session_status') {
-      return this.sessionsHandler.renderSessionStatusOverview();
+      return this.sessionsHandler.renderSessionStatusOverview(actorUserId, isOwner);
     }
     if (callbackData.startsWith('sess:refresh:')) {
       const page = Number(callbackData.split(':').pop() || '1');
-      const view = this.sessionsHandler.renderSessionsList(page);
+      const view = this.sessionsHandler.renderSessionsList(page, actorUserId);
       return {
         ...view,
         toastText: '🔄 تم تحديث حالة الجلسات',
@@ -388,7 +403,7 @@ export class TelegramBotController {
     }
     if (callbackData.startsWith('sess:view:')) {
       const sessionId = callbackData.slice('sess:view:'.length);
-      return this.sessionsHandler.renderSessionDetail(sessionId);
+      return this.sessionsHandler.renderSessionDetail(sessionId, actorUserId);
     }
     if (callbackData.startsWith('sess:reconnect:')) {
       const sessionId = callbackData.slice('sess:reconnect:'.length);
@@ -406,14 +421,14 @@ export class TelegramBotController {
     }
     if (callbackData.startsWith('sess:confirm_remove:')) {
       const sessionId = callbackData.slice('sess:confirm_remove:'.length);
-      return this.sessionsHandler.renderConfirmRemove(sessionId);
+      return this.sessionsHandler.renderConfirmRemove(sessionId, actorUserId);
     }
     if (callbackData.startsWith('sess:remove:')) {
       const sessionId = callbackData.slice('sess:remove:'.length);
       return this.sessionsHandler.handleRemove(sessionId, actorUserId);
     }
     if (callbackData === 'sess:confirm_purge_inactive') {
-      return this.sessionsHandler.renderConfirmPurgeInactive();
+      return this.sessionsHandler.renderConfirmPurgeInactive(actorUserId);
     }
     if (callbackData === 'sess:purge_inactive') {
       return this.sessionsHandler.handlePurgeInactive(actorUserId);
@@ -479,23 +494,23 @@ export class TelegramBotController {
     // 6: Group Management
     if (callbackData === 'menu:groups') {
       this.cancelAllWorkflowsForAdmin(actorUserId);
-      return this.groupsHandler.renderGroupManagementSubmenu();
+      return this.groupsHandler.renderGroupManagementSubmenu(actorUserId);
     }
     if (callbackData.startsWith('grp:list:')) {
       const sessionId = callbackData.slice('grp:list:'.length);
-      return this.groupsHandler.renderSessionGroups(sessionId, 1);
+      return this.groupsHandler.renderSessionGroups(sessionId, 1, actorUserId);
     }
     if (callbackData.startsWith('grp:list_page:')) {
       const parts = callbackData.split(':');
       const sessionId = parts[2];
       const page = Number(parts[3] || '1');
-      return this.groupsHandler.renderSessionGroups(sessionId, page);
+      return this.groupsHandler.renderSessionGroups(sessionId, page, actorUserId);
     }
     if (callbackData.startsWith('gv:')) {
       const shortId = callbackData.slice('gv:'.length);
       const resolved = this.groupWorkflow.resolveGroupRef(shortId, actorUserId);
       if (!resolved) {
-        return this.groupsHandler.renderGroupManagementSubmenu();
+        return this.groupsHandler.renderGroupManagementSubmenu(actorUserId);
       }
       return this.groupWorkflow.renderGroupDetails(
         resolved.sessionId,
@@ -512,7 +527,7 @@ export class TelegramBotController {
       const resolvedGroup = this.groupWorkflow.resolveGroupRef(shortId, actorUserId);
       const resolvedAction = this.groupWorkflow.resolveCompactAction(actionCode);
       if (!resolvedGroup || !resolvedAction) {
-        return this.groupsHandler.renderGroupManagementSubmenu();
+        return this.groupsHandler.renderGroupManagementSubmenu(actorUserId);
       }
       this.activeConversationMode.set(actorUserId, 'GROUP');
       return this.groupWorkflow.initiateGroupAction({
@@ -577,15 +592,15 @@ export class TelegramBotController {
     }
     if (callbackData.startsWith('menu:tasks:page:')) {
       const page = Number(callbackData.split(':').pop() || '1');
-      return this.tasksHandler.renderTaskMonitor(page);
+      return this.tasksHandler.renderTaskMonitor(page, actorUserId, isOwner);
     }
     if (callbackData.startsWith('task:view:')) {
       const taskId = callbackData.slice('task:view:'.length);
-      return this.tasksHandler.renderTaskDetail(taskId);
+      return this.tasksHandler.renderTaskDetail(taskId, actorUserId, isOwner);
     }
     if (callbackData.startsWith('task:cancel:')) {
       const taskId = callbackData.slice('task:cancel:'.length);
-      return this.tasksHandler.handleCancelTask(taskId, actorUserId);
+      return this.tasksHandler.handleCancelTask(taskId, actorUserId, isOwner);
     }
 
     // 9: Activity History
@@ -646,20 +661,23 @@ export class TelegramBotController {
 
     // 11: Help and System Status
     if (callbackData === 'menu:help_status' || callbackData === 'menu:help') {
-      return this.startHandler.renderHelpAndSystemStatus();
+      return this.startHandler.renderHelpAndSystemStatus({
+        isAdmin: isOwner,
+        actorUserId,
+      });
     }
 
     // 12: Sender Management & Integrated Tools & Diagnostics
     if (callbackData === 'menu:senders' || callbackData === 'tools:ceksender') {
-      return this.toolsHandler.renderSenderDiagnostics(1);
+      return this.toolsHandler.renderSenderDiagnostics(1, actorUserId);
     }
     if (callbackData.startsWith('menu:senders:page:')) {
       const page = Number(callbackData.split(':').pop() || '1');
-      return this.toolsHandler.renderSenderDiagnostics(page);
+      return this.toolsHandler.renderSenderDiagnostics(page, actorUserId);
     }
     if (callbackData === 'menu:tools' || callbackData === '/tools') {
       this.cancelAllWorkflowsForAdmin(actorUserId);
-      return this.toolsHandler.renderToolsMenu();
+      return this.toolsHandler.renderToolsMenu(isOwner);
     }
     if (callbackData === 'tools:prompt_testfunction') {
       this.cancelAllWorkflowsForAdmin(actorUserId);
@@ -701,7 +719,7 @@ export class TelegramBotController {
     if (callbackData === 'tools:run_sample_testfunction') {
       this.cancelAllWorkflowsForAdmin(actorUserId);
       const fallbackMode =
-        this.deps.sessionManager.listConnectedSessions().length === 0
+        this.deps.sessionManager.listConnectedSessions(actorUserId).length === 0
           ? '--mode=SIMULATION'
           : '';
       return this.toolsHandler.executeTestFunction(
@@ -774,13 +792,16 @@ export class TelegramBotController {
       return this.toolsHandler.renderCheckAllReport(actorUserId);
     }
     if (callbackData === 'tools:info') {
-      return this.toolsHandler.renderUserInfo(actorUserId);
+      return this.toolsHandler.renderUserInfo(actorUserId, isOwner);
     }
     if (callbackData === 'tools:gempa') {
       return this.toolsHandler.executeEarthquakeCheck();
     }
 
-    return this.startHandler.renderMainMenu({ isAdmin: true });
+    return this.startHandler.renderMainMenu({
+      isAdmin: isOwner,
+      actorUserId,
+    });
   }
 
   /**
@@ -810,8 +831,11 @@ export class TelegramBotController {
     this.cancelAllWorkflowsForAdmin(actorUserId);
     this.uiState.resetHome(actorUserId);
 
-    const isOwner = actorUserId === this.deps.config.TELEGRAM_ADMIN_ID;
-    const view = this.startHandler.renderMainMenu({ isAdmin: isOwner });
+    const isOwner = this.isOwnerUser(actorUserId);
+    const view = this.startHandler.renderMainMenu({
+      isAdmin: isOwner,
+      actorUserId,
+    });
 
     return this.uiState.deliverView({
       userId: actorUserId,
@@ -967,20 +991,29 @@ export class TelegramBotController {
     const command = rawCommand.replace(/@\w+$/, '');
     const args = parts.slice(1);
 
+    const isOwner = this.isOwnerUser(actorUserId);
+
     if (command === '/start' || command === '/menu') {
       this.cancelAllWorkflowsForAdmin(actorUserId);
       this.uiState.resetHome(actorUserId);
-      return this.startHandler.renderMainMenu({ isAdmin: true });
+      return this.startHandler.renderMainMenu({
+        isAdmin: isOwner,
+        actorUserId,
+      });
     }
     if (command === '/status' || command === '/help') {
       this.uiState.recordRouteTransition(actorUserId, 'menu:help_status');
-      return this.startHandler.renderHelpAndSystemStatus();
+      return this.startHandler.renderHelpAndSystemStatus({
+        isAdmin: isOwner,
+        actorUserId,
+      });
     }
     if (command === '/cancel') {
       this.cancelAllWorkflowsForAdmin(actorUserId);
       this.uiState.resetHome(actorUserId);
       return this.startHandler.renderMainMenu({
-        isAdmin: true,
+        isAdmin: isOwner,
+        actorUserId,
         noticeBanner: '✅ *تم إلغاء العملية الجارية والعودة للقائمة الرئيسية.*',
       });
     }
@@ -1019,18 +1052,18 @@ export class TelegramBotController {
       if (command === '/sessions') {
         this.cancelAllWorkflowsForAdmin(actorUserId);
         this.uiState.recordRouteTransition(actorUserId, 'menu:sessions:page:1');
-        return this.sessionsHandler.renderSessionsList(1);
+        return this.sessionsHandler.renderSessionsList(1, actorUserId);
       }
 
       if (command === '/tools') {
         this.cancelAllWorkflowsForAdmin(actorUserId);
         this.uiState.recordRouteTransition(actorUserId, 'menu:tools');
-        return this.toolsHandler.renderToolsMenu();
+        return this.toolsHandler.renderToolsMenu(isOwner);
       }
 
       if (command === '/ceksender') {
         this.uiState.recordRouteTransition(actorUserId, 'menu:senders:page:1');
-        return this.toolsHandler.renderSenderDiagnostics(1);
+        return this.toolsHandler.renderSenderDiagnostics(1, actorUserId);
       }
 
       if (command === '/cekall') {
@@ -1040,7 +1073,7 @@ export class TelegramBotController {
 
       if (command === '/info' || command === '/cekprem') {
         this.uiState.recordRouteTransition(actorUserId, 'tools:info');
-        return this.toolsHandler.renderUserInfo(actorUserId);
+        return this.toolsHandler.renderUserInfo(actorUserId, isOwner);
       }
 
       if (command === '/gempa') {
@@ -1469,7 +1502,8 @@ export class TelegramBotController {
 
     // Requirement 3: Do not interpret arbitrary messages as workflow inputs unless a workflow state is active.
     return this.startHandler.renderMainMenu({
-      isAdmin: true,
+      isAdmin: isOwner,
+      actorUserId,
       noticeBanner:
         'ℹ️ *لا توجد عملية إدخال نصي نشطة حالياً.*\nيرجى اختيار العملية المطلوبة من الأزرار التفاعلية أدناه أو إرسال أمر مباشر يبدأ بـ `/`.',
     });

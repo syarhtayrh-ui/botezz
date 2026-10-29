@@ -6,7 +6,7 @@ import {
 } from '../database/repositories/task-repository';
 import { AuditRepository } from '../database/repositories/audit-repository';
 import { TaskRunner, PerSessionExecutor } from './task-runner';
-import { ValidationError } from '../utils/errors';
+import { ValidationError, AuthorizationError } from '../utils/errors';
 
 export class TaskManager {
   private readonly activeTaskFingerprints = new Set<string>();
@@ -22,7 +22,8 @@ export class TaskManager {
 
   /**
    * Schedules and executes an operation across one or multiple selected sessions concurrently.
-   * Prevents accidental duplicate concurrent execution of the exact same task.
+   * Prevents accidental duplicate concurrent execution of the exact same task and applies
+   * staggered anti-ban pacing when multiple sessions execute toward the same target.
    */
   public async runMultiSessionTask(params: {
     operationType: TaskOperationType;
@@ -32,6 +33,7 @@ export class TaskManager {
     executor: PerSessionExecutor;
     dedupKey?: string;
     timeoutMs?: number;
+    staggerBaseDelayMs?: number;
     onCompleteCleanup?: () => void;
   }): Promise<TaskWithResults> {
     const uniqueSessionIds = Array.from(new Set(params.selectedSessionIds.filter(Boolean)));
@@ -58,6 +60,7 @@ export class TaskManager {
         operationType: params.operationType,
         targetSummary: params.targetSummary,
         selectedSessionIds: uniqueSessionIds,
+        ownerTelegramId: params.actorTelegramId,
       });
 
       this.auditRepo.record({
@@ -71,10 +74,24 @@ export class TaskManager {
         },
       });
 
+      const sessionIndexMap = new Map<string, number>();
+      uniqueSessionIds.forEach((sid, idx) => sessionIndexMap.set(sid, idx));
+      const staggerStepMs = params.staggerBaseDelayMs ?? 15;
+
+      const staggeredExecutor: PerSessionExecutor = async (sessionId: string) => {
+        const idx = sessionIndexMap.get(sessionId) ?? 0;
+        if (idx > 0 && uniqueSessionIds.length > 1 && staggerStepMs > 0) {
+          const jitter = Math.floor(Math.random() * Math.max(5, staggerStepMs));
+          const delayMs = Math.min(2000, idx * staggerStepMs + jitter);
+          await new Promise((r) => setTimeout(r, delayMs));
+        }
+        return params.executor(sessionId);
+      };
+
       const completedTask = await this.taskRunner.executeTask({
         taskId,
         sessionIds: uniqueSessionIds,
-        executor: params.executor,
+        executor: staggeredExecutor,
         timeoutMs: params.timeoutMs,
         onCompleteCleanup: params.onCompleteCleanup,
       });
@@ -105,13 +122,26 @@ export class TaskManager {
    * Note: Individual session operations that have already been dispatched to the WhatsApp socket
    * cannot be recalled mid-flight; queued sessions that have not started will be cancelled.
    */
-  public cancelTask(taskId: string, actorTelegramId: number): {
+  public cancelTask(
+    taskId: string,
+    actorTelegramId: number,
+    isOwner = false
+  ): {
     cancelled: boolean;
     messageArabic: string;
   } {
     const task = this.taskRepo.findByIdWithResults(taskId);
     if (!task) {
       throw new ValidationError('المهمة المطلوبة غير موجودة.');
+    }
+
+    if (
+      !isOwner &&
+      task.owner_telegram_id &&
+      task.owner_telegram_id > 0 &&
+      task.owner_telegram_id !== actorTelegramId
+    ) {
+      throw new AuthorizationError('⛔ غير مصرح لك بإلغاء مهام مستخدمين آخرين.');
     }
 
     if (task.status !== 'PENDING' && task.status !== 'RUNNING') {
@@ -136,11 +166,33 @@ export class TaskManager {
     };
   }
 
-  public getTask(taskId: string): TaskWithResults | undefined {
-    return this.taskRepo.findByIdWithResults(taskId);
+  public getTask(
+    taskId: string,
+    actorTelegramId?: number,
+    isOwner = false
+  ): TaskWithResults | undefined {
+    const task = this.taskRepo.findByIdWithResults(taskId);
+    if (!task) return undefined;
+    if (
+      !isOwner &&
+      actorTelegramId !== undefined &&
+      task.owner_telegram_id &&
+      task.owner_telegram_id > 0 &&
+      task.owner_telegram_id !== actorTelegramId
+    ) {
+      return undefined;
+    }
+    return task;
   }
 
-  public listRecentTasks(limit = 20): TaskWithResults[] {
+  public listRecentTasks(
+    limit = 20,
+    actorTelegramId?: number,
+    isOwner = false
+  ): TaskWithResults[] {
+    if (!isOwner && actorTelegramId !== undefined && actorTelegramId > 0) {
+      return this.taskRepo.listRecent(limit, actorTelegramId);
+    }
     return this.taskRepo.listRecent(limit);
   }
 

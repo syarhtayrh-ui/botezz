@@ -930,6 +930,27 @@ export function classifyDisconnectReason(
   };
 }
 
+/**
+ * Deterministically selects a realistic desktop browser profile per `sessionId`
+ * so concurrent multi-session sockets on the same server do not share an identical fingerprint.
+ */
+export function selectBrowserProfileForSession(
+  sessionId: string
+): [string, string, string] {
+  const profiles: Array<() => [string, string, string]> = [
+    () => Browsers.ubuntu('Chrome'),
+    () => Browsers.macOS('Chrome'),
+    () => Browsers.windows('Chrome'),
+    () => Browsers.macOS('Safari'),
+    () => Browsers.windows('Edge'),
+  ];
+  let hash = 0;
+  for (let i = 0; i < sessionId.length; i++) {
+    hash = (hash * 31 + sessionId.charCodeAt(i)) >>> 0;
+  }
+  return profiles[hash % profiles.length]!();
+}
+
 export class AthanasiaBaileysSessionDriver implements WhatsAppSessionDriver {
   public readonly isMock = false;
   private sock: WASocket | null = null;
@@ -1104,7 +1125,12 @@ export class AthanasiaBaileysSessionDriver implements WhatsAppSessionDriver {
       printQRInTerminal: false, // Required by athanasia-baileys for pairing code flow
       qrTimeout: 60_000, // Keep companion registration refs alive for 60s each during phone pairing
       logger: silentPino,
-      browser: Browsers.ubuntu('Chrome'),
+      browser: selectBrowserProfileForSession(this.sessionId),
+      keepAliveIntervalMs: 25_000,
+      connectTimeoutMs: 30_000,
+      defaultQueryTimeoutMs: 60_000,
+      retryRequestDelayMs: 350,
+      maxMsgRetryCount: 5,
       markOnlineOnConnect: false,
       syncFullHistory: false,
       generateHighQualityLinkPreview: false,
@@ -1549,6 +1575,28 @@ export class AthanasiaBaileysSessionDriver implements WhatsAppSessionDriver {
     return `${cleanedCode.slice(0, 4)}-${cleanedCode.slice(4)}`;
   }
 
+  private async simulateHumanPresenceBeforeSend(
+    sock: WASocket,
+    resolvedJid: string,
+    textLengthHint = 20
+  ): Promise<void> {
+    if (!resolvedJid || resolvedJid.endsWith('@newsletter')) {
+      return;
+    }
+    try {
+      if (resolvedJid.endsWith('@s.whatsapp.net')) {
+        await sock.presenceSubscribe(resolvedJid).catch(() => undefined);
+      }
+      await sock.sendPresenceUpdate('composing', resolvedJid).catch(() => undefined);
+      const baseMs = Math.min(800, Math.max(250, textLengthHint * 8));
+      const jitterMs = Math.floor(Math.random() * 250);
+      await new Promise((r) => setTimeout(r, baseMs + jitterMs));
+      await sock.sendPresenceUpdate('paused', resolvedJid).catch(() => undefined);
+    } catch {
+      // Never block message sending if presence update fails
+    }
+  }
+
   public async sendTextMessage(
     recipientJid: string,
     text: string
@@ -1558,6 +1606,7 @@ export class AthanasiaBaileysSessionDriver implements WhatsAppSessionDriver {
       throw new WhatsAppConnectionError('الجلسة غير متصلة حالياً لإرسال الرسائل.');
     }
     const resolvedJid = await this.resolveDirectRecipientJid(sock, recipientJid);
+    await this.simulateHumanPresenceBeforeSend(sock, resolvedJid, text.length);
     const res = await sock.sendMessage(resolvedJid, { text });
     const msgId = res?.key?.id || `msg_${Date.now()}`;
     if (res?.message) {
@@ -1612,6 +1661,11 @@ export class AthanasiaBaileysSessionDriver implements WhatsAppSessionDriver {
     const resolvedJid = await this.resolveDirectRecipientJid(
       sock,
       params.recipientJid
+    );
+    await this.simulateHumanPresenceBeforeSend(
+      sock,
+      resolvedJid,
+      params.caption?.length ?? 30
     );
     const res = await sock.sendMessage(resolvedJid, content);
     const msgId = res?.key?.id || `media_${Date.now()}`;
@@ -1896,6 +1950,7 @@ export class AthanasiaBaileysSessionDriver implements WhatsAppSessionDriver {
   }
 
   public async disconnect(): Promise<void> {
+    const wasOpen = this.wsOpen;
     this.wsOpen = false;
     this.handshakeReady = false;
     this.connectionState = 'CLOSED';
@@ -1908,6 +1963,9 @@ export class AthanasiaBaileysSessionDriver implements WhatsAppSessionDriver {
       this.evCleanup = null;
     }
     if (this.sock) {
+      if (wasOpen && typeof this.sock.sendPresenceUpdate === 'function') {
+        await this.sock.sendPresenceUpdate('unavailable').catch(() => undefined);
+      }
       try {
         this.sock.end(undefined);
       } catch {

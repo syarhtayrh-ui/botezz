@@ -11,8 +11,8 @@ import { toSafeArabicError } from '../../utils/errors';
 export class SessionsHandler {
   constructor(private readonly sessionManager: SessionManager) {}
 
-  public renderSessionsList(page = 1): BotViewResponse {
-    const sessions = this.sessionManager.listSessions();
+  public renderSessionsList(page = 1, actorUserId?: number): BotViewResponse {
+    const sessions = this.sessionManager.listSessions(actorUserId);
     const { rows, currentPage, totalPages } = buildSessionManagementKeyboard({
       sessions,
       page,
@@ -44,8 +44,11 @@ export class SessionsHandler {
    * Dedicated Session Status Overview screen (`menu:session_status`).
    * Displays clear status indicators for Active, Connecting/Pairing, Disconnected, and Failed sessions.
    */
-  public renderSessionStatusOverview(): BotViewResponse {
-    const sessions = this.sessionManager.listSessions();
+  public renderSessionStatusOverview(
+    actorUserId?: number,
+    isAdmin = true
+  ): BotViewResponse {
+    const sessions = this.sessionManager.listSessions(actorUserId);
     const active = sessions.filter(
       (s) => s.status === 'CONNECTED' || s.status === 'AUTHENTICATED'
     );
@@ -97,7 +100,7 @@ export class SessionsHandler {
       { text: '📲 ربط جلسة جديدة', callbackData: 'menu:link_account' },
     ]);
 
-    if (inactive.length + failed.length > 0) {
+    if (isAdmin && inactive.length + failed.length > 0) {
       rows.push([
         {
           text: `🧹 تنظيف غير المتصل (${inactive.length + failed.length})`,
@@ -129,18 +132,21 @@ export class SessionsHandler {
     };
   }
 
-  public renderSessionDetail(sessionId: string): BotViewResponse {
-    const verification = this.sessionManager.getLiveVerification(sessionId);
+  public renderSessionDetail(sessionId: string, actorUserId?: number): BotViewResponse {
+    const verification = this.sessionManager.getLiveVerification(
+      sessionId,
+      actorUserId
+    );
     if (!verification) {
       return {
-        text: '⚠️ لم يتم العثور على الجلسة المطلوبة.',
+        text: '⚠️ لم يتم العثور على الجلسة المطلوبة أو غير مصرح لك بالوصول إليها.',
         keyboard: [
           buildAppNavigationRow({
             backCallback: 'menu:sessions:page:1',
             refreshCallback: 'menu:sessions:page:1',
           }),
         ],
-        toastText: '⚠️ الجلسة غير موجودة',
+        toastText: '⚠️ الجلسة غير موجودة أو غير مصرح بها',
       };
     }
 
@@ -197,7 +203,7 @@ export class SessionsHandler {
   ): Promise<BotViewResponse> {
     try {
       await this.sessionManager.reconnectSession(sessionId, adminId);
-      const view = this.renderSessionDetail(sessionId);
+      const view = this.renderSessionDetail(sessionId, adminId);
       return {
         ...view,
         toastText: '🔄 تمت إعادة اتصال الجلسة بنجاح',
@@ -224,7 +230,7 @@ export class SessionsHandler {
   ): Promise<BotViewResponse> {
     try {
       await this.sessionManager.disconnectSession(sessionId, adminId);
-      const view = this.renderSessionDetail(sessionId);
+      const view = this.renderSessionDetail(sessionId, adminId);
       return {
         ...view,
         toastText: '🔌 تم قطع اتصال الجلسة',
@@ -245,10 +251,13 @@ export class SessionsHandler {
     }
   }
 
-  public renderConfirmRemove(sessionId: string): BotViewResponse {
-    const sess = this.sessionManager.getSession(sessionId);
+  public renderConfirmRemove(
+    sessionId: string,
+    actorUserId?: number
+  ): BotViewResponse {
+    const sess = this.sessionManager.getSession(sessionId, actorUserId);
     if (!sess) {
-      return this.renderSessionsList(1);
+      return this.renderSessionsList(1, actorUserId);
     }
 
     return {
@@ -304,8 +313,8 @@ export class SessionsHandler {
     }
   }
 
-  public renderConfirmPurgeInactive(): BotViewResponse {
-    const allSessions = this.sessionManager.listSessions();
+  public renderConfirmPurgeInactive(actorUserId?: number): BotViewResponse {
+    const allSessions = this.sessionManager.listSessions(actorUserId);
     const inactive = allSessions.filter(
       (s) => s.status !== 'CONNECTED' && s.status !== 'AUTHENTICATED'
     );
@@ -350,7 +359,7 @@ export class SessionsHandler {
   }
 
   public async handlePurgeInactive(adminId: number): Promise<BotViewResponse> {
-    const allSessions = this.sessionManager.listSessions();
+    const allSessions = this.sessionManager.listSessions(adminId);
     const inactive = allSessions.filter(
       (s) => s.status !== 'CONNECTED' && s.status !== 'AUTHENTICATED'
     );
