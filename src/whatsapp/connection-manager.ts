@@ -1,5 +1,4 @@
 import fs from 'node:fs';
-import vm from 'node:vm';
 import pino from 'pino';
 import makeWASocket, {
   makeCacheableSignalKeyStore,
@@ -9,12 +8,7 @@ import makeWASocket, {
   Browsers,
   jidNormalizedUser,
   areJidsSameUser,
-  generateWAMessageFromContent,
-  generateForwardMessageContent,
-  generateWAMessage,
-  prepareWAMessageMedia,
   proto,
-  jidDecode,
   WASocket,
   ConnectionState,
   GroupMetadata,
@@ -91,18 +85,17 @@ import {
   FunctionExecutionMode,
 } from '../database/repositories/function-lab-repository';
 import {
-  FunctionValidator,
   FunctionRegistry,
-  extractCrossRealmErrorMessage,
-  classifyFunctionError,
+  FunctionExecutor,
 } from '../function-lab';
 import {
   MessageNormalizer,
+  MessageSender,
   NormalizedIncomingMessage,
 } from './message-capabilities';
 
-const defaultFunctionValidator = new FunctionValidator();
 const defaultFunctionRegistry = new FunctionRegistry();
+const defaultFunctionExecutor = new FunctionExecutor(defaultFunctionRegistry);
 
 export interface TestFunctionExecutionParams {
   targetPhone: string;
@@ -124,6 +117,8 @@ export interface TestFunctionExecutionParams {
   captureConsole?: boolean;
   /** Optional custom 3rd argument passed to the sandboxed function */
   extraArg?: unknown;
+  /** Optional AbortSignal for immediate cancellation */
+  abortSignal?: AbortSignal;
   /** Optional correlation ID for diagnostic tracing */
   correlationId?: string;
 }
@@ -146,13 +141,18 @@ export interface TestFunctionExecutionResult {
   maxSendsLimit: number;
   abortedEarly: boolean;
   consoleLogs: string[];
+  returnValuesPreview?: string[];
   durationMs: number;
   failureCategory?: FunctionFailureCategory;
   lastError?: string;
 }
 
 export interface SafeSocketTargetAdapter {
-  sendMessage: (targetJid: string, message: AnyMessageContent) => Promise<unknown>;
+  sendMessage: (
+    targetJid: string,
+    message: AnyMessageContent,
+    options?: Record<string, unknown>
+  ) => Promise<unknown>;
   relayMessage: (
     targetJid: string,
     messageObj: proto.IMessage,
@@ -163,6 +163,8 @@ export interface SafeSocketTargetAdapter {
     state: 'available' | 'composing' | 'paused',
     targetJid: string
   ) => Promise<void>;
+  raw?: Partial<WASocket> | Record<string, unknown>;
+  [key: string]: unknown;
 }
 
 export interface SafeSocketOptions {
@@ -173,7 +175,8 @@ export interface SafeSocketOptions {
 /**
  * Creates a rate-limited, JID-normalized socket wrapper (expanded from Nebula `createSafeSock`).
  * Supports manual/dynamic `maxSends` configuration (`0` = unlimited, default `500`),
- * runtime inspection/adjustment (`sock.getMaxSends()`, `sock.setMaxSends(n)`), and per-method counters.
+ * runtime inspection/adjustment (`sock.getMaxSends()`, `sock.setMaxSends(n)`), per-method counters,
+ * and Proxy-based access to all underlying `athanasia-baileys` socket methods.
  */
 export function createSafeSock(
   adapter: SafeSocketTargetAdapter,
@@ -202,7 +205,12 @@ export function createSafeSock(
     sendCount++;
   };
 
-  return {
+  const rawTarget =
+    (adapter.raw as Record<string, unknown> | undefined) ||
+    (adapter as unknown as Record<string, unknown>);
+
+  const baseObj: Record<string, unknown> = {
+    raw: rawTarget,
     getSendCount: () => sendCount,
     getSendMessageCount: () => sendMessageCount,
     getRelayMessageCount: () => relayMessageCount,
@@ -213,11 +221,15 @@ export function createSafeSock(
         maxSendsLimit = Math.min(100000, Math.floor(newLimit));
       }
     },
-    sendMessage: async (target: string, message: AnyMessageContent) => {
+    sendMessage: async (
+      target: string,
+      message: AnyMessageContent,
+      sendOpts?: Record<string, unknown>
+    ) => {
       checkAndIncrementSend();
       sendMessageCount++;
       const jid = normalize(target);
-      return await adapter.sendMessage(jid, message);
+      return await adapter.sendMessage(jid, message, sendOpts);
     },
     relayMessage: async (
       target: string,
@@ -249,226 +261,78 @@ export function createSafeSock(
       }
     },
   };
+
+  return new Proxy(baseObj, {
+    get(targetObj, prop, receiver) {
+      if (Reflect.has(targetObj, prop)) {
+        return Reflect.get(targetObj, prop, receiver);
+      }
+      if (rawTarget && prop in rawTarget) {
+        const val = rawTarget[prop as string];
+        return typeof val === 'function' ? val.bind(rawTarget) : val;
+      }
+      if (prop in adapter) {
+        const val = (adapter as Record<string, unknown>)[prop as string];
+        return typeof val === 'function' ? val.bind(adapter) : val;
+      }
+      return undefined;
+    },
+  }) as {
+    raw: Record<string, unknown>;
+    getSendCount: () => number;
+    getSendMessageCount: () => number;
+    getRelayMessageCount: () => number;
+    getPresenceCount: () => number;
+    getMaxSends: () => number;
+    setMaxSends: (newLimit: number) => void;
+    sendMessage: (
+      target: string,
+      message: AnyMessageContent,
+      options?: Record<string, unknown>
+    ) => Promise<unknown>;
+    relayMessage: (
+      target: string,
+      messageObj: proto.IMessage,
+      opts?: Record<string, unknown>
+    ) => Promise<unknown>;
+    presenceSubscribe: (jid: string) => Promise<void>;
+    sendPresenceUpdate: (
+      state: 'available' | 'composing' | 'paused',
+      jid: string
+    ) => Promise<void>;
+    [key: string]: unknown;
+  };
 }
 
 /**
- * Executes a custom `async function <name>(...)` or registered Function Lab function inside an isolated VM context
- * with `athanasia-baileys` helpers and `createSafeSock` (expanded from Nebula `/testfunction`).
- *
- * Includes full fixes for the `AewCh` failure:
- * - Resolves named functions from `FunctionRegistry` (e.g. `AewCh`, `nebulaSocketProbe`)
- * - Strips Markdown code fences, invisible Unicode marks, and repairs single-line `//` comments
- * - Pre-validates syntax with `vm.Script`
- * - Uses `extractCrossRealmErrorMessage` so V8 VM errors never fall back to generic `'خطأ برمجي'`
+ * Unified Function Lab execution entrypoint delegating directly to `FunctionExecutor`.
+ * Ensures both `AthanasiaBaileysSessionDriver` and `MockWhatsAppSessionDriver` share the exact
+ * same VM sandbox, Baileys helpers, flexible parser, and timer cleanup.
  */
 export async function runSandboxedTestFunction(
   sessionId: string,
   params: TestFunctionExecutionParams,
   adapter: SafeSocketTargetAdapter
 ): Promise<TestFunctionExecutionResult> {
-  const digits = String(params.targetPhone || '').replace(/[^0-9]/g, '');
-  if (digits.length < 7 || digits.length > 15) {
-    throw new ValidationError(
-      'رقم الهاتف الهدف غير صالح. يرجى إدخال رقم دولي صحيح (مثال: +966501234567).'
-    );
-  }
-
-  const iterations = Math.max(
-    1,
-    Math.min(Number(params.iterations) || 1, 10000)
-  );
-  const targetJid = `${digits}@s.whatsapp.net`;
-  const executionMode: FunctionExecutionMode = params.executionMode || 'LIVE';
-
-  let rawCode = String(params.funcCode || '').trim();
-  const registeredDef = defaultFunctionRegistry.resolveFunction(rawCode);
-  if (registeredDef) {
-    rawCode = registeredDef.sourceCode;
-  }
-
-  const parsed = defaultFunctionValidator.parseAndValidateSource(rawCode);
-  if (!parsed.valid) {
-    throw new ValidationError(
-      parsed.errorMessageAr ||
-        `فشل تحليل كود الدالة (${parsed.funcName}): خطأ تركيبي في الكود`
-    );
-  }
-
-  const funcName = parsed.funcName;
-  const configuredMaxSends =
-    params.maxSends !== undefined &&
-    Number.isFinite(params.maxSends) &&
-    params.maxSends >= 0
-      ? Math.min(100000, Math.floor(params.maxSends))
-      : 500;
-
-  const consoleLogs: string[] = [];
-  const captureConsole = params.captureConsole !== false;
-  const pushLog = (level: string, args: unknown[]) => {
-    if (!captureConsole || consoleLogs.length >= 25) return;
-    const formatted = args
-      .map((a) => {
-        if (typeof a === 'string') return a;
-        try {
-          return JSON.stringify(a);
-        } catch {
-          return String(a);
-        }
-      })
-      .join(' ')
-      .slice(0, 200);
-    consoleLogs.push(level === 'LOG' ? formatted : `[${level}] ${formatted}`);
-  };
-
-  const effectiveAdapter: SafeSocketTargetAdapter =
-    executionMode === 'DRY_RUN' || executionMode === 'SIMULATION'
-      ? {
-          sendMessage: async (jid, content) => {
-            const keys = Object.keys(content || {}).join(',');
-            pushLog(executionMode, [`sendMessage -> ${jid} [${keys}]`]);
-            return {
-              key: {
-                remoteJid: jid,
-                fromMe: true,
-                id: `${executionMode.toLowerCase()}_msg_${Date.now()}`,
-              },
-            };
-          },
-          relayMessage: async (jid) => {
-            pushLog(executionMode, [`relayMessage -> ${jid}`]);
-            return `${executionMode.toLowerCase()}_relay_${Date.now()}`;
-          },
-          presenceSubscribe: async () => undefined,
-          sendPresenceUpdate: async () => undefined,
-        }
-      : adapter;
-
-  const safeSock = createSafeSock(effectiveAdapter, { maxSends: configuredMaxSends });
-  const stepDelayMs =
-    params.delayMs !== undefined && Number.isFinite(params.delayMs)
-      ? Math.min(Math.max(0, Math.floor(params.delayMs)), 60000)
-      : 200;
-  const vmTimeoutMs =
-    params.vmTimeoutMs !== undefined && Number.isFinite(params.vmTimeoutMs)
-      ? Math.min(Math.max(500, Math.floor(params.vmTimeoutMs)), 60000)
-      : 5000;
-  const maxSleepMs =
-    params.maxSleepMs !== undefined && Number.isFinite(params.maxSleepMs)
-      ? Math.min(Math.max(0, Math.floor(params.maxSleepMs)), 60000)
-      : 10000;
-  const stopOnError = Boolean(params.stopOnError);
-
-  const sleep = (ms: number) =>
-    new Promise((resolve) =>
-      setTimeout(resolve, Math.min(Math.max(0, Number(ms) || 0), maxSleepMs))
-    );
-
-  const sandbox = {
-    console: {
-      log: (...args: unknown[]) => pushLog('LOG', args),
-      info: (...args: unknown[]) => pushLog('INFO', args),
-      warn: (...args: unknown[]) => pushLog('WARN', args),
-      error: (...args: unknown[]) => pushLog('ERR', args),
+  return defaultFunctionExecutor.execute(
+    {
+      sessionId,
+      targetPhone: params.targetPhone,
+      iterations: params.iterations,
+      funcCodeOrName: params.funcCode,
+      executionMode: params.executionMode,
+      delayMs: params.delayMs,
+      maxSends: params.maxSends,
+      vmTimeoutMs: params.vmTimeoutMs,
+      maxSleepMs: params.maxSleepMs,
+      stopOnError: params.stopOnError,
+      captureConsole: params.captureConsole,
+      extraArg: params.extraArg,
+      abortSignal: params.abortSignal,
+      correlationId: params.correlationId,
     },
-    Buffer,
-    sock: safeSock,
-    target: targetJid,
-    sessionId,
-    executionMode,
-    maxSends: configuredMaxSends,
-    sleep,
-    generateWAMessageFromContent,
-    generateForwardMessageContent,
-    generateWAMessage,
-    prepareWAMessageMedia,
-    proto,
-    jidDecode,
-    areJidsSameUser,
-  };
-
-  const context = vm.createContext(sandbox);
-  const wrapper = `${parsed.normalizedCode}\n${funcName}`;
-  let fn: (...args: unknown[]) => Promise<unknown>;
-  try {
-    const evaluated = vm.runInContext(wrapper, context, { timeout: vmTimeoutMs });
-    if (typeof evaluated !== 'function') {
-      throw new Error('Evaluated target is not a function');
-    }
-    fn = evaluated as (...args: unknown[]) => Promise<unknown>;
-  } catch (err) {
-    const extracted = extractCrossRealmErrorMessage(err);
-    throw new ValidationError(
-      `فشل تحليل كود الدالة (${funcName}): ${extracted.message}`
-    );
-  }
-
-  const arity = fn.length;
-  let iterationsSucceeded = 0;
-  let iterationsFailed = 0;
-  let abortedEarly = false;
-  let lastError: string | undefined;
-  let failureCategory: FunctionFailureCategory | undefined;
-  const startTime = Date.now();
-
-  for (let i = 0; i < iterations; i++) {
-    try {
-      const iterContext =
-        params.extraArg !== undefined
-          ? params.extraArg
-          : {
-              iteration: i + 1,
-              totalIterations: iterations,
-              sessionId,
-              executionMode,
-              maxSends: safeSock.getMaxSends(),
-              sendCount: safeSock.getSendCount(),
-            };
-      if (arity === 1) {
-        await fn(targetJid);
-      } else if (arity === 2) {
-        await fn(safeSock, targetJid);
-      } else {
-        await fn(safeSock, targetJid, iterContext);
-      }
-      iterationsSucceeded++;
-    } catch (err) {
-      iterationsFailed++;
-      const extracted = extractCrossRealmErrorMessage(err);
-      const classified = classifyFunctionError(err, 'RUNTIME');
-      failureCategory = classified.category;
-      lastError = extracted.message;
-      if (stopOnError) {
-        abortedEarly = true;
-        break;
-      }
-    }
-    if (i + 1 < iterations && stepDelayMs > 0 && executionMode !== 'DRY_RUN') {
-      await sleep(stepDelayMs);
-    }
-  }
-
-  return {
-    correlationId: params.correlationId,
-    sessionId,
-    executionMode,
-    targetJid,
-    targetDigits: digits,
-    funcName,
-    arity,
-    iterationsRequested: iterations,
-    iterationsSucceeded,
-    iterationsFailed,
-    sendCount: safeSock.getSendCount(),
-    sendMessageCount: safeSock.getSendMessageCount(),
-    relayMessageCount: safeSock.getRelayMessageCount(),
-    presenceCount: safeSock.getPresenceCount(),
-    maxSendsLimit: safeSock.getMaxSends(),
-    abortedEarly,
-    consoleLogs,
-    durationMs: Date.now() - startTime,
-    failureCategory,
-    lastError,
-  };
+    adapter
+  );
 }
 
 /**
@@ -1067,11 +931,18 @@ export class AthanasiaBaileysSessionDriver implements WhatsAppSessionDriver {
     resolve: () => void;
     reject: (err: Error) => void;
   }>();
+  public messageSender?: MessageSender;
 
   constructor(
     public readonly sessionId: string,
-    private readonly authDir: string
-  ) {}
+    private readonly authDir: string,
+    optionsOrSender?: MessageSender | { messageSender?: MessageSender }
+  ) {
+    this.messageSender =
+      optionsOrSender instanceof MessageSender
+        ? optionsOrSender
+        : optionsOrSender?.messageSender;
+  }
 
   private resolveHandshakeWaiters(): void {
     for (const waiter of this.handshakeWaiters) {
@@ -1346,14 +1217,62 @@ export class AthanasiaBaileysSessionDriver implements WhatsAppSessionDriver {
       }
     };
 
+    const messagesUpdateListener = (
+      updates: Array<{
+        key?: { id?: string | null; remoteJid?: string | null };
+        update?: { status?: number };
+      }>
+    ) => {
+      if (!this.messageSender || !Array.isArray(updates)) return;
+      for (const u of updates) {
+        if (u?.key?.id && typeof u?.update?.status === 'number') {
+          this.messageSender.recordAckUpdate({
+            sessionId: this.sessionId,
+            messageId: u.key.id,
+            statusNumber: u.update.status,
+          });
+        }
+      }
+    };
+
+    const receiptUpdateListener = (
+      updates: Array<{
+        key?: { id?: string | null; remoteJid?: string | null };
+        receipt?: {
+          readTimestamp?: unknown;
+          playedTimestamp?: unknown;
+          receiptTimestamp?: unknown;
+        };
+      }>
+    ) => {
+      if (!this.messageSender || !Array.isArray(updates)) return;
+      for (const r of updates) {
+        if (!r?.key?.id || !r?.receipt) continue;
+        const receiptType = r.receipt.readTimestamp
+          ? 'read'
+          : r.receipt.playedTimestamp
+            ? 'played'
+            : 'delivery';
+        this.messageSender.recordAckUpdate({
+          sessionId: this.sessionId,
+          messageId: r.key.id,
+          receiptType,
+        });
+      }
+    };
+
     sock.ev.on('creds.update', credsListener);
     sock.ev.on('connection.update', connectionListener);
+    sock.ev.on('messages.update', messagesUpdateListener);
+    sock.ev.on('message-receipt.update', receiptUpdateListener);
 
     this.evCleanup = () => {
       unbindStore();
       try {
         sock.ev.off('creds.update', credsListener);
         sock.ev.off('connection.update', connectionListener);
+        sock.ev.off('messages.update', messagesUpdateListener);
+        sock.ev.off('message-receipt.update', receiptUpdateListener);
       } catch {
         // Ignore cleanup errors
       }
@@ -1798,7 +1717,9 @@ export class AthanasiaBaileysSessionDriver implements WhatsAppSessionDriver {
     }
     const sock = this.ensureSocket();
     return runSandboxedTestFunction(this.sessionId, params, {
-      sendMessage: async (targetJid, message) => sock.sendMessage(targetJid, message),
+      raw: sock as unknown as Record<string, unknown>,
+      sendMessage: async (targetJid, message, options) =>
+        sock.sendMessage(targetJid, message, options),
       relayMessage: async (targetJid, messageObj, opts = {}) =>
         sock.relayMessage(targetJid, messageObj, opts),
       presenceSubscribe: async (targetJid) => {
@@ -1878,10 +1799,28 @@ export class MockWhatsAppSessionDriver implements WhatsAppSessionDriver {
   public lastRequestedPhoneDigits: string | null = null;
   private lastCloseError: WhatsAppConnectionError | null = null;
 
+  private readonly messageSender?: MessageSender;
+
   constructor(
     public readonly sessionId: string,
-    initialPhoneDigits = '966501234567'
+    initialPhoneOrSender:
+      | string
+      | MessageSender
+      | { messageSender?: MessageSender; initialPhoneDigits?: string } = '966501234567',
+    options?: { messageSender?: MessageSender }
   ) {
+    let initialPhoneDigits = '966501234567';
+    if (typeof initialPhoneOrSender === 'string') {
+      initialPhoneDigits = initialPhoneOrSender;
+      this.messageSender = options?.messageSender;
+    } else if (initialPhoneOrSender instanceof MessageSender) {
+      this.messageSender = initialPhoneOrSender;
+    } else if (initialPhoneOrSender && typeof initialPhoneOrSender === 'object') {
+      this.messageSender = initialPhoneOrSender.messageSender;
+      if (initialPhoneOrSender.initialPhoneDigits) {
+        initialPhoneDigits = initialPhoneOrSender.initialPhoneDigits;
+      }
+    }
     this.currentJid = `${initialPhoneDigits}@s.whatsapp.net`;
     this.seedDefaultGroups();
   }
@@ -2279,6 +2218,42 @@ export class MockWhatsAppSessionDriver implements WhatsAppSessionDriver {
         delayMs: params.delayMs ?? this.simulatedDelayMs,
       },
       {
+        raw: {
+          user: { id: this.currentJid, name: `Mock (${this.sessionId})` },
+          groupMetadata: async (jid: string) => this.getGroupMetadata(jid),
+          groupFetchAllParticipating: async () => {
+            const obj: Record<string, GroupSummary> = {};
+            for (const [k, v] of this.simulatedGroups.entries()) {
+              obj[k] = v;
+            }
+            return obj;
+          },
+          groupParticipantsUpdate: async (
+            jid: string,
+            participants: string[],
+            action: ParticipantAction
+          ) => {
+            await this.updateGroupParticipants(jid, participants, action);
+            return participants.map((p) => ({ status: '200', jid: p }));
+          },
+          groupInviteCode: async (jid: string) => this.getGroupInviteCode(jid),
+          groupAcceptInvite: async (code: string) => this.acceptGroupInvite(code),
+          newsletterMetadata: async (_type: string, key: string) =>
+            this.getChannelMetadata(key),
+          onWhatsApp: async (...jids: string[]) =>
+            jids.map((j) => ({
+              jid: j.includes('@') ? j : `${j.replace(/\D/g, '')}@s.whatsapp.net`,
+              exists: true,
+            })),
+          fetchStatus: async (jid: string) => ({
+            status: 'متاح عبر Botezz Function Lab',
+            setAt: new Date(),
+            jid,
+          }),
+          profilePictureUrl: async (jid: string) =>
+            `https://pps.whatsapp.net/v/mock_${jid.split('@')[0]}.jpg`,
+          updateProfileStatus: async () => undefined,
+        },
         sendMessage: async (targetJid, _message) => {
           if (this.shouldFailSend) {
             throw new WhatsAppConnectionError('رفض الإرسال من الجلسة في وضع الاختبار.');

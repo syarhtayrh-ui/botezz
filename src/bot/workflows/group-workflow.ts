@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import { SessionManager } from '../../whatsapp/session-manager';
 import { TaskManager } from '../../tasks/task-manager';
 import {
@@ -31,14 +32,81 @@ export interface ManageGroupWorkflowState {
 
 export type GroupWorkflowState = JoinGroupWorkflowState | ManageGroupWorkflowState;
 
+export type CompactGroupActionCode = 'INV' | 'ADD' | 'PRO' | 'DEM' | 'REM' | 'LV';
+
+const COMPACT_ACTION_TO_FULL: Record<CompactGroupActionCode, GroupManagementActionType> = {
+  INV: 'GET_INVITE_LINK',
+  ADD: 'ADD_PARTICIPANT',
+  PRO: 'PROMOTE_PARTICIPANT',
+  DEM: 'DEMOTE_PARTICIPANT',
+  REM: 'REMOVE_PARTICIPANT',
+  LV: 'LEAVE_GROUP',
+};
+
 export class GroupWorkflow {
   private readonly states = new Map<number, GroupWorkflowState>();
+  private readonly groupRefs = new Map<string, { sessionId: string; groupJid: string }>();
+  private readonly activeGroupByAdmin = new Map<
+    number,
+    { sessionId: string; groupJid: string; shortId: string }
+  >();
+  private lastActiveGroup?: { sessionId: string; groupJid: string; shortId: string };
 
   constructor(
     private readonly sessionManager: SessionManager,
     private readonly taskManager: TaskManager,
     private readonly groupOps: GroupOperations
   ) {}
+
+  public registerGroupRef(sessionId: string, groupJid: string): string {
+    const shortId = crypto
+      .createHash('sha1')
+      .update(`${sessionId}:${groupJid}`)
+      .digest('hex')
+      .slice(0, 10);
+    this.groupRefs.set(shortId, { sessionId, groupJid });
+    return shortId;
+  }
+
+  public resolveGroupRef(
+    shortId: string,
+    adminId?: number
+  ): { sessionId: string; groupJid: string } | undefined {
+    const found = this.groupRefs.get(shortId);
+    if (found) return found;
+    if (adminId !== undefined) {
+      const active = this.activeGroupByAdmin.get(adminId);
+      if (active) return { sessionId: active.sessionId, groupJid: active.groupJid };
+    }
+    if (this.lastActiveGroup) {
+      return {
+        sessionId: this.lastActiveGroup.sessionId,
+        groupJid: this.lastActiveGroup.groupJid,
+      };
+    }
+    return undefined;
+  }
+
+  public resolveCompactAction(
+    codeOrAction: string
+  ): GroupManagementActionType | undefined {
+    const upper = codeOrAction.toUpperCase() as CompactGroupActionCode;
+    if (upper in COMPACT_ACTION_TO_FULL) {
+      return COMPACT_ACTION_TO_FULL[upper];
+    }
+    const validActions: GroupManagementActionType[] = [
+      'GET_INVITE_LINK',
+      'ADD_PARTICIPANT',
+      'REMOVE_PARTICIPANT',
+      'PROMOTE_PARTICIPANT',
+      'DEMOTE_PARTICIPANT',
+      'LEAVE_GROUP',
+    ];
+    if (validActions.includes(codeOrAction as GroupManagementActionType)) {
+      return codeOrAction as GroupManagementActionType;
+    }
+    return undefined;
+  }
 
   public getState(adminId: number): GroupWorkflowState | undefined {
     return this.states.get(adminId);
@@ -223,10 +291,18 @@ export class GroupWorkflow {
   // --- Group Management Submenu & Permission-Sensitive Actions (Section 9) ---
   public async renderGroupDetails(
     sessionId: string,
-    groupJid: string
+    groupJid: string,
+    adminId?: number
   ): Promise<BotViewResponse> {
     try {
       const group = await this.groupOps.getGroupDetails(sessionId, groupJid);
+      const shortId = this.registerGroupRef(sessionId, groupJid);
+      const activeEntry = { sessionId, groupJid, shortId };
+      this.lastActiveGroup = activeEntry;
+      if (adminId !== undefined) {
+        this.activeGroupByAdmin.set(adminId, activeEntry);
+      }
+
       const adminBadge = group.isBotAdmin
         ? '🟢 مشرف في المجموعة (يمتلك صلاحيات الإدارة)'
         : '🟡 عضو عادي (صلاحيات الإدارة غير متاحة)';
@@ -245,27 +321,27 @@ export class GroupWorkflow {
         rows.push([
           {
             text: '🔗 استخراج رابط الدعوة',
-            callbackData: `grp:act:${sessionId}:${groupJid}:GET_INVITE_LINK`,
+            callbackData: `ga:${shortId}:INV`,
           },
           {
             text: '➕ إضافة عضو',
-            callbackData: `grp:act:${sessionId}:${groupJid}:ADD_PARTICIPANT`,
+            callbackData: `ga:${shortId}:ADD`,
           },
         ]);
         rows.push([
           {
             text: '⬆️ ترقية عضو لمشرف',
-            callbackData: `grp:act:${sessionId}:${groupJid}:PROMOTE_PARTICIPANT`,
+            callbackData: `ga:${shortId}:PRO`,
           },
           {
             text: '⬇️ إلغاء إشراف عضو',
-            callbackData: `grp:act:${sessionId}:${groupJid}:DEMOTE_PARTICIPANT`,
+            callbackData: `ga:${shortId}:DEM`,
           },
         ]);
         rows.push([
           {
             text: '🚫 إزالة عضو من المجموعة',
-            callbackData: `grp:act:${sessionId}:${groupJid}:REMOVE_PARTICIPANT`,
+            callbackData: `ga:${shortId}:REM`,
           },
         ]);
       }
@@ -273,7 +349,7 @@ export class GroupWorkflow {
       rows.push([
         {
           text: '🚪 مغادرة المجموعة (يتطلب تأكيد)',
-          callbackData: `grp:act:${sessionId}:${groupJid}:LEAVE_GROUP`,
+          callbackData: `ga:${shortId}:LV`,
         },
       ]);
       rows.push([
@@ -308,6 +384,9 @@ export class GroupWorkflow {
     const { adminId, sessionId, groupJid, action } = params;
     try {
       const group = await this.groupOps.getGroupDetails(sessionId, groupJid);
+      const shortId = this.registerGroupRef(sessionId, groupJid);
+      this.activeGroupByAdmin.set(adminId, { sessionId, groupJid, shortId });
+      this.lastActiveGroup = { sessionId, groupJid, shortId };
 
       if (action === 'GET_INVITE_LINK') {
         const resultMsg = await this.groupOps.executeAdminGroupAction({
@@ -322,7 +401,7 @@ export class GroupWorkflow {
             [
               {
                 text: '🔙 العودة لتفاصيل المجموعة',
-                callbackData: `grp:view:${sessionId}:${groupJid}`,
+                callbackData: `gv:${shortId}`,
               },
             ],
           ],
@@ -348,7 +427,7 @@ export class GroupWorkflow {
           keyboard: [
             [
               { text: '✅ تأكيد المغادرة', callbackData: 'wf_grp:confirm_action' },
-              { text: '❌ إلغاء', callbackData: `grp:view:${sessionId}:${groupJid}` },
+              { text: '❌ إلغاء', callbackData: `gv:${shortId}` },
             ],
           ],
         };
@@ -380,7 +459,7 @@ export class GroupWorkflow {
           [
             {
               text: '🔙 إلغاء والعودة للمجموعة',
-              callbackData: `grp:view:${sessionId}:${groupJid}`,
+              callbackData: `gv:${shortId}`,
             },
           ],
         ],
@@ -402,6 +481,7 @@ export class GroupWorkflow {
 
     state.targetPhone = rawPhone.trim();
     state.step = 'AWAITING_ACTION_CONFIRMATION';
+    const shortId = this.registerGroupRef(state.sessionId, state.groupJid);
 
     return {
       text:
@@ -416,7 +496,7 @@ export class GroupWorkflow {
           { text: '✅ تأكيد التنفيذ', callbackData: 'wf_grp:confirm_action' },
           {
             text: '❌ إلغاء',
-            callbackData: `grp:view:${state.sessionId}:${state.groupJid}`,
+            callbackData: `gv:${shortId}`,
           },
         ],
       ],
@@ -433,6 +513,7 @@ export class GroupWorkflow {
     }
 
     const { sessionId, groupJid, action, targetPhone } = state;
+    const shortId = this.registerGroupRef(sessionId, groupJid);
     this.states.delete(adminId);
 
     try {
@@ -459,7 +540,7 @@ export class GroupWorkflow {
           [
             {
               text: '🔙 العودة لتفاصيل المجموعة',
-              callbackData: `grp:view:${sessionId}:${groupJid}`,
+              callbackData: `gv:${shortId}`,
             },
           ],
         ],

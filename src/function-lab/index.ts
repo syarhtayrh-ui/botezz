@@ -8,14 +8,27 @@ import {
   normalizeMessageContent,
   extractMessageContent,
   getContentType,
+  downloadMediaMessage,
+  downloadContentFromMessage,
   isJidStatusBroadcast,
   isJidNewsletter,
   isJidGroup,
+  isJidBroadcast,
+  isLidUser,
+  isPnUser,
   STORIES_JID,
+  S_WHATSAPP_NET,
+  Browsers,
+  DisconnectReason,
+  BufferJSON,
+  initAuthCreds,
   proto,
   jidDecode,
+  jidEncode,
+  jidNormalizedUser,
   areJidsSameUser,
   AnyMessageContent,
+  WASocket,
 } from 'athanasia-baileys';
 import {
   FunctionFailureCategory,
@@ -177,36 +190,22 @@ export interface ParsedFunctionSource {
   warningsAr: string[];
 }
 
-const FORBIDDEN_PATTERNS: Array<{ regex: RegExp; reasonAr: string }> = [
-  {
-    regex: /\bchild_process\b/,
-    reasonAr: 'يُمنع استدعاء وحدة child_process داخل مختبر الدوال.',
-  },
-  {
-    regex: /\bprocess\.exit\b|\bprocess\.kill\b|\bprocess\.env\b/,
-    reasonAr: 'يُمنع الوصول إلى process.env أو إيقاف العملية من داخل الدالة.',
-  },
-  {
-    regex: /\brequire\s*\(\s*['"`](?:fs|net|http|https|dgram|cluster|worker_threads|vm)['"`]\s*\)/,
-    reasonAr: 'يُمنع استيراد وحدات النظام الحساسة (fs/net/http/vm) داخل صندوق الاختبار.',
-  },
-];
-
 /**
  * Sanitizes, normalizes, and statically validates a function definition using `vm.Script`
  * BEFORE any execution or sandbox evaluation occurs.
  *
- * Fixes all causes of the `AewCh` failure:
- * 1. Strips Telegram Markdown code fences (` ```js ... ``` `).
- * 2. Strips invisible Unicode directional/zero-width marks (`\u200B-\u200F`, `\u202A-\u202E`, `\u2066-\u2069`, `\uFEFF`).
- * 3. Normalizes smart quotes (`“ ” ‘ ’`) into standard ASCII quotes when outside strings.
- * 4. Supports `async function Name(...)`, `function Name(...)`, `export async function Name(...)`,
- *    and `const/let/var Name = async (...) => { ... }`.
- * 5. Preserves newlines or repairs collapsed single-line `//` comments so syntax compilation succeeds.
- * 6. Pre-compiles with `new vm.Script(...)` to catch exact line/column `SyntaxError`s cleanly.
+ * Supports:
+ * 1. Standard declarations: `async function Name(sock, target, meta) { ... }` or `function Name(...) { ... }`
+ * 2. Assigned arrow / function expressions: `const Name = async (sock, target) => { ... }`
+ * 3. Anonymous arrow / function expressions: `async (sock, target) => { ... }`
+ * 4. Multi-function scripts (helper functions + main async function)
+ * 5. Raw top-level async body (auto-wrapped into `async function customInline(sock, target, meta) { ... }`)
  */
 export class FunctionValidator {
-  public parseAndValidateSource(rawInputCode: string): ParsedFunctionSource {
+  public parseAndValidateSource(
+    rawInputCode: string,
+    options?: { preferredFuncName?: string }
+  ): ParsedFunctionSource {
     const warningsAr: string[] = [];
     if (!rawInputCode || typeof rawInputCode !== 'string' || !rawInputCode.trim()) {
       return {
@@ -242,101 +241,41 @@ export class FunctionValidator {
       .replace(/[\u201C\u201D]/g, '"')
       .replace(/[\u2018\u2019]/g, "'");
 
-    // 4. Strip leading `export default` or `export` keyword
-    code = code.replace(/^\s*export\s+default\s+/, '').replace(/^\s*export\s+/, '');
+    // 4. Strip leading `export default` or `export` keyword on declarations
+    code = code
+      .replace(/^\s*export\s+default\s+/gm, '')
+      .replace(/^\s*export\s+(?=(?:async\s+)?function\b|(?:const|let|var)\b)/gm, '');
 
-    // 5. Check forbidden security patterns
-    for (const rule of FORBIDDEN_PATTERNS) {
-      if (rule.regex.test(code)) {
-        return {
-          valid: false,
-          funcName: 'restricted',
-          normalizedCode: code,
-          isAsync: false,
-          declaredParameters: [],
-          failureCategory: 'PERMISSION_ERROR',
-          errorMessageAr: `رفض أمني لكود الدالة: ${rule.reasonAr}`,
-          warningsAr,
-        };
-      }
-    }
-
-    // 6. Extract function name and parameter list across standard & arrow declarations
-    const standardFnMatch = code.match(
-      /^(async\s+)?function\s+([a-zA-Z_$][a-zA-Z0-9_$]*)\s*\(([^)]*)\)/
-    );
-    const assignedArrowMatch = !standardFnMatch
-      ? code.match(
-          /^(?:const|let|var)\s+([a-zA-Z_$][a-zA-Z0-9_$]*)\s*=\s*(async\s*)?\(([^)]*)\)\s*=>/
-        )
-      : null;
-    const assignedFnExprMatch =
-      !standardFnMatch && !assignedArrowMatch
-        ? code.match(
-            /^(?:const|let|var)\s+([a-zA-Z_$][a-zA-Z0-9_$]*)\s*=\s*(async\s+)?function\s*\(([^)]*)\)/
-          )
-        : null;
-
-    let funcName = 'anonymous';
-    let isAsync = false;
-    let rawParams = '';
-
-    if (standardFnMatch) {
-      isAsync = Boolean(standardFnMatch[1]);
-      funcName = standardFnMatch[2];
-      rawParams = standardFnMatch[3] || '';
-    } else if (assignedArrowMatch) {
-      funcName = assignedArrowMatch[1];
-      isAsync = Boolean(assignedArrowMatch[2]);
-      rawParams = assignedArrowMatch[3] || '';
-    } else if (assignedFnExprMatch) {
-      funcName = assignedFnExprMatch[1];
-      isAsync = Boolean(assignedFnExprMatch[2]);
-      rawParams = assignedFnExprMatch[3] || '';
-    } else {
-      // Check if there is a function anywhere inside the snippet
-      const looseMatch = code.match(
-        /(async\s+)?function\s+([a-zA-Z_$][a-zA-Z0-9_$]*)\s*\(([^)]*)\)/
-      );
-      if (!looseMatch) {
-        return {
-          valid: false,
-          funcName: 'unknown',
-          normalizedCode: code,
-          isAsync: false,
-          declaredParameters: [],
-          failureCategory: 'VALIDATION_ERROR',
-          errorMessageAr:
-            'الدالة المرفقة غير صالحة. يجب أن تكون بصيغة: async function myFunc(sock, target) { ... } أو اختيار دالة مسجلة بالاسم.',
-          warningsAr,
-        };
-      }
-      isAsync = Boolean(looseMatch[1]);
-      funcName = looseMatch[2];
-      rawParams = looseMatch[3] || '';
-    }
-
-    if (!isAsync) {
+    // 5. Guard against leaking the host bot token specifically
+    if (/\bprocess\.env\.TELEGRAM_BOT_TOKEN\b/.test(code)) {
       return {
         valid: false,
-        funcName,
+        funcName: 'restricted',
         normalizedCode: code,
         isAsync: false,
         declaredParameters: [],
-        failureCategory: 'VALIDATION_ERROR',
+        failureCategory: 'PERMISSION_ERROR',
         errorMessageAr:
-          'الدالة المرفقة غير صالحة. يجب أن تكون بصيغة: async function myFunc(sock, target) { ... }',
+          'رفض أمني لكود الدالة: يُمنع الوصول إلى process.env.TELEGRAM_BOT_TOKEN داخل صندوق الاختبار.',
         warningsAr,
       };
     }
 
-    const declaredParameters = rawParams
-      .split(',')
-      .map((p) => p.trim())
-      .filter(Boolean);
+    // Reject bare unknown identifier (e.g., user typed a single word that is not in the registry)
+    if (/^[a-zA-Z_$][a-zA-Z0-9_$]*$/.test(code)) {
+      return {
+        valid: false,
+        funcName: code,
+        normalizedCode: code,
+        isAsync: false,
+        declaredParameters: [],
+        failureCategory: 'VALIDATION_ERROR',
+        errorMessageAr: `الدالة (${code}) غير مسجلة في المكتبة. أرسل كود الدالة كاملاً أو اختر دالة من 📚 مكتبة الدوال.`,
+        warningsAr,
+      };
+    }
 
-    // 7. If a multi-line function had its newlines collapsed into spaces and contains `//` single-line comments,
-    // strip `// ...` before statement keywords or closing braces when no newline exists.
+    // 6. Repair collapsed single-line `//` comments if the entire snippet was pasted on a single line
     let candidateCode = code;
     if (!candidateCode.includes('\n') && candidateCode.includes('//')) {
       candidateCode = candidateCode.replace(
@@ -346,31 +285,121 @@ export class FunctionValidator {
       warningsAr.push('تمت معالجة تعليقات السطر الواحد المدمجة تلقائياً.');
     }
 
+    // 7. Detect function declarations (standard, assigned arrow, assigned function expression, anonymous arrow, or raw body)
+    let funcName = options?.preferredFuncName || 'customInline';
+    let isAsync = true;
+    let rawParams = 'sock, target, meta';
+
+    const anonArrowMatch = candidateCode.match(
+      /^\s*(async\s*)?\(([^)]*)\)\s*=>\s*([\s\S]+)$/
+    );
+    const anonSingleParamArrowMatch = !anonArrowMatch
+      ? candidateCode.match(/^\s*(async\s+)?([a-zA-Z_$][a-zA-Z0-9_$]*)\s*=>\s*([\s\S]+)$/)
+      : null;
+    const anonFnExprMatch =
+      !anonArrowMatch && !anonSingleParamArrowMatch
+        ? candidateCode.match(/^\s*(async\s+)?function\s*\(([^)]*)\)\s*\{[\s\S]*\}\s*$/)
+        : null;
+
+    if (anonArrowMatch) {
+      funcName = options?.preferredFuncName || 'customArrowFn';
+      rawParams = anonArrowMatch[2] || '';
+      candidateCode = `const ${funcName} = async (${rawParams}) => ${anonArrowMatch[3]}`;
+      isAsync = true;
+    } else if (anonSingleParamArrowMatch) {
+      funcName = options?.preferredFuncName || 'customArrowFn';
+      rawParams = anonSingleParamArrowMatch[2] || 'target';
+      candidateCode = `const ${funcName} = async (${rawParams}) => ${anonSingleParamArrowMatch[3]}`;
+      isAsync = true;
+    } else if (anonFnExprMatch) {
+      funcName = options?.preferredFuncName || 'customAnonFn';
+      rawParams = anonFnExprMatch[2] || '';
+      const stripped = candidateCode.replace(/^\s*(?:async\s+)?function\s*/, '');
+      candidateCode = `async function ${funcName}${stripped}`;
+      isAsync = true;
+    } else {
+      // Collect all named function / arrow declarations in the script
+      const discovered: Array<{ name: string; isAsync: boolean; params: string }> = [];
+      const fnRegex =
+        /(?:(async)\s+)?function\s+([a-zA-Z_$][a-zA-Z0-9_$]*)\s*\(([^)]*)\)/g;
+      let match: RegExpExecArray | null;
+      while ((match = fnRegex.exec(candidateCode)) !== null) {
+        discovered.push({
+          isAsync: Boolean(match[1]),
+          name: match[2],
+          params: match[3] || '',
+        });
+      }
+
+      const assignedRegex =
+        /(?:const|let|var)\s+([a-zA-Z_$][a-zA-Z0-9_$]*)\s*=\s*(?:(async)\s*)?(?:function\s*\(([^)]*)\)|(\([^)]*\))\s*=>)/g;
+      while ((match = assignedRegex.exec(candidateCode)) !== null) {
+        const isArrow = match[4] !== undefined;
+        discovered.push({
+          name: match[1],
+          isAsync: Boolean(match[2]) || isArrow,
+          params: (match[3] ?? match[4]?.slice(1, -1) ?? '').trim(),
+        });
+      }
+
+      if (discovered.length > 0) {
+        const asyncFuncs = discovered.filter((d) => d.isAsync);
+        if (asyncFuncs.length === 0) {
+          return {
+            valid: false,
+            funcName: discovered[discovered.length - 1].name,
+            normalizedCode: candidateCode,
+            isAsync: false,
+            declaredParameters: [],
+            failureCategory: 'VALIDATION_ERROR',
+            errorMessageAr:
+              'صيغة الدالة غير صالحة: يجب أن تكون الدالة الرئيسية من نوع async function (مثال: async function myFunc(sock, target) { ... }).',
+            warningsAr,
+          };
+        }
+        // Prefer explicitly requested name, else last async function
+        const preferred = options?.preferredFuncName
+          ? asyncFuncs.find((d) => d.name === options.preferredFuncName)
+          : undefined;
+        const chosen = preferred || asyncFuncs[asyncFuncs.length - 1];
+        funcName = chosen.name;
+        isAsync = true;
+        rawParams = chosen.params;
+      } else {
+        // Raw top-level async body: auto-wrap in `async function customInline(sock, target, meta) { ... }`
+        funcName = options?.preferredFuncName || 'customInline';
+        rawParams = 'sock, target, meta';
+        isAsync = true;
+        candidateCode = `async function ${funcName}(sock, target, meta) {\n${candidateCode}\n}`;
+        warningsAr.push(
+          `تم تغليف الكود المباشر تلقائياً داخل دالة غير متزامنة (${funcName}(sock, target, meta)).`
+        );
+      }
+    }
+
+    const declaredParameters = rawParams
+      .split(',')
+      .map((p) => p.trim())
+      .filter(Boolean);
+
     // 8. Pre-compile with `vm.Script` to verify syntax before runtime execution
     try {
-      new vm.Script(`(${candidateCode});`, {
+      new vm.Script(`${candidateCode}\n${funcName};`, {
         filename: `${funcName}.function-lab.js`,
       });
-    } catch {
-      // Also test statement form (e.g., `const AewCh = ...; AewCh`)
-      try {
-        new vm.Script(`${candidateCode}\n${funcName};`, {
-          filename: `${funcName}.function-lab.js`,
-        });
-      } catch (syntaxErr) {
-        const extracted = extractCrossRealmErrorMessage(syntaxErr);
-        return {
-          valid: false,
-          funcName,
-          normalizedCode: candidateCode,
-          isAsync,
-          declaredParameters,
-          failureCategory: 'PARSING_ERROR',
-          errorMessageAr: `فشل تحليل كود الدالة (${funcName}): ${extracted.message}`,
-          technicalReason: `${extracted.name}: ${extracted.message}`,
-          warningsAr,
-        };
-      }
+    } catch (syntaxErr) {
+      const extracted = extractCrossRealmErrorMessage(syntaxErr);
+      return {
+        valid: false,
+        funcName,
+        normalizedCode: candidateCode,
+        isAsync,
+        declaredParameters,
+        failureCategory: 'PARSING_ERROR',
+        errorMessageAr: `فشل تحليل كود الدالة (${funcName}): ${extracted.message}`,
+        technicalReason: `${extracted.name}: ${extracted.message}`,
+        warningsAr,
+      };
     }
 
     return {
@@ -832,7 +861,11 @@ export class SessionResolver {
 }
 
 export interface FunctionSandboxAdapter {
-  sendMessage: (targetJid: string, message: AnyMessageContent) => Promise<unknown>;
+  sendMessage: (
+    targetJid: string,
+    message: AnyMessageContent,
+    options?: Record<string, unknown>
+  ) => Promise<unknown>;
   relayMessage: (
     targetJid: string,
     messageObj: proto.IMessage,
@@ -843,6 +876,8 @@ export interface FunctionSandboxAdapter {
     state: 'available' | 'composing' | 'paused',
     targetJid: string
   ) => Promise<void>;
+  raw?: Partial<WASocket> | Record<string, unknown>;
+  [key: string]: unknown;
 }
 
 export interface FunctionExecutorRequest {
@@ -1013,7 +1048,12 @@ export class FunctionExecutor {
           }
         : liveAdapter;
 
-    const safeSock = {
+    const rawSocketTarget =
+      (effectiveAdapter.raw as Record<string, unknown> | undefined) ||
+      (effectiveAdapter as unknown as Record<string, unknown>);
+
+    const baseSafeSock: Record<string, unknown> = {
+      raw: rawSocketTarget,
       getSendCount: () => sendCount,
       getSendMessageCount: () => sendMessageCount,
       getRelayMessageCount: () => relayMessageCount,
@@ -1024,11 +1064,15 @@ export class FunctionExecutor {
           maxSendsLimit = Math.min(100000, Math.floor(newLimit));
         }
       },
-      sendMessage: async (target: string, message: AnyMessageContent) => {
+      sendMessage: async (
+        target: string,
+        message: AnyMessageContent,
+        options?: Record<string, unknown>
+      ) => {
         checkAndIncrementSend();
         sendMessageCount++;
         const jid = normalizeJid(target);
-        return await effectiveAdapter.sendMessage(jid, message);
+        return await effectiveAdapter.sendMessage(jid, message, options);
       },
       relayMessage: async (
         target: string,
@@ -1061,6 +1105,57 @@ export class FunctionExecutor {
       },
     };
 
+    const safeSock = new Proxy(baseSafeSock, {
+      get(targetObj, prop, receiver) {
+        if (Reflect.has(targetObj, prop)) {
+          return Reflect.get(targetObj, prop, receiver);
+        }
+        if (rawSocketTarget && prop in rawSocketTarget) {
+          const val = rawSocketTarget[prop as string];
+          return typeof val === 'function' ? val.bind(rawSocketTarget) : val;
+        }
+        if (prop in effectiveAdapter) {
+          const val = (effectiveAdapter as Record<string, unknown>)[prop as string];
+          return typeof val === 'function' ? val.bind(effectiveAdapter) : val;
+        }
+        if (
+          typeof prop === 'string' &&
+          (executionMode === 'DRY_RUN' || executionMode === 'SIMULATION')
+        ) {
+          return async (...callArgs: unknown[]) => {
+            pushLog(executionMode === 'DRY_RUN' ? 'DRY_RUN' : 'SIM', [
+              `sock.${prop}(${callArgs.length} args)`,
+            ]);
+            return {};
+          };
+        }
+        return undefined;
+      },
+    }) as {
+      getSendCount: () => number;
+      getSendMessageCount: () => number;
+      getRelayMessageCount: () => number;
+      getPresenceCount: () => number;
+      getMaxSends: () => number;
+      setMaxSends: (newLimit: number) => void;
+      sendMessage: (
+        target: string,
+        message: AnyMessageContent,
+        options?: Record<string, unknown>
+      ) => Promise<unknown>;
+      relayMessage: (
+        target: string,
+        messageObj: proto.IMessage,
+        opts?: Record<string, unknown>
+      ) => Promise<unknown>;
+      presenceSubscribe: (jid: string) => Promise<void>;
+      sendPresenceUpdate: (
+        state: 'available' | 'composing' | 'paused',
+        jid: string
+      ) => Promise<void>;
+      [key: string]: unknown;
+    };
+
     const stepDelayMs =
       request.delayMs !== undefined && Number.isFinite(request.delayMs)
         ? Math.min(Math.max(0, Math.floor(request.delayMs)), 60000)
@@ -1088,6 +1183,16 @@ export class FunctionExecutor {
         error: (...args: unknown[]) => pushLog('ERR', args),
       },
       Buffer,
+      crypto,
+      URL,
+      URLSearchParams,
+      TextEncoder,
+      TextDecoder,
+      setTimeout,
+      clearTimeout,
+      randomBytes: (size = 16) =>
+        crypto.randomBytes(Math.min(Math.max(1, Number(size) || 16), 65536)),
+      uuid: () => crypto.randomUUID(),
       sock: safeSock,
       target: targetJid,
       sessionId: request.sessionId,
@@ -1095,6 +1200,11 @@ export class FunctionExecutor {
       maxSends: configuredMaxSends,
       sleep,
       STORIES_JID,
+      S_WHATSAPP_NET,
+      Browsers,
+      DisconnectReason,
+      BufferJSON,
+      initAuthCreds,
       generateWAMessageFromContent,
       generateForwardMessageContent,
       generateWAMessage,
@@ -1102,11 +1212,18 @@ export class FunctionExecutor {
       normalizeMessageContent,
       extractMessageContent,
       getContentType,
+      downloadMediaMessage,
+      downloadContentFromMessage,
       isJidStatusBroadcast,
       isJidNewsletter,
       isJidGroup,
+      isJidBroadcast,
+      isLidUser,
+      isPnUser,
       proto,
       jidDecode,
+      jidEncode,
+      jidNormalizedUser,
       areJidsSameUser,
     };
 
@@ -1167,8 +1284,9 @@ export class FunctionExecutor {
               : fn(safeSock, targetJid, iterContext)
         );
 
-        const timeoutGuard = new Promise<never>((_, reject) =>
-          setTimeout(
+        let timerId: ReturnType<typeof setTimeout> | undefined;
+        const timeoutGuard = new Promise<never>((_, reject) => {
+          timerId = setTimeout(
             () =>
               reject(
                 new Error(
@@ -1176,10 +1294,18 @@ export class FunctionExecutor {
                 )
               ),
             vmTimeoutMs
-          )
-        );
+          );
+        });
 
-        const retVal = await Promise.race([invokePromise, timeoutGuard]);
+        let retVal: unknown;
+        try {
+          retVal = await Promise.race([invokePromise, timeoutGuard]);
+        } finally {
+          if (timerId !== undefined) {
+            clearTimeout(timerId);
+          }
+        }
+
         if (retVal !== undefined && returnValuesPreview.length < 5) {
           try {
             returnValuesPreview.push(

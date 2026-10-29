@@ -1,6 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { resolveSafeChildPath } from '../security/validation';
+import { purgeFileLocksForDirectory } from './atomic-auth-state';
 import { createLogger } from '../logging/logger';
 
 const log = createLogger('session-store');
@@ -294,6 +295,7 @@ export class SessionStore {
     if (fs.existsSync(safeDir)) {
       const info = this.inspectCredentials(sessionId);
       if (forceReset || !info.registered || info.corrupted) {
+        purgeFileLocksForDirectory(safeDir);
         fs.rmSync(safeDir, { recursive: true, force: true });
       }
     }
@@ -337,6 +339,7 @@ export class SessionStore {
    */
   public removeSessionAuthDir(sessionId: string): void {
     const safeDir = resolveSafeChildPath(this.baseDir, sessionId);
+    purgeFileLocksForDirectory(safeDir);
     if (fs.existsSync(safeDir)) {
       fs.rmSync(safeDir, { recursive: true, force: true });
       log.info('Removed isolated session auth directory', { sessionId });

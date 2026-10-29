@@ -18,14 +18,30 @@ const log = createLogger('atomic-auth-state');
  */
 class FileMutex {
   private queue: Promise<void> = Promise.resolve();
+  private pendingCount = 0;
+
+  constructor(
+    private readonly filePath: string,
+    private readonly onIdle: (filePath: string, instance: FileMutex) => void
+  ) {}
+
+  public get isIdle(): boolean {
+    return this.pendingCount === 0;
+  }
 
   public runExclusive<T>(fn: () => Promise<T>): Promise<T> {
+    this.pendingCount++;
     const next = this.queue.then(fn, fn);
     this.queue = next.then(
       () => undefined,
       () => undefined
     );
-    return next;
+    return next.finally(() => {
+      this.pendingCount--;
+      if (this.pendingCount === 0) {
+        this.onIdle(this.filePath, this);
+      }
+    });
   }
 }
 
@@ -34,10 +50,31 @@ const globalFileLocks = new Map<string, FileMutex>();
 function getFileLock(filePath: string): FileMutex {
   let lock = globalFileLocks.get(filePath);
   if (!lock) {
-    lock = new FileMutex();
+    lock = new FileMutex(filePath, (key, instance) => {
+      if (globalFileLocks.get(key) === instance && instance.isIdle) {
+        globalFileLocks.delete(key);
+      }
+    });
     globalFileLocks.set(filePath, lock);
   }
   return lock;
+}
+
+export function purgeFileLocksForDirectory(folderPath: string): number {
+  const resolved = path.resolve(folderPath);
+  const prefix = resolved.endsWith(path.sep) ? resolved : `${resolved}${path.sep}`;
+  let removed = 0;
+  for (const key of Array.from(globalFileLocks.keys())) {
+    if (key === resolved || key.startsWith(prefix)) {
+      globalFileLocks.delete(key);
+      removed++;
+    }
+  }
+  return removed;
+}
+
+export function getActiveFileLockCount(): number {
+  return globalFileLocks.size;
 }
 
 export function sanitizeAuthFileName(file: string): string {

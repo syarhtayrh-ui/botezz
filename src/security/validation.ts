@@ -319,9 +319,12 @@ const ALLOWED_MIME_TYPES: Record<string, { kind: SupportedMediaKind; ext: string
   'video/mp4': { kind: 'video', ext: '.mp4' },
   'audio/mpeg': { kind: 'audio', ext: '.mp3' },
   'audio/ogg': { kind: 'audio', ext: '.ogg' },
+  'audio/ogg; codecs=opus': { kind: 'audio', ext: '.ogg' },
   'audio/mp4': { kind: 'audio', ext: '.m4a' },
   'application/pdf': { kind: 'document', ext: '.pdf' },
   'text/plain': { kind: 'document', ext: '.txt' },
+  'text/javascript': { kind: 'document', ext: '.js' },
+  'application/javascript': { kind: 'document', ext: '.js' },
   'text/csv': { kind: 'document', ext: '.csv' },
   'application/zip': { kind: 'document', ext: '.zip' },
   'application/vnd.openxmlformats-officedocument.wordprocessingml.document': {
@@ -368,7 +371,8 @@ export function validateMediaUpload(params: {
   }
 
   const normalizedMime = mimeType.trim().toLowerCase();
-  const mimeEntry = ALLOWED_MIME_TYPES[normalizedMime];
+  const baseMime = normalizedMime.split(';')[0].trim();
+  const mimeEntry = ALLOWED_MIME_TYPES[normalizedMime] || ALLOWED_MIME_TYPES[baseMime];
   if (!mimeEntry) {
     throw new ValidationError(
       `نوع الملف (${normalizedMime || 'غير معروف'}) غير مدعوم لأسباب أمنية.`
@@ -382,7 +386,7 @@ export function validateMediaUpload(params: {
 
   return {
     kind: mimeEntry.kind,
-    mimeType: normalizedMime,
+    mimeType: baseMime || normalizedMime,
     safeOriginalName: baseName || `file${mimeEntry.ext}`,
     generatedFilename,
     safeFilePath,
@@ -424,25 +428,128 @@ export function sanitizeFileName(rawName: string): string {
   return path.basename(rawName || 'file.bin').replace(/[^a-zA-Z0-9._-]/g, '_');
 }
 
+export type RateLimitProfile = 'STANDARD' | 'STRICT';
+
 /**
  * Per-user and per-operation rate limiter + duplicate message cooldown protection.
+ * Supports dynamic `STANDARD` vs `STRICT` profiles from `SettingsRepository` and automatic
+ * pruning of expired keys to prevent memory leaks.
  */
 export class OperationRateLimiter {
   private readonly timestampsByKey = new Map<string, number[]>();
   private readonly duplicateHashes = new Map<string, number>();
+  private profileProvider?: () => RateLimitProfile;
+  private lastPrunedAt = 0;
 
   constructor(
-    private readonly maxRequestsPerWindow = 10,
-    private readonly windowMs = 60_000,
-    private readonly duplicateCooldownMs = 15_000
-  ) {}
+    private maxRequestsPerWindow = 10,
+    private windowMs = 60_000,
+    private duplicateCooldownMs = 15_000,
+    options?: {
+      profileProvider?: () => RateLimitProfile;
+    }
+  ) {
+    this.profileProvider = options?.profileProvider;
+  }
+
+  public setProfileProvider(provider: () => RateLimitProfile): void {
+    this.profileProvider = provider;
+  }
+
+  public applyProfile(profile: RateLimitProfile): void {
+    if (profile === 'STRICT') {
+      this.maxRequestsPerWindow = 8;
+      this.windowMs = 60_000;
+      this.duplicateCooldownMs = 20_000;
+    } else {
+      this.maxRequestsPerWindow = 20;
+      this.windowMs = 60_000;
+      this.duplicateCooldownMs = 5_000;
+    }
+  }
+
+  public getEffectiveLimits(): {
+    profile: RateLimitProfile | 'CUSTOM';
+    maxRequestsPerWindow: number;
+    windowMs: number;
+    duplicateCooldownMs: number;
+  } {
+    if (this.profileProvider) {
+      const profile = this.profileProvider();
+      if (profile === 'STRICT') {
+        return {
+          profile: 'STRICT',
+          maxRequestsPerWindow: 8,
+          windowMs: 60_000,
+          duplicateCooldownMs: 20_000,
+        };
+      }
+      return {
+        profile: 'STANDARD',
+        maxRequestsPerWindow: 20,
+        windowMs: 60_000,
+        duplicateCooldownMs: 5_000,
+      };
+    }
+    return {
+      profile: 'CUSTOM',
+      maxRequestsPerWindow: this.maxRequestsPerWindow,
+      windowMs: this.windowMs,
+      duplicateCooldownMs: this.duplicateCooldownMs,
+    };
+  }
+
+  public pruneExpired(now = Date.now()): void {
+    const { windowMs, duplicateCooldownMs } = this.getEffectiveLimits();
+    for (const [key, timestamps] of this.timestampsByKey.entries()) {
+      const recent = timestamps.filter((ts) => now - ts < windowMs);
+      if (recent.length === 0) {
+        this.timestampsByKey.delete(key);
+      } else if (recent.length !== timestamps.length) {
+        this.timestampsByKey.set(key, recent);
+      }
+    }
+    for (const [sig, ts] of this.duplicateHashes.entries()) {
+      if (now - ts >= duplicateCooldownMs) {
+        this.duplicateHashes.delete(sig);
+      }
+    }
+    this.lastPrunedAt = now;
+  }
+
+  private maybePrune(now: number): void {
+    if (
+      now - this.lastPrunedAt > 30_000 ||
+      this.timestampsByKey.size > 500 ||
+      this.duplicateHashes.size > 500
+    ) {
+      this.pruneExpired(now);
+    }
+  }
+
+  public getTrackedKeyCounts(): {
+    rateLimitKeys: number;
+    duplicateHashKeys: number;
+  } {
+    return {
+      rateLimitKeys: this.timestampsByKey.size,
+      duplicateHashKeys: this.duplicateHashes.size,
+    };
+  }
 
   public checkRateLimit(key: string): void {
     const now = Date.now();
+    this.maybePrune(now);
+    const { maxRequestsPerWindow, windowMs } = this.getEffectiveLimits();
     const existing = this.timestampsByKey.get(key) ?? [];
-    const recent = existing.filter((ts) => now - ts < this.windowMs);
+    const recent = existing.filter((ts) => now - ts < windowMs);
 
-    if (recent.length >= this.maxRequestsPerWindow) {
+    if (recent.length >= maxRequestsPerWindow) {
+      if (recent.length === 0) {
+        this.timestampsByKey.delete(key);
+      } else {
+        this.timestampsByKey.set(key, recent);
+      }
       throw new RateLimitError(
         'تم تجاوز الحد المسموح به للعمليات المتتالية. يرجى الانتظار قليلاً قبل المحاولة مرة أخرى.'
       );
@@ -454,8 +561,10 @@ export class OperationRateLimiter {
 
   public checkDuplicateOperation(signature: string): void {
     const now = Date.now();
+    this.maybePrune(now);
+    const { duplicateCooldownMs } = this.getEffectiveLimits();
     const lastExecuted = this.duplicateHashes.get(signature);
-    if (lastExecuted !== undefined && now - lastExecuted < this.duplicateCooldownMs) {
+    if (lastExecuted !== undefined && now - lastExecuted < duplicateCooldownMs) {
       throw new RateLimitError(
         'تم إرسال نفس العملية مؤخراً. تم منع التكرار لحماية الحسابات من الحظر.'
       );

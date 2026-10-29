@@ -313,8 +313,13 @@ declare module 'athanasia-baileys' {
       type: 'invite' | 'jid' | 'INVITE' | 'JID',
       key: string
     ): Promise<NewsletterMetadataResult | null>;
+    onWhatsApp?(...jids: string[]): Promise<Array<{ jid: string; exists: boolean; lid?: string }>>;
+    fetchStatus?(...jids: string[]): Promise<unknown>;
+    profilePictureUrl?(jid: string, type?: 'preview' | 'image', timeoutMs?: number): Promise<string | undefined>;
+    updateProfileStatus?(status: string): Promise<void>;
     end(error?: Error): void;
     logout(msg?: string): Promise<void>;
+    [key: string]: unknown;
   }
 
   export namespace proto {

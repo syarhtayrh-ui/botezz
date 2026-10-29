@@ -110,6 +110,16 @@ export function buildSessionDetailKeyboard(session: SessionRecord): InlineKeyboa
       { text: '🔌 قطع اتصال الجلسة', callbackData: `sess:disconnect:${session.id}` },
       { text: '👥 مجموعات هذه الجلسة', callbackData: `grp:list:${session.id}` },
     ]);
+  } else if (
+    session.status === 'REQUIRES_REPAIR' ||
+    session.status === 'LOGGED_OUT'
+  ) {
+    rows.push([
+      {
+        text: '📲 إعادة الربط برقم هاتف (إصلاح الجلسة)',
+        callbackData: `sess:repair:${session.id}`,
+      },
+    ]);
   } else {
     rows.push([
       { text: '🔄 إعادة اتصال الجلسة', callbackData: `sess:reconnect:${session.id}` },

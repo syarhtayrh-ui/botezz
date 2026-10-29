@@ -4,6 +4,8 @@ import { SessionRepository } from './database/repositories/session-repository';
 import { TaskRepository } from './database/repositories/task-repository';
 import { SettingsRepository } from './database/repositories/settings-repository';
 import { AuditRepository } from './database/repositories/audit-repository';
+import { FunctionLabRepository } from './database/repositories/function-lab-repository';
+import { MessageSender, MediaProcessor } from './whatsapp/message-capabilities';
 import { SessionStore } from './whatsapp/session-store';
 import { MockWhatsAppSessionDriver } from './whatsapp/connection-manager';
 import { SessionManager } from './whatsapp/session-manager';
@@ -21,6 +23,7 @@ export interface HarnessSingleton {
   isLiveConfigured: boolean;
   validationIssues: string[];
   db: AppDatabase;
+  sessionRepo: SessionRepository;
   sessionManager: SessionManager;
   taskManager: TaskManager;
   auditRepo: AuditRepository;
@@ -45,18 +48,38 @@ export async function getRuntimeHarness(): Promise<HarnessSingleton> {
   const taskRepo = new TaskRepository(db);
   const settingsRepo = new SettingsRepository(db);
   const auditRepo = new AuditRepository(db);
+  const functionLabRepo = new FunctionLabRepository(db);
+  const messageSender = new MessageSender(functionLabRepo);
+  const mediaProcessor = new MediaProcessor({
+    maxMediaSizeMb: config.MAX_UPLOAD_SIZE_MB,
+    tempDir: config.TEMP_UPLOAD_DIR,
+  });
 
   const sessionStore = new SessionStore(config.WHATSAPP_AUTH_DIR);
   const sessionManager = new SessionManager(
     sessionRepo,
     auditRepo,
     sessionStore,
-    (sessionId) => new MockWhatsAppSessionDriver(sessionId)
+    (sessionId) => new MockWhatsAppSessionDriver(sessionId, messageSender)
   );
 
-  const rateLimiter = new OperationRateLimiter(30, 60_000, 3_000);
-  const sendMessageOp = new SendMessageOperation(sessionManager, rateLimiter);
-  const sendMediaOp = new SendMediaOperation(sessionManager, rateLimiter);
+  const rateLimiter = new OperationRateLimiter(30, 60_000, 3_000, {
+    profileProvider: () =>
+      settingsRepo.get('rate_limit_profile', 'STANDARD') === 'STRICT'
+        ? 'STRICT'
+        : 'STANDARD',
+  });
+  const sendMessageOp = new SendMessageOperation(
+    sessionManager,
+    rateLimiter,
+    messageSender
+  );
+  const sendMediaOp = new SendMediaOperation(
+    sessionManager,
+    rateLimiter,
+    messageSender,
+    mediaProcessor
+  );
   const groupOps = new GroupOperations(sessionManager, auditRepo, rateLimiter);
 
   const taskRunner = new TaskRunner(
@@ -66,31 +89,34 @@ export async function getRuntimeHarness(): Promise<HarnessSingleton> {
   );
   const taskManager = new TaskManager(taskRepo, auditRepo, taskRunner);
 
-  await sessionManager.restoreSessionsOnStartup();
+  // Only run simulated startup restoration and demo seeding when NOT sharing a live production database
+  if (!isLiveConfigured) {
+    await sessionManager.restoreSessionsOnStartup();
 
-  // Seed 2 deterministic simulated sessions if database is empty so multi-session journeys work out of the box
-  if (sessionManager.listSessions().length === 0) {
-    const s1 = sessionManager.createSession(
-      'حساب العمليات الرئيسي (محاكاة)',
-      config.TELEGRAM_ADMIN_ID
-    );
-    await sessionManager.initiatePairing({
-      sessionId: s1.id,
-      rawPhoneNumber: '+966501234567',
-      actorTelegramId: config.TELEGRAM_ADMIN_ID,
-      autoCompleteInMock: true,
-    });
+    // Seed 2 deterministic simulated sessions if database is empty so multi-session journeys work out of the box
+    if (sessionRepo.listAll().length === 0) {
+      const s1 = sessionManager.createSession(
+        'حساب العمليات الرئيسي (محاكاة)',
+        config.TELEGRAM_ADMIN_ID
+      );
+      await sessionManager.initiatePairing({
+        sessionId: s1.id,
+        rawPhoneNumber: '+966501234567',
+        actorTelegramId: config.TELEGRAM_ADMIN_ID,
+        autoCompleteInMock: true,
+      });
 
-    const s2 = sessionManager.createSession(
-      'حساب مساندة العملاء (محاكاة)',
-      config.TELEGRAM_ADMIN_ID
-    );
-    await sessionManager.initiatePairing({
-      sessionId: s2.id,
-      rawPhoneNumber: '+966558889999',
-      actorTelegramId: config.TELEGRAM_ADMIN_ID,
-      autoCompleteInMock: true,
-    });
+      const s2 = sessionManager.createSession(
+        'حساب مساندة العملاء (محاكاة)',
+        config.TELEGRAM_ADMIN_ID
+      );
+      await sessionManager.initiatePairing({
+        sessionId: s2.id,
+        rawPhoneNumber: '+966558889999',
+        actorTelegramId: config.TELEGRAM_ADMIN_ID,
+        autoCompleteInMock: true,
+      });
+    }
   }
 
   const controller = new TelegramBotController({
@@ -117,6 +143,7 @@ export async function getRuntimeHarness(): Promise<HarnessSingleton> {
     isLiveConfigured,
     validationIssues,
     db,
+    sessionRepo,
     sessionManager,
     taskManager,
     auditRepo,

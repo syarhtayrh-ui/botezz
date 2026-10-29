@@ -39,7 +39,8 @@ export type ToolsInputStep =
   | 'AWAITING_SHORTLINK'
   | 'AWAITING_TESTFUNCTION'
   | 'AWAITING_TF_MAX_SENDS'
-  | 'AWAITING_TF_DELAY';
+  | 'AWAITING_TF_DELAY'
+  | 'AWAITING_SAVE_FUNCTION_NAME';
 
 export const DEFAULT_SAMPLE_TEST_FUNCTION = `async function nebulaSocketProbe(sock, target, meta) {
   console.log('Executing probe iteration', meta?.iteration, 'maxSends=', sock.getMaxSends());
@@ -52,6 +53,11 @@ export class ToolsHandler {
   private readonly inputStates = new Map<number, ToolsInputStep>();
   private readonly selectedFunctionByAdmin = new Map<number, string>();
   private readonly selectedModeByAdmin = new Map<number, FunctionExecutionMode>();
+  private readonly lastCustomFunctionByAdmin = new Map<
+    number,
+    { funcName: string; sourceCode: string }
+  >();
+  private readonly activeExecutionAbortByAdmin = new Map<number, AbortController>();
   public readonly functionLabRepo: FunctionLabRepository;
   public readonly functionRegistry: FunctionRegistry;
   public readonly functionValidator: FunctionValidator;
@@ -451,9 +457,11 @@ export class ToolsHandler {
         `📌 *طرق التشغيل والتحكم المتقدم:*\n` +
         `1️⃣ *بتحديد اسم الدالة المسجلة مباشرة (مثل \`AewCh\`):*\n` +
         `\`/testfunction +966501234567 5 AewCh\`\n` +
-        `2️⃣ *بالرد على رسالة كود أو إرسال كود متعدد الأسطر:*\n` +
+        `2️⃣ *بالرد على رسالة كود أو إرسال كود أو رفع ملف (\`.js\` / \`.txt\`):*\n` +
         `\`/testfunction +966501234567 10 --max=2500 --delay=100 --session=ALL --stop-on-error\`\n` +
-        `3️⃣ *وضع الفحص الجاف أو المحاكاة بدون إرسال حقيقي:*\n` +
+        `3️⃣ *لحفظ دالة مخصصة في المكتبة أو إيقاف دالة جارية:*\n` +
+        `\`/savefunction MyFunc\` (بالرد على الكود) | \`/stopfunction\`\n` +
+        `4️⃣ *وضع الفحص الجاف أو المحاكاة بدون إرسال حقيقي:*\n` +
         `\`/testfunction +966501234567 3 AewCh --dry-run\` أو \`--sim\``,
       keyboard: [
         [
@@ -474,6 +482,16 @@ export class ToolsHandler {
           {
             text: '🔢 تحديد حد الإرسال يدوياً',
             callbackData: 'tools:tf_prompt_max',
+          },
+        ],
+        [
+          {
+            text: '💾 حفظ آخر دالة في المكتبة',
+            callbackData: 'tools:flab_prompt_save',
+          },
+          {
+            text: '🛑 إيقاف الدالة الجارية',
+            callbackData: 'tools:flab_stop',
           },
         ],
         [
@@ -689,11 +707,197 @@ export class ToolsHandler {
       this.cancel(adminId);
       return this.setDelayConfig(adminId, rawText);
     }
+    if (step === 'AWAITING_SAVE_FUNCTION_NAME') {
+      this.cancel(adminId);
+      return this.saveCustomFunction(adminId, rawText, repliedText);
+    }
     if (step === 'AWAITING_TESTFUNCTION') {
       this.cancel(adminId);
       return this.executeTestFunction(adminId, rawText, repliedText);
     }
     return this.renderToolsMenu();
+  }
+
+  public promptSaveLastFunction(adminId: number): BotViewResponse {
+    const lastFn = this.lastCustomFunctionByAdmin.get(adminId);
+    this.inputStates.set(adminId, 'AWAITING_SAVE_FUNCTION_NAME');
+    return {
+      text:
+        `💾 *حفظ دالة مخصصة في مكتبة الدوال (Save Function to Registry)*\n\n` +
+        (lastFn
+          ? `الدالة الجاهزة للحفظ من آخر تشغيل: \`${lastFn.funcName}\`\n` +
+            `أرسل الآن **الاسم المطلوب** لحفظها به في قاعدة البيانات (أو أرسل \`${lastFn.funcName}\` للاحتفاظ بنفس الاسم)، أو قم بالرد على أي كود دالة باسم جديد:`
+          : `أرسل الآن اسم الدالة متبوعاً بكود الدالة (أو بالرد على رسالة تحتوي على كود الدالة) لحفظها في المكتبة الدائمة:`),
+      keyboard: [buildBackCancelRow('tools:prompt_testfunction')],
+    };
+  }
+
+  public saveCustomFunction(
+    adminId: number,
+    rawInput: string,
+    repliedText?: string
+  ): BotViewResponse {
+    try {
+      const trimmed = rawInput.trim();
+      const lastFn = this.lastCustomFunctionByAdmin.get(adminId);
+
+      // Extract optional name and optional inline code
+      let requestedName = '';
+      let codeSource = (repliedText || '').trim();
+
+      const asyncIdx = trimmed.search(/(?:export\s+)?(?:async\s+)?function\s+|=>|\{/);
+      if (asyncIdx > 0 && !codeSource) {
+        requestedName = trimmed.slice(0, asyncIdx).trim().split(/\s+/)[0] || '';
+        codeSource = trimmed.slice(asyncIdx).trim();
+      } else if (asyncIdx === 0 && !codeSource) {
+        codeSource = trimmed;
+      } else {
+        requestedName = trimmed.split(/\s+/)[0] || '';
+      }
+
+      if (!codeSource && lastFn) {
+        codeSource = lastFn.sourceCode;
+      }
+
+      if (!codeSource) {
+        return {
+          text:
+            `⚠️ *لم يتم العثور على كود دالة لحفظه.*\n` +
+            `يرجى تشغيل دالة أولاً عبر \`/testfunction\` ثم الضغط على **💾 حفظ هذه الدالة في المكتبة**، أو استخدام \`/savefunction <name>\` بالرد على رسالة تحتوي على كود الدالة.`,
+          keyboard: [buildBackCancelRow('tools:prompt_testfunction')],
+        };
+      }
+
+      const parsed = this.functionValidator.parseAndValidateSource(codeSource);
+      if (!parsed.valid) {
+        return {
+          text: `⚠️ *تعذر حفظ الدالة في المكتبة:*\n${parsed.errorMessageAr || 'خطأ تركيبي في الكود'}`,
+          keyboard: [buildBackCancelRow('tools:prompt_testfunction')],
+        };
+      }
+
+      const finalName =
+        requestedName && /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(requestedName)
+          ? requestedName
+          : parsed.funcName;
+
+      // Replace function declaration name if custom valid name was provided
+      const finalSource =
+        finalName !== parsed.funcName
+          ? parsed.normalizedCode.replace(
+              new RegExp(`function\\s+${parsed.funcName}\\b`),
+              `function ${finalName}`
+            )
+          : parsed.normalizedCode;
+
+      const saved = this.functionRegistry.registerFunction({
+        name: finalName,
+        descriptionAr: `دالة مخصصة محفوظة بواسطة المسؤول (${finalName})`,
+        category: 'custom',
+        sourceCode: finalSource,
+        createdBy: adminId,
+      });
+
+      this.selectedFunctionByAdmin.set(adminId, saved.name);
+      this.lastCustomFunctionByAdmin.set(adminId, {
+        funcName: saved.name,
+        sourceCode: saved.sourceCode,
+      });
+
+      this.auditRepo.record({
+        actorTelegramId: adminId,
+        action: 'FUNCTION_LAB_CUSTOM_SAVED',
+        targetId: saved.name,
+        outcome: 'SUCCESS',
+        metadata: { functionId: saved.functionId, version: saved.version },
+      });
+
+      return {
+        text:
+          `✅ *تم حفظ الدالة المخصصة في مكتبة الدوال بنجاح!*\n` +
+          `━━━━━━━━━━━━━━━━━━\n` +
+          `🧩 *اسم الدالة:* \`${saved.name}\` (الإصدار \`v${saved.version}\`)\n` +
+          `🆔 *المعرف:* \`${saved.functionId}\`\n` +
+          `📌 تم تعيين \`${saved.name}\` كدالة نشطة حالياً. يمكنك تشغيلها مباشرة عبر:\n` +
+          `\`/testfunction +966501234567 1 ${saved.name}\``,
+        keyboard: [
+          [
+            {
+              text: `🧪 فحص جاف (${saved.name})`,
+              callbackData: `tools:flab_dryrun:${saved.name}`,
+            },
+            {
+              text: '📚 فتح مكتبة الدوال',
+              callbackData: 'tools:flab_catalog',
+            },
+          ],
+          [
+            {
+              text: '🔙 لوحة /testfunction',
+              callbackData: 'tools:prompt_testfunction',
+            },
+          ],
+        ],
+        toastText: `💾 تم حفظ الدالة ${saved.name}`,
+      };
+    } catch (err) {
+      const safeErr = toSafeArabicError(err);
+      return {
+        text: `⚠️ *تعذر حفظ الدالة:*\n${safeErr.userMessage}`,
+        keyboard: [buildBackCancelRow('tools:prompt_testfunction')],
+      };
+    }
+  }
+
+  public stopActiveFunction(adminId: number): BotViewResponse {
+    const controller = this.activeExecutionAbortByAdmin.get(adminId);
+    if (controller && !controller.signal.aborted) {
+      controller.abort();
+      this.activeExecutionAbortByAdmin.delete(adminId);
+      this.auditRepo.record({
+        actorTelegramId: adminId,
+        action: 'FUNCTION_LAB_STOPPED',
+        targetId: String(adminId),
+        outcome: 'SUCCESS',
+      });
+      return this.promptTestFunction(
+        adminId,
+        '🛑 *تم إرسال إشارة الإيقاف الفوري (AbortSignal) للدالة الجارية بنجاح.*'
+      );
+    }
+    return this.promptTestFunction(
+      adminId,
+      'ℹ️ *لا توجد دالة قيد التشغيل حالياً لإيقافها.*'
+    );
+  }
+
+  /**
+   * Handles `.js`, `.ts`, or `.txt` code files uploaded directly in Telegram
+   * when the admin is in Function Lab (`TOOLS` mode) or provides a `/testfunction` or `/savefunction` caption.
+   */
+  public async handleCodeFileUpload(
+    adminId: number,
+    params: {
+      fileName: string;
+      codeText: string;
+      caption?: string;
+    }
+  ): Promise<BotViewResponse> {
+    const caption = (params.caption || '').trim();
+    const codeText = params.codeText.trim();
+
+    if (/^\/savefunction\b/i.test(caption)) {
+      const nameArg = caption.replace(/^\/savefunction(?:@\w+)?\s*/i, '').trim();
+      const fallbackName =
+        nameArg ||
+        params.fileName
+          .replace(/\.[^.]+$/, '')
+          .replace(/[^A-Za-z0-9_$]/g, '_');
+      return this.saveCustomFunction(adminId, fallbackName, codeText);
+    }
+
+    const argsAfterCmd = caption.replace(/^\/testfunction(?:@\w+)?\s*/i, '').trim();
+    return this.executeTestFunction(adminId, argsAfterCmd, codeText);
   }
 
   /**
@@ -1020,16 +1224,43 @@ export class ToolsHandler {
         };
       }
 
+      this.lastCustomFunctionByAdmin.set(adminId, {
+        funcName: preValidation.funcName,
+        sourceCode: preValidation.normalizedCode,
+      });
+
       const targetSessions = sessionResolution.sessions;
       const overallStart = Date.now();
-      const results = await Promise.all(
-        targetSessions.map(async (sess) => {
-          if (sessionResolution.isSimulatedOfflineSession) {
-            const execRes = await this.functionExecutor.execute({
-              sessionId: sess.id,
+      const abortController = new AbortController();
+      this.activeExecutionAbortByAdmin.set(adminId, abortController);
+
+      let results;
+      try {
+        results = await Promise.all(
+          targetSessions.map(async (sess) => {
+            if (sessionResolution.isSimulatedOfflineSession) {
+              const execRes = await this.functionExecutor.execute({
+                sessionId: sess.id,
+                targetPhone: targetRaw,
+                iterations,
+                funcCodeOrName: preValidation.normalizedCode,
+                executionMode: effectiveMode,
+                maxSends: effectiveMaxSends,
+                delayMs: effectiveDelayMs,
+                vmTimeoutMs: effectiveVmTimeoutMs,
+                stopOnError: effectiveStopOnError,
+                captureConsole: savedConfig.captureConsole,
+                correlationId,
+                abortSignal: abortController.signal,
+              });
+              return { session: sess, res: execRes };
+            }
+
+            const driver = this.sessionManager.getDriver(sess.id);
+            const res = await driver.executeTestFunction({
               targetPhone: targetRaw,
               iterations,
-              funcCodeOrName: preValidation.normalizedCode,
+              funcCode: preValidation.normalizedCode,
               executionMode: effectiveMode,
               maxSends: effectiveMaxSends,
               delayMs: effectiveDelayMs,
@@ -1037,26 +1268,16 @@ export class ToolsHandler {
               stopOnError: effectiveStopOnError,
               captureConsole: savedConfig.captureConsole,
               correlationId,
+              abortSignal: abortController.signal,
             });
-            return { session: sess, res: execRes };
-          }
-
-          const driver = this.sessionManager.getDriver(sess.id);
-          const res = await driver.executeTestFunction({
-            targetPhone: targetRaw,
-            iterations,
-            funcCode: preValidation.normalizedCode,
-            executionMode: effectiveMode,
-            maxSends: effectiveMaxSends,
-            delayMs: effectiveDelayMs,
-            vmTimeoutMs: effectiveVmTimeoutMs,
-            stopOnError: effectiveStopOnError,
-            captureConsole: savedConfig.captureConsole,
-            correlationId,
-          });
-          return { session: sess, res };
-        })
-      );
+            return { session: sess, res };
+          })
+        );
+      } finally {
+        if (this.activeExecutionAbortByAdmin.get(adminId) === abortController) {
+          this.activeExecutionAbortByAdmin.delete(adminId);
+        }
+      }
       const overallDurationMs = Date.now() - overallStart;
 
       const primary = results[0].res;
@@ -1224,12 +1445,22 @@ export class ToolsHandler {
         keyboard: [
           [
             {
-              text: '⚙️ تعديل حد الإرسال والإعدادات',
-              callbackData: 'tools:prompt_testfunction',
+              text: '💾 حفظ هذه الدالة في المكتبة',
+              callbackData: 'tools:flab_prompt_save',
             },
             {
               text: '📚 مكتبة الدوال',
               callbackData: 'tools:flab_catalog',
+            },
+          ],
+          [
+            {
+              text: '⚙️ تعديل حد الإرسال والإعدادات',
+              callbackData: 'tools:prompt_testfunction',
+            },
+            {
+              text: '🛑 إيقاف الدالة الجارية',
+              callbackData: 'tools:flab_stop',
             },
           ],
           [

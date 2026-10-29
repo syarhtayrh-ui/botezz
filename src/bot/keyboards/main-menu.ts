@@ -7,10 +7,18 @@ export interface InlineButtonSpec {
 
 export type InlineKeyboardRows = InlineButtonSpec[][];
 
+export const MAX_TELEGRAM_CALLBACK_DATA_BYTES = 64;
+
 export function toGrammyInlineKeyboard(rows: InlineKeyboardRows): InlineKeyboard {
   const kb = new InlineKeyboard();
   rows.forEach((row, rowIdx) => {
     row.forEach((btn) => {
+      const byteLen = Buffer.byteLength(btn.callbackData, 'utf8');
+      if (byteLen > MAX_TELEGRAM_CALLBACK_DATA_BYTES) {
+        throw new Error(
+          `Telegram callback_data exceeds 64-byte limit (${byteLen} bytes): ${btn.callbackData}`
+        );
+      }
       kb.text(btn.text, btn.callbackData);
     });
     if (rowIdx < rows.length - 1) {

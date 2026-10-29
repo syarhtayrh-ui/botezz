@@ -43,6 +43,11 @@ export interface SessionManagerOptions {
   reconnectBaseDelayMs?: number;
   reconnectMaxDelayMs?: number;
   defaultAutoCompleteInMock?: boolean;
+  onDisconnectAlert?: (params: {
+    session: SessionRecord;
+    newStatus: SessionRecord['status'];
+    reasonAr: string;
+  }) => void;
 }
 
 export interface SessionHealthReport {
@@ -85,6 +90,7 @@ export class SessionManager {
   private readonly reconnectBaseDelayMs: number;
   private readonly reconnectMaxDelayMs: number;
   public defaultAutoCompleteInMock: boolean;
+  private onDisconnectAlert?: SessionManagerOptions['onDisconnectAlert'];
   private isShuttingDown = false;
 
   constructor(
@@ -100,6 +106,13 @@ export class SessionManager {
     this.reconnectBaseDelayMs = options?.reconnectBaseDelayMs ?? 1_000;
     this.reconnectMaxDelayMs = options?.reconnectMaxDelayMs ?? 15_000;
     this.defaultAutoCompleteInMock = options?.defaultAutoCompleteInMock ?? true;
+    this.onDisconnectAlert = options?.onDisconnectAlert;
+  }
+
+  public setDisconnectAlertHandler(
+    handler: SessionManagerOptions['onDisconnectAlert']
+  ): void {
+    this.onDisconnectAlert = handler;
   }
 
   private nextGeneration(sessionId: string): number {
@@ -559,19 +572,27 @@ export class SessionManager {
         void driver.disconnect().catch(() => undefined);
       }
       this.sessionStore.removeSessionAuthDir(sessionId);
-      this.sessionRepo.updateStatus({
+      const reasonAr = evt.errorMessage || 'تم تسجيل الخروج أو إلغاء صلاحية الجلسة.';
+      const updated = this.sessionRepo.updateStatus({
         id: sessionId,
         status: 'LOGGED_OUT',
         reconnectAttempts: 0,
         lastDisconnectCode: evt.statusCode ?? 401,
         lastDisconnectReason: 'LOGGED_OUT',
         healthStatus: 'UNHEALTHY',
-        lastError: evt.errorMessage || 'تم تسجيل الخروج أو إلغاء صلاحية الجلسة.',
+        lastError: reasonAr,
       });
       log.warn('Session logged out and local credentials purged', {
         sessionId,
         generation,
       });
+      if (updated) {
+        this.onDisconnectAlert?.({
+          session: updated,
+          newStatus: 'LOGGED_OUT',
+          reasonAr,
+        });
+      }
       return;
     }
 
@@ -637,13 +658,14 @@ export class SessionManager {
           void driver.disconnect().catch(() => undefined);
         }
         this.clearReconnectTimer(sessionId);
-        this.sessionRepo.updateStatus({
+        const reasonAr = evt.errorMessage || classification.arabicMessage;
+        const updated = this.sessionRepo.updateStatus({
           id: sessionId,
           status: 'REQUIRES_REPAIR',
           lastDisconnectCode: evt.statusCode ?? null,
           lastDisconnectReason: classification.category,
           healthStatus: 'UNHEALTHY',
-          lastError: evt.errorMessage || classification.arabicMessage,
+          lastError: reasonAr,
         });
         log.warn('Registered session requires manual repair; auto-reconnect disabled', {
           sessionId,
@@ -651,17 +673,33 @@ export class SessionManager {
           statusCode: evt.statusCode,
           category: classification.category,
         });
+        if (updated) {
+          this.onDisconnectAlert?.({
+            session: updated,
+            newStatus: 'REQUIRES_REPAIR',
+            reasonAr,
+          });
+        }
         return;
       }
 
-      this.sessionRepo.updateStatus({
+      const reasonAr =
+        evt.errorMessage || classification.arabicMessage || 'انقطع الاتصال مؤقتاً.';
+      const updated = this.sessionRepo.updateStatus({
         id: sessionId,
         status: 'DISCONNECTED',
         lastDisconnectCode: evt.statusCode ?? null,
         lastDisconnectReason: classification.category,
         healthStatus: 'DEGRADED',
-        lastError: evt.errorMessage || classification.arabicMessage || 'انقطع الاتصال مؤقتاً.',
+        lastError: reasonAr,
       });
+      if (updated) {
+        this.onDisconnectAlert?.({
+          session: updated,
+          newStatus: 'DISCONNECTED',
+          reasonAr,
+        });
+      }
       this.scheduleBoundedReconnect(sessionId);
     }
   }
@@ -1140,8 +1178,7 @@ export class SessionManager {
       record.status === 'PAIRING_PENDING' ||
       record.status === 'WAITING_FOR_PAIRING' ||
       record.status === 'CONNECTING' ||
-      record.status === 'AUTHENTICATING' ||
-      record.status === 'RECOVERING'
+      record.status === 'AUTHENTICATING'
     ) {
       const isHandshakeOrPairingAlive = Boolean(
         (driver && diag?.socketActive) ||
@@ -1161,7 +1198,7 @@ export class SessionManager {
       return record;
     }
 
-    if (record.status === 'RECONNECTING') {
+    if (record.status === 'RECONNECTING' || record.status === 'RECOVERING') {
       const isReconnectAlive = Boolean(
         (driver && diag?.socketActive) || hasReconnectTimer
       );
@@ -1174,6 +1211,7 @@ export class SessionManager {
         });
         return reconciled ?? { ...record, status: 'DISCONNECTED' };
       }
+      return record;
     }
 
     return record;

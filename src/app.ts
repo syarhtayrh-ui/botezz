@@ -4,6 +4,8 @@ import { SessionRepository } from './database/repositories/session-repository';
 import { TaskRepository } from './database/repositories/task-repository';
 import { SettingsRepository } from './database/repositories/settings-repository';
 import { AuditRepository } from './database/repositories/audit-repository';
+import { FunctionLabRepository } from './database/repositories/function-lab-repository';
+import { MessageSender, MediaProcessor } from './whatsapp/message-capabilities';
 import { SessionStore } from './whatsapp/session-store';
 import { AthanasiaBaileysSessionDriver } from './whatsapp/connection-manager';
 import { SessionManager } from './whatsapp/session-manager';
@@ -40,21 +42,42 @@ export async function startStandaloneBotApplication(): Promise<void> {
   const taskRepo = new TaskRepository(db);
   const settingsRepo = new SettingsRepository(db);
   const auditRepo = new AuditRepository(db);
+  const functionLabRepo = new FunctionLabRepository(db);
+  const messageSender = new MessageSender(functionLabRepo);
+  const mediaProcessor = new MediaProcessor({
+    maxMediaSizeMb: config.MAX_UPLOAD_SIZE_MB,
+    tempDir: config.TEMP_UPLOAD_DIR,
+  });
 
   const sessionStore = new SessionStore(config.WHATSAPP_AUTH_DIR);
   const sessionManager = new SessionManager(
     sessionRepo,
     auditRepo,
     sessionStore,
-    (sessionId, authDir) => new AthanasiaBaileysSessionDriver(sessionId, authDir)
+    (sessionId, authDir) =>
+      new AthanasiaBaileysSessionDriver(sessionId, authDir, messageSender)
   );
   shutdownManager.register('whatsapp-sessions', () =>
     sessionManager.shutdownAll()
   );
 
-  const rateLimiter = new OperationRateLimiter(15, 60_000, 10_000);
-  const sendMessageOp = new SendMessageOperation(sessionManager, rateLimiter);
-  const sendMediaOp = new SendMediaOperation(sessionManager, rateLimiter);
+  const rateLimiter = new OperationRateLimiter(15, 60_000, 10_000, {
+    profileProvider: () =>
+      settingsRepo.get('rate_limit_profile', 'STANDARD') === 'STRICT'
+        ? 'STRICT'
+        : 'STANDARD',
+  });
+  const sendMessageOp = new SendMessageOperation(
+    sessionManager,
+    rateLimiter,
+    messageSender
+  );
+  const sendMediaOp = new SendMediaOperation(
+    sessionManager,
+    rateLimiter,
+    messageSender,
+    mediaProcessor
+  );
   const groupOps = new GroupOperations(sessionManager, auditRepo, rateLimiter);
 
   const taskRunner = new TaskRunner(
@@ -79,6 +102,28 @@ export async function startStandaloneBotApplication(): Promise<void> {
   });
 
   const bot = createGrammyBot(controller, config, auditRepo);
+  sessionManager.setDisconnectAlertHandler(({ session, newStatus, reasonAr }) => {
+    const notifySetting = settingsRepo.get('notify_on_disconnect', 'ENABLED');
+    if (notifySetting !== 'ENABLED') return;
+    const alertText =
+      `🔔 *تنبيه حالة جلسة واتساب (${newStatus})*\n` +
+      `━━━━━━━━━━━━━━━━━━\n` +
+      `📛 *الجلسة:* ${session.label} (\`${session.id}\`)\n` +
+      `📱 *الرقم:* \`${session.masked_phone || 'غير مقترن'}\`\n` +
+      `📌 *الحالة الجديدة:* \`${newStatus}\`\n` +
+      `⚠️ *السبب:* ${reasonAr}`;
+    void bot.api
+      .sendMessage(config.TELEGRAM_ADMIN_ID, alertText, {
+        parse_mode: 'Markdown',
+      })
+      .catch((err) => {
+        log.warn('Failed to send disconnect notification to admin', {
+          sessionId: session.id,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
+  });
+
   shutdownManager.register('telegram-bot', async () => {
     await bot.stop();
   });

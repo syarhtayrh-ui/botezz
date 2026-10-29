@@ -64,6 +64,15 @@ export interface TelegramControllerDeps {
 export interface HandleInteractionOptions {
   transport?: TelegramMessageTransport;
   skipDuplicateCheck?: boolean;
+  chatId?: number;
+}
+
+export interface IncomingTelegramMediaUpload {
+  originalFilename: string;
+  mimeType: string;
+  sizeBytes: number;
+  contentBuffer: Buffer;
+  caption?: string;
 }
 
 /**
@@ -186,6 +195,8 @@ export class TelegramBotController {
       configuredAdminId: this.deps.config.TELEGRAM_ADMIN_ID,
       actionDescription: `callback:${callbackData}`,
       auditRepo: this.deps.auditRepo,
+      settingsRepo: this.deps.settingsRepo,
+      chatId: options?.chatId,
     });
 
     if (!options?.skipDuplicateCheck) {
@@ -480,11 +491,42 @@ export class TelegramBotController {
       const page = Number(parts[3] || '1');
       return this.groupsHandler.renderSessionGroups(sessionId, page);
     }
+    if (callbackData.startsWith('gv:')) {
+      const shortId = callbackData.slice('gv:'.length);
+      const resolved = this.groupWorkflow.resolveGroupRef(shortId, actorUserId);
+      if (!resolved) {
+        return this.groupsHandler.renderGroupManagementSubmenu();
+      }
+      return this.groupWorkflow.renderGroupDetails(
+        resolved.sessionId,
+        resolved.groupJid,
+        actorUserId
+      );
+    }
+    if (callbackData.startsWith('ga:')) {
+      const parts = callbackData.split(':');
+      // Supports both `ga:<shortId>:<actionCode>` and `ga:<actionCode>`
+      const hasShortId = parts.length >= 3;
+      const shortId = hasShortId ? parts[1] : '';
+      const actionCode = hasShortId ? parts[2] : parts[1];
+      const resolvedGroup = this.groupWorkflow.resolveGroupRef(shortId, actorUserId);
+      const resolvedAction = this.groupWorkflow.resolveCompactAction(actionCode);
+      if (!resolvedGroup || !resolvedAction) {
+        return this.groupsHandler.renderGroupManagementSubmenu();
+      }
+      this.activeConversationMode.set(actorUserId, 'GROUP');
+      return this.groupWorkflow.initiateGroupAction({
+        adminId: actorUserId,
+        sessionId: resolvedGroup.sessionId,
+        groupJid: resolvedGroup.groupJid,
+        action: resolvedAction,
+      });
+    }
     if (callbackData.startsWith('grp:view:')) {
       const parts = callbackData.split(':');
       const sessionId = parts[2];
       const groupJid = parts.slice(3).join(':');
-      return this.groupWorkflow.renderGroupDetails(sessionId, groupJid);
+      return this.groupWorkflow.renderGroupDetails(sessionId, groupJid, actorUserId);
     }
     if (callbackData.startsWith('grp:act:')) {
       const parts = callbackData.split(':');
@@ -699,6 +741,16 @@ export class TelegramBotController {
       this.cancelAllWorkflowsForAdmin(actorUserId);
       return this.toolsHandler.renderCapabilitiesMatrix();
     }
+    if (
+      callbackData === 'tools:flab_prompt_save' ||
+      callbackData === 'tools:flab_save_last'
+    ) {
+      this.activeConversationMode.set(actorUserId, 'TOOLS');
+      return this.toolsHandler.promptSaveLastFunction(actorUserId);
+    }
+    if (callbackData === 'tools:flab_stop') {
+      return this.toolsHandler.stopActiveFunction(actorUserId);
+    }
     if (callbackData === 'tools:prompt_channel') {
       this.cancelAllWorkflowsForAdmin(actorUserId);
       this.activeConversationMode.set(actorUserId, 'TOOLS');
@@ -747,18 +799,112 @@ export class TelegramBotController {
       configuredAdminId: this.deps.config.TELEGRAM_ADMIN_ID,
       actionDescription: 'command:start',
       auditRepo: this.deps.auditRepo,
+      settingsRepo: this.deps.settingsRepo,
+      chatId: options?.chatId,
     });
 
     this.cancelAllWorkflowsForAdmin(actorUserId);
     this.uiState.resetHome(actorUserId);
 
-    const view = this.startHandler.renderMainMenu({ isAdmin: true });
+    const isOwner = actorUserId === this.deps.config.TELEGRAM_ADMIN_ID;
+    const view = this.startHandler.renderMainMenu({ isAdmin: isOwner });
 
     return this.uiState.deliverView({
       userId: actorUserId,
       view,
       pendingWorkflow: 'NONE',
       preferEdit: false,
+      transport: options?.transport,
+    });
+  }
+
+  /**
+   * Processes incoming media or code files uploaded from Telegram (`message:document`,
+   * `message:photo`, `message:video`, `message:audio`, `message:voice`, `message:sticker`).
+   */
+  public async handleMediaUpload(
+    actorUserId: number,
+    upload: IncomingTelegramMediaUpload,
+    options?: HandleInteractionOptions
+  ): Promise<BotViewResponse> {
+    verifyTelegramAdmin({
+      candidateUserId: actorUserId,
+      configuredAdminId: this.deps.config.TELEGRAM_ADMIN_ID,
+      actionDescription: `upload:${upload.originalFilename.slice(0, 24)}`,
+      auditRepo: this.deps.auditRepo,
+      settingsRepo: this.deps.settingsRepo,
+      chatId: options?.chatId,
+    });
+
+    const mode = this.getConversationMode(actorUserId);
+    const caption = (upload.caption || '').trim();
+    const lowerName = upload.originalFilename.toLowerCase();
+    const isCodeExtension =
+      lowerName.endsWith('.js') ||
+      lowerName.endsWith('.ts') ||
+      lowerName.endsWith('.mjs') ||
+      lowerName.endsWith('.cjs') ||
+      lowerName.endsWith('.txt');
+    const isFunctionLabCaption =
+      /^\/(?:testfunction|savefunction)\b/i.test(caption);
+
+    let view: BotViewResponse;
+
+    if (
+      (mode === 'TOOLS' && isCodeExtension) ||
+      (isFunctionLabCaption && isCodeExtension)
+    ) {
+      const codeText = upload.contentBuffer.toString('utf8');
+      view = await this.toolsHandler.handleCodeFileUpload(actorUserId, {
+        fileName: upload.originalFilename,
+        codeText,
+        caption: upload.caption,
+      });
+      this.activeConversationMode.set(actorUserId, 'TOOLS');
+    } else {
+      const mediaState = this.mediaWorkflow.getState(actorUserId);
+      if (mode === 'MEDIA' && mediaState?.step === 'AWAITING_FILE') {
+        view = this.mediaWorkflow.handleFileUpload(actorUserId, upload);
+      } else if (caption) {
+        // Allow quick media upload if caption starts with a phone number or JID
+        const tokens = caption.split(/\s+/);
+        const firstToken = tokens[0] || '';
+        if (/^(?:\+?\d{8,15}|\d+@g\.us|\d+@s\.whatsapp\.net)$/.test(firstToken)) {
+          this.cancelAllWorkflowsForAdmin(actorUserId);
+          this.activeConversationMode.set(actorUserId, 'MEDIA');
+          this.mediaWorkflow.start(actorUserId);
+          const recView = this.mediaWorkflow.handleRecipientInput(
+            actorUserId,
+            firstToken
+          );
+          if (this.mediaWorkflow.getState(actorUserId)?.step === 'AWAITING_FILE') {
+            view = this.mediaWorkflow.handleFileUpload(actorUserId, {
+              ...upload,
+              caption: tokens.slice(1).join(' ') || undefined,
+            });
+          } else {
+            view = recView;
+          }
+        } else {
+          this.cancelAllWorkflowsForAdmin(actorUserId);
+          this.activeConversationMode.set(actorUserId, 'MEDIA');
+          view = this.mediaWorkflow.start(actorUserId);
+        }
+      } else {
+        this.cancelAllWorkflowsForAdmin(actorUserId);
+        this.activeConversationMode.set(actorUserId, 'MEDIA');
+        view = this.mediaWorkflow.start(actorUserId);
+      }
+    }
+
+    const sess = this.uiState.getOrCreateSession(actorUserId);
+    const preferEdit = sess.activeMessageId !== undefined;
+
+    return this.uiState.deliverView({
+      userId: actorUserId,
+      view,
+      pendingWorkflow: this.getConversationMode(actorUserId),
+      preferEdit,
       transport: options?.transport,
     });
   }
@@ -779,6 +925,8 @@ export class TelegramBotController {
       configuredAdminId: this.deps.config.TELEGRAM_ADMIN_ID,
       actionDescription: `text:${text.slice(0, 24)}`,
       auditRepo: this.deps.auditRepo,
+      settingsRepo: this.deps.settingsRepo,
+      chatId: options?.chatId,
     });
 
     const trimmed = text.trim();
@@ -942,6 +1090,25 @@ export class TelegramBotController {
           rawArgsAfterCommand,
           repliedText
         );
+      }
+
+      if (command === '/savefunction') {
+        const rawArgsAfterCommand = trimmed.replace(/^\/\S+\s*/, '');
+        if (!rawArgsAfterCommand && !repliedText) {
+          this.cancelAllWorkflowsForAdmin(actorUserId);
+          this.activeConversationMode.set(actorUserId, 'TOOLS');
+          return this.toolsHandler.promptSaveLastFunction(actorUserId);
+        }
+        this.activeConversationMode.set(actorUserId, 'TOOLS');
+        return this.toolsHandler.saveCustomFunction(
+          actorUserId,
+          rawArgsAfterCommand,
+          repliedText
+        );
+      }
+
+      if (command === '/stopfunction') {
+        return this.toolsHandler.stopActiveFunction(actorUserId);
       }
 
       if (command === '/settfmax') {
@@ -1317,8 +1484,28 @@ export function createGrammyBot(
 ): Bot {
   const bot = new Bot(config.TELEGRAM_BOT_TOKEN);
 
-  // Strict administrator allowlist middleware on all updates
-  bot.use(createGrammyAuthorizationMiddleware(config.TELEGRAM_ADMIN_ID, auditRepo));
+  // Strict administrator & active subscription allowlist middleware on all updates
+  bot.use(
+    createGrammyAuthorizationMiddleware(
+      config.TELEGRAM_ADMIN_ID,
+      auditRepo,
+      controller['deps'].settingsRepo
+    )
+  );
+
+  const downloadTelegramFileBuffer = async (fileId: string): Promise<Buffer> => {
+    const fileInfo = await bot.api.getFile(fileId);
+    if (!fileInfo.file_path) {
+      throw new Error('تعذر الحصول على مسار الملف من خادم تيليجرام.');
+    }
+    const fileUrl = `https://api.telegram.org/file/bot${config.TELEGRAM_BOT_TOKEN}/${fileInfo.file_path}`;
+    const res = await fetch(fileUrl, { signal: AbortSignal.timeout(30_000) });
+    if (!res.ok) {
+      throw new Error(`فشل تحميل الملف من خادم تيليجرام (HTTP ${res.status}).`);
+    }
+    const arrayBuffer = await res.arrayBuffer();
+    return Buffer.from(arrayBuffer);
+  };
 
   bot.on('callback_query:data', async (ctx) => {
     if (!ctx.from) return;
@@ -1331,7 +1518,7 @@ export function createGrammyBot(
       await controller.handleCallbackQuery(
         ctx.from.id,
         ctx.callbackQuery.data,
-        { transport }
+        { transport, chatId: ctx.chat?.id }
       );
     } catch (err) {
       const safeErr = toSafeArabicError(err);
@@ -1358,7 +1545,10 @@ export function createGrammyBot(
         controller.uiState,
         ctx.from.id
       );
-      await controller.handleStartCommand(ctx.from.id, { transport });
+      await controller.handleStartCommand(ctx.from.id, {
+        transport,
+        chatId: ctx.chat?.id,
+      });
     } catch (err) {
       const safeErr = toSafeArabicError(err);
       log.error('Telegram start command error', {
@@ -1377,7 +1567,10 @@ export function createGrammyBot(
         controller.uiState,
         ctx.from.id
       );
-      await controller.handleStartCommand(ctx.from.id, { transport });
+      await controller.handleStartCommand(ctx.from.id, {
+        transport,
+        chatId: ctx.chat?.id,
+      });
     } catch (err) {
       const safeErr = toSafeArabicError(err);
       log.error('Telegram menu command error', {
@@ -1404,7 +1597,7 @@ export function createGrammyBot(
         ctx.from.id,
         ctx.message.text,
         repliedText,
-        { transport }
+        { transport, chatId: ctx.chat?.id }
       );
     } catch (err) {
       const safeErr = toSafeArabicError(err);
@@ -1412,6 +1605,167 @@ export function createGrammyBot(
         category: safeErr.category,
         error: safeErr.sanitizedTechnicalMessage,
       });
+      await ctx.reply(safeErr.userMessage);
+    }
+  });
+
+  bot.on('message:document', async (ctx) => {
+    if (!ctx.from || !ctx.message.document) return;
+    try {
+      const doc = ctx.message.document;
+      const buffer = await downloadTelegramFileBuffer(doc.file_id);
+      const transport = createGrammyTransport(
+        ctx as unknown as Parameters<typeof createGrammyTransport>[0],
+        controller.uiState,
+        ctx.from.id
+      );
+      await controller.handleMediaUpload(
+        ctx.from.id,
+        {
+          originalFilename: doc.file_name || `document_${Date.now()}.bin`,
+          mimeType: doc.mime_type || 'application/octet-stream',
+          sizeBytes: doc.file_size || buffer.length,
+          contentBuffer: buffer,
+          caption: ctx.message.caption,
+        },
+        { transport, chatId: ctx.chat?.id }
+      );
+    } catch (err) {
+      const safeErr = toSafeArabicError(err);
+      await ctx.reply(safeErr.userMessage);
+    }
+  });
+
+  bot.on('message:photo', async (ctx) => {
+    if (!ctx.from || !ctx.message.photo || ctx.message.photo.length === 0) return;
+    try {
+      const highestRes = ctx.message.photo[ctx.message.photo.length - 1];
+      const buffer = await downloadTelegramFileBuffer(highestRes.file_id);
+      const transport = createGrammyTransport(
+        ctx as unknown as Parameters<typeof createGrammyTransport>[0],
+        controller.uiState,
+        ctx.from.id
+      );
+      await controller.handleMediaUpload(
+        ctx.from.id,
+        {
+          originalFilename: `photo_${Date.now()}.jpg`,
+          mimeType: 'image/jpeg',
+          sizeBytes: highestRes.file_size || buffer.length,
+          contentBuffer: buffer,
+          caption: ctx.message.caption,
+        },
+        { transport, chatId: ctx.chat?.id }
+      );
+    } catch (err) {
+      const safeErr = toSafeArabicError(err);
+      await ctx.reply(safeErr.userMessage);
+    }
+  });
+
+  bot.on('message:video', async (ctx) => {
+    if (!ctx.from || !ctx.message.video) return;
+    try {
+      const vid = ctx.message.video;
+      const buffer = await downloadTelegramFileBuffer(vid.file_id);
+      const transport = createGrammyTransport(
+        ctx as unknown as Parameters<typeof createGrammyTransport>[0],
+        controller.uiState,
+        ctx.from.id
+      );
+      await controller.handleMediaUpload(
+        ctx.from.id,
+        {
+          originalFilename: vid.file_name || `video_${Date.now()}.mp4`,
+          mimeType: vid.mime_type || 'video/mp4',
+          sizeBytes: vid.file_size || buffer.length,
+          contentBuffer: buffer,
+          caption: ctx.message.caption,
+        },
+        { transport, chatId: ctx.chat?.id }
+      );
+    } catch (err) {
+      const safeErr = toSafeArabicError(err);
+      await ctx.reply(safeErr.userMessage);
+    }
+  });
+
+  bot.on('message:audio', async (ctx) => {
+    if (!ctx.from || !ctx.message.audio) return;
+    try {
+      const aud = ctx.message.audio;
+      const buffer = await downloadTelegramFileBuffer(aud.file_id);
+      const transport = createGrammyTransport(
+        ctx as unknown as Parameters<typeof createGrammyTransport>[0],
+        controller.uiState,
+        ctx.from.id
+      );
+      await controller.handleMediaUpload(
+        ctx.from.id,
+        {
+          originalFilename: aud.file_name || `audio_${Date.now()}.mp3`,
+          mimeType: aud.mime_type || 'audio/mpeg',
+          sizeBytes: aud.file_size || buffer.length,
+          contentBuffer: buffer,
+          caption: ctx.message.caption,
+        },
+        { transport, chatId: ctx.chat?.id }
+      );
+    } catch (err) {
+      const safeErr = toSafeArabicError(err);
+      await ctx.reply(safeErr.userMessage);
+    }
+  });
+
+  bot.on('message:voice', async (ctx) => {
+    if (!ctx.from || !ctx.message.voice) return;
+    try {
+      const voice = ctx.message.voice;
+      const buffer = await downloadTelegramFileBuffer(voice.file_id);
+      const transport = createGrammyTransport(
+        ctx as unknown as Parameters<typeof createGrammyTransport>[0],
+        controller.uiState,
+        ctx.from.id
+      );
+      await controller.handleMediaUpload(
+        ctx.from.id,
+        {
+          originalFilename: `voice_${Date.now()}.ogg`,
+          mimeType: voice.mime_type || 'audio/ogg',
+          sizeBytes: voice.file_size || buffer.length,
+          contentBuffer: buffer,
+          caption: ctx.message.caption,
+        },
+        { transport, chatId: ctx.chat?.id }
+      );
+    } catch (err) {
+      const safeErr = toSafeArabicError(err);
+      await ctx.reply(safeErr.userMessage);
+    }
+  });
+
+  bot.on('message:sticker', async (ctx) => {
+    if (!ctx.from || !ctx.message.sticker) return;
+    try {
+      const stk = ctx.message.sticker;
+      const buffer = await downloadTelegramFileBuffer(stk.file_id);
+      const transport = createGrammyTransport(
+        ctx as unknown as Parameters<typeof createGrammyTransport>[0],
+        controller.uiState,
+        ctx.from.id
+      );
+      await controller.handleMediaUpload(
+        ctx.from.id,
+        {
+          originalFilename: `sticker_${Date.now()}.webp`,
+          mimeType: 'image/webp',
+          sizeBytes: stk.file_size || buffer.length,
+          contentBuffer: buffer,
+        },
+        { transport, chatId: ctx.chat?.id }
+      );
+    } catch (err) {
+      const safeErr = toSafeArabicError(err);
       await ctx.reply(safeErr.userMessage);
     }
   });

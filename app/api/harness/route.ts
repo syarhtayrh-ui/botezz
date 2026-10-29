@@ -5,7 +5,11 @@ import { toSafeArabicError } from '../../../src/utils/errors';
 export async function GET() {
   try {
     const harness = await getRuntimeHarness();
-    const sessions = harness.sessionManager.listSessions();
+    // In live production mode, read SQLite session records directly so the web dashboard
+    // never overwrites live socket statuses owned by the standalone bot process.
+    const sessions = harness.isLiveConfigured
+      ? harness.sessionRepo.listAll()
+      : harness.sessionManager.listSessions();
     const tasks = harness.taskManager.listRecentTasks(15);
     const auditLogs = harness.auditRepo.listRecent(20);
     const settings = harness.settingsRepo.listAll();
@@ -73,7 +77,9 @@ export async function POST(req: NextRequest) {
 
     harness.lastBotView = view;
 
-    const sessions = harness.sessionManager.listSessions();
+    const sessions = harness.isLiveConfigured
+      ? harness.sessionRepo.listAll()
+      : harness.sessionManager.listSessions();
     const tasks = harness.taskManager.listRecentTasks(15);
     const auditLogs = harness.auditRepo.listRecent(20);
     const runnerStats = harness.taskManager.getRunnerStats();

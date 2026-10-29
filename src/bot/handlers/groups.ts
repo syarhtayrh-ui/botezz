@@ -69,10 +69,11 @@ export class GroupsHandler {
 
       for (const g of slice) {
         const roleTag = g.isBotAdmin ? '🛡️ مشرف' : '👤 عضو';
+        const shortId = this.groupWorkflow.registerGroupRef(sessionId, g.jid);
         rows.push([
           {
             text: `${roleTag} | ${g.subject} (${g.size} عضو)`,
-            callbackData: `grp:view:${sessionId}:${g.jid}`,
+            callbackData: `gv:${shortId}`,
           },
         ]);
       }

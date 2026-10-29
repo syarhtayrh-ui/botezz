@@ -5,6 +5,7 @@ import {
   validateMessageText,
   OperationRateLimiter,
 } from '../../security/validation';
+import { MessageSender } from '../message-capabilities';
 
 export interface SendTextOperationInput {
   sessionId: string;
@@ -13,10 +14,15 @@ export interface SendTextOperationInput {
 }
 
 export class SendMessageOperation {
+  private readonly messageSender: MessageSender;
+
   constructor(
     private readonly sessionManager: SessionManager,
-    private readonly rateLimiter: OperationRateLimiter
-  ) {}
+    private readonly rateLimiter: OperationRateLimiter,
+    messageSender?: MessageSender
+  ) {
+    this.messageSender = messageSender ?? new MessageSender();
+  }
 
   public async executeForSession(input: SendTextOperationInput): Promise<string> {
     const normalizedRecipient = validateRecipient(input.recipient);
@@ -31,8 +37,22 @@ export class SendMessageOperation {
     );
 
     const driver = this.sessionManager.getDriver(input.sessionId);
-    const { messageId } = await driver.sendTextMessage(targetJid, validText);
+    const verifiedResult = await this.messageSender.sendVerifiedMessage(
+      {
+        sessionId: input.sessionId,
+        targetJid,
+        content: { text: validText },
+        maxRetries: 1,
+      },
+      {
+        isConnected: () => true,
+        sendMessage: async (jid) => {
+          const { messageId } = await driver.sendTextMessage(jid, validText);
+          return { key: { id: messageId } };
+        },
+      }
+    );
 
-    return `تم إرسال الرسالة النصية بنجاح إلى ${normalizedRecipient.displayTarget} (معرف: ${messageId})`;
+    return `تم إرسال الرسالة النصية بنجاح إلى ${normalizedRecipient.displayTarget} (معرف: ${verifiedResult.messageId})`;
   }
 }
