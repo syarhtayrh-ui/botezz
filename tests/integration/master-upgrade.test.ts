@@ -671,9 +671,75 @@ test('Botezz V5 Upgrade: Multi-Tenant Subscriber Isolation, Strict Owner/Subscri
     const profileA2 = selectBrowserProfileForSession(pairSubA.session.id);
     assert.deepEqual(profileA, profileA2);
     assert.equal(profileA.length, 3);
+
+    // 6. Pillar 4: 4-Step Interactive Video Call Streaming Workflow (menu:video_call -> recipient -> upload .mp4 -> preview/toggle loop/duration -> confirm_execute -> stop)
+    assert.ok(subAButtonCallbacks.includes('menu:video_call'));
+
+    // Step 1: Start workflow and enter target WhatsApp phone number
+    const vcallStep1 = await env.controller.handleCallbackQuery(
+      subA,
+      'menu:video_call'
+    );
+    assert.ok(vcallStep1.text.includes('الخطوة 1 من 4'));
+
+    const vcallStep2 = await env.controller.handleTextMessage(
+      subA,
+      '+966501234567'
+    );
+    assert.ok(vcallStep2.text.includes('الخطوة 2 من 4'));
+    assert.ok(vcallStep2.text.includes('+966501234567'));
+
+    // Step 2: Upload recorded .mp4 video file to Telegram
+    const fakeMp4Buffer = Buffer.from(
+      '00000018667479706d703432000000006d70343269736f6d000000086d64617401020304',
+      'hex'
+    );
+    const vcallStep3 = await env.controller.handleMediaUpload(subA, {
+      originalFilename: 'promo_interview.mp4',
+      mimeType: 'video/mp4',
+      sizeBytes: fakeMp4Buffer.length,
+      contentBuffer: fakeMp4Buffer,
+    });
+    assert.ok(vcallStep3.text.includes('الخطوة 3 من 4'));
+    assert.ok(vcallStep3.text.includes('promo_interview.mp4'));
+    assert.ok(vcallStep3.text.includes('مفعل ✅'));
+    assert.ok(vcallStep3.text.includes('60 ثانية'));
+
+    // Step 3b: Toggle loop and cycle duration on the preview screen
+    const toggledLoopView = await env.controller.handleCallbackQuery(
+      subA,
+      'wf_vcall:toggle_loop'
+    );
+    assert.ok(toggledLoopView.text.includes('معطل ❌'));
+
+    const cycledDurationView = await env.controller.handleCallbackQuery(
+      subA,
+      'wf_vcall:cycle_duration'
+    );
+    assert.ok(cycledDurationView.text.includes('180 ثانية'));
+
+    // Step 4: Confirm and start live video call stream (uses PTV fallback in container environment)
+    const vcallStep4 = await env.controller.handleCallbackQuery(
+      subA,
+      'wf_vcall:confirm_execute'
+    );
+    assert.ok(vcallStep4.text.includes('الخطوة 4 من 4'));
+    assert.ok(vcallStep4.text.includes('sim_ptv_'));
+    assert.ok(vcallStep4.text.includes('promo_interview.mp4'));
+
+    // Stop active call and verify cleanup
+    const stoppedView = await env.controller.handleCallbackQuery(
+      subA,
+      'wf_vcall:stop'
+    );
+    assert.ok(stoppedView.text.includes('تم إنهاء المكالمة المرئية'));
+    assert.ok(
+      fs.existsSync(path.resolve(process.cwd(), 'scripts/setup-ubuntu-video-engine.sh'))
+    );
   } finally {
     await env.cleanup();
   }
 });
+
 
 

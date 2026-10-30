@@ -63,7 +63,10 @@ export function buildMainMenuKeyboard(
       { text: '📎 إرسال وسائط أو ملف', callbackData: 'menu:send_media' },
     ],
     [
+      { text: '📹 اتصال مرئي ببث مسجل', callbackData: 'menu:video_call' },
       { text: '🔗 الانضمام إلى مجموعة', callbackData: 'menu:join_group' },
+    ],
+    [
       { text: '🛠️ الأدوات ومختبر الدوال', callbackData: 'menu:tools' },
     ],
   ];

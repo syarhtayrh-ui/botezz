@@ -10,6 +10,8 @@ import { PairingWorkflow, BotViewResponse } from './workflows/pairing-workflow';
 import { MessageWorkflow } from './workflows/message-workflow';
 import { MediaWorkflow } from './workflows/media-workflow';
 import { GroupWorkflow } from './workflows/group-workflow';
+import { VideoCallWorkflow } from './workflows/video-call-workflow';
+import { UbuntuVideoCallBridge } from '../whatsapp/video-call-bridge';
 import { StartHandler } from './handlers/start';
 import { SessionsHandler } from './handlers/sessions';
 import { MessagingHandler } from './handlers/messaging';
@@ -44,6 +46,7 @@ export type ConversationMode =
   | 'PAIRING'
   | 'MESSAGE'
   | 'MEDIA'
+  | 'VIDEO_CALL'
   | 'GROUP'
   | 'TOOLS'
   | 'SETTINGS';
@@ -57,6 +60,7 @@ export interface TelegramControllerDeps {
   groupOps: GroupOperations;
   auditRepo: AuditRepository;
   settingsRepo: SettingsRepository;
+  videoCallBridge?: UbuntuVideoCallBridge;
   duplicateTapWindowMs?: number;
   callbackTimeoutMs?: number;
 }
@@ -88,6 +92,8 @@ export class TelegramBotController {
   public readonly messageWorkflow: MessageWorkflow;
   public readonly mediaWorkflow: MediaWorkflow;
   public readonly groupWorkflow: GroupWorkflow;
+  public readonly videoCallBridge: UbuntuVideoCallBridge;
+  public readonly videoCallWorkflow: VideoCallWorkflow;
 
   public readonly startHandler: StartHandler;
   public readonly sessionsHandler: SessionsHandler;
@@ -124,6 +130,14 @@ export class TelegramBotController {
       deps.sessionManager,
       deps.taskManager,
       deps.groupOps
+    );
+    this.videoCallBridge = deps.videoCallBridge ?? new UbuntuVideoCallBridge();
+    this.videoCallWorkflow = new VideoCallWorkflow(
+      deps.sessionManager,
+      this.videoCallBridge,
+      deps.auditRepo,
+      deps.config.TEMP_UPLOAD_DIR,
+      deps.config.MAX_UPLOAD_SIZE_MB
     );
 
     this.startHandler = new StartHandler(deps.sessionManager, deps.taskManager);
@@ -162,6 +176,7 @@ export class TelegramBotController {
     this.messageWorkflow.cancel(adminId);
     this.mediaWorkflow.cancel(adminId);
     this.groupWorkflow.cancel(adminId);
+    this.videoCallWorkflow.cancel(adminId);
     this.toolsHandler.cancel(adminId);
     this.settingsHandler.cancel(adminId);
     this.activeConversationMode.set(adminId, 'NONE');
@@ -489,6 +504,42 @@ export class TelegramBotController {
     if (callbackData === 'wf_media:confirm_execute') {
       this.activeConversationMode.set(actorUserId, 'NONE');
       return this.mediaWorkflow.confirmAndExecute(actorUserId);
+    }
+
+    // 5b: Live Video Call Streaming Workflow (Ubuntu V4L2 + FFmpeg + ADB / PTV Fallback)
+    if (callbackData === 'menu:video_call') {
+      this.cancelAllWorkflowsForAdmin(actorUserId);
+      this.activeConversationMode.set(actorUserId, 'VIDEO_CALL');
+      return this.videoCallWorkflow.start(actorUserId);
+    }
+    if (callbackData === 'wf_vcall:sample_video') {
+      this.activeConversationMode.set(actorUserId, 'VIDEO_CALL');
+      return this.videoCallWorkflow.attachSampleVideo(actorUserId);
+    }
+    if (callbackData === 'wf_vcall:toggle_loop') {
+      this.activeConversationMode.set(actorUserId, 'VIDEO_CALL');
+      return this.videoCallWorkflow.toggleLoop(actorUserId);
+    }
+    if (callbackData === 'wf_vcall:cycle_duration') {
+      this.activeConversationMode.set(actorUserId, 'VIDEO_CALL');
+      return this.videoCallWorkflow.cycleDuration(actorUserId);
+    }
+    if (callbackData.startsWith('wf_vcall:select_sess:')) {
+      const sessId = callbackData.slice('wf_vcall:select_sess:'.length);
+      this.activeConversationMode.set(actorUserId, 'VIDEO_CALL');
+      return this.videoCallWorkflow.selectSession(actorUserId, sessId);
+    }
+    if (callbackData === 'wf_vcall:reupload') {
+      this.activeConversationMode.set(actorUserId, 'VIDEO_CALL');
+      return this.videoCallWorkflow.promptReupload(actorUserId);
+    }
+    if (callbackData === 'wf_vcall:confirm_execute') {
+      this.activeConversationMode.set(actorUserId, 'NONE');
+      return this.videoCallWorkflow.confirmAndExecute(actorUserId);
+    }
+    if (callbackData === 'wf_vcall:stop') {
+      this.activeConversationMode.set(actorUserId, 'NONE');
+      return this.videoCallWorkflow.stopActiveCall(actorUserId);
     }
 
     // 6: Group Management
@@ -889,6 +940,9 @@ export class TelegramBotController {
         caption: upload.caption,
       });
       this.activeConversationMode.set(actorUserId, 'TOOLS');
+    } else if (mode === 'VIDEO_CALL') {
+      view = await this.videoCallWorkflow.handleVideoUpload(actorUserId, upload);
+      this.activeConversationMode.set(actorUserId, 'VIDEO_CALL');
     } else {
       const mediaState = this.mediaWorkflow.getState(actorUserId);
       if (mode === 'MEDIA' && mediaState?.step === 'AWAITING_FILE') {
@@ -1417,6 +1471,19 @@ export class TelegramBotController {
         return this.settingsHandler.renderSubscriptionsMenu(1);
       }
 
+      if (command === '/videocall') {
+        this.cancelAllWorkflowsForAdmin(actorUserId);
+        this.activeConversationMode.set(actorUserId, 'VIDEO_CALL');
+        if (args.length > 0) {
+          this.videoCallWorkflow.start(actorUserId);
+          return this.videoCallWorkflow.handleRecipientInput(
+            actorUserId,
+            args.join(' ')
+          );
+        }
+        return this.videoCallWorkflow.start(actorUserId);
+      }
+
       if (command === '/claim') {
         const entry = this.deps.settingsRepo.addPremiumSubscription(
           String(actorUserId),
@@ -1457,6 +1524,27 @@ export class TelegramBotController {
       const state = this.mediaWorkflow.getState(actorUserId);
       if (state?.step === 'AWAITING_RECIPIENT') {
         return this.mediaWorkflow.handleRecipientInput(actorUserId, trimmed);
+      }
+    }
+
+    if (mode === 'VIDEO_CALL') {
+      const state = this.videoCallWorkflow.getState(actorUserId);
+      if (state?.step === 'AWAITING_RECIPIENT') {
+        return this.videoCallWorkflow.handleRecipientInput(actorUserId, trimmed);
+      }
+      if (state?.step === 'AWAITING_VIDEO') {
+        return {
+          text: `🎬 الرجاء رفع ملف الفيديو المسجل (\`.mp4\`, \`.mov\`, \`.webm\`, \`.mkv\`) أو الضغط على زر الفيديو التجريبي أدناه للمعاينة:`,
+          keyboard: [
+            [
+              {
+                text: '🎬 إرفاق فيديو تجريبي للمعاينة (sample_call.mp4)',
+                callbackData: 'wf_vcall:sample_video',
+              },
+            ],
+            buildBackCancelRow('menu:main'),
+          ],
+        };
       }
     }
 

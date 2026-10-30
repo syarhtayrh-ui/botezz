@@ -598,6 +598,8 @@ export interface WhatsAppSessionDriver {
     mimeType: string;
     fileName: string;
     caption?: string;
+    ptv?: boolean;
+    gifPlayback?: boolean;
   }): Promise<{ messageId: string }>;
   listParticipatingGroups(): Promise<GroupSummary[]>;
   getGroupMetadata(groupJid: string): Promise<GroupSummary>;
@@ -1623,6 +1625,8 @@ export class AthanasiaBaileysSessionDriver implements WhatsAppSessionDriver {
     mimeType: string;
     fileName: string;
     caption?: string;
+    ptv?: boolean;
+    gifPlayback?: boolean;
   }): Promise<{ messageId: string }> {
     const sock = this.ensureSocket();
     if (this.connectionState !== 'CONNECTED' || !this.wsOpen) {
@@ -1642,6 +1646,8 @@ export class AthanasiaBaileysSessionDriver implements WhatsAppSessionDriver {
         video: fileBuffer,
         mimetype: params.mimeType,
         caption: params.caption,
+        ...(params.ptv ? { ptv: true } : {}),
+        ...(params.gifPlayback ? { gifPlayback: true } : {}),
       };
     } else if (params.kind === 'audio') {
       content = {
@@ -2290,6 +2296,8 @@ export class MockWhatsAppSessionDriver implements WhatsAppSessionDriver {
     mimeType: string;
     fileName: string;
     caption?: string;
+    ptv?: boolean;
+    gifPlayback?: boolean;
   }): Promise<{ messageId: string }> {
     if (this.simulatedDelayMs > 0) {
       await new Promise((r) => setTimeout(r, this.simulatedDelayMs));
@@ -2301,7 +2309,8 @@ export class MockWhatsAppSessionDriver implements WhatsAppSessionDriver {
       throw new WhatsAppConnectionError('الملف المؤقت غير موجود لإرساله.');
     }
     this.sentMessagesCount++;
-    return { messageId: `sim_media_${this.sessionId}_${Date.now()}` };
+    const prefix = params.ptv ? 'sim_ptv' : 'sim_media';
+    return { messageId: `${prefix}_${this.sessionId}_${Date.now()}` };
   }
 
   public async listParticipatingGroups(): Promise<GroupSummary[]> {
