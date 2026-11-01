@@ -36,6 +36,12 @@ import {
 } from '../whatsapp/operations/group-operations';
 import { AuditRepository } from '../database/repositories/audit-repository';
 import { SettingsRepository } from '../database/repositories/settings-repository';
+import { InboxRepository } from '../database/repositories/inbox-repository';
+import { StatusRepository } from '../database/repositories/status-repository';
+import { IncomingMessageReceiver } from '../whatsapp/incoming-message-receiver';
+import { StatusDownloaderService } from '../whatsapp/status-downloader';
+import { InboxHandler, InboxFilterKind } from './handlers/inbox';
+import { StoriesHandler, StoriesFilterKind } from './handlers/stories';
 import { toSafeArabicError } from '../utils/errors';
 import { createLogger } from '../logging/logger';
 
@@ -60,6 +66,10 @@ export interface TelegramControllerDeps {
   groupOps: GroupOperations;
   auditRepo: AuditRepository;
   settingsRepo: SettingsRepository;
+  inboxRepo?: InboxRepository;
+  statusRepo?: StatusRepository;
+  incomingMessageReceiver?: IncomingMessageReceiver;
+  statusDownloader?: StatusDownloaderService;
   videoCallBridge?: UbuntuVideoCallBridge;
   duplicateTapWindowMs?: number;
   callbackTimeoutMs?: number;
@@ -103,6 +113,12 @@ export class TelegramBotController {
   public readonly tasksHandler: TasksHandler;
   public readonly settingsHandler: SettingsHandler;
   public readonly toolsHandler: ToolsHandler;
+  public readonly inboxRepo: InboxRepository;
+  public readonly statusRepo: StatusRepository;
+  public readonly incomingMessageReceiver: IncomingMessageReceiver;
+  public readonly statusDownloader: StatusDownloaderService;
+  public readonly inboxHandler: InboxHandler;
+  public readonly storiesHandler: StoriesHandler;
 
   private activeConversationMode = new Map<number, ConversationMode>();
 
@@ -131,13 +147,60 @@ export class TelegramBotController {
       deps.taskManager,
       deps.groupOps
     );
-    this.videoCallBridge = deps.videoCallBridge ?? new UbuntuVideoCallBridge();
+    this.videoCallBridge =
+      deps.videoCallBridge ??
+      new UbuntuVideoCallBridge(deps.sessionManager, deps.auditRepo);
     this.videoCallWorkflow = new VideoCallWorkflow(
       deps.sessionManager,
       this.videoCallBridge,
       deps.auditRepo,
       deps.config.TEMP_UPLOAD_DIR,
       deps.config.MAX_UPLOAD_SIZE_MB
+    );
+
+    const appDb = (deps.auditRepo as unknown as { db: ConstructorParameters<typeof InboxRepository>[0] }).db;
+    const sessionRepo = (deps.sessionManager as unknown as { sessionRepo: ConstructorParameters<typeof IncomingMessageReceiver>[1] }).sessionRepo;
+    this.inboxRepo = deps.inboxRepo ?? new InboxRepository(appDb);
+    this.statusRepo = deps.statusRepo ?? new StatusRepository(appDb);
+    this.incomingMessageReceiver =
+      deps.incomingMessageReceiver ??
+      new IncomingMessageReceiver(
+        this.inboxRepo,
+        sessionRepo,
+        deps.config.TEMP_UPLOAD_DIR
+      );
+    this.statusDownloader =
+      deps.statusDownloader ??
+      new StatusDownloaderService(
+        this.statusRepo,
+        sessionRepo,
+        deps.config.TEMP_UPLOAD_DIR
+      );
+
+    deps.sessionManager.addIncomingMessageListener(
+      ({ sessionId, rawMessage, sock }) => {
+        const key = rawMessage?.key as { remoteJid?: string } | undefined;
+        if (String(key?.remoteJid || '') === 'status@broadcast') {
+          void this.statusDownloader
+            .processStatusMessage({ sessionId, rawMessage, sock })
+            .catch(() => undefined);
+        } else {
+          void this.incomingMessageReceiver
+            .processIncomingMessage({ sessionId, rawMessage, sock })
+            .catch(() => undefined);
+        }
+      }
+    );
+
+    this.inboxHandler = new InboxHandler(
+      this.inboxRepo,
+      this.incomingMessageReceiver,
+      deps.sessionManager
+    );
+    this.storiesHandler = new StoriesHandler(
+      this.statusRepo,
+      this.statusDownloader,
+      deps.sessionManager
     );
 
     this.startHandler = new StartHandler(deps.sessionManager, deps.taskManager);
@@ -506,11 +569,19 @@ export class TelegramBotController {
       return this.mediaWorkflow.confirmAndExecute(actorUserId);
     }
 
-    // 5b: Live Video Call Streaming Workflow (Ubuntu V4L2 + FFmpeg + ADB / PTV Fallback)
-    if (callbackData === 'menu:video_call') {
+    // 5b: Live Video Call Streaming Workflow (Native Protocol Call Engine + PTV)
+    if (callbackData === 'menu:video_call' || callbackData === 'wf_vcall:start') {
       this.cancelAllWorkflowsForAdmin(actorUserId);
       this.activeConversationMode.set(actorUserId, 'VIDEO_CALL');
       return this.videoCallWorkflow.start(actorUserId);
+    }
+    if (callbackData === 'wf_vcall:instant_ring_video') {
+      this.activeConversationMode.set(actorUserId, 'NONE');
+      return this.videoCallWorkflow.startInstantCallRing(actorUserId, 'video');
+    }
+    if (callbackData === 'wf_vcall:instant_ring_voice') {
+      this.activeConversationMode.set(actorUserId, 'NONE');
+      return this.videoCallWorkflow.startInstantCallRing(actorUserId, 'voice');
     }
     if (callbackData === 'wf_vcall:sample_video') {
       this.activeConversationMode.set(actorUserId, 'VIDEO_CALL');
@@ -524,8 +595,19 @@ export class TelegramBotController {
       this.activeConversationMode.set(actorUserId, 'VIDEO_CALL');
       return this.videoCallWorkflow.cycleDuration(actorUserId);
     }
-    if (callbackData.startsWith('wf_vcall:select_sess:')) {
-      const sessId = callbackData.slice('wf_vcall:select_sess:'.length);
+    if (callbackData === 'wf_vcall:cycle_mode') {
+      this.activeConversationMode.set(actorUserId, 'VIDEO_CALL');
+      return this.videoCallWorkflow.cycleProtocolMode(actorUserId);
+    }
+    if (callbackData === 'wf_vcall:cycle_waves') {
+      this.activeConversationMode.set(actorUserId, 'VIDEO_CALL');
+      return this.videoCallWorkflow.cycleWavesCount(actorUserId);
+    }
+    if (
+      callbackData.startsWith('wf_vcall:select_sess:') ||
+      callbackData.startsWith('wf_vcall:sess:')
+    ) {
+      const sessId = callbackData.split(':').pop() || '';
       this.activeConversationMode.set(actorUserId, 'VIDEO_CALL');
       return this.videoCallWorkflow.selectSession(actorUserId, sessId);
     }
@@ -537,9 +619,71 @@ export class TelegramBotController {
       this.activeConversationMode.set(actorUserId, 'NONE');
       return this.videoCallWorkflow.confirmAndExecute(actorUserId);
     }
-    if (callbackData === 'wf_vcall:stop') {
+    if (callbackData === 'wf_vcall:stop' || callbackData.startsWith('wf_vcall:stop:')) {
       this.activeConversationMode.set(actorUserId, 'NONE');
       return this.videoCallWorkflow.stopActiveCall(actorUserId);
+    }
+
+    // 5c: Incoming Messages Receiver & Archive (Inbox)
+    if (callbackData === 'menu:inbox') {
+      this.cancelAllWorkflowsForAdmin(actorUserId);
+      return this.inboxHandler.renderInboxMenu(actorUserId, 1);
+    }
+    if (callbackData.startsWith('menu:inbox:page:')) {
+      const page = Number(callbackData.split(':').pop() || '1');
+      this.cancelAllWorkflowsForAdmin(actorUserId);
+      return this.inboxHandler.renderInboxMenu(actorUserId, page);
+    }
+    if (callbackData.startsWith('inbox:view:')) {
+      const id = callbackData.slice('inbox:view:'.length);
+      return this.inboxHandler.viewMessage(actorUserId, id);
+    }
+    if (callbackData.startsWith('inbox:dl:')) {
+      const id = callbackData.slice('inbox:dl:'.length);
+      return this.inboxHandler.downloadMessageFile(actorUserId, id);
+    }
+    if (callbackData.startsWith('inbox:filter:')) {
+      const filter = callbackData
+        .slice('inbox:filter:'.length)
+        .toUpperCase() as InboxFilterKind;
+      return this.inboxHandler.setFilter(actorUserId, filter);
+    }
+    if (callbackData === 'inbox:toggle_autoforward') {
+      return this.inboxHandler.toggleAutoForward(actorUserId);
+    }
+    if (callbackData === 'inbox:simulate_batch') {
+      return this.inboxHandler.simulateBatch(actorUserId);
+    }
+
+    // 5d: WhatsApp Status / Stories Downloader
+    if (callbackData === 'menu:stories') {
+      this.cancelAllWorkflowsForAdmin(actorUserId);
+      return this.storiesHandler.renderStoriesMenu(actorUserId, 1);
+    }
+    if (callbackData.startsWith('menu:stories:page:')) {
+      const page = Number(callbackData.split(':').pop() || '1');
+      this.cancelAllWorkflowsForAdmin(actorUserId);
+      return this.storiesHandler.renderStoriesMenu(actorUserId, page);
+    }
+    if (callbackData.startsWith('stories:dl:')) {
+      const id = callbackData.slice('stories:dl:'.length);
+      return this.storiesHandler.downloadStatus(actorUserId, id);
+    }
+    if (callbackData.startsWith('stories:dlc:')) {
+      const phone = callbackData.slice('stories:dlc:'.length);
+      return this.storiesHandler.downloadAllByContact(actorUserId, phone);
+    }
+    if (callbackData.startsWith('stories:filter:')) {
+      const filter = callbackData
+        .slice('stories:filter:'.length)
+        .toUpperCase() as StoriesFilterKind;
+      return this.storiesHandler.setFilter(actorUserId, filter);
+    }
+    if (callbackData === 'stories:toggle_autoforward') {
+      return this.storiesHandler.toggleAutoForward(actorUserId);
+    }
+    if (callbackData === 'stories:simulate_batch') {
+      return this.storiesHandler.simulateBatch(actorUserId);
     }
 
     // 6: Group Management
@@ -820,6 +964,25 @@ export class TelegramBotController {
     ) {
       this.activeConversationMode.set(actorUserId, 'TOOLS');
       return this.toolsHandler.promptSaveLastFunction(actorUserId);
+    }
+    if (callbackData === 'tools:flab_prompt_upload_save') {
+      this.cancelAllWorkflowsForAdmin(actorUserId);
+      this.activeConversationMode.set(actorUserId, 'TOOLS');
+      return this.toolsHandler.promptUploadFunctionToSave(actorUserId);
+    }
+    if (callbackData === 'tools:flab_confirm_upload_name') {
+      this.activeConversationMode.set(actorUserId, 'TOOLS');
+      const view = this.toolsHandler.confirmUploadedFunctionName(actorUserId);
+      if (this.toolsHandler.getStep(actorUserId) === 'NONE') {
+        this.activeConversationMode.set(actorUserId, 'NONE');
+      }
+      return view;
+    }
+    if (callbackData.startsWith('tools:flab_prompt_run:')) {
+      const fnName = callbackData.slice('tools:flab_prompt_run:'.length);
+      this.cancelAllWorkflowsForAdmin(actorUserId);
+      this.activeConversationMode.set(actorUserId, 'TOOLS');
+      return this.toolsHandler.promptRunSavedFunction(actorUserId, fnName);
     }
     if (callbackData === 'tools:flab_stop') {
       return this.toolsHandler.stopActiveFunction(actorUserId);
@@ -1113,6 +1276,18 @@ export class TelegramBotController {
         this.cancelAllWorkflowsForAdmin(actorUserId);
         this.uiState.recordRouteTransition(actorUserId, 'menu:tools');
         return this.toolsHandler.renderToolsMenu(isOwner);
+      }
+
+      if (command === '/inbox') {
+        this.cancelAllWorkflowsForAdmin(actorUserId);
+        this.uiState.recordRouteTransition(actorUserId, 'menu:inbox:page:1');
+        return this.inboxHandler.renderInboxMenu(actorUserId, 1);
+      }
+
+      if (command === '/stories' || command === '/statusdl') {
+        this.cancelAllWorkflowsForAdmin(actorUserId);
+        this.uiState.recordRouteTransition(actorUserId, 'menu:stories:page:1');
+        return this.storiesHandler.renderStoriesMenu(actorUserId, 1);
       }
 
       if (command === '/ceksender') {

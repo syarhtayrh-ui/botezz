@@ -40,7 +40,10 @@ export type ToolsInputStep =
   | 'AWAITING_TESTFUNCTION'
   | 'AWAITING_TF_MAX_SENDS'
   | 'AWAITING_TF_DELAY'
-  | 'AWAITING_SAVE_FUNCTION_NAME';
+  | 'AWAITING_SAVE_FUNCTION_NAME'
+  | 'AWAITING_UPLOAD_FUNCTION_FILE'
+  | 'AWAITING_UPLOADED_FUNCTION_NAME'
+  | 'AWAITING_RUN_SAVED_FUNCTION_PARAMS';
 
 export const DEFAULT_SAMPLE_TEST_FUNCTION = `async function nebulaSocketProbe(sock, target, meta) {
   console.log('Executing probe iteration', meta?.iteration, 'maxSends=', sock.getMaxSends());
@@ -56,6 +59,10 @@ export class ToolsHandler {
   private readonly lastCustomFunctionByAdmin = new Map<
     number,
     { funcName: string; sourceCode: string }
+  >();
+  private readonly stagedUploadedFunctionByAdmin = new Map<
+    number,
+    { fileName: string; codeText: string; detectedFuncName: string }
   >();
   private readonly activeExecutionAbortByAdmin = new Map<number, AbortController>();
   public readonly functionLabRepo: FunctionLabRepository;
@@ -478,35 +485,41 @@ export class ToolsHandler {
             callbackData: 'tools:flab_catalog',
           },
           {
-            text: '💾 حفظ آخر دالة',
-            callbackData: 'tools:flab_prompt_save',
+            text: '📤 رفع ملف دالة لحفظها',
+            callbackData: 'tools:flab_prompt_upload_save',
           },
         ],
         [
+          {
+            text: '💾 حفظ آخر دالة',
+            callbackData: 'tools:flab_prompt_save',
+          },
           {
             text: '🛑 إيقاف التنفيذ الجاري',
             callbackData: 'tools:flab_stop',
           },
+        ],
+        [
           {
             text: `🛡️ التغليف الذكي: ${cfg.smartWrap ? 'مفعل' : 'معطل'}`,
             callbackData: 'tools:tf_toggle_smart_wrap',
           },
-        ],
-        [
           {
             text: `⏱️ الفاصل الزمني (${cfg.delayMs}ms)`,
             callbackData: 'tools:tf_prompt_delay',
           },
+        ],
+        [
           {
             text: `📡 النطاق: ${cfg.sessionScope === 'ALL' ? 'كل الجلسات (ALL)' : 'جلسة واحدة (FIRST)'}`,
             callbackData: 'tools:tf_toggle_scope',
           },
-        ],
-        [
           {
             text: `🔄 عند الخطأ: ${cfg.stopOnError ? 'إيقاف' : 'استمرار'}`,
             callbackData: 'tools:tf_toggle_stop_on_error',
           },
+        ],
+        [
           {
             text: '🔙 رجوع للأدوات',
             callbackData: 'menu:tools',
@@ -650,6 +663,115 @@ export class ToolsHandler {
     );
   }
 
+  public promptUploadFunctionToSave(adminId: number): BotViewResponse {
+    this.inputStates.set(adminId, 'AWAITING_UPLOAD_FUNCTION_FILE');
+    return {
+      text:
+        `📤 *رفع ملف دالة مخصصة لحفظها في المكتبة (Upload Function File)*\n` +
+        `━━━━━━━━━━━━━━━━━━\n` +
+        `الخطوة 1 من 2: أرسل الآن **ملف الدالة** (\`.js\`, \`.ts\`, \`.mjs\`, \`.txt\`) أو الصق كود الدالة مباشرة.\n\n` +
+        `💡 سيتم فحص الكود تلقائياً ثم سؤالك عن الاسم المخصص الذي ترغب بحفظ الدالة به لتشغيلها لاحقاً بالاسم فقط.`,
+      keyboard: [buildBackCancelRow('tools:prompt_testfunction')],
+      toastText: '📤 ارفع ملف الدالة (.js / .txt)',
+    };
+  }
+
+  public stageUploadedFunctionCode(
+    adminId: number,
+    fileName: string,
+    codeText: string
+  ): BotViewResponse {
+    const parsed = this.functionValidator.parseAndValidateSource(codeText);
+    if (!parsed.valid) {
+      this.inputStates.set(adminId, 'AWAITING_UPLOAD_FUNCTION_FILE');
+      return {
+        text:
+          `⚠️ *تعذر قبول ملف الدالة (${fileName}):*\n` +
+          `${parsed.errorMessageAr || 'خطأ تركيبي في كود الدالة'}\n\n` +
+          `يرجى تصحيح الكود وإعادة رفع الملف (\`.js\` / \`.txt\`):`,
+        keyboard: [buildBackCancelRow('tools:prompt_testfunction')],
+      };
+    }
+
+    this.stagedUploadedFunctionByAdmin.set(adminId, {
+      fileName,
+      codeText: parsed.normalizedCode,
+      detectedFuncName: parsed.funcName,
+    });
+    this.inputStates.set(adminId, 'AWAITING_UPLOADED_FUNCTION_NAME');
+
+    return {
+      text:
+        `✅ *تم فحص وقبول ملف الدالة بنجاح!* (\`${fileName}\`)\n` +
+        `━━━━━━━━━━━━━━━━━━\n` +
+        `🧩 *الاسم المكتشف داخل الكود:* \`${parsed.funcName}\`\n` +
+        `🔢 *المعاملات المكتشفة:* \`(${parsed.declaredParameters.join(', ') || 'sock, target'})\`\n\n` +
+        `الخطوة 2 من 2: أرسل الآن **الاسم الذي تريد حفظ الدالة به** (مثال: \`MyStickerAttack\`) أو اضغط على الزر أدناه للحفظ بالاسم المكتشف مباشرة:`,
+      keyboard: [
+        [
+          {
+            text: `✅ حفظ بالاسم (${parsed.funcName})`,
+            callbackData: 'tools:flab_confirm_upload_name',
+          },
+        ],
+        buildBackCancelRow('tools:prompt_testfunction'),
+      ],
+      toastText: `✅ تم التحقق من ${parsed.funcName}`,
+    };
+  }
+
+  public confirmUploadedFunctionName(
+    adminId: number,
+    customNameInput?: string
+  ): BotViewResponse {
+    const staged = this.stagedUploadedFunctionByAdmin.get(adminId);
+    if (!staged) {
+      return this.promptUploadFunctionToSave(adminId);
+    }
+
+    const cleanedInput = (customNameInput || '')
+      .trim()
+      .split(/\s+/)[0]
+      ?.replace(/[^A-Za-z0-9_$]/g, '');
+    const chosenName =
+      cleanedInput && /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(cleanedInput)
+        ? cleanedInput
+        : staged.detectedFuncName;
+
+    this.stagedUploadedFunctionByAdmin.delete(adminId);
+    this.cancel(adminId);
+    return this.saveCustomFunction(adminId, chosenName, staged.codeText);
+  }
+
+  public promptRunSavedFunction(adminId: number, funcName: string): BotViewResponse {
+    const resolved = this.functionRegistry.resolveFunction(funcName);
+    if (!resolved) {
+      return this.renderFunctionCatalog(adminId);
+    }
+    this.selectedFunctionByAdmin.set(adminId, resolved.name);
+    this.inputStates.set(adminId, 'AWAITING_RUN_SAVED_FUNCTION_PARAMS');
+
+    return {
+      text:
+        `🚀 *تشغيل الدالة المحفوظة:* \`${resolved.name}\` (\`v${resolved.version}\`)\n` +
+        `━━━━━━━━━━━━━━━━━━\n` +
+        `📝 *الوصف:* ${resolved.descriptionAr}\n\n` +
+        `أرسل الآن **رقم الهاتف المستهدف وعدد التكرارات** لتشغيل الدالة فوراً:\n` +
+        `• مثال للتنفيذ الحي: \`+966501234567 5\`\n` +
+        `• مثال لوضع المحاكاة الآمن: \`+966501234567 2 --sim\``,
+      keyboard: [
+        [
+          {
+            text: `🧪 فحص جاف سريع (${resolved.name.slice(0, 20)})`,
+            callbackData: `tools:flab_dryrun:${resolved.name.slice(0, 34)}`,
+          },
+        ],
+        buildBackCancelRow('tools:flab_catalog'),
+      ],
+      toastText: `🚀 أدخل الرقم والعدد لتشغيل ${resolved.name}`,
+    };
+  }
+
   public async handleGuidedInput(
     adminId: number,
     rawText: string,
@@ -675,6 +797,20 @@ export class ToolsHandler {
     if (step === 'AWAITING_TF_DELAY') {
       this.cancel(adminId);
       return this.setDelayConfig(adminId, rawText);
+    }
+    if (step === 'AWAITING_UPLOAD_FUNCTION_FILE') {
+      return this.stageUploadedFunctionCode(adminId, 'pasted_function.js', rawText);
+    }
+    if (step === 'AWAITING_UPLOADED_FUNCTION_NAME') {
+      return this.confirmUploadedFunctionName(adminId, rawText);
+    }
+    if (step === 'AWAITING_RUN_SAVED_FUNCTION_PARAMS') {
+      const selectedFn = this.selectedFunctionByAdmin.get(adminId);
+      this.cancel(adminId);
+      const combinedArgs = selectedFn
+        ? `${rawText.trim()} ${selectedFn}`
+        : rawText.trim();
+      return this.executeTestFunction(adminId, combinedArgs, repliedText);
     }
     if (step === 'AWAITING_SAVE_FUNCTION_NAME') {
       this.cancel(adminId);
@@ -781,26 +917,32 @@ export class ToolsHandler {
         metadata: { functionId: saved.functionId, version: saved.version },
       });
 
+      const safeSavedName = saved.name.slice(0, 34);
+
       return {
         text:
           `✅ *تم حفظ الدالة المخصصة في مكتبة الدوال بنجاح!*\n` +
           `━━━━━━━━━━━━━━━━━━\n` +
           `🧩 *اسم الدالة:* \`${saved.name}\` (الإصدار \`v${saved.version}\`)\n` +
           `🆔 *المعرف:* \`${saved.functionId}\`\n` +
-          `📌 تم تعيين \`${saved.name}\` كدالة نشطة حالياً. يمكنك تشغيلها مباشرة عبر:\n` +
+          `📌 تم تعيين \`${saved.name}\` كدالة نشطة حالياً. يمكنك تشغيلها مباشرة بالاسم عبر:\n` +
           `\`/testfunction +966501234567 1 ${saved.name}\``,
         keyboard: [
           [
             {
-              text: `🧪 فحص جاف (${saved.name})`,
-              callbackData: `tools:flab_dryrun:${saved.name}`,
+              text: `🚀 تشغيل الدالة الآن (${saved.name.slice(0, 18)})`,
+              callbackData: `tools:flab_prompt_run:${safeSavedName}`,
             },
+            {
+              text: `🧪 فحص جاف (${saved.name.slice(0, 16)})`,
+              callbackData: `tools:flab_dryrun:${safeSavedName}`,
+            },
+          ],
+          [
             {
               text: '📚 فتح مكتبة الدوال',
               callbackData: 'tools:flab_catalog',
             },
-          ],
-          [
             {
               text: '🔙 لوحة /testfunction',
               callbackData: 'tools:prompt_testfunction',
@@ -854,9 +996,29 @@ export class ToolsHandler {
   ): Promise<BotViewResponse> {
     const caption = (params.caption || '').trim();
     const codeText = params.codeText.trim();
+    const currentStep = this.getStep(adminId);
+
+    if (currentStep === 'AWAITING_UPLOAD_FUNCTION_FILE') {
+      if (caption && !caption.startsWith('/')) {
+        // User provided desired function name in caption while uploading file
+        const stagedView = this.stageUploadedFunctionCode(
+          adminId,
+          params.fileName,
+          codeText
+        );
+        if (this.getStep(adminId) === 'AWAITING_UPLOADED_FUNCTION_NAME') {
+          return this.confirmUploadedFunctionName(adminId, caption);
+        }
+        return stagedView;
+      }
+      return this.stageUploadedFunctionCode(adminId, params.fileName, codeText);
+    }
 
     if (/^\/savefunction\b/i.test(caption)) {
       const nameArg = caption.replace(/^\/savefunction(?:@\w+)?\s*/i, '').trim();
+      if (!nameArg) {
+        return this.stageUploadedFunctionCode(adminId, params.fileName, codeText);
+      }
       const fallbackName =
         nameArg ||
         params.fileName
@@ -866,6 +1028,9 @@ export class ToolsHandler {
     }
 
     const argsAfterCmd = caption.replace(/^\/testfunction(?:@\w+)?\s*/i, '').trim();
+    if (!argsAfterCmd) {
+      return this.stageUploadedFunctionCode(adminId, params.fileName, codeText);
+    }
     return this.executeTestFunction(adminId, argsAfterCmd, codeText);
   }
 

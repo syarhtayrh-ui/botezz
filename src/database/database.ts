@@ -18,6 +18,11 @@ import {
   MIGRATION_005_UP_SQL,
   MIGRATION_005_DOWN_SQL,
 } from './migrations/005_multi_tenant_isolation';
+import {
+  MIGRATION_006_ID,
+  MIGRATION_006_UP_SQL,
+  MIGRATION_006_DOWN_SQL,
+} from './migrations/006_inbox_statuses_and_native_calls';
 import { DatabaseError } from '../utils/errors';
 import { createLogger } from '../logging/logger';
 
@@ -137,6 +142,18 @@ export class AppDatabase {
     } else {
       this.ensureMultiTenantColumns();
     }
+
+    const existing006 = checkStmt.get(MIGRATION_006_ID) as { id: string } | undefined;
+    if (!existing006) {
+      this.runInTransaction(() => {
+        this.sqlite.exec(MIGRATION_006_UP_SQL);
+        const insertStmt = this.sqlite.prepare(
+          'INSERT INTO schema_migrations (id, applied_at) VALUES (?, ?)'
+        );
+        insertStmt.run(MIGRATION_006_ID, new Date().toISOString());
+      });
+      log.info('Database migration applied', { migrationId: MIGRATION_006_ID });
+    }
   }
 
   private ensureMultiTenantColumns(): void {
@@ -170,14 +187,15 @@ export class AppDatabase {
   }
 
   /**
-   * Safely rolls back a reversible migration (003, 004, or 005)
+   * Safely rolls back a reversible migration (003, 004, 005, or 006)
    * without losing core session or settings rows.
    */
   public rollbackMigration(migrationId: string): boolean {
     if (
       migrationId !== MIGRATION_003_ID &&
       migrationId !== MIGRATION_004_ID &&
-      migrationId !== MIGRATION_005_ID
+      migrationId !== MIGRATION_005_ID &&
+      migrationId !== MIGRATION_006_ID
     ) {
       throw new DatabaseError(
         `الترحيل (${migrationId}) غير قابل للتراجع التلقائي حفاظاً على الجلسات الأساسية.`
@@ -190,11 +208,13 @@ export class AppDatabase {
     if (!existing) return false;
 
     const downSql =
-      migrationId === MIGRATION_005_ID
-        ? MIGRATION_005_DOWN_SQL
-        : migrationId === MIGRATION_004_ID
-          ? MIGRATION_004_DOWN_SQL
-          : MIGRATION_003_DOWN_SQL;
+      migrationId === MIGRATION_006_ID
+        ? MIGRATION_006_DOWN_SQL
+        : migrationId === MIGRATION_005_ID
+          ? MIGRATION_005_DOWN_SQL
+          : migrationId === MIGRATION_004_ID
+            ? MIGRATION_004_DOWN_SQL
+            : MIGRATION_003_DOWN_SQL;
 
     this.sqlite.exec('PRAGMA foreign_keys = OFF;');
     try {

@@ -1,4 +1,5 @@
 import fs from 'node:fs';
+import crypto from 'node:crypto';
 import pino from 'pino';
 import makeWASocket, {
   makeCacheableSignalKeyStore,
@@ -15,6 +16,13 @@ import makeWASocket, {
   ParticipantAction,
   AnyMessageContent,
 } from 'athanasia-baileys';
+
+export interface BinaryNode {
+  tag: string;
+  attrs: Record<string, string>;
+  content?: BinaryNode[] | Uint8Array | string;
+  [key: string]: unknown;
+}
 import { createAtomicMultiFileAuthState } from './atomic-auth-state';
 import {
   SupportedMediaKind,
@@ -166,6 +174,8 @@ export interface SafeSocketTargetAdapter {
     state: 'available' | 'composing' | 'paused',
     targetJid: string
   ) => Promise<void>;
+  sendNode?: (node: BinaryNode) => Promise<void>;
+  query?: (node: BinaryNode, timeoutMs?: number) => Promise<unknown>;
   raw?: Partial<WASocket> | Record<string, unknown>;
   [key: string]: unknown;
 }
@@ -583,6 +593,11 @@ export interface ConnectionEventCallbacks {
     errorMessage?: string;
     isRegistered?: boolean;
   }) => void;
+  onIncomingMessage?: (params: {
+    sessionId: string;
+    rawMessage: Record<string, unknown>;
+    sock?: WASocket;
+  }) => void;
 }
 
 export interface WhatsAppSessionDriver {
@@ -601,6 +616,17 @@ export interface WhatsAppSessionDriver {
     ptv?: boolean;
     gifPlayback?: boolean;
   }): Promise<{ messageId: string }>;
+  sendNode?(node: BinaryNode): Promise<void>;
+  query?(node: BinaryNode, timeoutMs?: number): Promise<unknown>;
+  sendNativeCallOffer?(params: {
+    targetJid: string;
+    isVideo: boolean;
+    callId?: string;
+  }): Promise<{ callId: string; mode: string }>;
+  terminateNativeCall?(params: {
+    targetJid: string;
+    callId: string;
+  }): Promise<void>;
   listParticipatingGroups(): Promise<GroupSummary[]>;
   getGroupMetadata(groupJid: string): Promise<GroupSummary>;
   getGroupInviteCode(groupJid: string): Promise<string>;
@@ -1417,10 +1443,34 @@ export class AthanasiaBaileysSessionDriver implements WhatsAppSessionDriver {
       }
     };
 
+    const incomingMessagesUpsertListener = ({
+      messages: newMessages,
+    }: {
+      messages: Array<Record<string, unknown>>;
+      type: string;
+    }) => {
+      if (!callbacks.onIncomingMessage || !Array.isArray(newMessages)) return;
+      for (const msg of newMessages) {
+        try {
+          callbacks.onIncomingMessage({
+            sessionId: this.sessionId,
+            rawMessage: msg,
+            sock,
+          });
+        } catch (err) {
+          log.warn('Error in onIncomingMessage listener', {
+            sessionId: this.sessionId,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }
+      }
+    };
+
     sock.ev.on('creds.update', credsListener);
     sock.ev.on('connection.update', connectionListener);
     sock.ev.on('messages.update', messagesUpdateListener);
     sock.ev.on('message-receipt.update', receiptUpdateListener);
+    sock.ev.on('messages.upsert', incomingMessagesUpsertListener as never);
 
     this.evCleanup = () => {
       unbindStore();
@@ -1429,6 +1479,7 @@ export class AthanasiaBaileysSessionDriver implements WhatsAppSessionDriver {
         sock.ev.off('connection.update', connectionListener);
         sock.ev.off('messages.update', messagesUpdateListener);
         sock.ev.off('message-receipt.update', receiptUpdateListener);
+        sock.ev.off('messages.upsert', incomingMessagesUpsertListener as never);
       } catch {
         // Ignore cleanup errors
       }
@@ -1893,6 +1944,184 @@ export class AthanasiaBaileysSessionDriver implements WhatsAppSessionDriver {
     }
   }
 
+  public async sendNode(node: BinaryNode): Promise<void> {
+    const sock = this.ensureSocket();
+    if (typeof sock.sendNode === 'function') {
+      await sock.sendNode(node);
+    }
+  }
+
+  public async query(node: BinaryNode, timeoutMs?: number): Promise<unknown> {
+    const sock = this.ensureSocket();
+    if (typeof sock.query === 'function') {
+      return await sock.query(node, timeoutMs);
+    }
+    return undefined;
+  }
+
+  public async sendNativeCallOffer(params: {
+    targetJid: string;
+    isVideo: boolean;
+    callId?: string;
+  }): Promise<{ callId: string; mode: string }> {
+    const sock = this.ensureSocket();
+    if (this.connectionState !== 'CONNECTED' || !this.wsOpen) {
+      throw new WhatsAppConnectionError('الجلسة غير متصلة حالياً لإرسال رنين المكالمة.');
+    }
+    const resolvedJid = await this.resolveDirectRecipientJid(sock, params.targetJid);
+    const callId = (
+      params.callId || crypto.randomBytes(16).toString('hex')
+    ).toUpperCase();
+    const selfJid =
+      sock.user?.id || sock.authState?.creds?.me?.id || resolvedJid;
+
+    const callNode: BinaryNode = {
+      tag: 'call',
+      attrs: {
+        to: resolvedJid,
+        id:
+          typeof sock.generateMessageTag === 'function'
+            ? sock.generateMessageTag()
+            : crypto.randomBytes(8).toString('hex').toUpperCase(),
+      },
+      content: [
+        {
+          tag: 'offer',
+          attrs: {
+            'call-id': callId,
+            'call-creator': selfJid,
+          },
+          content: [
+            ...(params.isVideo
+              ? [
+                  {
+                    tag: 'video',
+                    attrs: {
+                      enc: 'vp8',
+                      dec: 'vp8',
+                      orientation: '0',
+                      screen_share: 'false',
+                      device: '0',
+                    },
+                  },
+                ]
+              : []),
+            {
+              tag: 'audio',
+              attrs: {
+                enc: 'opus',
+                rate: '16000',
+              },
+            },
+            {
+              tag: 'net',
+              attrs: {
+                medium: '3',
+              },
+            },
+            {
+              tag: 'capability',
+              attrs: {
+                ver: '1',
+              },
+              content: Buffer.from([1, 4, 255, 131, 207, 4]),
+            },
+            {
+              tag: 'encopt',
+              attrs: {
+                keygen: '2',
+              },
+            },
+          ],
+        },
+      ],
+    };
+
+    let stanzaSent = false;
+    try {
+      if (typeof sock.sendNode === 'function') {
+        await sock.sendNode(callNode);
+        stanzaSent = true;
+      }
+    } catch (err) {
+      log.warn('Raw call offer stanza warning; continuing with protocol relay fallback', {
+        sessionId: this.sessionId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+
+    try {
+      const msgId = SmartProtocolWrapper.generateStandardMessageId(selfJid);
+      const relayPayload: proto.IMessage = {
+        viewOnceMessage: {
+          message: {
+            scheduledCallCreationMessage: {
+              scheduledTimestampMs: Date.now() + 1000,
+              callType: params.isVideo ? 2 : 1,
+              title: params.isVideo ? 'مكالمة فيديو واردة' : 'مكالمة صوتية واردة',
+            },
+          },
+        },
+      };
+      this.memoryStore.cacheSentMessage(resolvedJid, msgId, relayPayload);
+      const prepared = SmartProtocolWrapper.prepareRelayPayload(
+        resolvedJid,
+        relayPayload,
+        { messageId: msgId },
+        selfJid
+      );
+      await sock.relayMessage(resolvedJid, prepared.message, prepared.options);
+    } catch {
+      // Non-fatal companion relay
+    }
+
+    await Promise.allSettled([this.credsSaveChain, this.flushAuthWrites()]);
+    return {
+      callId,
+      mode: stanzaSent ? 'NATIVE_CALL_STANZA+RELAY' : 'PROTOCOL_RELAY',
+    };
+  }
+
+  public async terminateNativeCall(params: {
+    targetJid: string;
+    callId: string;
+  }): Promise<void> {
+    if (!this.sock || !this.wsOpen) return;
+    try {
+      const resolvedJid = await this.resolveDirectRecipientJid(
+        this.sock,
+        params.targetJid
+      );
+      const selfJid =
+        this.sock.user?.id || this.sock.authState?.creds?.me?.id || resolvedJid;
+      const terminateNode: BinaryNode = {
+        tag: 'call',
+        attrs: {
+          to: resolvedJid,
+          id:
+            typeof this.sock.generateMessageTag === 'function'
+              ? this.sock.generateMessageTag()
+              : crypto.randomBytes(8).toString('hex').toUpperCase(),
+        },
+        content: [
+          {
+            tag: 'terminate',
+            attrs: {
+              'call-id': params.callId,
+              'call-creator': selfJid,
+              reason: 'timeout',
+            },
+          },
+        ],
+      };
+      if (typeof this.sock.sendNode === 'function') {
+        await this.sock.sendNode(terminateNode);
+      }
+    } catch {
+      // Best-effort call termination
+    }
+  }
+
   /**
    * Executes a custom `async function` in the isolated VM sandbox against the active Athanasia Baileys socket
    * (adapted from Nebula `/testfunction`).
@@ -1906,6 +2135,8 @@ export class AthanasiaBaileysSessionDriver implements WhatsAppSessionDriver {
         relayMessage: async () => undefined,
         presenceSubscribe: async () => undefined,
         sendPresenceUpdate: async () => undefined,
+        sendNode: async () => undefined,
+        query: async () => ({ tag: 'iq', attrs: { type: 'result' }, content: [] }),
       });
     }
     const sock = this.ensureSocket();
@@ -1942,6 +2173,17 @@ export class AthanasiaBaileysSessionDriver implements WhatsAppSessionDriver {
             this.memoryStore.cacheSentMessage(resolvedJid, msgId, messageObj);
           }
           return await sock.relayMessage(resolvedJid, messageObj, relayOpts);
+        },
+        sendNode: async (node: BinaryNode) => {
+          if (typeof sock.sendNode === 'function') {
+            await sock.sendNode(node);
+          }
+        },
+        query: async (node: BinaryNode, timeoutMs?: number) => {
+          if (typeof sock.query === 'function') {
+            return await sock.query(node, timeoutMs);
+          }
+          return { tag: 'iq', attrs: { type: 'result' }, content: [] };
         },
         presenceSubscribe: async (targetJid) => {
           await sock.presenceSubscribe(targetJid);
@@ -2435,6 +2677,73 @@ export class MockWhatsAppSessionDriver implements WhatsAppSessionDriver {
     }
   }
 
+  public readonly sentNodes: BinaryNode[] = [];
+  public readonly sentCallOffers: Array<{
+    targetJid: string;
+    isVideo: boolean;
+    callId: string;
+  }> = [];
+  public readonly terminatedCalls: Array<{
+    targetJid: string;
+    callId: string;
+  }> = [];
+
+  public async sendNode(node: BinaryNode): Promise<void> {
+    if (!this.connected || !this.registered) {
+      throw new WhatsAppConnectionError('الجلسة غير متصلة حالياً.');
+    }
+    this.sentNodes.push(node);
+    this.sentMessagesCount++;
+  }
+
+  public async query(node: BinaryNode, _timeoutMs?: number): Promise<unknown> {
+    if (!this.connected || !this.registered) {
+      throw new WhatsAppConnectionError('الجلسة غير متصلة حالياً.');
+    }
+    this.sentNodes.push(node);
+    return { tag: 'iq', attrs: { type: 'result' }, content: [] };
+  }
+
+  public async sendNativeCallOffer(params: {
+    targetJid: string;
+    isVideo: boolean;
+    callId?: string;
+  }): Promise<{ callId: string; mode: string }> {
+    if (!this.connected || !this.registered) {
+      throw new WhatsAppConnectionError('الجلسة غير متصلة حالياً لإرسال رنين المكالمة.');
+    }
+    const callId = (
+      params.callId || crypto.randomBytes(16).toString('hex')
+    ).toUpperCase();
+    this.sentCallOffers.push({
+      targetJid: params.targetJid,
+      isVideo: params.isVideo,
+      callId,
+    });
+    this.sentMessagesCount++;
+    return {
+      callId,
+      mode: 'MOCK_NATIVE_CALL_STANZA',
+    };
+  }
+
+  public async terminateNativeCall(params: {
+    targetJid: string;
+    callId: string;
+  }): Promise<void> {
+    this.terminatedCalls.push({
+      targetJid: params.targetJid,
+      callId: params.callId,
+    });
+  }
+
+  public simulateIncomingMessage(rawMessage: Record<string, unknown>): void {
+    this.callbacks?.onIncomingMessage?.({
+      sessionId: this.sessionId,
+      rawMessage,
+    });
+  }
+
   public async executeTestFunction(
     params: TestFunctionExecutionParams
   ): Promise<TestFunctionExecutionResult> {
@@ -2503,6 +2812,18 @@ export class MockWhatsAppSessionDriver implements WhatsAppSessionDriver {
             this.sentMessagesCount++;
           }
           return `sim_relay_${Date.now()}`;
+        },
+        sendNode: async (node: BinaryNode) => {
+          if (!isOfflineSafeMode) {
+            this.sentNodes.push(node);
+            this.sentMessagesCount++;
+          }
+        },
+        query: async (node: BinaryNode) => {
+          if (!isOfflineSafeMode) {
+            this.sentNodes.push(node);
+          }
+          return { tag: 'iq', attrs: { type: 'result' }, content: [] };
         },
         presenceSubscribe: async () => undefined,
         sendPresenceUpdate: async () => undefined,

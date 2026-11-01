@@ -67,6 +67,10 @@ export function buildMainMenuKeyboard(
       { text: '🔗 الانضمام إلى مجموعة', callbackData: 'menu:join_group' },
     ],
     [
+      { text: '📥 قسم استقبال الرسائل', callbackData: 'menu:inbox:page:1' },
+      { text: '⭕ تحميلات الحالات', callbackData: 'menu:stories:page:1' },
+    ],
+    [
       { text: '🛠️ الأدوات ومختبر الدوال', callbackData: 'menu:tools' },
     ],
   ];

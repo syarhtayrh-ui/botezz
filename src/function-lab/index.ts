@@ -36,6 +36,28 @@ import {
   AnyMessageContent,
   WASocket,
 } from 'athanasia-baileys';
+
+export interface BinaryNode {
+  tag: string;
+  attrs: Record<string, string>;
+  content?: BinaryNode[] | Uint8Array | string;
+  [key: string]: unknown;
+}
+import {
+  imageBuilder,
+  stickerBuilder,
+  createSolidImagePng,
+  createGradientImagePng,
+  createMinimalJpegThumbnail,
+  createWebpSticker,
+  createStickerPackZip,
+  buildWhatsAppStickerExifPayload,
+  createVoicePttWaveform,
+  createSilentOggOpusBuffer,
+  createMinimalMp4Buffer,
+  createMinimalPdfBuffer,
+  createSandboxRequire,
+} from './media-sticker-toolkit';
 import {
   FunctionFailureCategory,
   FunctionExecutionMode,
@@ -51,6 +73,22 @@ import {
 import { ValidationError } from '../utils/errors';
 import { redactString, redactObject, maskPhoneNumber } from '../security/redaction';
 import { createLogger } from '../logging/logger';
+
+export {
+  imageBuilder,
+  stickerBuilder,
+  createSolidImagePng,
+  createGradientImagePng,
+  createMinimalJpegThumbnail,
+  createWebpSticker,
+  createStickerPackZip,
+  buildWhatsAppStickerExifPayload,
+  createVoicePttWaveform,
+  createSilentOggOpusBuffer,
+  createMinimalMp4Buffer,
+  createMinimalPdfBuffer,
+  createSandboxRequire,
+};
 
 const log = createLogger('function-lab');
 
@@ -247,10 +285,14 @@ export class FunctionValidator {
       .replace(/[\u201C\u201D]/g, '"')
       .replace(/[\u2018\u2019]/g, "'");
 
-    // 4. Strip leading `export default` or `export` keyword on declarations
+    // 4. Strip leading `export default`, `export`, or `module.exports =` keyword on declarations
     code = code
       .replace(/^\s*export\s+default\s+/gm, '')
-      .replace(/^\s*export\s+(?=(?:async\s+)?function\b|(?:const|let|var)\b)/gm, '');
+      .replace(/^\s*export\s+(?=(?:async\s+)?function\b|(?:const|let|var)\b)/gm, '')
+      .replace(
+        /^\s*(?:module\.)?exports(?:\.[a-zA-Z0-9_$]+)?\s*=\s*(?=(?:async\s+)?function\b|(?:async\s*)?\(|(?:async\s+)?[a-zA-Z_$][a-zA-Z0-9_$]*\s*=>)/gm,
+        ''
+      );
 
     // 5. Guard against leaking the host bot token specifically
     if (/\bprocess\.env\.TELEGRAM_BOT_TOKEN\b/.test(code)) {
@@ -768,6 +810,8 @@ export interface FunctionSandboxAdapter {
     messageObj: proto.IMessage,
     opts?: Record<string, unknown>
   ) => Promise<unknown>;
+  sendNode?: (node: BinaryNode) => Promise<unknown>;
+  query?: (node: BinaryNode, timeoutMs?: number) => Promise<unknown>;
   presenceSubscribe: (targetJid: string) => Promise<void>;
   sendPresenceUpdate: (
     state: 'available' | 'composing' | 'paused',
@@ -827,7 +871,7 @@ export interface FunctionExecutorResult {
  * Automatically enriches outgoing `relayMessage` and `sendMessage` payloads with:
  * 1. Genuine WhatsApp Web v2 Message IDs (`generateMessageIDV2` / `3EB0...`)
  * 2. Automatic `messageContextInfo` (`deviceListMetadata`, `deviceListMetadataVersion: 2`, 32-byte `messageSecret`)
- * 3. Automatic `<biz><interactive .../></biz>` binary node decoration for `interactiveMessage`, `buttonsMessage`, and `listMessage`
+ * 3. Non-destructive `<biz><interactive .../></biz>` binary node decoration for `interactiveMessage`, `buttonsMessage`, and `listMessage`
  */
 export class SmartProtocolWrapper {
   public static generateStandardMessageId(userId?: string): string {
@@ -897,15 +941,27 @@ export class SmartProtocolWrapper {
         message.messageContextInfo && typeof message.messageContextInfo === 'object'
           ? (message.messageContextInfo as Record<string, unknown>)
           : {};
+      const existingDeviceListMeta =
+        existingCtx.deviceListMetadata &&
+        typeof existingCtx.deviceListMetadata === 'object'
+          ? (existingCtx.deviceListMetadata as Record<string, unknown>)
+          : {};
       message.messageContextInfo = {
-        deviceListMetadata: existingCtx.deviceListMetadata ?? {},
+        ...existingCtx,
+        deviceListMetadata: {
+          ...existingDeviceListMeta,
+        },
         deviceListMetadataVersion: existingCtx.deviceListMetadataVersion ?? 2,
         messageSecret: existingCtx.messageSecret ?? crypto.randomBytes(32),
-        ...existingCtx,
       };
     }
 
-    if (!options.additionalNodes) {
+    const existingNodes = Array.isArray(options.additionalNodes)
+      ? ([...options.additionalNodes] as Array<{ tag?: string; [k: string]: unknown }>)
+      : [];
+    const hasBizNode = existingNodes.some((n) => n && n.tag === 'biz');
+
+    if (!hasBizNode) {
       const inner = SmartProtocolWrapper.unwrapInnerMessage(message) || message;
       const interactiveMsg = inner.interactiveMessage as
         | {
@@ -925,57 +981,55 @@ export class SmartProtocolWrapper {
             b?.name === 'payment_status'
         );
         const flowName = hasPaymentFlow ? 'payment_info' : 'mixed';
-        options.additionalNodes = [
-          {
-            tag: 'biz',
-            attrs: {},
-            content: [
-              {
-                tag: 'interactive',
-                attrs: { type: 'native_flow', v: '1' },
-                content: [
-                  {
-                    tag: 'native_flow',
-                    attrs: { v: '9', name: flowName },
-                  },
-                ],
-              },
-            ],
-          },
-        ];
+        existingNodes.push({
+          tag: 'biz',
+          attrs: {},
+          content: [
+            {
+              tag: 'interactive',
+              attrs: { type: 'native_flow', v: '1' },
+              content: [
+                {
+                  tag: 'native_flow',
+                  attrs: { v: '9', name: flowName },
+                },
+              ],
+            },
+          ],
+        });
       } else if (inner.buttonsMessage) {
-        options.additionalNodes = [
-          {
-            tag: 'biz',
-            attrs: {},
-            content: [
-              {
-                tag: 'interactive',
-                attrs: { type: 'native_flow', v: '1' },
-                content: [
-                  {
-                    tag: 'native_flow',
-                    attrs: { v: '9', name: 'mixed' },
-                  },
-                ],
-              },
-            ],
-          },
-        ];
+        existingNodes.push({
+          tag: 'biz',
+          attrs: {},
+          content: [
+            {
+              tag: 'interactive',
+              attrs: { type: 'native_flow', v: '1' },
+              content: [
+                {
+                  tag: 'native_flow',
+                  attrs: { v: '9', name: 'mixed' },
+                },
+              ],
+            },
+          ],
+        });
       } else if (inner.listMessage) {
-        options.additionalNodes = [
-          {
-            tag: 'biz',
-            attrs: {},
-            content: [
-              {
-                tag: 'list',
-                attrs: { v: '2', type: 'product_list' },
-              },
-            ],
-          },
-        ];
+        existingNodes.push({
+          tag: 'biz',
+          attrs: {},
+          content: [
+            {
+              tag: 'list',
+              attrs: { v: '2', type: 'product_list' },
+            },
+          ],
+        });
       }
+    }
+
+    if (existingNodes.length > 0) {
+      options.additionalNodes = existingNodes;
     }
 
     return { message, options, messageId };
@@ -1517,39 +1571,162 @@ export class FunctionExecutor {
       lastSendTimestamp = Date.now();
     };
 
+    const fallbackWaUploadToServer = async () => {
+      const hex = crypto.randomBytes(12).toString('hex');
+      return {
+        mediaUrl: `https://mmg.whatsapp.net/v/t62.7118-24/${hex}.enc`,
+        directPath: `/v/t62.7118-24/${hex}.enc`,
+        url: `https://mmg.whatsapp.net/v/t62.7118-24/${hex}.enc`,
+        handle: hex,
+      };
+    };
+
+    const effectiveWaUploadToServer =
+      executionMode === 'LIVE' &&
+      typeof rawSocketTarget?.waUploadToServer === 'function'
+        ? rawSocketTarget.waUploadToServer.bind(rawSocketTarget)
+        : fallbackWaUploadToServer;
+
+    const buildSyntheticMediaMessage = (
+      mediaContent: Record<string, unknown>
+    ): proto.IMessage => {
+      const hex = crypto.randomBytes(12).toString('hex');
+      const url = `https://mmg.whatsapp.net/v/t62.7118-24/${hex}.enc`;
+      const directPath = `/v/t62.7118-24/${hex}.enc`;
+      const mediaKey = crypto.randomBytes(32);
+      const fileSha256 = crypto.randomBytes(32);
+      const fileEncSha256 = crypto.randomBytes(32);
+      const caption =
+        typeof mediaContent.caption === 'string' ? mediaContent.caption : undefined;
+
+      if ('image' in mediaContent) {
+        const buf = Buffer.isBuffer(mediaContent.image)
+          ? mediaContent.image
+          : createSolidImagePng(64, 64, [37, 211, 102]);
+        return {
+          imageMessage: {
+            url,
+            directPath,
+            mediaKey,
+            fileSha256,
+            fileEncSha256,
+            fileLength: buf.length,
+            mimetype: String(mediaContent.mimetype || 'image/png'),
+            caption,
+            width: 512,
+            height: 512,
+            jpegThumbnail: createMinimalJpegThumbnail(),
+          },
+        };
+      }
+      if ('sticker' in mediaContent) {
+        const buf = Buffer.isBuffer(mediaContent.sticker)
+          ? mediaContent.sticker
+          : createWebpSticker();
+        return {
+          stickerMessage: {
+            url,
+            directPath,
+            mediaKey,
+            fileSha256,
+            fileEncSha256,
+            fileLength: buf.length,
+            mimetype: 'image/webp',
+            width: 512,
+            height: 512,
+            isAnimated: Boolean(mediaContent.isAnimated),
+          },
+        };
+      }
+      if ('video' in mediaContent) {
+        const buf = Buffer.isBuffer(mediaContent.video)
+          ? mediaContent.video
+          : createMinimalMp4Buffer();
+        const isPtv = Boolean(mediaContent.ptv);
+        const videoPayload = {
+          url,
+          directPath,
+          mediaKey,
+          fileSha256,
+          fileEncSha256,
+          fileLength: buf.length,
+          mimetype: String(mediaContent.mimetype || 'video/mp4'),
+          caption,
+          seconds: Number(mediaContent.seconds || 5),
+          gifPlayback: Boolean(mediaContent.gifPlayback),
+          jpegThumbnail: createMinimalJpegThumbnail(),
+        };
+        return isPtv
+          ? { ptvMessage: videoPayload }
+          : { videoMessage: videoPayload };
+      }
+      if ('audio' in mediaContent) {
+        const buf = Buffer.isBuffer(mediaContent.audio)
+          ? mediaContent.audio
+          : createSilentOggOpusBuffer(3);
+        return {
+          audioMessage: {
+            url,
+            directPath,
+            mediaKey,
+            fileSha256,
+            fileEncSha256,
+            fileLength: buf.length,
+            mimetype: String(mediaContent.mimetype || 'audio/ogg; codecs=opus'),
+            ptt: Boolean(mediaContent.ptt),
+            seconds: Number(mediaContent.seconds || 3),
+            waveform: createVoicePttWaveform(64),
+          },
+        };
+      }
+      const docBuf = Buffer.isBuffer(mediaContent.document)
+        ? mediaContent.document
+        : createMinimalPdfBuffer();
+      return {
+        documentMessage: {
+          url,
+          directPath,
+          mediaKey,
+          fileSha256,
+          fileEncSha256,
+          fileLength: docBuf.length,
+          mimetype: String(mediaContent.mimetype || 'application/pdf'),
+          fileName: String(mediaContent.fileName || 'document.pdf'),
+          caption,
+        },
+      };
+    };
+
     const uploadMediaHelper = async (
       mediaContent: AnyMessageContent,
       options: Record<string, unknown> = {}
     ): Promise<proto.IMessage> => {
-      const realUpload =
-        typeof rawSocketTarget?.waUploadToServer === 'function'
-          ? rawSocketTarget.waUploadToServer.bind(rawSocketTarget)
-          : undefined;
-      const fallbackUpload = async () => ({
-        mediaUrl: `https://mmg.whatsapp.net/v/t62.7118-24/${crypto.randomBytes(8).toString('hex')}.enc`,
-        directPath: `/v/t62.7118-24/${crypto.randomBytes(12).toString('hex')}.enc`,
-        handle: crypto.randomBytes(8).toString('hex'),
-      });
       try {
         return await prepareWAMessageMedia(mediaContent, {
-          upload:
-            executionMode === 'DRY_RUN' ||
-            executionMode === 'SIMULATION' ||
-            !realUpload
-              ? fallbackUpload
-              : realUpload,
+          upload: effectiveWaUploadToServer,
           ...options,
         });
       } catch {
-        return await prepareWAMessageMedia(mediaContent, {
-          upload: fallbackUpload,
-          ...options,
-        });
+        try {
+          return await prepareWAMessageMedia(mediaContent, {
+            upload: fallbackWaUploadToServer,
+            ...options,
+          });
+        } catch {
+          return buildSyntheticMediaMessage(
+            (mediaContent || {}) as Record<string, unknown>
+          );
+        }
       }
     };
 
     const baseSafeSock: Record<string, unknown> = {
       raw: rawSocketTarget,
+      user: (rawSocketTarget?.user as Record<string, unknown> | undefined) || {
+        id: socketUserId || '966500000000@s.whatsapp.net',
+        name: 'Botezz Session',
+      },
+      waUploadToServer: effectiveWaUploadToServer,
       getSendCount: () => sendCount,
       getSendMessageCount: () => sendMessageCount,
       getRelayMessageCount: () => relayMessageCount,
@@ -1600,6 +1777,52 @@ export class FunctionExecutor {
           );
         }
         return await effectiveAdapter.relayMessage(jid, messageObj, opts);
+      },
+      sendNode: async (node: BinaryNode) => {
+        checkAndIncrementSend();
+        if (
+          executionMode === 'DRY_RUN' ||
+          executionMode === 'SIMULATION' ||
+          (!effectiveAdapter.sendNode && typeof rawSocketTarget?.sendNode !== 'function')
+        ) {
+          pushLog(executionMode === 'DRY_RUN' ? 'DRY_RUN' : 'SIM', [
+            `sendNode <${node?.tag || 'node'} to="${maskPhoneNumber(String(node?.attrs?.to || targetJid))}">`,
+          ]);
+          return { ok: true, tag: node?.tag || 'node' };
+        }
+        if (typeof effectiveAdapter.sendNode === 'function') {
+          return await effectiveAdapter.sendNode(node);
+        }
+        if (typeof rawSocketTarget?.sendNode === 'function') {
+          return await (rawSocketTarget.sendNode as (n: BinaryNode) => Promise<unknown>)(node);
+        }
+        return undefined;
+      },
+      query: async (node: BinaryNode, timeoutMs?: number) => {
+        checkAndIncrementSend();
+        if (
+          executionMode === 'DRY_RUN' ||
+          executionMode === 'SIMULATION' ||
+          (!effectiveAdapter.query && typeof rawSocketTarget?.query !== 'function')
+        ) {
+          pushLog(executionMode === 'DRY_RUN' ? 'DRY_RUN' : 'SIM', [
+            `query <${node?.tag || 'iq'} xmlns="${String(node?.attrs?.xmlns || '')}">`,
+          ]);
+          return {
+            tag: node?.tag || 'iq',
+            attrs: { type: 'result', id: node?.attrs?.id || 'q_1' },
+            content: [],
+          };
+        }
+        if (typeof effectiveAdapter.query === 'function') {
+          return await effectiveAdapter.query(node, timeoutMs);
+        }
+        if (typeof rawSocketTarget?.query === 'function') {
+          return await (
+            rawSocketTarget.query as (n: BinaryNode, t?: number) => Promise<unknown>
+          )(node, timeoutMs);
+        }
+        return { tag: 'iq', attrs: { type: 'result' }, content: [] };
       },
       presenceSubscribe: async (jid: string) => {
         try {
@@ -1668,6 +1891,8 @@ export class FunctionExecutor {
         messageObj: proto.IMessage,
         opts?: Record<string, unknown>
       ) => Promise<unknown>;
+      sendNode: (node: BinaryNode) => Promise<unknown>;
+      query: (node: BinaryNode, timeoutMs?: number) => Promise<unknown>;
       presenceSubscribe: (jid: string) => Promise<void>;
       sendPresenceUpdate: (
         state: 'available' | 'composing' | 'paused',
@@ -1710,9 +1935,130 @@ export class FunctionExecutor {
       relayMessageFn: (t, msgObj, opts) => safeSock.relayMessage(t, msgObj, opts),
     });
 
-    const sandbox: Record<string, unknown> = {
+    const wrappedGenerateWAMessageFromContent = (
+      jid: string,
+      message: proto.IMessage,
+      options?: Record<string, unknown>
+    ) => {
+      const effectiveOpts = {
+        userJid: socketUserId || targetJid,
+        ...(options || {}),
+      };
+      return generateWAMessageFromContent(
+        normalizeJid(jid || targetJid),
+        message,
+        effectiveOpts as Parameters<typeof generateWAMessageFromContent>[2]
+      );
+    };
+
+    const wrappedGenerateWAMessageContent = async (
+      message: AnyMessageContent,
+      options?: Record<string, unknown>
+    ) => {
+      const effectiveOpts = {
+        upload: effectiveWaUploadToServer,
+        ...(options || {}),
+      };
+      try {
+        return await generateWAMessageContent(
+          message,
+          effectiveOpts as unknown as Parameters<typeof generateWAMessageContent>[1]
+        );
+      } catch {
+        return buildSyntheticMediaMessage(
+          (message || {}) as Record<string, unknown>
+        );
+      }
+    };
+
+    const wrappedGenerateWAMessage = async (
+      jid: string,
+      content: AnyMessageContent,
+      options?: Record<string, unknown>
+    ) => {
+      const effectiveOpts = {
+        userJid: socketUserId || targetJid,
+        upload: effectiveWaUploadToServer,
+        ...(options || {}),
+      };
+      try {
+        return await generateWAMessage(
+          normalizeJid(jid || targetJid),
+          content,
+          effectiveOpts as unknown as Parameters<typeof generateWAMessage>[2]
+        );
+      } catch {
+        const msgContent = await wrappedGenerateWAMessageContent(content, effectiveOpts);
+        return wrappedGenerateWAMessageFromContent(
+          normalizeJid(jid || targetJid),
+          msgContent,
+          effectiveOpts
+        );
+      }
+    };
+
+    const baileysDynamic = Baileys as Record<string, unknown>;
+    const waBinaryHelpers = {
+      encodeBinaryNode: baileysDynamic.encodeBinaryNode,
+      decodeBinaryNode: baileysDynamic.decodeBinaryNode,
+      getBinaryNodeChild: baileysDynamic.getBinaryNodeChild,
+      getBinaryNodeChildren: baileysDynamic.getBinaryNodeChildren,
+      getAllBinaryNodeChildren: baileysDynamic.getAllBinaryNodeChildren,
+      getBinaryNodeChildBuffer: baileysDynamic.getBinaryNodeChildBuffer,
+      getBinaryNodeChildString: baileysDynamic.getBinaryNodeChildString,
+      jidDecode,
+      jidEncode,
+      jidNormalizedUser,
+      areJidsSameUser,
+      isJidStatusBroadcast,
+      isJidNewsletter,
+      isJidGroup,
+      isJidBroadcast,
+      isLidUser,
+      isPnUser,
+      S_WHATSAPP_NET,
+      STORIES_JID,
+    };
+
+    const sandboxBaileysModule: Record<string, unknown> = {
       ...Baileys,
-      baileys: Baileys,
+      default: Baileys,
+      proto,
+      WABinary: waBinaryHelpers,
+      ...waBinaryHelpers,
+      generateWAMessageFromContent: wrappedGenerateWAMessageFromContent,
+      generateWAMessage: wrappedGenerateWAMessage,
+      generateWAMessageContent: wrappedGenerateWAMessageContent,
+      prepareWAMessageMedia: (
+        content: AnyMessageContent,
+        opts?: Record<string, unknown>
+      ) => uploadMediaHelper(content, opts),
+      builders,
+      ...builders,
+      imageBuilder,
+      stickerBuilder,
+      createSolidImagePng,
+      createGradientImagePng,
+      createMinimalJpegThumbnail,
+      createWebpSticker,
+      createStickerPackZip,
+      createVoicePttWaveform,
+      createSilentOggOpusBuffer,
+      createMinimalMp4Buffer,
+      createMinimalPdfBuffer,
+    };
+
+    const sandboxRequire = createSandboxRequire({ sandboxBaileysModule });
+    const sandboxModule: { exports: unknown } = { exports: {} };
+
+    const sandbox: Record<string, unknown> = {
+      ...sandboxBaileysModule,
+      baileys: sandboxBaileysModule,
+      Baileys: sandboxBaileysModule,
+      WABinary: waBinaryHelpers,
+      require: sandboxRequire,
+      module: sandboxModule,
+      exports: sandboxModule.exports,
       console: {
         log: (...args: unknown[]) => pushLog('LOG', args),
         info: (...args: unknown[]) => pushLog('INFO', args),
@@ -1752,8 +2098,17 @@ export class FunctionExecutor {
       sock: safeSock,
       client: safeSock,
       conn: safeSock,
+      ptz: safeSock,
+      ryn: safeSock,
+      wa: safeSock,
+      bot: safeSock,
+      hisoka: safeSock,
+      x: safeSock,
       target: targetJid,
       jid: targetJid,
+      to: targetJid,
+      chatId: targetJid,
+      nomor: digits,
       meta: {
         iteration: 1,
         totalIterations: iterations,
@@ -1771,6 +2126,17 @@ export class FunctionExecutor {
       delay: sleep,
       builders,
       ...builders,
+      imageBuilder,
+      stickerBuilder,
+      createSolidImagePng,
+      createGradientImagePng,
+      createMinimalJpegThumbnail,
+      createWebpSticker,
+      createStickerPackZip,
+      createVoicePttWaveform,
+      createSilentOggOpusBuffer,
+      createMinimalMp4Buffer,
+      createMinimalPdfBuffer,
       SmartProtocolWrapper,
       STORIES_JID,
       S_WHATSAPP_NET,
@@ -1780,10 +2146,10 @@ export class FunctionExecutor {
       initAuthCreds,
       generateMessageIDV2,
       generateMessageID,
-      generateWAMessageFromContent,
+      generateWAMessageFromContent: wrappedGenerateWAMessageFromContent,
       generateForwardMessageContent,
-      generateWAMessage,
-      generateWAMessageContent,
+      generateWAMessage: wrappedGenerateWAMessage,
+      generateWAMessageContent: wrappedGenerateWAMessageContent,
       prepareWAMessageMedia: (
         content: AnyMessageContent,
         opts?: Record<string, unknown>
@@ -1809,7 +2175,7 @@ export class FunctionExecutor {
     };
 
     const context = vm.createContext(sandbox);
-    const wrapper = `${parsed.normalizedCode}\n${funcName}`;
+    const wrapper = `${parsed.normalizedCode}\n;(typeof ${funcName} === 'function' ? ${funcName} : (typeof module !== 'undefined' && typeof module.exports === 'function' ? module.exports : ${funcName}))`;
     let fn: (...args: unknown[]) => unknown;
     try {
       const script = new vm.Script(wrapper, {
@@ -1844,10 +2210,24 @@ export class FunctionExecutor {
       'number',
       'chatid',
       'chat',
+      'user',
+      'id',
+      'm',
+      'peserta',
     ].includes(firstParamClean);
-    const isSockSingleParam = ['sock', 'client', 'conn', 'wa', 'bot'].includes(
-      firstParamClean
-    );
+    const isSockSingleParam = [
+      'sock',
+      'client',
+      'conn',
+      'wa',
+      'bot',
+      'ptz',
+      'ryn',
+      'hisoka',
+      'x',
+      'socket',
+      's',
+    ].includes(firstParamClean);
 
     let iterationsSucceeded = 0;
     let iterationsFailed = 0;

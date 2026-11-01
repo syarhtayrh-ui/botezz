@@ -1,5 +1,7 @@
+import fs from 'node:fs';
+import { InputFile } from 'grammy';
 import { InlineKeyboardRows, toGrammyInlineKeyboard } from './keyboards/main-menu';
-import { BotViewResponse } from './workflows/pairing-workflow';
+import { BotViewResponse, TelegramMediaAttachment } from './workflows/pairing-workflow';
 import { toSafeArabicError } from '../utils/errors';
 import { stripMarkdown, isMarkdownEntityError } from '../utils/markdown';
 import { createLogger } from '../logging/logger';
@@ -31,6 +33,7 @@ export interface UserUiSessionState {
   currentRoute: string;
   history: string[];
   lastView?: BotViewResponse;
+  sentAttachments: TelegramMediaAttachment[];
   inFlightCallbacks: Set<string>;
   lastCallbackAt: Map<string, number>;
   stats: UiSessionStats;
@@ -50,6 +53,7 @@ export interface TelegramMessageTransport {
     messageId: number,
     keyboard: InlineKeyboardRows
   ): Promise<void>;
+  sendMediaAttachment?(attachment: TelegramMediaAttachment): Promise<void>;
   answerCallbackQuery?(options?: {
     text?: string;
     showAlert?: boolean;
@@ -98,7 +102,10 @@ export function isNavigableRoute(callbackData: string): boolean {
     callbackData === 'tools:prompt_testfunction' ||
     callbackData === 'tools:prompt_channel' ||
     callbackData === 'tools:prompt_ip' ||
-    callbackData === 'tools:prompt_shortlink'
+    callbackData === 'tools:prompt_shortlink' ||
+    callbackData.startsWith('inbox:view:') ||
+    callbackData.startsWith('inbox:filter:') ||
+    callbackData.startsWith('stories:filter:')
   );
 }
 
@@ -132,6 +139,7 @@ export class BotUiStateManager {
         userId,
         currentRoute: 'menu:main',
         history: [],
+        sentAttachments: [],
         inFlightCallbacks: new Set<string>(),
         lastCallbackAt: new Map<string, number>(),
         stats: {
@@ -339,6 +347,27 @@ export class BotUiStateManager {
       deliveryMode = 'NEW_MESSAGE';
     }
 
+    if (Array.isArray(view.mediaAttachments) && view.mediaAttachments.length > 0) {
+      for (const att of view.mediaAttachments) {
+        sess.sentAttachments.push(att);
+        if (sess.sentAttachments.length > 100) {
+          sess.sentAttachments.shift();
+        }
+        if (transport?.sendMediaAttachment) {
+          try {
+            await transport.sendMediaAttachment(att);
+          } catch (attErr) {
+            log.warn('Failed sending media attachment to Telegram', {
+              userId,
+              fileName: att.fileName,
+              error:
+                attErr instanceof Error ? attErr.message : String(attErr),
+            });
+          }
+        }
+      }
+    }
+
     const enriched: BotViewResponse = {
       ...view,
       route: view.route || sess.currentRoute,
@@ -510,6 +539,54 @@ export function createGrammyTransport(
         text: options?.text,
         show_alert: options?.showAlert,
       });
+    },
+    sendMediaAttachment: async (attachment) => {
+      if (!fs.existsSync(attachment.filePath)) {
+        return;
+      }
+      const inputFile = new InputFile(attachment.filePath, attachment.fileName);
+      const anyCtx = ctx as Record<string, unknown>;
+      const captionOpts = attachment.caption
+        ? { caption: attachment.caption }
+        : {};
+      if (
+        attachment.kind === 'photo' &&
+        typeof anyCtx.replyWithPhoto === 'function'
+      ) {
+        await (
+          anyCtx.replyWithPhoto as (
+            f: InputFile,
+            o?: Record<string, unknown>
+          ) => Promise<unknown>
+        )(inputFile, captionOpts);
+      } else if (
+        attachment.kind === 'video' &&
+        typeof anyCtx.replyWithVideo === 'function'
+      ) {
+        await (
+          anyCtx.replyWithVideo as (
+            f: InputFile,
+            o?: Record<string, unknown>
+          ) => Promise<unknown>
+        )(inputFile, captionOpts);
+      } else if (
+        attachment.kind === 'audio' &&
+        typeof anyCtx.replyWithAudio === 'function'
+      ) {
+        await (
+          anyCtx.replyWithAudio as (
+            f: InputFile,
+            o?: Record<string, unknown>
+          ) => Promise<unknown>
+        )(inputFile, captionOpts);
+      } else if (typeof anyCtx.replyWithDocument === 'function') {
+        await (
+          anyCtx.replyWithDocument as (
+            f: InputFile,
+            o?: Record<string, unknown>
+          ) => Promise<unknown>
+        )(inputFile, captionOpts);
+      }
     },
   };
 }

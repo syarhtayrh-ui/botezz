@@ -12,6 +12,7 @@ import {
   AthanasiaBaileysSessionDriver,
   MockWhatsAppSessionDriver,
   SessionSocketDiagnostics,
+  ConnectionEventCallbacks,
   classifyDisconnectReason,
 } from './connection-manager';
 import { normalizePhoneNumber } from '../security/validation';
@@ -94,6 +95,9 @@ export class SessionManager {
   public defaultAutoCompleteInMock: boolean;
   private configuredAdminId: number;
   private onDisconnectAlert?: SessionManagerOptions['onDisconnectAlert'];
+  private readonly incomingMessageListeners = new Set<
+    NonNullable<ConnectionEventCallbacks['onIncomingMessage']>
+  >();
   private isShuttingDown = false;
 
   constructor(
@@ -148,6 +152,30 @@ export class SessionManager {
     handler: SessionManagerOptions['onDisconnectAlert']
   ): void {
     this.onDisconnectAlert = handler;
+  }
+
+  public addIncomingMessageListener(
+    listener: NonNullable<ConnectionEventCallbacks['onIncomingMessage']>
+  ): () => void {
+    this.incomingMessageListeners.add(listener);
+    return () => {
+      this.incomingMessageListeners.delete(listener);
+    };
+  }
+
+  private dispatchIncomingMessage(
+    params: Parameters<NonNullable<ConnectionEventCallbacks['onIncomingMessage']>>[0]
+  ): void {
+    for (const listener of this.incomingMessageListeners) {
+      try {
+        listener(params);
+      } catch (err) {
+        log.warn('Error in SessionManager incomingMessageListener', {
+          sessionId: params.sessionId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }
   }
 
   private nextGeneration(sessionId: string): number {
@@ -350,6 +378,7 @@ export class SessionManager {
       await driver.connect({
         onStatusChange: (evt) =>
           this.handleDriverStatusUpdate(sessionId!, generation, evt),
+        onIncomingMessage: (msgEvt) => this.dispatchIncomingMessage(msgEvt),
       });
 
       const pairingCode = await driver.requestPairingCode(
@@ -754,6 +783,7 @@ export class SessionManager {
     await driver.connect({
       onStatusChange: (evt) =>
         this.handleDriverStatusUpdate(sessionId, generation, evt),
+      onIncomingMessage: (msgEvt) => this.dispatchIncomingMessage(msgEvt),
     });
   }
 
@@ -905,6 +935,7 @@ export class SessionManager {
         await driver.connect({
           onStatusChange: (evt) =>
             this.handleDriverStatusUpdate(session.id, generation, evt),
+          onIncomingMessage: (msgEvt) => this.dispatchIncomingMessage(msgEvt),
         });
         restoredCount++;
       } catch (err) {
@@ -1001,6 +1032,7 @@ export class SessionManager {
       await driver.connect({
         onStatusChange: (evt) =>
           this.handleDriverStatusUpdate(sessionId, generation, evt),
+        onIncomingMessage: (msgEvt) => this.dispatchIncomingMessage(msgEvt),
       });
     } catch (err) {
       await this.cleanupExistingDriver(sessionId);

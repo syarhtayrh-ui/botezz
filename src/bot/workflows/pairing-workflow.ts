@@ -9,6 +9,14 @@ import { ValidationError, toSafeArabicError } from '../../utils/errors';
 import { escapeMarkdown } from '../../utils/markdown';
 import { UiDeliveryMode, UiSessionStats } from '../ui-state';
 
+export interface TelegramMediaAttachment {
+  filePath: string;
+  fileName: string;
+  mimeType: string;
+  kind: 'document' | 'photo' | 'video' | 'audio' | 'sticker';
+  caption?: string;
+}
+
 export interface BotViewResponse {
   text: string;
   keyboard: InlineKeyboardRows;
@@ -18,6 +26,8 @@ export interface BotViewResponse {
   showAlert?: boolean;
   /** Route identifier for navigation history */
   route?: string;
+  /** Optional real file/media attachments to send to Telegram */
+  mediaAttachments?: TelegramMediaAttachment[];
   /** Stateful single-message UI delivery metadata */
   uiMeta?: {
     deliveryMode: UiDeliveryMode;

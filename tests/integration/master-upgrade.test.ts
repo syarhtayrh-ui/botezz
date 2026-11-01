@@ -741,5 +741,309 @@ test('Botezz V5 Upgrade: Multi-Tenant Subscriber Isolation, Strict Owner/Subscri
   }
 });
 
+test('Master Prompt Google Studio (Pillars 1-5): Media/Sticker Toolkit, Sandbox require(), Upload-to-Save Function Workflow, Instant Native Protocol Call Ringing, Inbox Archiver, and Status Downloader', async () => {
+  const env = createUpgradeTestHarness();
+  try {
+    const ownerId = env.config.TELEGRAM_ADMIN_ID;
+    env.settingsRepo.setCooldownSeconds(0);
+
+    const pairRes = await env.sessionManager.initiatePairing({
+      rawPhoneNumber: '+966501112233',
+      label: 'Primary Master Session',
+      actorTelegramId: ownerId,
+      autoCompleteInMock: true,
+    });
+    const sessionId = pairRes.session.id;
+    const mockDriver = env.sessionManager.getDriver(
+      sessionId,
+      ownerId
+    ) as MockWhatsAppSessionDriver;
+
+    // =========================================================================
+    // PILLAR 1: Media & Sticker Toolkit, Sandbox require(), WABinary, sendNode,
+    // non-destructive SmartProtocolWrapper, and Upload Function File to Save & Run
+    // =========================================================================
+    const complexMediaStickerFunction = `
+      const baileys = require('@whiskeysockets/baileys');
+      const fs = require('fs');
+      const sharp = require('sharp');
+      const { Sticker } = require('wa-sticker-formatter');
+
+      module.exports = async function masterProtocolTest(client, chatId) {
+        // 1. Create PNG, JPEG, WebP sticker with EXIF, and Sticker Pack ZIP inside sandbox
+        const pngBuf = imageBuilder.createGradientImagePng(96, 96, [255, 0, 128], [0, 200, 255]);
+        const jpgThumb = imageBuilder.createMinimalJpegThumbnail();
+        const webpBuf = stickerBuilder.createWebpSticker({
+          width: 64,
+          height: 64,
+          packName: 'Botezz Master Pack',
+          authorName: 'Botezz Lab',
+          emojis: ['🔥', '⚡']
+        });
+        const zipBuf = stickerBuilder.createStickerPackZip({
+          packName: 'Botezz ZIP Pack',
+          stickersCount: 2
+        });
+
+        // 2. Virtual fs fallback for non-existent local files (prevents ENOENT in pasted scripts)
+        const fallbackWebp = fs.readFileSync('./missing_sticker.webp');
+        const sharpOut = await sharp(pngBuf).resize(64, 64).webp().toBuffer();
+        const formattedSticker = await new Sticker(pngBuf, { pack: 'Test' }).toBuffer();
+
+        // 3. Test prepareWAMessageMedia + sock.waUploadToServer + sock.sendNode + WABinary
+        const uploadedMedia = await prepareWAMessageMedia(
+          { image: pngBuf, jpegThumbnail: jpgThumb },
+          { upload: client.waUploadToServer }
+        );
+        await client.sendNode({
+          tag: 'iq',
+          attrs: { to: WABinary.S_WHATSAPP_NET, type: 'get', xmlns: 'w:p' },
+          content: []
+        });
+
+        // 4. Test custom additionalNodes & messageContextInfo preservation in relayMessage
+        await client.relayMessage(
+          chatId,
+          {
+            stickerMessage: {
+              url: 'https://mmg.whatsapp.net/v/t62.15575-24/mock.enc',
+              mimetype: 'image/webp',
+              fileLength: webpBuf.length
+            },
+            messageContextInfo: {
+              deviceListMetadataVersion: 2
+            }
+          },
+          {
+            additionalNodes: [{ tag: 'meta', attrs: { custom_attr: 'preserved_ok' } }]
+          }
+        );
+
+        await client.sendMessage(chatId, { sticker: formattedSticker });
+        console.log(
+          'Toolkitcheck:',
+          pngBuf.slice(1, 4).toString('ascii') === 'PNG',
+          webpBuf.slice(0, 4).toString('ascii') === 'RIFF',
+          webpBuf.includes(Buffer.from('EXIF')),
+          zipBuf.slice(0, 2).toString('ascii') === 'PK',
+          fallbackWebp.slice(0, 4).toString('ascii') === 'RIFF',
+          sharpOut.length > 10,
+          Boolean(uploadedMedia.imageMessage)
+        );
+      };
+    `;
+
+    const pillar1Exec = await env.controller.handleTextMessage(
+      ownerId,
+      '/testfunction +966509998877 1 --delay=0',
+      complexMediaStickerFunction
+    );
+    assert.ok(pillar1Exec.text.includes('masterProtocolTest'));
+    assert.ok(pillar1Exec.text.includes('1/1'));
+    assert.ok(
+      pillar1Exec.text.includes('Toolkitcheck: true true true true true true true')
+    );
+    assert.ok(mockDriver.sentNodes.length >= 1);
+
+    // Interactive Upload Function File to Save -> Name -> Confirm -> Run by Name
+    const promptUploadView = await env.controller.handleCallbackQuery(
+      ownerId,
+      'tools:flab_prompt_upload_save'
+    );
+    assert.ok(
+      promptUploadView.text.includes('رفع ملف دالة مخصصة لحفظها في المكتبة')
+    );
+
+    const uploadedFnCode = Buffer.from(
+      `async function fileSavedStickerSender(sock, target) {
+        const stk = createWebpSticker({ packName: 'SavedFilePack', authorName: 'Admin' });
+        await sock.sendMessage(target, { sticker: stk });
+      }`,
+      'utf8'
+    );
+    const stageView = await env.controller.handleMediaUpload(ownerId, {
+      originalFilename: 'my_sticker_func.js',
+      mimeType: 'application/javascript',
+      sizeBytes: uploadedFnCode.length,
+      contentBuffer: uploadedFnCode,
+    });
+    assert.ok(stageView.text.includes('تم فحص وقبول ملف الدالة بنجاح'));
+    assert.ok(stageView.text.includes('fileSavedStickerSender'));
+
+    // Enter a custom name and confirm saving
+    const customNameReply = await env.controller.handleTextMessage(
+      ownerId,
+      'StickerWaveFn'
+    );
+    assert.ok(
+      customNameReply.text.includes('تم حفظ الدالة المخصصة في مكتبة الدوال بنجاح')
+    );
+    assert.ok(customNameReply.text.includes('StickerWaveFn'));
+
+    // Click "Run this function now" (`tools:flab_prompt_run:StickerWaveFn`) and supply `<phone> <iterations>`
+    const promptRunSaved = await env.controller.handleCallbackQuery(
+      ownerId,
+      'tools:flab_prompt_run:StickerWaveFn'
+    );
+    assert.ok(promptRunSaved.text.includes('تشغيل الدالة المحفوظة'));
+    assert.ok(promptRunSaved.text.includes('StickerWaveFn'));
+
+    const runSavedResult = await env.controller.handleTextMessage(
+      ownerId,
+      '+966508887766 2 --delay=0'
+    );
+    assert.ok(runSavedResult.text.includes('StickerWaveFn'));
+    assert.ok(runSavedResult.text.includes('2/2'));
+
+    // =========================================================================
+    // PILLAR 2: Pure WhatsApp Protocol Native Video & Voice Call Engine
+    // (Instant Call Ringing without uploading a video file + Multi-Wave + Terminate)
+    // =========================================================================
+    await env.controller.handleCallbackQuery(ownerId, 'menu:video_call');
+    const step2Call = await env.controller.handleTextMessage(
+      ownerId,
+      '+966504443322'
+    );
+    assert.ok(
+      step2Call.text.includes('بدء رنين مكالمة فيديو أو صوتية فوري عبر البروتوكول')
+    );
+
+    // Cycle ringing waves count (1 -> 3)
+    const cycledWaves = await env.controller.handleCallbackQuery(
+      ownerId,
+      'wf_vcall:cycle_waves'
+    );
+    assert.ok(cycledWaves.text.includes('3'));
+
+    // Trigger instant video call ring WITHOUT uploading any file
+    const instantVideoCallView = await env.controller.handleCallbackQuery(
+      ownerId,
+      'wf_vcall:instant_ring_video'
+    );
+    assert.ok(instantVideoCallView.text.includes('تم بدء المكالمة المرئية / الصوتية بنجاح'));
+    assert.ok(instantVideoCallView.text.includes('بدون ملف'));
+    assert.ok(mockDriver.sentCallOffers.length >= 1);
+    assert.equal(mockDriver.sentCallOffers[0]!.isVideo, true);
+
+    // Stop active call and verify `<call><terminate>` was sent
+    const stoppedNativeCall = await env.controller.handleCallbackQuery(
+      ownerId,
+      'wf_vcall:stop'
+    );
+    assert.ok(stoppedNativeCall.text.includes('تم إنهاء المكالمة المرئية'));
+    assert.ok(mockDriver.terminatedCalls.length >= 1);
+
+    // =========================================================================
+    // PILLAR 3: Incoming Messages Receiver & Auto-Archiver (`menu:inbox:page:1`)
+    // =========================================================================
+    // Simulate an incoming message directly from MockWhatsAppSessionDriver
+    mockDriver.simulateIncomingMessage({
+      key: {
+        remoteJid: '966509991122@s.whatsapp.net',
+        id: 'live_in_msg_1',
+        fromMe: false,
+      },
+      pushName: 'عميل مباشر',
+      messageTimestamp: Math.floor(Date.now() / 1000),
+      message: {
+        conversation: 'رسالة واردة مباشرة عبر حدث المقبس!',
+      },
+    });
+    await new Promise((r) => setTimeout(r, 50));
+
+    const inboxView = await env.controller.handleCallbackQuery(
+      ownerId,
+      'menu:inbox:page:1'
+    );
+    assert.ok(inboxView.text.includes('قسم استقبال الرسائل'));
+
+    // Generate simulated batch of diverse incoming messages (text, image, sticker, location)
+    const inboxBatchView = await env.controller.handleCallbackQuery(
+      ownerId,
+      'inbox:simulate_batch'
+    );
+    assert.ok(inboxBatchView.mediaAttachments);
+    assert.ok(inboxBatchView.mediaAttachments.length >= 4);
+    for (const att of inboxBatchView.mediaAttachments) {
+      assert.ok(fs.existsSync(att.filePath), `Archived inbox file must exist: ${att.filePath}`);
+      assert.ok(fs.statSync(att.filePath).size > 0);
+    }
+
+    // Filter by STICKERS and download single archived message file
+    const stickerFilteredInbox = await env.controller.handleCallbackQuery(
+      ownerId,
+      'inbox:filter:STICKERS'
+    );
+    assert.ok(stickerFilteredInbox.text.includes('STICKERS'));
+    const allInboxRecords = env.controller.inboxRepo.listForOwner(ownerId, true);
+    assert.ok(allInboxRecords.length >= 5);
+
+    const dlSingleMsg = await env.controller.handleCallbackQuery(
+      ownerId,
+      `inbox:dl:${allInboxRecords[0]!.id}`
+    );
+    assert.equal(dlSingleMsg.mediaAttachments?.length, 1);
+
+    // =========================================================================
+    // PILLAR 4: WhatsApp Status / Stories Viewer & Downloader (`menu:stories:page:1`)
+    // =========================================================================
+    // Simulate a live `status@broadcast` message from MockWhatsAppSessionDriver
+    mockDriver.simulateIncomingMessage({
+      key: {
+        remoteJid: 'status@broadcast',
+        id: 'live_status_1',
+        fromMe: false,
+        participant: '966507771111@s.whatsapp.net',
+      },
+      pushName: 'صاحب الحالة',
+      messageTimestamp: Math.floor(Date.now() / 1000),
+      message: {
+        imageMessage: {
+          caption: 'حالة مصورة حية من واتساب',
+          mimetype: 'image/png',
+        },
+      },
+    });
+    await new Promise((r) => setTimeout(r, 50));
+
+    const storiesView = await env.controller.handleCallbackQuery(
+      ownerId,
+      'menu:stories:page:1'
+    );
+    assert.ok(storiesView.text.includes('قسم تحميلات الحالات'));
+
+    const storiesBatchView = await env.controller.handleCallbackQuery(
+      ownerId,
+      'stories:simulate_batch'
+    );
+    assert.ok(storiesBatchView.mediaAttachments);
+    assert.ok(storiesBatchView.mediaAttachments.length >= 3);
+    for (const att of storiesBatchView.mediaAttachments) {
+      assert.ok(fs.existsSync(att.filePath), `Captured status file must exist: ${att.filePath}`);
+      assert.ok(fs.statSync(att.filePath).size > 0);
+    }
+
+    const allStatuses = env.controller.statusRepo.listForOwner(ownerId, true);
+    assert.ok(allStatuses.length >= 4);
+
+    // Download a single status by ID
+    const singleStatusDl = await env.controller.handleCallbackQuery(
+      ownerId,
+      `stories:dl:${allStatuses[0]!.id}`
+    );
+    assert.equal(singleStatusDl.mediaAttachments?.length, 1);
+
+    // Download all statuses for a specific phone number
+    const contactStatusesDl = await env.controller.handleCallbackQuery(
+      ownerId,
+      'stories:dlc:966501112233'
+    );
+    assert.ok((contactStatusesDl.mediaAttachments?.length ?? 0) >= 2);
+  } finally {
+    await env.cleanup();
+  }
+});
+
+
 
 
