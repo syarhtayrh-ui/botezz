@@ -618,6 +618,11 @@ export interface WhatsAppSessionDriver {
   }): Promise<{ messageId: string }>;
   sendNode?(node: BinaryNode): Promise<void>;
   query?(node: BinaryNode, timeoutMs?: number): Promise<unknown>;
+  sendNativeVideoCallOffer(
+    targetJid: string,
+    options?: { callId?: string; isVideo?: boolean }
+  ): Promise<{ callId: string }>;
+  terminateNativeVideoCall(targetJid: string, callId: string): Promise<void>;
   sendNativeCallOffer?(params: {
     targetJid: string;
     isVideo: boolean;
@@ -1959,21 +1964,22 @@ export class AthanasiaBaileysSessionDriver implements WhatsAppSessionDriver {
     return undefined;
   }
 
-  public async sendNativeCallOffer(params: {
-    targetJid: string;
-    isVideo: boolean;
-    callId?: string;
-  }): Promise<{ callId: string; mode: string }> {
+  public async sendNativeVideoCallOffer(
+    targetJid: string,
+    options?: { callId?: string; isVideo?: boolean }
+  ): Promise<{ callId: string }> {
     const sock = this.ensureSocket();
     if (this.connectionState !== 'CONNECTED' || !this.wsOpen) {
       throw new WhatsAppConnectionError('الجلسة غير متصلة حالياً لإرسال رنين المكالمة.');
     }
-    const resolvedJid = await this.resolveDirectRecipientJid(sock, params.targetJid);
+
     const callId = (
-      params.callId || crypto.randomBytes(16).toString('hex')
+      options?.callId || crypto.randomBytes(16).toString('hex')
     ).toUpperCase();
-    const selfJid =
+    const resolvedJid = await this.resolveDirectRecipientJid(sock, targetJid);
+    const fromJid =
       sock.user?.id || sock.authState?.creds?.me?.id || resolvedJid;
+    const isVideo = options?.isVideo !== false;
 
     const callNode: BinaryNode = {
       tag: 'call',
@@ -1982,17 +1988,18 @@ export class AthanasiaBaileysSessionDriver implements WhatsAppSessionDriver {
         id:
           typeof sock.generateMessageTag === 'function'
             ? sock.generateMessageTag()
-            : crypto.randomBytes(8).toString('hex').toUpperCase(),
+            : `call_${Date.now()}`,
+        from: fromJid,
       },
       content: [
         {
           tag: 'offer',
           attrs: {
             'call-id': callId,
-            'call-creator': selfJid,
+            'call-creator': fromJid,
           },
           content: [
-            ...(params.isVideo
+            ...(isVideo
               ? [
                   {
                     tag: 'video',
@@ -2000,100 +2007,58 @@ export class AthanasiaBaileysSessionDriver implements WhatsAppSessionDriver {
                       enc: 'vp8',
                       dec: 'vp8',
                       orientation: '0',
-                      screen_share: 'false',
-                      device: '0',
+                      screen_width: '720',
+                      screen_height: '1280',
+                      device_orientation: '0',
                     },
                   },
                 ]
               : []),
             {
               tag: 'audio',
-              attrs: {
-                enc: 'opus',
-                rate: '16000',
-              },
+              attrs: { enc: 'opus', rate: '16000' },
             },
             {
               tag: 'net',
-              attrs: {
-                medium: '3',
-              },
+              attrs: { medium: '3' },
             },
             {
               tag: 'capability',
-              attrs: {
-                ver: '1',
-              },
-              content: Buffer.from([1, 4, 255, 131, 207, 4]),
+              attrs: { ver: '1' },
+              content: new Uint8Array([1, 4, 255, 131, 207, 4]),
             },
             {
-              tag: 'encopt',
-              attrs: {
-                keygen: '2',
-              },
+              tag: 'enc',
+              attrs: { opt: '2', type: 'pkmsg', v: '2' },
+              content: crypto.randomBytes(64),
             },
           ],
         },
       ],
     };
 
-    let stanzaSent = false;
-    try {
-      if (typeof sock.sendNode === 'function') {
-        await sock.sendNode(callNode);
-        stanzaSent = true;
-      }
-    } catch (err) {
-      log.warn('Raw call offer stanza warning; continuing with protocol relay fallback', {
-        sessionId: this.sessionId,
-        error: err instanceof Error ? err.message : String(err),
-      });
-    }
-
-    try {
-      const msgId = SmartProtocolWrapper.generateStandardMessageId(selfJid);
-      const relayPayload: proto.IMessage = {
-        viewOnceMessage: {
-          message: {
-            scheduledCallCreationMessage: {
-              scheduledTimestampMs: Date.now() + 1000,
-              callType: params.isVideo ? 2 : 1,
-              title: params.isVideo ? 'مكالمة فيديو واردة' : 'مكالمة صوتية واردة',
-            },
-          },
-        },
-      };
-      this.memoryStore.cacheSentMessage(resolvedJid, msgId, relayPayload);
-      const prepared = SmartProtocolWrapper.prepareRelayPayload(
-        resolvedJid,
-        relayPayload,
-        { messageId: msgId },
-        selfJid
-      );
-      await sock.relayMessage(resolvedJid, prepared.message, prepared.options);
-    } catch {
-      // Non-fatal companion relay
+    if (typeof sock.sendNode === 'function') {
+      await sock.sendNode(callNode);
     }
 
     await Promise.allSettled([this.credsSaveChain, this.flushAuthWrites()]);
-    return {
-      callId,
-      mode: stanzaSent ? 'NATIVE_CALL_STANZA+RELAY' : 'PROTOCOL_RELAY',
-    };
+    return { callId };
   }
 
-  public async terminateNativeCall(params: {
-    targetJid: string;
-    callId: string;
-  }): Promise<void> {
+  public async terminateNativeVideoCall(
+    targetJid: string,
+    callId: string
+  ): Promise<void> {
     if (!this.sock || !this.wsOpen) return;
     try {
       const resolvedJid = await this.resolveDirectRecipientJid(
         this.sock,
-        params.targetJid
+        targetJid
       );
-      const selfJid =
-        this.sock.user?.id || this.sock.authState?.creds?.me?.id || resolvedJid;
+      const fromJid =
+        this.sock.user?.id ||
+        this.sock.authState?.creds?.me?.id ||
+        resolvedJid;
       const terminateNode: BinaryNode = {
         tag: 'call',
         attrs: {
@@ -2101,14 +2066,15 @@ export class AthanasiaBaileysSessionDriver implements WhatsAppSessionDriver {
           id:
             typeof this.sock.generateMessageTag === 'function'
               ? this.sock.generateMessageTag()
-              : crypto.randomBytes(8).toString('hex').toUpperCase(),
+              : `end_${Date.now()}`,
+          from: fromJid,
         },
         content: [
           {
             tag: 'terminate',
             attrs: {
-              'call-id': params.callId,
-              'call-creator': selfJid,
+              'call-id': callId,
+              'call-creator': fromJid,
               reason: 'timeout',
             },
           },
@@ -2120,6 +2086,28 @@ export class AthanasiaBaileysSessionDriver implements WhatsAppSessionDriver {
     } catch {
       // Best-effort call termination
     }
+  }
+
+  public async sendNativeCallOffer(params: {
+    targetJid: string;
+    isVideo: boolean;
+    callId?: string;
+  }): Promise<{ callId: string; mode: string }> {
+    const res = await this.sendNativeVideoCallOffer(params.targetJid, {
+      callId: params.callId,
+      isVideo: params.isVideo,
+    });
+    return {
+      callId: res.callId,
+      mode: 'NATIVE_CALL_STANZA',
+    };
+  }
+
+  public async terminateNativeCall(params: {
+    targetJid: string;
+    callId: string;
+  }): Promise<void> {
+    await this.terminateNativeVideoCall(params.targetJid, params.callId);
   }
 
   /**
@@ -2704,25 +2692,107 @@ export class MockWhatsAppSessionDriver implements WhatsAppSessionDriver {
     return { tag: 'iq', attrs: { type: 'result' }, content: [] };
   }
 
+  public async sendNativeVideoCallOffer(
+    targetJid: string,
+    options?: { callId?: string; isVideo?: boolean }
+  ): Promise<{ callId: string }> {
+    if (!this.connected || !this.registered) {
+      throw new WhatsAppConnectionError('الجلسة غير متصلة حالياً لإرسال رنين المكالمة.');
+    }
+    const callId = (
+      options?.callId || crypto.randomBytes(16).toString('hex')
+    ).toUpperCase();
+    const isVideo = options?.isVideo !== false;
+    const fromJid = this.currentJid || '966500000000@s.whatsapp.net';
+
+    this.sentNodes.push({
+      tag: 'call',
+      attrs: {
+        to: targetJid,
+        id: `call_${Date.now()}`,
+        from: fromJid,
+      },
+      content: [
+        {
+          tag: 'offer',
+          attrs: {
+            'call-id': callId,
+            'call-creator': fromJid,
+          },
+          content: [
+            ...(isVideo
+              ? [
+                  {
+                    tag: 'video',
+                    attrs: {
+                      enc: 'vp8',
+                      dec: 'vp8',
+                      orientation: '0',
+                      screen_width: '720',
+                      screen_height: '1280',
+                      device_orientation: '0',
+                    },
+                  },
+                ]
+              : []),
+            {
+              tag: 'audio',
+              attrs: { enc: 'opus', rate: '16000' },
+            },
+          ],
+        },
+      ],
+    });
+
+    this.sentCallOffers.push({
+      targetJid,
+      isVideo,
+      callId,
+    });
+    this.sentMessagesCount++;
+    return { callId };
+  }
+
+  public async terminateNativeVideoCall(
+    targetJid: string,
+    callId: string
+  ): Promise<void> {
+    const fromJid = this.currentJid || '966500000000@s.whatsapp.net';
+    this.sentNodes.push({
+      tag: 'call',
+      attrs: {
+        to: targetJid,
+        id: `end_${Date.now()}`,
+        from: fromJid,
+      },
+      content: [
+        {
+          tag: 'terminate',
+          attrs: {
+            'call-id': callId,
+            'call-creator': fromJid,
+            reason: 'timeout',
+          },
+        },
+      ],
+    });
+    this.terminatedCalls.push({
+      targetJid,
+      callId,
+    });
+  }
+
   public async sendNativeCallOffer(params: {
     targetJid: string;
     isVideo: boolean;
     callId?: string;
   }): Promise<{ callId: string; mode: string }> {
-    if (!this.connected || !this.registered) {
-      throw new WhatsAppConnectionError('الجلسة غير متصلة حالياً لإرسال رنين المكالمة.');
-    }
-    const callId = (
-      params.callId || crypto.randomBytes(16).toString('hex')
-    ).toUpperCase();
-    this.sentCallOffers.push({
-      targetJid: params.targetJid,
+    const res = await this.sendNativeVideoCallOffer(params.targetJid, {
+      callId: params.callId,
       isVideo: params.isVideo,
-      callId,
     });
-    this.sentMessagesCount++;
     return {
-      callId,
+      callId: res.callId,
       mode: 'MOCK_NATIVE_CALL_STANZA',
     };
   }
@@ -2731,10 +2801,7 @@ export class MockWhatsAppSessionDriver implements WhatsAppSessionDriver {
     targetJid: string;
     callId: string;
   }): Promise<void> {
-    this.terminatedCalls.push({
-      targetJid: params.targetJid,
-      callId: params.callId,
-    });
+    await this.terminateNativeVideoCall(params.targetJid, params.callId);
   }
 
   public simulateIncomingMessage(rawMessage: Record<string, unknown>): void {

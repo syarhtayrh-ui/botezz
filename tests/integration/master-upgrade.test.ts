@@ -672,60 +672,71 @@ test('Botezz V5 Upgrade: Multi-Tenant Subscriber Isolation, Strict Owner/Subscri
     assert.deepEqual(profileA, profileA2);
     assert.equal(profileA.length, 3);
 
-    // 6. Pillar 4: 4-Step Interactive Video Call Streaming Workflow (menu:video_call -> recipient -> upload .mp4 -> preview/toggle loop/duration -> confirm_execute -> stop)
+    // 6. Pillar 4: Mandatory 3-Step Interactive Video Call Streaming Workflow
+    // (menu:video_call -> Step 1: upload .mp4 -> Step 2: enter phone number -> Step 3: immediate call & camera stream -> repeat/change recipient/stop)
     assert.ok(subAButtonCallbacks.includes('menu:video_call'));
 
-    // Step 1: Start workflow and enter target WhatsApp phone number
+    // Step 1: Start workflow -> immediately prompts for video file upload (`AWAITING_VIDEO`)
     const vcallStep1 = await env.controller.handleCallbackQuery(
       subA,
       'menu:video_call'
     );
-    assert.ok(vcallStep1.text.includes('الخطوة 1 من 4'));
+    assert.ok(vcallStep1.text.includes('الخطوة 1 من 2'));
+    assert.ok(vcallStep1.text.includes('الرجاء إرسال أو رفع ملف الفيديو'));
 
-    const vcallStep2 = await env.controller.handleTextMessage(
-      subA,
-      '+966501234567'
-    );
-    assert.ok(vcallStep2.text.includes('الخطوة 2 من 4'));
-    assert.ok(vcallStep2.text.includes('+966501234567'));
-
-    // Step 2: Upload recorded .mp4 video file to Telegram
+    // Step 2: Upload recorded .mp4 video file to Telegram -> transitions to `AWAITING_RECIPIENT`
     const fakeMp4Buffer = Buffer.from(
       '00000018667479706d703432000000006d70343269736f6d000000086d64617401020304',
       'hex'
     );
-    const vcallStep3 = await env.controller.handleMediaUpload(subA, {
+    const vcallStep2 = await env.controller.handleMediaUpload(subA, {
       originalFilename: 'promo_interview.mp4',
       mimeType: 'video/mp4',
       sizeBytes: fakeMp4Buffer.length,
       contentBuffer: fakeMp4Buffer,
     });
-    assert.ok(vcallStep3.text.includes('الخطوة 3 من 4'));
+    assert.ok(
+      vcallStep2.text.includes('تم استلام وتجهيز ملف الفيديو للبث بنجاح')
+    );
+    assert.ok(vcallStep2.text.includes('promo_interview.mp4'));
+    assert.ok(vcallStep2.text.includes('الخطوة 2 من 2'));
+
+    // Step 3: Enter target WhatsApp phone number -> immediately starts call ring & video stream (`STREAMING_ACTIVE`)
+    const vcallStep3 = await env.controller.handleTextMessage(
+      subA,
+      '+966501234567'
+    );
+    assert.ok(
+      vcallStep3.text.includes('تم بدء المكالمة المرئية وبث الفيديو بنجاح')
+    );
+    assert.ok(vcallStep3.text.includes('+966501234567'));
     assert.ok(vcallStep3.text.includes('promo_interview.mp4'));
-    assert.ok(vcallStep3.text.includes('مفعل ✅'));
-    assert.ok(vcallStep3.text.includes('60 ثانية'));
 
-    // Step 3b: Toggle loop and cycle duration on the preview screen
-    const toggledLoopView = await env.controller.handleCallbackQuery(
+    // Active Call Controls: Repeat call to same recipient (`wf_vcall:repeat_call`)
+    const repeatedCallView = await env.controller.handleCallbackQuery(
       subA,
-      'wf_vcall:toggle_loop'
+      'wf_vcall:repeat_call'
     );
-    assert.ok(toggledLoopView.text.includes('معطل ❌'));
+    assert.ok(
+      repeatedCallView.text.includes('تم بدء المكالمة المرئية وبث الفيديو بنجاح')
+    );
 
-    const cycledDurationView = await env.controller.handleCallbackQuery(
+    // Active Call Controls: Change recipient keeping the same video (`wf_vcall:change_recipient`)
+    const changeRecPrompt = await env.controller.handleCallbackQuery(
       subA,
-      'wf_vcall:cycle_duration'
+      'wf_vcall:change_recipient'
     );
-    assert.ok(cycledDurationView.text.includes('180 ثانية'));
+    assert.ok(changeRecPrompt.text.includes('الرجاء إرسال الرقم المستهدف الآن'));
+    assert.ok(changeRecPrompt.text.includes('promo_interview.mp4'));
 
-    // Step 4: Confirm and start live video call stream (uses PTV fallback in container environment)
-    const vcallStep4 = await env.controller.handleCallbackQuery(
+    const secondRecipientCall = await env.controller.handleTextMessage(
       subA,
-      'wf_vcall:confirm_execute'
+      '+966509998877'
     );
-    assert.ok(vcallStep4.text.includes('الخطوة 4 من 4'));
-    assert.ok(vcallStep4.text.includes('sim_ptv_'));
-    assert.ok(vcallStep4.text.includes('promo_interview.mp4'));
+    assert.ok(
+      secondRecipientCall.text.includes('تم بدء المكالمة المرئية وبث الفيديو بنجاح')
+    );
+    assert.ok(secondRecipientCall.text.includes('+966509998877'));
 
     // Stop active call and verify cleanup
     const stoppedView = await env.controller.handleCallbackQuery(
@@ -896,32 +907,35 @@ test('Master Prompt Google Studio (Pillars 1-5): Media/Sticker Toolkit, Sandbox 
     assert.ok(runSavedResult.text.includes('2/2'));
 
     // =========================================================================
-    // PILLAR 2: Pure WhatsApp Protocol Native Video & Voice Call Engine
-    // (Instant Call Ringing without uploading a video file + Multi-Wave + Terminate)
+    // PILLAR 2: Pure WhatsApp Protocol Fake Video Call Engine (3-Step Flow:
+    // Step 1: menu:video_call -> Step 2: attach sample_call.mp4 -> Step 3: send phone -> Immediate Native Call Offer + PTV Stream)
     // =========================================================================
-    await env.controller.handleCallbackQuery(ownerId, 'menu:video_call');
-    const step2Call = await env.controller.handleTextMessage(
+    const step1Prompt = await env.controller.handleCallbackQuery(
+      ownerId,
+      'menu:video_call'
+    );
+    assert.ok(step1Prompt.text.includes('الخطوة 1 من 2'));
+
+    // Step 2: Attach sample video (`wf_vcall:sample_video`) -> transitions to `AWAITING_RECIPIENT`
+    const step2Attached = await env.controller.handleCallbackQuery(
+      ownerId,
+      'wf_vcall:sample_video'
+    );
+    assert.ok(
+      step2Attached.text.includes('تم استلام وتجهيز ملف الفيديو للبث بنجاح')
+    );
+    assert.ok(step2Attached.text.includes('sample_call.mp4'));
+    assert.ok(step2Attached.text.includes('الخطوة 2 من 2'));
+
+    // Step 3: Send target phone number -> immediately triggers `<call><offer><video/></offer></call>` + `ptvMessage` camera stream
+    const activeCallView = await env.controller.handleTextMessage(
       ownerId,
       '+966504443322'
     );
     assert.ok(
-      step2Call.text.includes('بدء رنين مكالمة فيديو أو صوتية فوري عبر البروتوكول')
+      activeCallView.text.includes('تم بدء المكالمة المرئية وبث الفيديو بنجاح')
     );
-
-    // Cycle ringing waves count (1 -> 3)
-    const cycledWaves = await env.controller.handleCallbackQuery(
-      ownerId,
-      'wf_vcall:cycle_waves'
-    );
-    assert.ok(cycledWaves.text.includes('3'));
-
-    // Trigger instant video call ring WITHOUT uploading any file
-    const instantVideoCallView = await env.controller.handleCallbackQuery(
-      ownerId,
-      'wf_vcall:instant_ring_video'
-    );
-    assert.ok(instantVideoCallView.text.includes('تم بدء المكالمة المرئية / الصوتية بنجاح'));
-    assert.ok(instantVideoCallView.text.includes('بدون ملف'));
+    assert.ok(activeCallView.text.includes('sample_call.mp4'));
     assert.ok(mockDriver.sentCallOffers.length >= 1);
     assert.equal(mockDriver.sentCallOffers[0]!.isVideo, true);
 

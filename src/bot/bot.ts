@@ -569,7 +569,7 @@ export class TelegramBotController {
       return this.mediaWorkflow.confirmAndExecute(actorUserId);
     }
 
-    // 5b: Live Video Call Streaming Workflow (Native Protocol Call Engine + PTV)
+    // 5b: Live Video Call Streaming Workflow (3-Step Flow: Upload Video -> Send Phone -> Immediate Stream)
     if (callbackData === 'menu:video_call' || callbackData === 'wf_vcall:start') {
       this.cancelAllWorkflowsForAdmin(actorUserId);
       this.activeConversationMode.set(actorUserId, 'VIDEO_CALL');
@@ -584,8 +584,21 @@ export class TelegramBotController {
       return this.videoCallWorkflow.startInstantCallRing(actorUserId, 'voice');
     }
     if (callbackData === 'wf_vcall:sample_video') {
+      const res = await this.videoCallWorkflow.attachSampleVideo(actorUserId);
+      const nextStep = this.videoCallWorkflow.getState(actorUserId)?.step;
+      this.activeConversationMode.set(
+        actorUserId,
+        nextStep === 'STREAMING_ACTIVE' ? 'NONE' : 'VIDEO_CALL'
+      );
+      return res;
+    }
+    if (callbackData === 'wf_vcall:repeat_call') {
+      this.activeConversationMode.set(actorUserId, 'NONE');
+      return this.videoCallWorkflow.repeatCall(actorUserId);
+    }
+    if (callbackData === 'wf_vcall:change_recipient') {
       this.activeConversationMode.set(actorUserId, 'VIDEO_CALL');
-      return this.videoCallWorkflow.attachSampleVideo(actorUserId);
+      return this.videoCallWorkflow.promptChangeRecipient(actorUserId);
     }
     if (callbackData === 'wf_vcall:toggle_loop') {
       this.activeConversationMode.set(actorUserId, 'VIDEO_CALL');
@@ -1105,7 +1118,11 @@ export class TelegramBotController {
       this.activeConversationMode.set(actorUserId, 'TOOLS');
     } else if (mode === 'VIDEO_CALL') {
       view = await this.videoCallWorkflow.handleVideoUpload(actorUserId, upload);
-      this.activeConversationMode.set(actorUserId, 'VIDEO_CALL');
+      const nextStep = this.videoCallWorkflow.getState(actorUserId)?.step;
+      this.activeConversationMode.set(
+        actorUserId,
+        nextStep === 'STREAMING_ACTIVE' ? 'NONE' : 'VIDEO_CALL'
+      );
     } else {
       const mediaState = this.mediaWorkflow.getState(actorUserId);
       if (mode === 'MEDIA' && mediaState?.step === 'AWAITING_FILE') {
@@ -1650,9 +1667,9 @@ export class TelegramBotController {
         this.cancelAllWorkflowsForAdmin(actorUserId);
         this.activeConversationMode.set(actorUserId, 'VIDEO_CALL');
         if (args.length > 0) {
-          this.videoCallWorkflow.start(actorUserId);
-          return this.videoCallWorkflow.handleRecipientInput(
+          return this.videoCallWorkflow.start(
             actorUserId,
+            undefined,
             args.join(' ')
           );
         }
@@ -1705,15 +1722,27 @@ export class TelegramBotController {
     if (mode === 'VIDEO_CALL') {
       const state = this.videoCallWorkflow.getState(actorUserId);
       if (state?.step === 'AWAITING_RECIPIENT') {
-        return this.videoCallWorkflow.handleRecipientInput(actorUserId, trimmed);
+        const res = await this.videoCallWorkflow.handleRecipientInput(
+          actorUserId,
+          trimmed
+        );
+        const nextStep = this.videoCallWorkflow.getState(actorUserId)?.step;
+        this.activeConversationMode.set(
+          actorUserId,
+          nextStep === 'STREAMING_ACTIVE' ? 'NONE' : 'VIDEO_CALL'
+        );
+        return res;
       }
       if (state?.step === 'AWAITING_VIDEO') {
+        if (/^[\d+\s()-]{7,20}$/.test(trimmed)) {
+          return this.videoCallWorkflow.handleRecipientInput(actorUserId, trimmed);
+        }
         return {
-          text: `🎬 الرجاء رفع ملف الفيديو المسجل (\`.mp4\`, \`.mov\`, \`.webm\`, \`.mkv\`) أو الضغط على زر الفيديو التجريبي أدناه للمعاينة:`,
+          text: `🎬 *الخطوة 1 من 2:* الرجاء رفع ملف الفيديو المسجل (\`.mp4\`, \`.mov\`, \`.webm\`, \`.mkv\`) أولاً أو الضغط على زر الفيديو التجريبي أدناه:`,
           keyboard: [
             [
               {
-                text: '🎬 إرفاق فيديو تجريبي للمعاينة (sample_call.mp4)',
+                text: '🎬 استخدام فيديو تجريبي جاهز (sample_call.mp4)',
                 callbackData: 'wf_vcall:sample_video',
               },
             ],

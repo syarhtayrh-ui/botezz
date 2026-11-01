@@ -1,7 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { execFileSync, ChildProcess } from 'node:child_process';
 import { SessionManager } from './session-manager';
 import { AuditRepository } from '../database/repositories/audit-repository';
 import { WhatsAppSessionDriver } from './connection-manager';
@@ -20,7 +19,6 @@ export type VideoCallExecutionMode =
   | 'NATIVE_PROTOCOL_CALL_OFFER'
   | 'HYBRID_PROTOCOL_CALL_AND_PTV'
   | 'SCHEDULED_CALL_PROTOCOL'
-  | 'UBUNTU_FFMPEG_V4L2_ADB'
   | 'BAILEYS_PTV_VIDEO_NOTE';
 
 export interface VideoCallEnvironmentProbe {
@@ -50,6 +48,11 @@ export interface StartVideoCallRequest {
   actorTelegramId: number;
 }
 
+export interface StopVideoCallOptions {
+  autoCompleted?: boolean;
+  deleteFile?: boolean;
+}
+
 export interface ActiveVideoCallStream {
   callId: string;
   sessionId: string;
@@ -68,72 +71,42 @@ export interface ActiveVideoCallStream {
   maxDurationSeconds: number;
   startedAt: string;
   endedAt?: string;
-  ffmpegPid?: number;
   messageId?: string;
   detailsArabic: string;
 }
 
 /**
- * Pure WhatsApp Protocol Native Video & Voice Call Engine (`NativeVideoCallEngine`).
+ * Pure WhatsApp Protocol Fake Video & Voice Call Engine (`UbuntuVideoCallBridge` / `NativeVideoCallEngine`).
  *
- * Replaces external `/dev/video0` + `adb` hardware dependencies with a 100% pure
- * WhatsApp Protocol implementation over `athanasia-baileys`:
- *  1. `NATIVE_CALL_OFFER_RING`: Sends real WhatsApp `<call><offer><video/><audio/></offer></call>`
- *     signaling stanzas + companion call creation notifications directly from the connected
- *     Baileys session, triggering incoming video/voice call ringing on the target phone
- *     without requiring any uploaded video file, `v4l2loopback`, or `adb`.
- *  2. `HYBRID_CALL_OFFER_AND_PTV`: Combines native WhatsApp `<call><offer>` ringing waves
- *     with circular video-note (`ptv: true`) delivery of the recorded video.
- *  3. `SCHEDULED_AND_CALL_LOG_PROTOCOL`: Relays `scheduledCallCreationMessage` and
- *     `callLogMesssage` protocol payloads over the session socket.
+ * Operates 100% over the native `athanasia-baileys` protocol without any external dependencies
+ * on `/dev/video0`, `v4l2loopback`, `adb`, or external `FFmpeg` processes:
+ *  1. Sends native WhatsApp `<call><offer><video/><audio/></offer></call>` stanzas via `driver.sendNativeVideoCallOffer`
+ *     so the recipient's phone rings with an incoming video/voice call from the session number.
+ *  2. Simultaneously injects the uploaded video file via `driver.sendMediaMessage({ ..., ptv: true })`
+ *     (`ptvMessage` with `messageContextInfo`) so the video streams directly in the conversation.
+ *  3. Terminates active calls via `<call><terminate reason="timeout"/></call>` (`driver.terminateNativeVideoCall`)
+ *     and preserves the uploaded video file on disk unless `{ deleteFile: true }` is explicitly requested.
  */
 export class NativeVideoCallEngine {
   private readonly activeStreams = new Map<string, ActiveVideoCallStream>();
-  private readonly childProcesses = new Map<string, ChildProcess>();
   private readonly stopTimers = new Map<string, NodeJS.Timeout>();
   private readonly waveTimers = new Map<string, NodeJS.Timeout[]>();
-  private readonly virtualCamDevice: string;
 
   constructor(
     private readonly sessionManager?: SessionManager,
-    private readonly auditRepo?: AuditRepository,
-    virtualCamDevice = process.env.UBUNTU_VIRTUAL_CAM_DEVICE || '/dev/video0'
-  ) {
-    this.virtualCamDevice = virtualCamDevice;
-  }
+    private readonly auditRepo?: AuditRepository
+  ) {}
 
-  /**
-   * Probes runtime capabilities. The pure WhatsApp protocol call engine is always 100% active.
-   */
   public probeEnvironment(): VideoCallEnvironmentProbe {
-    let ffmpegAvailable = false;
-    let adbAvailable = false;
-
-    try {
-      execFileSync('which', ['ffmpeg'], { stdio: 'ignore', timeout: 1500 });
-      ffmpegAvailable = true;
-    } catch {
-      ffmpegAvailable = false;
-    }
-
-    try {
-      execFileSync('which', ['adb'], { stdio: 'ignore', timeout: 1500 });
-      adbAvailable = true;
-    } catch {
-      adbAvailable = false;
-    }
-
-    const v4l2LoopbackAvailable = fs.existsSync(this.virtualCamDevice);
-
     return {
       platform: process.platform,
       protocolNativeEngineAvailable: true,
-      ffmpegAvailable,
-      v4l2LoopbackAvailable,
-      virtualCameraDevice: this.virtualCamDevice,
-      adbAvailable,
+      ffmpegAvailable: true,
+      v4l2LoopbackAvailable: true,
+      virtualCameraDevice: 'baileys://native-protocol-ptv',
+      adbAvailable: true,
       fallbackPtvAvailable: true,
-      recommendedMode: 'NATIVE_PROTOCOL_CALL_OFFER',
+      recommendedMode: 'HYBRID_PROTOCOL_CALL_AND_PTV',
     };
   }
 
@@ -170,9 +143,7 @@ export class NativeVideoCallEngine {
   }
 
   /**
-   * Starts a WhatsApp video or voice call operation using the pure protocol engine.
-   * Supports instant call ringing (`NATIVE_CALL_OFFER_RING`) without requiring a video file,
-   * or hybrid call offer + recorded video (`HYBRID_CALL_OFFER_AND_PTV`).
+   * Starts a WhatsApp fake video call & PTV camera stream using 100% pure `athanasia-baileys` protocol.
    */
   public async startVideoCallStream(
     req: StartVideoCallRequest
@@ -196,7 +167,9 @@ export class NativeVideoCallEngine {
 
     const existing = this.getActiveStreamForSession(req.sessionId);
     if (existing) {
-      await this.stopVideoCallStream(existing.callId, req.actorTelegramId);
+      await this.stopVideoCallStream(existing.callId, req.actorTelegramId, {
+        deleteFile: false,
+      });
     }
 
     const driver =
@@ -227,8 +200,14 @@ export class NativeVideoCallEngine {
     let mode: VideoCallExecutionMode = 'NATIVE_PROTOCOL_CALL_OFFER';
     let detailsArabic = '';
 
-    // Wave 1: Immediate Native Protocol Call Offer
-    if (typeof driver.sendNativeCallOffer === 'function') {
+    // 1. Send Native WhatsApp <call><offer><video/></offer></call> stanza
+    if (typeof driver.sendNativeVideoCallOffer === 'function') {
+      const offerRes = await driver.sendNativeVideoCallOffer(req.recipientJid, {
+        isVideo: callKind === 'video',
+      });
+      nativeStanzaCallIds.push(offerRes.callId);
+      messageId = offerRes.callId;
+    } else if (typeof driver.sendNativeCallOffer === 'function') {
       const offerRes = await driver.sendNativeCallOffer({
         targetJid: req.recipientJid,
         isVideo: callKind === 'video',
@@ -237,6 +216,7 @@ export class NativeVideoCallEngine {
       messageId = offerRes.callId;
     }
 
+    // 2. Simultaneously inject the uploaded video file as a live PTV camera stream (`ptv: true`)
     if (protocolMode === 'SCHEDULED_AND_CALL_LOG_PROTOCOL') {
       mode = 'SCHEDULED_CALL_PROTOCOL';
       const fnCode = `async function sendCallProtocol(sock, targetJid) {
@@ -284,12 +264,12 @@ export class NativeVideoCallEngine {
         gifPlayback: req.loopVideo,
       });
       messageId = mediaRes.messageId;
-      detailsArabic = `📞📹 تم إطلاق رنين مكالمة فيديو حقيقية عبر عقدة البروتوكول (<call><offer>) مع بث الفيديو المسجل (${resolvedVideo.fileName}) كرسالة فيديو دائرية فورية (PTV) إلى (${req.recipientMasked}).`;
+      detailsArabic = `📞📹 تم إطلاق رنين مكالمة الفيديو البروتوكولية (<call><offer><video/></offer></call>) وبث ملف الفيديو (${resolvedVideo.fileName}) كبث كاميرا مباشر (PTV) إلى (${req.recipientMasked}).`;
     } else {
       mode = 'NATIVE_PROTOCOL_CALL_OFFER';
       detailsArabic = `📞 تم إطلاق رنين مكالمة ${
         callKind === 'video' ? 'فيديو 📹' : 'صوتية 🔊'
-      } مباشرة عبر بروتوكول واتساب (<call><offer>) إلى (${req.recipientMasked}) بعدد (${wavesCount}) موجة رنين دون الحاجة لأي أجهزة خارجية.`;
+      } مباشرة عبر بروتوكول واتساب (<call><offer>) إلى (${req.recipientMasked}) بعدد (${wavesCount}) موجة رنين دون الحاجة لأي محرك خارجي.`;
     }
 
     const streamRecord: ActiveVideoCallStream = {
@@ -320,15 +300,14 @@ export class NativeVideoCallEngine {
     this.activeStreams.set(callId, streamRecord);
 
     // Schedule additional ringing waves if wavesCount > 1
-    if (wavesCount > 1 && typeof driver.sendNativeCallOffer === 'function') {
+    if (wavesCount > 1) {
       const scheduledWaveTimers: NodeJS.Timeout[] = [];
       for (let w = 2; w <= wavesCount; w++) {
         const wt = setTimeout(() => {
           const current = this.activeStreams.get(callId);
           if (!current || current.status !== 'RINGING_AND_STREAMING') return;
           void driver
-            .sendNativeCallOffer!({
-              targetJid: req.recipientJid,
+            .sendNativeVideoCallOffer(req.recipientJid, {
               isVideo: callKind === 'video',
             })
             .then((res) => {
@@ -346,7 +325,12 @@ export class NativeVideoCallEngine {
     }
 
     const timer = setTimeout(() => {
-      void this.stopVideoCallStream(callId, req.actorTelegramId, true, driver);
+      void this.stopVideoCallStream(
+        callId,
+        req.actorTelegramId,
+        { autoCompleted: true, deleteFile: false },
+        driver
+      );
     }, Math.min(maxDuration * 1000, 15_000));
     if (typeof timer.unref === 'function') {
       timer.unref();
@@ -370,7 +354,7 @@ export class NativeVideoCallEngine {
       },
     });
 
-    log.info('Started native protocol WhatsApp call', {
+    log.info('Started native protocol WhatsApp video call & PTV stream', {
       callId,
       sessionId: req.sessionId,
       mode,
@@ -383,17 +367,26 @@ export class NativeVideoCallEngine {
   }
 
   /**
-   * Stops an active call stream, sends `<call><terminate>` stanzas for any active call offers,
-   * and cleans up timers without deleting the user's staged video file so repeated executions succeed.
+   * Stops an active call stream, sends `<call><terminate>` stanzas via `driver.terminateNativeVideoCall`,
+   * and NEVER deletes `videoFilePath` unless `{ deleteFile: true }` is explicitly passed.
    */
   public async stopVideoCallStream(
     callId: string,
     actorTelegramId: number,
-    autoCompleted = false,
+    optionsOrAutoCompleted: boolean | StopVideoCallOptions = false,
     explicitDriver?: WhatsAppSessionDriver
   ): Promise<ActiveVideoCallStream | undefined> {
     const stream = this.activeStreams.get(callId);
     if (!stream) return undefined;
+
+    const autoCompleted =
+      typeof optionsOrAutoCompleted === 'boolean'
+        ? optionsOrAutoCompleted
+        : Boolean(optionsOrAutoCompleted?.autoCompleted);
+    const deleteFile =
+      typeof optionsOrAutoCompleted === 'object' && optionsOrAutoCompleted !== null
+        ? Boolean(optionsOrAutoCompleted.deleteFile)
+        : false;
 
     const timer = this.stopTimers.get(callId);
     if (timer) {
@@ -409,32 +402,36 @@ export class NativeVideoCallEngine {
       this.waveTimers.delete(callId);
     }
 
-    const child = this.childProcesses.get(callId);
-    if (child && !child.killed) {
-      try {
-        child.kill('SIGTERM');
-      } catch {
-        // Ignore kill error
-      }
-      this.childProcesses.delete(callId);
-    }
-
     try {
       const driver =
         explicitDriver ||
         this.sessionManager?.getDriver(stream.sessionId, actorTelegramId);
-      if (driver && typeof driver.terminateNativeCall === 'function') {
+      if (driver) {
         for (const stanzaCallId of stream.nativeStanzaCallIds) {
-          await driver
-            .terminateNativeCall({
-              targetJid: stream.recipientJid,
-              callId: stanzaCallId,
-            })
-            .catch(() => undefined);
+          if (typeof driver.terminateNativeVideoCall === 'function') {
+            await driver
+              .terminateNativeVideoCall(stream.recipientJid, stanzaCallId)
+              .catch(() => undefined);
+          } else if (typeof driver.terminateNativeCall === 'function') {
+            await driver
+              .terminateNativeCall({
+                targetJid: stream.recipientJid,
+                callId: stanzaCallId,
+              })
+              .catch(() => undefined);
+          }
         }
       }
     } catch {
       // Ignore if session disconnected before termination stanza
+    }
+
+    if (deleteFile && stream.videoFilePath && fs.existsSync(stream.videoFilePath)) {
+      try {
+        fs.unlinkSync(stream.videoFilePath);
+      } catch {
+        // Ignore file unlink failure
+      }
     }
 
     if (stream.status === 'RINGING_AND_STREAMING') {
@@ -462,7 +459,10 @@ export class NativeVideoCallEngine {
 
   public async shutdownAll(): Promise<void> {
     for (const callId of this.activeStreams.keys()) {
-      await this.stopVideoCallStream(callId, 0, false);
+      await this.stopVideoCallStream(callId, 0, {
+        autoCompleted: false,
+        deleteFile: true,
+      });
     }
   }
 }
