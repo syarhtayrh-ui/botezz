@@ -229,8 +229,9 @@ export class InboxHandler {
     };
   }
 
-  public viewMessage(_adminId: number, recordId: string): BotViewResponse {
-    const rec = this.inboxRepo.findById(recordId);
+  public viewMessage(adminId: number, recordId: string): BotViewResponse {
+    const isOwner = this.sessionManager.isOwner(adminId);
+    const rec = this.inboxRepo.findById(recordId, adminId, isOwner);
     if (!rec) {
       return {
         text: '⚠️ لم يتم العثور على الرسالة المطلوبة.',
@@ -297,7 +298,8 @@ export class InboxHandler {
   }
 
   public promptForward(adminId: number, recordId: string): BotViewResponse {
-    const rec = this.inboxRepo.findById(recordId);
+    const isOwner = this.sessionManager.isOwner(adminId);
+    const rec = this.inboxRepo.findById(recordId, adminId, isOwner);
     if (!rec) {
       return {
         text: '⚠️ لم يتم العثور على الرسالة المراد إعادة توجيهها.',
@@ -364,7 +366,8 @@ export class InboxHandler {
       };
     }
 
-    const rec = this.inboxRepo.findById(recordId);
+    const isOwner = this.sessionManager.isOwner(adminId);
+    const rec = this.inboxRepo.findById(recordId, adminId, isOwner);
     if (!rec) {
       this.forwardDrafts.delete(adminId);
       return {
@@ -556,7 +559,8 @@ export class InboxHandler {
     adminId: number,
     recordId: string
   ): BotViewResponse {
-    const rec = this.inboxRepo.findById(recordId);
+    const isOwner = this.sessionManager.isOwner(adminId);
+    const rec = this.inboxRepo.findById(recordId, adminId, isOwner);
     if (!rec || !rec.file_path || !fs.existsSync(rec.file_path)) {
       return {
         text: '⚠️ ملف هذه الرسالة غير موجود على القرص.',

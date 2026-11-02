@@ -83,6 +83,7 @@ export class StatusDownloaderService {
     directPathHint?: string
   ): Buffer | null {
     const searchDirs = [
+      path.join(this.baseDataDir, 'whatsapp-sessions', sessionId),
       path.join(this.baseDataDir, 'sessions', sessionId),
       path.join(this.baseDataDir, 'downloads'),
       path.join(this.baseDataDir, 'temp_uploads'),

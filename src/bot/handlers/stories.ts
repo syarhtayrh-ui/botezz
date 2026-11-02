@@ -197,7 +197,8 @@ export class StoriesHandler {
   }
 
   public downloadStatus(adminId: number, recordId: string): BotViewResponse {
-    const rec = this.statusRepo.findById(recordId);
+    const isOwner = this.sessionManager.isOwner(adminId);
+    const rec = this.statusRepo.findById(recordId, adminId, isOwner);
     if (!rec || !rec.file_path || !fs.existsSync(rec.file_path)) {
       return {
         text: '⚠️ ملف هذه الحالة غير موجود على القرص.',

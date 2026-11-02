@@ -80,9 +80,20 @@ async function main(): Promise<void> {
   console.log('    - Duration (sec)  :', mediaInspection.durationSeconds);
   console.log('    - VoIP Preset     :', mediaInspection.targetVoipResolution);
 
-  const sessionsRoot = path.resolve(process.cwd(), 'data', 'sessions', sessionId);
+  const candidateSessionDirs = [
+    ...(process.env.WHATSAPP_AUTH_DIR
+      ? [path.resolve(process.env.WHATSAPP_AUTH_DIR, sessionId)]
+      : []),
+    path.resolve(process.cwd(), 'data', 'whatsapp-sessions', sessionId),
+    path.resolve(process.cwd(), 'data', 'sessions', sessionId),
+  ];
+  const sessionsRoot =
+    candidateSessionDirs.find((dir) => fs.existsSync(dir)) ||
+    candidateSessionDirs[0]!;
   if (!fs.existsSync(sessionsRoot)) {
-    throw new Error(`Session auth directory not found at: ${sessionsRoot}`);
+    throw new Error(
+      `Session auth directory not found. Checked: ${candidateSessionDirs.join(', ')}`
+    );
   }
 
   console.log(`\n[3] Loading WhatsApp session "${sessionId}" from ${sessionsRoot}...`);

@@ -1,4 +1,5 @@
-import { Bot } from 'grammy';
+import fs from 'node:fs';
+import { Bot, InputFile } from 'grammy';
 import { AppConfig } from '../config/env';
 import {
   verifyTelegramAdmin,
@@ -1838,6 +1839,79 @@ export function createGrammyBot(
       controller['deps'].settingsRepo
     )
   );
+
+  const forwardCapturedAttachmentToTelegram = async (
+    ownerTelegramId: number,
+    attachment: {
+      kind: 'photo' | 'video' | 'audio' | 'document' | 'sticker';
+      filePath: string;
+      fileName: string;
+      caption?: string;
+    },
+    onForwarded: () => void
+  ): Promise<void> => {
+    const targetChatId =
+      ownerTelegramId > 0 ? ownerTelegramId : config.TELEGRAM_ADMIN_ID;
+    if (
+      !targetChatId ||
+      !attachment?.filePath ||
+      !fs.existsSync(attachment.filePath)
+    ) {
+      return;
+    }
+    const inputFile = new InputFile(attachment.filePath, attachment.fileName);
+    const captionOpts = attachment.caption ? { caption: attachment.caption } : {};
+    if (attachment.kind === 'photo') {
+      await bot.api.sendPhoto(targetChatId, inputFile, captionOpts);
+    } else if (attachment.kind === 'video') {
+      await bot.api.sendVideo(targetChatId, inputFile, captionOpts);
+    } else if (attachment.kind === 'audio') {
+      await bot.api.sendAudio(targetChatId, inputFile, captionOpts);
+    } else {
+      await bot.api.sendDocument(targetChatId, inputFile, captionOpts);
+    }
+    onForwarded();
+  };
+
+  controller.incomingMessageReceiver.onMessageArchived = (record, attachment) => {
+    const targetAdminId =
+      record.owner_telegram_id > 0
+        ? record.owner_telegram_id
+        : config.TELEGRAM_ADMIN_ID;
+    if (!controller.incomingMessageReceiver.isAutoForwardEnabled(targetAdminId)) {
+      return;
+    }
+    void forwardCapturedAttachmentToTelegram(
+      record.owner_telegram_id,
+      attachment,
+      () => controller.inboxRepo.markForwarded(record.id)
+    ).catch((err) => {
+      log.warn('Failed auto-forwarding archived inbox message to Telegram', {
+        recordId: record.id,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    });
+  };
+
+  controller.statusDownloader.onStatusCaptured = (record, attachment) => {
+    const targetAdminId =
+      record.owner_telegram_id > 0
+        ? record.owner_telegram_id
+        : config.TELEGRAM_ADMIN_ID;
+    if (!controller.statusDownloader.isAutoForwardEnabled(targetAdminId)) {
+      return;
+    }
+    void forwardCapturedAttachmentToTelegram(
+      record.owner_telegram_id,
+      attachment,
+      () => controller.statusRepo.markForwarded(record.id)
+    ).catch((err) => {
+      log.warn('Failed auto-forwarding captured status to Telegram', {
+        recordId: record.id,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    });
+  };
 
   const downloadTelegramFileBuffer = async (fileId: string): Promise<Buffer> => {
     const fileInfo = await bot.api.getFile(fileId);

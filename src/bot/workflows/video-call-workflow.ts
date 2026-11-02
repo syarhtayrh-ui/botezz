@@ -9,6 +9,7 @@ import {
 import { AuditRepository } from '../../database/repositories/audit-repository';
 import { normalizePhoneNumber } from '../../security/validation';
 import { createMinimalMp4Buffer } from '../../function-lab/media-sticker-toolkit';
+import { generatePlayableVoipMp4File } from '../../whatsapp/voip-media-pipeline';
 import {
   InlineButtonSpec,
   InlineKeyboardRows,
@@ -328,6 +329,29 @@ export class VideoCallWorkflow {
     return this.renderAwaitingRecipientStep(adminId);
   }
 
+  private async createSampleVideoFile(
+    adminId: number
+  ): Promise<{ filePath: string; sizeBytes: number }> {
+    const filePath = path.join(
+      this.tempUploadDir,
+      `sample_call_${adminId}_${Date.now()}.mp4`
+    );
+    try {
+      await generatePlayableVoipMp4File(filePath, {
+        width: 640,
+        height: 360,
+        durationSeconds: 3,
+        includeAudio: true,
+      });
+    } catch {
+      fs.writeFileSync(filePath, createMinimalMp4Buffer());
+    }
+    const sizeBytes = fs.existsSync(filePath)
+      ? fs.statSync(filePath).size
+      : 0;
+    return { filePath, sizeBytes };
+  }
+
   public async attachSampleVideo(adminId: number): Promise<BotViewResponse> {
     let state = this.states.get(adminId);
     if (!state || !state.selectedSessionId) {
@@ -338,17 +362,12 @@ export class VideoCallWorkflow {
       }
     }
 
-    const sampleBuf = createMinimalMp4Buffer();
-    const filePath = path.join(
-      this.tempUploadDir,
-      `sample_call_${adminId}_${Date.now()}.mp4`
-    );
-    fs.writeFileSync(filePath, sampleBuf);
+    const { filePath, sizeBytes } = await this.createSampleVideoFile(adminId);
 
     state.videoFilePath = filePath;
     state.videoFileName = 'sample_call.mp4';
     state.mimeType = 'video/mp4';
-    state.sizeBytes = sampleBuf.length;
+    state.sizeBytes = sizeBytes;
     state.protocolMode = 'HIROOSY_VOIP_VIDEO_CALL';
 
     if (state.recipientJid) {
@@ -389,16 +408,11 @@ export class VideoCallWorkflow {
       state.recipientDisplay = normalized.e164;
 
       if (!state.videoFilePath || !fs.existsSync(state.videoFilePath)) {
-        const sampleBuf = createMinimalMp4Buffer();
-        const filePath = path.join(
-          this.tempUploadDir,
-          `sample_call_${adminId}_${Date.now()}.mp4`
-        );
-        fs.writeFileSync(filePath, sampleBuf);
+        const { filePath, sizeBytes } = await this.createSampleVideoFile(adminId);
         state.videoFilePath = filePath;
         state.videoFileName = 'sample_call.mp4';
         state.mimeType = 'video/mp4';
-        state.sizeBytes = sampleBuf.length;
+        state.sizeBytes = sizeBytes;
         state.protocolMode = 'HIROOSY_VOIP_VIDEO_CALL';
       }
 

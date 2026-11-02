@@ -2,9 +2,34 @@ import { NextRequest, NextResponse } from 'next/server';
 import { getRuntimeHarness } from '../../../src/runtime-harness';
 import { toSafeArabicError } from '../../../src/utils/errors';
 
-export async function GET() {
+function isAuthorizedApiRequest(
+  req: NextRequest | undefined,
+  isLiveConfigured: boolean
+): boolean {
+  const configuredSecret = process.env.DASHBOARD_API_SECRET?.trim();
+  if (!isLiveConfigured || !configuredSecret) {
+    return true;
+  }
+  if (!req) {
+    return false;
+  }
+  const headerSecret = req.headers.get('x-api-secret')?.trim();
+  const bearerSecret = req.headers
+    .get('authorization')
+    ?.replace(/^Bearer\s+/i, '')
+    .trim();
+  return headerSecret === configuredSecret || bearerSecret === configuredSecret;
+}
+
+export async function GET(req: NextRequest) {
   try {
     const harness = await getRuntimeHarness();
+    if (!isAuthorizedApiRequest(req, harness.isLiveConfigured)) {
+      return NextResponse.json(
+        { ok: false, error: 'غير مصرح بالوصول إلى واجهة البرمجة (Unauthorized).' },
+        { status: 401 }
+      );
+    }
     // In live production mode, read SQLite session records directly so the web dashboard
     // never overwrites live socket statuses owned by the standalone bot process.
     const sessions = harness.isLiveConfigured
@@ -52,6 +77,12 @@ export async function GET() {
 
 export async function POST(req: NextRequest) {
   const harness = await getRuntimeHarness();
+  if (!isAuthorizedApiRequest(req, harness.isLiveConfigured)) {
+    return NextResponse.json(
+      { ok: false, error: 'غير مصرح بالوصول إلى واجهة البرمجة (Unauthorized).' },
+      { status: 401 }
+    );
+  }
   try {
     const body = (await req.json()) as {
       type: 'callback' | 'text';

@@ -51,6 +51,8 @@ next-env.d.ts
 /data/*.db
 /data/whatsapp-sessions/
 /data/tmp/
+/data/temp_uploads/
+/data/downloads/
 !/data/.gitkeep
 
 # Playwright verification artifacts
