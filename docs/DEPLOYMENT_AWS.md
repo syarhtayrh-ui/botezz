@@ -9,21 +9,21 @@
 - **AMI**: Ubuntu Server 24.04 LTS (HVM), SSD Volume Type (`t3.small` or `t3.medium` recommended).
 - **Storage**: Enable **EBS Encryption** on the root volume (minimum 16 GB gp3).
 - **Security Group**:
-  - **Inbound**: Allow SSH (`TCP 22`) strictly from your administrative IP address. **No public inbound HTTP/HTTPS ports are required** for the standalone Telegram Bot daemon because `grammY` uses outbound long-polling and `athanasia-baileys` uses outbound WebSockets.
-  - **Outbound**: Allow `TCP 443` (HTTPS/WSS to `api.telegram.org`, `web.whatsapp.com`, `github.com`, and `registry.npmjs.org`).
+  - **Inbound**: Allow SSH (`TCP 22`) strictly from your administrative IP address. **No public inbound HTTP/HTTPS ports are required** for the standalone Telegram Bot daemon because `grammY` uses outbound long-polling and `@hiroosy/baileys-lite` uses outbound WebSockets and UDP/TCP relay sockets.
+  - **Outbound**: Allow `TCP 443` and UDP relay ports (HTTPS/WSS/SRTP to `api.telegram.org`, `web.whatsapp.com`, and `registry.npmjs.org`).
 
 ---
 
 ## 2. Install Runtime & Clone Project
 
-> **Note on `athanasia-baileys`**: This project uses `athanasia-baileys` (`github:AthanasiaCMD/athanasia-baileys#2dce999d419dfc73afd86c0a478963e04aac41bc`, v1.0.0), which enforces Node.js `>=20.0.0` via its `preinstall` check and fetches `github:AthanasiaCMD/libsignal-node` via `git`. Ensure `git` is installed on the EC2 instance before running `npm install`.
+> **Note on `@hiroosy/baileys-lite`**: This project uses `@hiroosy/baileys-lite@0.3.6` and `@hiroosy/baileys-lite/voip`, which requires Node.js `>=20.0.0` and `ffmpeg` for real-time VoIP audio/video encoding.
 
 ```bash
 ssh ubuntu@<YOUR_EC2_PUBLIC_IP>
 
-# Install Node.js 22 LTS and Git (required for athanasia-baileys GitHub dependency resolution)
+# Install Node.js 22 LTS, FFmpeg, and Git
 sudo apt-get update && sudo apt-get upgrade -y
-sudo apt-get install -y curl git ca-certificates build-essential
+sudo apt-get install -y curl git ffmpeg ca-certificates build-essential
 curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
 sudo apt-get install -y nodejs
 
@@ -33,7 +33,7 @@ sudo chown ubuntu:ubuntu /opt/whatsapp-telegram-bot
 git clone <YOUR_GITHUB_REPO_URL> /opt/whatsapp-telegram-bot
 cd /opt/whatsapp-telegram-bot
 
-# Run setup (installs athanasia-baileys from GitHub, sets 0700 permissions, runs tests)
+# Run setup (installs @hiroosy/baileys-lite, sets 0700 permissions, runs tests)
 chmod +x scripts/setup.sh scripts/health-check.sh
 ./scripts/setup.sh
 ```

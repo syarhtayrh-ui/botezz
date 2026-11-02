@@ -606,28 +606,61 @@ declare module '@hiroosy/baileys-lite/voip' {
   export type VoipResolutionPreset =
     | '240p'
     | '360p'
-    | '360p_portrait'
     | '480p'
-    | '480p_portrait'
     | '720p'
-    | '720p_portrait'
     | '1080p'
     | VoipVideoConfig;
+
+  export interface WaCallMediaSessionLike {
+    callId?: string;
+    peerJid?: string;
+    isVideo?: boolean;
+    audioSendCount?: number;
+    audioOctetsSent?: number;
+    realAudioSendCount?: number;
+    videoSendCount?: number;
+    videoOctetsSent?: number;
+    videoIdrSendCount?: number;
+    firstPacketSent?: boolean;
+    mediaFlowStarted?: boolean;
+    mediaStartedAtMs?: number;
+    videoEngine?: {
+      accessUnitsSent?: number;
+      running?: boolean;
+    } | null;
+    audioEngine?: {
+      captureRunning?: boolean;
+      playbackRunning?: boolean;
+    } | null;
+    [key: string]: unknown;
+  }
 
   export interface VoipCallInstance extends EventEmitter {
     readonly callId: string | null;
     readonly target: string | null;
     readonly isVideoDowngraded: boolean;
+    mediaSession?: WaCallMediaSessionLike;
+    getMediaStats?(): {
+      audioSendCount?: number;
+      audioOctetsSent?: number;
+      videoSendCount?: number;
+      videoOctetsSent?: number;
+      videoIdrSendCount?: number;
+    };
     mute(value?: boolean): void;
     raiseHand(value?: boolean): void;
     shareScreen(value?: boolean): void;
     react(emoji: string): boolean;
     upgradeToVideo(): Promise<void>;
     hangup(): Promise<void>;
+    end?(): Promise<void>;
     silent(value?: boolean): Promise<boolean>;
   }
 
   export interface VoipCoordinatorLike {
+    manager?: {
+      calls?: Map<string, WaCallMediaSessionLike>;
+    };
     startCall(options: {
       peerJid: string;
       isVideo?: boolean;

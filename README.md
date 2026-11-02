@@ -1,13 +1,13 @@
 # WhatsApp Multi-Session Management System Controlled Through Telegram
 
-A modular, production-oriented Node.js + TypeScript system for managing multiple independent WhatsApp Web sessions (`athanasia-baileys` v1.0.0 from `github:AthanasiaCMD/athanasia-baileys`) through an authorized Arabic Telegram Bot (`grammY`), backed by SQLite persistence (`node:sqlite`), Zod startup validation, Pino redacted structured logging, and bounded concurrent multi-session task execution.
+A modular, production-oriented Node.js + TypeScript system for managing multiple independent WhatsApp Web sessions (`@hiroosy/baileys-lite@0.3.6` + `@hiroosy/baileys-lite/voip`) through an authorized Arabic Telegram Bot (`grammY`), backed by SQLite persistence (`node:sqlite`), Zod startup validation, Pino redacted structured logging, and bounded concurrent multi-session task execution.
 
 ---
 
 ## Key Capabilities
 
-1. **Multi-Account WhatsApp Session Management (`athanasia-baileys`)**:
-   - Link multiple independent WhatsApp accounts via interactive Pairing Code workflow (supports both auto-generated 8-character codes and `athanasia-baileys` custom 8-character pairing codes `sock.requestPairingCode(phoneNumber, customCode)`).
+1. **Multi-Account WhatsApp Session Management (`@hiroosy/baileys-lite`)**:
+   - Link multiple independent WhatsApp accounts via interactive Pairing Code workflow (supports both auto-generated 8-character codes and `@hiroosy/baileys-lite` custom 8-character pairing codes `sock.requestPairingCode(phoneNumber, customCode)`).
    - Strict per-session filesystem isolation (`WHATSAPP_AUTH_DIR/<sessionId>`, mode `0700`).
    - Automatic session restoration on startup, `DisconnectReason.restartRequired` (`515`) post-pairing socket recreation, and bounded exponential backoff reconnection with jitter.
    - Automatic credential invalidation and cleanup on logout (`DisconnectReason.loggedOut`).
@@ -18,7 +18,7 @@ A modular, production-oriented Node.js + TypeScript system for managing multiple
    - Select one or multiple sessions to execute text messaging, validated media/file sending, or group joining concurrently up to `MAX_CONCURRENT_TASKS`.
    - Per-session timeout protection, isolated failure handling (`COMPLETED`, `PARTIALLY_COMPLETED`, `FAILED`, `CANCELLED`), duplicate-task prevention, and cooperative cancellation.
 4. **Group Management & Permission Verification**:
-   - List participating groups (supporting both `PN` and `LID` addressing modes in `athanasia-baileys`), inspect metadata and participants, generate invite links, join groups via invite link, add/remove/promote/demote participants (verified for Group Admin permissions and per-participant status codes), and leave groups after confirmation.
+   - List participating groups (supporting both `PN` and `LID` addressing modes in `@hiroosy/baileys-lite`), inspect metadata and participants, generate invite links, join groups via invite link, add/remove/promote/demote participants (verified for Group Admin permissions and per-participant status codes), and leave groups after confirmation.
 5. **Interactive Local Web Control Center & Telegram Simulator (Port 3000)**:
    - Distinguishes clearly between the **Standalone Production Telegram Daemon (`npm run bot:start`)** and the **Local Web Harness / Simulator (`npm run dev`)** connected to the real SQLite database and `TelegramBotController`.
 
@@ -28,10 +28,10 @@ A modular, production-oriented Node.js + TypeScript system for managing multiple
 
 ```text
 src/
-  app.ts                          # Standalone production daemon entrypoint (grammY + athanasia-baileys)
+  app.ts                          # Standalone production daemon entrypoint (grammY + @hiroosy/baileys-lite)
   runtime-harness.ts              # Singleton bridge for the local web inspection & simulator UI
   types/
-    athanasia-baileys.d.ts        # Strict TypeScript declarations for athanasia-baileys CommonJS build
+    baileys-lite.d.ts             # Strict TypeScript declarations for @hiroosy/baileys-lite & @hiroosy/baileys-lite/voip
   config/
     env.ts                        # Zod environment variable startup validation
   bot/
@@ -58,7 +58,7 @@ src/
   whatsapp/
     session-manager.ts            # Session lifecycle, pairing lock, 515 restart & backoff reconnect
     session-store.ts              # Isolated 0700 per-session credential directory store
-    connection-manager.ts         # AthanasiaBaileysSessionDriver (live) & MockWhatsAppSessionDriver (test/sim)
+    connection-manager.ts         # HiroosyBaileysSessionDriver (live) & MockWhatsAppSessionDriver (test/sim)
     operations/
       send-message.ts             # Validated text sending with rate-limit & dedup cooldown
       send-media.ts               # Validated media sending with automatic temp file cleanup

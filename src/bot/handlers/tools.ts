@@ -1654,7 +1654,7 @@ export class ToolsHandler {
   }
 
   /**
-   * Implements `/cekidch <channel_link>` using `athanasia-baileys` `newsletterMetadata`.
+   * Implements `/cekidch <channel_link>` using `@hiroosy/baileys-lite` `newsletterMetadata`.
    */
   public async executeChannelLookup(
     adminId: number,
@@ -1856,7 +1856,7 @@ export class ToolsHandler {
         `• مدة التشغيل (Runtime): \`${formatRuntime()}\`\n` +
         `• استهلاك الذاكرة (Memory RSS): \`${formatMemory()}\`\n` +
         `• مهلة التهدئة (Cooldown): \`${cooldownSec}s\`\n` +
-        `• محرك البروتوكول: \`@hiroosy/baileys-lite@0.3.6\` (متوافق مع \`athanasia-baileys@1.0.0\`)`,
+        `• محرك البروتوكول: \`@hiroosy/baileys-lite@0.3.6\` + \`@hiroosy/baileys-lite/voip\``,
       keyboard: [
         [
           { text: '📱 تفاصيل المقابس (/ceksender)', callbackData: 'tools:ceksender' },

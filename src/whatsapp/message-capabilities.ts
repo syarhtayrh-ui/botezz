@@ -162,7 +162,7 @@ export interface NormalizedIncomingMessage {
 }
 
 export interface WhatsAppCapabilityMatrix {
-  libraryName: '@hiroosy/baileys-lite' | 'athanasia-baileys';
+  libraryName: '@hiroosy/baileys-lite';
   libraryVersion: string;
   textAndExtendedText: { supported: boolean; notesAr: string };
   quotedMessages: { supported: boolean; notesAr: string };
@@ -1061,7 +1061,7 @@ export interface SafeMediaDownloadResult {
  * Safe Media & Sticker Processor.
  * Performs magic-byte MIME detection, WebP sticker validation (RIFF/WEBP + VP8X animation flag),
  * strict file size limits, path-traversal-safe temporary file management, and privacy-respecting
- * encrypted media downloads via `athanasia-baileys` `downloadMediaMessage`.
+ * encrypted media downloads via `@hiroosy/baileys-lite` `downloadMediaMessage`.
  */
 export class MediaProcessor {
   private readonly maxMediaBytes: number;
@@ -1233,7 +1233,7 @@ export class MediaProcessor {
   }
 
   /**
-   * Downloads and decrypts media from a normalized incoming message using `athanasia-baileys`
+   * Downloads and decrypts media from a normalized incoming message using `@hiroosy/baileys-lite`
    * `downloadMediaMessage`, while strictly refusing to bypass View-Once privacy restrictions.
    */
   public async downloadIncomingMediaSafely(

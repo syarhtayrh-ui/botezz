@@ -10,7 +10,7 @@ import makeWASocket, {
 } from '../src/whatsapp/baileys-compat';
 import {
   resolveWhatsAppWebVersion,
-  AthanasiaBaileysSessionDriver,
+  HiroosyBaileysSessionDriver,
 } from '../src/whatsapp/connection-manager';
 import { maskPhoneNumber } from '../src/security/redaction';
 
@@ -143,9 +143,9 @@ async function runIsolatedConnectionDiagnostic(): Promise<void> {
     }
   }
 
-  // 2. Test actual production driver (`AthanasiaBaileysSessionDriver`) handshake readiness
+  // 2. Test actual production driver (`HiroosyBaileysSessionDriver`) handshake readiness
   const tempAuthDir = fs.mkdtempSync(path.join(os.tmpdir(), 'wa-diag-driver-'));
-  const driver = new AthanasiaBaileysSessionDriver('diag_session', tempAuthDir);
+  const driver = new HiroosyBaileysSessionDriver('diag_session', tempAuthDir);
   let handshakeReadyReached = false;
   let disconnectCode: number | undefined;
   let disconnectMessage: string | undefined;

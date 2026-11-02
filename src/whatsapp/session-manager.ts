@@ -9,7 +9,7 @@ import { SessionStore, CredentialInspectionResult } from './session-store';
 import {
   WhatsAppSessionDriver,
   DriverFactory,
-  AthanasiaBaileysSessionDriver,
+  HiroosyBaileysSessionDriver,
   MockWhatsAppSessionDriver,
   SessionSocketDiagnostics,
   ConnectionEventCallbacks,
@@ -105,7 +105,7 @@ export class SessionManager {
     private readonly auditRepo: AuditRepository,
     private readonly sessionStore: SessionStore,
     private readonly driverFactory: DriverFactory = (sessionId, authDir) =>
-      new AthanasiaBaileysSessionDriver(sessionId, authDir),
+      new HiroosyBaileysSessionDriver(sessionId, authDir),
     options?: SessionManagerOptions
   ) {
     this.maxReconnectAttempts = options?.maxReconnectAttempts ?? 5;
@@ -301,7 +301,7 @@ export class SessionManager {
   }
 
   /**
-   * Initiates the WhatsApp pairing code flow for a session using athanasia-baileys.
+   * Initiates the WhatsApp pairing code flow for a session using @hiroosy/baileys-lite.
    * Validates phone number BEFORE creating or modifying any session or socket.
    * Supports optional custom 8-character pairing code (`+966501234567 CODE1234`).
    * Prevents duplicate concurrent pairing workflows for the same session or phone number.
@@ -605,7 +605,7 @@ export class SessionManager {
     }
 
     if (evt.status === 'RESTART_REQUIRED') {
-      // athanasia-baileys emits DisconnectReason.restartRequired (515) immediately after
+      // @hiroosy/baileys-lite emits DisconnectReason.restartRequired (515) immediately after
       // pairing finishes (`companion_finish` / `pair-success`). Reconnect immediately with the saved credentials.
       this.clearPairingTimer(sessionId);
       this.clearReconnectTimer(sessionId);

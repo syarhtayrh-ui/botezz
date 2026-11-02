@@ -138,7 +138,7 @@ test('Session creation, pairing workflow, state isolation, restoration, and dele
     assert.ok(pairedStep.text.includes('رمز الربط'));
     assert.ok(pairedStep.text.includes('WA96-4567'));
 
-    // 4. Link a second isolated account with custom 8-char Athanasia Baileys pairing code
+    // 4. Link a second isolated account with custom 8-char @hiroosy/baileys-lite pairing code
     await env.controller.handleCallbackQuery(adminId, 'menu:add_account');
     const customPairedStep = await env.controller.handleTextMessage(
       adminId,
@@ -336,7 +336,7 @@ test('Integrated Nebula features: Tools menu, Channel metadata (/cekidch), Sende
 
     const checkAll = await env.controller.handleCallbackQuery(adminId, 'tools:cekall');
     assert.ok(checkAll.text.includes('التقرير الشامل للنظام والجلسات'));
-    assert.ok(checkAll.text.includes('athanasia-baileys@1.0.0'));
+    assert.ok(checkAll.text.includes('@hiroosy/baileys-lite@0.3.6'));
 
     const infoCard = await env.controller.handleCallbackQuery(adminId, 'tools:info');
     assert.ok(infoCard.text.includes('بطاقة معلومات الحساب'));

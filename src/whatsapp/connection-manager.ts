@@ -195,7 +195,7 @@ export interface SafeSocketOptions {
  * Creates a rate-limited, JID-normalized socket wrapper (expanded from Nebula `createSafeSock`).
  * Supports manual/dynamic `maxSends` configuration (`0` = unlimited, default `0`),
  * runtime inspection/adjustment (`sock.getMaxSends()`, `sock.setMaxSends(n)`), per-method counters,
- * SmartProtocolWrapper integration, and Proxy-based access to all underlying `athanasia-baileys` socket methods.
+ * SmartProtocolWrapper integration, and Proxy-based access to all underlying `@hiroosy/baileys-lite` socket methods.
  */
 export function createSafeSock(
   adapter: SafeSocketTargetAdapter,
@@ -341,7 +341,7 @@ export function createSafeSock(
 
 /**
  * Unified Function Lab execution entrypoint delegating directly to `FunctionExecutor`.
- * Ensures both `AthanasiaBaileysSessionDriver` and `MockWhatsAppSessionDriver` share the exact
+ * Ensures both `HiroosyBaileysSessionDriver` and `MockWhatsAppSessionDriver` share the exact
  * same VM sandbox, Baileys helpers, flexible parser, and timer cleanup.
  */
 export async function runSandboxedTestFunction(
@@ -400,7 +400,7 @@ export class SessionMemoryStore {
   }
 
   /**
-   * Caches an outgoing or incoming `proto.IMessage` so `athanasia-baileys` `sendMessagesAgain`
+   * Caches an outgoing or incoming `proto.IMessage` so `@hiroosy/baileys-lite` `sendMessagesAgain`
    * can re-encrypt and re-transmit the payload when a companion device or recipient sends
    * `<receipt type="retry">`, preventing post-send and post-pairing session disconnects.
    */
@@ -622,25 +622,19 @@ export interface WhatsAppSessionDriver {
   }): Promise<{ messageId: string }>;
   sendNode?(node: BinaryNode): Promise<void>;
   query?(node: BinaryNode, timeoutMs?: number): Promise<unknown>;
-  sendNativeVideoCallOffer(
+  recordSimulatedVoipCallOffer?(
     targetJid: string,
     options?: { callId?: string; isVideo?: boolean }
   ): Promise<{ callId: string }>;
-  terminateNativeVideoCall(targetJid: string, callId: string): Promise<void>;
+  recordSimulatedVoipCallTermination?(
+    targetJid: string,
+    callId: string
+  ): Promise<void>;
   forwardMessage(
     targetJid: string,
     messagePayloadOrRaw: Record<string, unknown>,
     options?: { forceForward?: boolean }
   ): Promise<{ messageId: string; forwarded: boolean }>;
-  sendNativeCallOffer?(params: {
-    targetJid: string;
-    isVideo: boolean;
-    callId?: string;
-  }): Promise<{ callId: string; mode: string }>;
-  terminateNativeCall?(params: {
-    targetJid: string;
-    callId: string;
-  }): Promise<void>;
   listParticipatingGroups(): Promise<GroupSummary[]>;
   getGroupMetadata(groupJid: string): Promise<GroupSummary>;
   getGroupInviteCode(groupJid: string): Promise<string>;
@@ -667,15 +661,14 @@ export interface WhatsAppSessionDriver {
 }
 
 /**
- * Production Athanasia Baileys Socket Driver (`athanasia-baileys` v1.0.0).
+ * Production Hiroosy Baileys-Lite Socket Driver (`@hiroosy/baileys-lite` v0.3.6).
  * Implements the exact socket, pairing-code (`requestPairingCode(phoneNumber, code)`),
  * Noise + `pair-device` handshake synchronization, serialized credential persistence,
  * group metadata caching (`cachedGroupMetadata`), newsletter/channel inspection (`newsletterMetadata`),
- * and LID/PN participant resolution APIs of `github:AthanasiaCMD/athanasia-baileys`.
+ * and LID/PN participant resolution APIs of `@hiroosy/baileys-lite`.
  */
 /**
- * Minimum revision threshold above the expired `[2, 3000, 1030831524]` bundled in
- * `athanasia-baileys/lib/Defaults/baileys-version.json` (which WhatsApp servers reject with `<failure reason="405"/>`).
+ * Minimum revision threshold above legacy static revisions (which WhatsApp servers reject with `<failure reason="405"/>`).
  */
 const EXPIRED_BUNDLED_REVISION = 1030831524;
 const VERIFIED_BASELINE_WA_WEB_VERSION: [number, number, number] = [2, 3000, 1052053390];
@@ -703,18 +696,10 @@ export function invalidateWhatsAppWebVersionCache(): void {
 }
 
 /**
- * Resolves a live, compatible WhatsApp Web client version supported by `athanasia-baileys`.
+ * Resolves a live, compatible WhatsApp Web client version supported by `@hiroosy/baileys-lite`.
  *
- * Root-cause note:
- * `fetchLatestBaileysVersion()` in `athanasia-baileys` queries
- * `https://raw.githubusercontent.com/AthanasiaCMD/athanasia-baileys/refs/heads/master/lib/Defaults/baileys-version.json`
- * which returns HTTP 404 (the repository uses branch `main`, and its static JSON contains `[2, 3000, 1030831524]`).
- * Because `fetchLatestBaileysVersion()` catches errors internally without throwing, it silently returns
- * `[2, 3000, 1030831524]`, which WhatsApp servers immediately reject during `validateConnection()` with
- * `<failure reason="405" location="vll"/>`.
- *
- * By contrast, `fetchLatestWaWebVersion()` in `athanasia-baileys` queries `https://web.whatsapp.com/sw.js`
- * and extracts the active `client_revision`, which passes WhatsApp's handshake and emits `pair-device` (`qr`).
+ * Queries `fetchLatestWaWebVersion()` (`https://web.whatsapp.com/sw.js`) and `fetchLatestBaileysVersion()`
+ * to extract an active `client_revision` that passes WhatsApp's handshake and emits `pair-device` (`qr`).
  */
 export async function resolveWhatsAppWebVersion(forceRefresh = false): Promise<{
   version: [number, number, number];
@@ -995,7 +980,7 @@ export function selectBrowserProfileForSession(
   return profiles[hash % profiles.length]!();
 }
 
-export class AthanasiaBaileysSessionDriver implements WhatsAppSessionDriver {
+export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
   public readonly isMock = false;
   private sock: WASocket | null = null;
   private evCleanup: (() => void) | null = null;
@@ -1130,7 +1115,7 @@ export class AthanasiaBaileysSessionDriver implements WhatsAppSessionDriver {
     const version = resolvedVersionInfo.version;
     this.resolvedWaVersion = version;
 
-    log.info('Initializing Athanasia Baileys socket', {
+    log.info('Initializing @hiroosy/baileys-lite socket', {
       sessionId: this.sessionId,
       waVersion: version.join('.'),
       versionSource: resolvedVersionInfo.source,
@@ -1166,7 +1151,7 @@ export class AthanasiaBaileysSessionDriver implements WhatsAppSessionDriver {
         creds: state.creds,
         keys: cacheableKeys,
       },
-      printQRInTerminal: false, // Required by athanasia-baileys for pairing code flow
+      printQRInTerminal: false, // Required by @hiroosy/baileys-lite for pairing code flow
       qrTimeout: 60_000, // Keep companion registration refs alive for 60s each during phone pairing
       logger: silentPino,
       browser: selectBrowserProfileForSession(this.sessionId),
@@ -1519,7 +1504,7 @@ export class AthanasiaBaileysSessionDriver implements WhatsAppSessionDriver {
   }
 
   /**
-   * Initiates pairing code generation using `athanasia-baileys`'s `sock.requestPairingCode(phoneNumber, code?)`.
+   * Initiates pairing code generation using `@hiroosy/baileys-lite`'s `sock.requestPairingCode(phoneNumber, code?)`.
    * Explicitly waits for the Noise handshake (`validateConnection`) and `CB:iq,type:set,pair-device` (`qr` event)
    * to complete BEFORE calling `sock.requestPairingCode`, preventing premature `creds.me` mutation
    * and uninitialized Noise frame encryption.
@@ -1531,7 +1516,7 @@ export class AthanasiaBaileysSessionDriver implements WhatsAppSessionDriver {
     const sock = this.ensureSocket();
     if (typeof sock.requestPairingCode !== 'function') {
       throw new UnsupportedOperationError(
-        'إصدار مكتبة athanasia-baileys الحالي لا يدعم توليد رمز الربط النصي (Pairing Code).'
+        'إصدار مكتبة @hiroosy/baileys-lite الحالي لا يدعم توليد رمز الربط النصي (Pairing Code).'
       );
     }
 
@@ -1759,7 +1744,7 @@ export class AthanasiaBaileysSessionDriver implements WhatsAppSessionDriver {
   }
 
   /**
-   * Maps `athanasia-baileys` GroupMetadata (supporting both PN and LID addressing modes)
+   * Maps `@hiroosy/baileys-lite` GroupMetadata (supporting both PN and LID addressing modes)
    * into a normalized GroupSummary.
    */
   private mapGroupMetadata(sock: WASocket, meta: GroupMetadata): GroupSummary {
@@ -1868,7 +1853,7 @@ export class AthanasiaBaileysSessionDriver implements WhatsAppSessionDriver {
   }
 
   /**
-   * Queries WhatsApp Channel (Newsletter) metadata via `athanasia-baileys` `newsletterMetadata`
+   * Queries WhatsApp Channel (Newsletter) metadata via `@hiroosy/baileys-lite` `newsletterMetadata`
    * (adapted from Nebula `/cekidch` command).
    */
   public async getChannelMetadata(
@@ -1947,7 +1932,7 @@ export class AthanasiaBaileysSessionDriver implements WhatsAppSessionDriver {
       handshakeReady: this.handshakeReady,
       connectionState: this.connectionState,
       platform: String(creds?.platform || 'Ubuntu / Chrome'),
-      device: String(creds?.device || 'Athanasia-Baileys Multi-Device'),
+      device: String(creds?.device || 'Hiroosy-Baileys-Lite Multi-Device'),
       meJid,
       ...stats,
     };
@@ -1982,130 +1967,6 @@ export class AthanasiaBaileysSessionDriver implements WhatsAppSessionDriver {
       return await sock.query(node, timeoutMs);
     }
     return undefined;
-  }
-
-  public async sendNativeVideoCallOffer(
-    targetJid: string,
-    options?: { callId?: string; isVideo?: boolean }
-  ): Promise<{ callId: string }> {
-    const sock = this.ensureSocket();
-    if (this.connectionState !== 'CONNECTED' || !this.wsOpen) {
-      throw new WhatsAppConnectionError('الجلسة غير متصلة حالياً لإرسال رنين المكالمة.');
-    }
-
-    const callId = (
-      options?.callId || crypto.randomBytes(16).toString('hex')
-    ).toUpperCase();
-    const resolvedJid = await this.resolveDirectRecipientJid(sock, targetJid);
-    const fromJid =
-      sock.user?.id || sock.authState?.creds?.me?.id || resolvedJid;
-    const isVideo = options?.isVideo !== false;
-
-    const callNode: BinaryNode = {
-      tag: 'call',
-      attrs: {
-        to: resolvedJid,
-        id:
-          typeof sock.generateMessageTag === 'function'
-            ? sock.generateMessageTag()
-            : `call_${Date.now()}`,
-        from: fromJid,
-      },
-      content: [
-        {
-          tag: 'offer',
-          attrs: {
-            'call-id': callId,
-            'call-creator': fromJid,
-          },
-          content: [
-            ...(isVideo
-              ? [
-                  {
-                    tag: 'video',
-                    attrs: {
-                      enc: 'vp8',
-                      dec: 'vp8',
-                      orientation: '0',
-                      screen_width: '720',
-                      screen_height: '1280',
-                      device_orientation: '0',
-                    },
-                  },
-                ]
-              : []),
-            {
-              tag: 'audio',
-              attrs: { enc: 'opus', rate: '16000' },
-            },
-            {
-              tag: 'net',
-              attrs: { medium: '3' },
-            },
-            {
-              tag: 'capability',
-              attrs: { ver: '1' },
-              content: new Uint8Array([1, 4, 255, 131, 207, 4]),
-            },
-            {
-              tag: 'enc',
-              attrs: { opt: '2', type: 'pkmsg', v: '2' },
-              content: crypto.randomBytes(64),
-            },
-          ],
-        },
-      ],
-    };
-
-    if (typeof sock.sendNode === 'function') {
-      await sock.sendNode(callNode);
-    }
-
-    await Promise.allSettled([this.credsSaveChain, this.flushAuthWrites()]);
-    return { callId };
-  }
-
-  public async terminateNativeVideoCall(
-    targetJid: string,
-    callId: string
-  ): Promise<void> {
-    if (!this.sock || !this.wsOpen) return;
-    try {
-      const resolvedJid = await this.resolveDirectRecipientJid(
-        this.sock,
-        targetJid
-      );
-      const fromJid =
-        this.sock.user?.id ||
-        this.sock.authState?.creds?.me?.id ||
-        resolvedJid;
-      const terminateNode: BinaryNode = {
-        tag: 'call',
-        attrs: {
-          to: resolvedJid,
-          id:
-            typeof this.sock.generateMessageTag === 'function'
-              ? this.sock.generateMessageTag()
-              : `end_${Date.now()}`,
-          from: fromJid,
-        },
-        content: [
-          {
-            tag: 'terminate',
-            attrs: {
-              'call-id': callId,
-              'call-creator': fromJid,
-              reason: 'timeout',
-            },
-          },
-        ],
-      };
-      if (typeof this.sock.sendNode === 'function') {
-        await this.sock.sendNode(terminateNode);
-      }
-    } catch {
-      // Best-effort call termination
-    }
   }
 
   public async forwardMessage(
@@ -2161,30 +2022,8 @@ export class AthanasiaBaileysSessionDriver implements WhatsAppSessionDriver {
     return { messageId: waMsg.key.id!, forwarded: true };
   }
 
-  public async sendNativeCallOffer(params: {
-    targetJid: string;
-    isVideo: boolean;
-    callId?: string;
-  }): Promise<{ callId: string; mode: string }> {
-    const res = await this.sendNativeVideoCallOffer(params.targetJid, {
-      callId: params.callId,
-      isVideo: params.isVideo,
-    });
-    return {
-      callId: res.callId,
-      mode: 'NATIVE_CALL_STANZA',
-    };
-  }
-
-  public async terminateNativeCall(params: {
-    targetJid: string;
-    callId: string;
-  }): Promise<void> {
-    await this.terminateNativeVideoCall(params.targetJid, params.callId);
-  }
-
   /**
-   * Executes a custom `async function` in the isolated VM sandbox against the active Athanasia Baileys socket
+   * Executes a custom `async function` in the isolated VM sandbox against the active `@hiroosy/baileys-lite` socket
    * (adapted from Nebula `/testfunction`).
    */
   public async executeTestFunction(
@@ -2297,10 +2136,7 @@ export class AthanasiaBaileysSessionDriver implements WhatsAppSessionDriver {
   }
 }
 
-export {
-  AthanasiaBaileysSessionDriver as BaileysSessionDriver,
-  AthanasiaBaileysSessionDriver as HiroosyBaileysSessionDriver,
-};
+export { HiroosyBaileysSessionDriver as BaileysSessionDriver };
 
 /**
  * Deterministic Mock / Simulation Driver for Automated Testing and Local Web Preview.
@@ -2768,7 +2604,7 @@ export class MockWhatsAppSessionDriver implements WhatsAppSessionDriver {
     return { tag: 'iq', attrs: { type: 'result' }, content: [] };
   }
 
-  public async sendNativeVideoCallOffer(
+  public async recordSimulatedVoipCallOffer(
     targetJid: string,
     options?: { callId?: string; isVideo?: boolean }
   ): Promise<{ callId: string }> {
@@ -2779,46 +2615,6 @@ export class MockWhatsAppSessionDriver implements WhatsAppSessionDriver {
       options?.callId || crypto.randomBytes(16).toString('hex')
     ).toUpperCase();
     const isVideo = options?.isVideo !== false;
-    const fromJid = this.currentJid || '966500000000@s.whatsapp.net';
-
-    this.sentNodes.push({
-      tag: 'call',
-      attrs: {
-        to: targetJid,
-        id: `call_${Date.now()}`,
-        from: fromJid,
-      },
-      content: [
-        {
-          tag: 'offer',
-          attrs: {
-            'call-id': callId,
-            'call-creator': fromJid,
-          },
-          content: [
-            ...(isVideo
-              ? [
-                  {
-                    tag: 'video',
-                    attrs: {
-                      enc: 'vp8',
-                      dec: 'vp8',
-                      orientation: '0',
-                      screen_width: '720',
-                      screen_height: '1280',
-                      device_orientation: '0',
-                    },
-                  },
-                ]
-              : []),
-            {
-              tag: 'audio',
-              attrs: { enc: 'opus', rate: '16000' },
-            },
-          ],
-        },
-      ],
-    });
 
     this.sentCallOffers.push({
       targetJid,
@@ -2829,29 +2625,10 @@ export class MockWhatsAppSessionDriver implements WhatsAppSessionDriver {
     return { callId };
   }
 
-  public async terminateNativeVideoCall(
+  public async recordSimulatedVoipCallTermination(
     targetJid: string,
     callId: string
   ): Promise<void> {
-    const fromJid = this.currentJid || '966500000000@s.whatsapp.net';
-    this.sentNodes.push({
-      tag: 'call',
-      attrs: {
-        to: targetJid,
-        id: `end_${Date.now()}`,
-        from: fromJid,
-      },
-      content: [
-        {
-          tag: 'terminate',
-          attrs: {
-            'call-id': callId,
-            'call-creator': fromJid,
-            reason: 'timeout',
-          },
-        },
-      ],
-    });
     this.terminatedCalls.push({
       targetJid,
       callId,
@@ -2885,28 +2662,6 @@ export class MockWhatsAppSessionDriver implements WhatsAppSessionDriver {
     });
     this.sentMessagesCount++;
     return { messageId, forwarded: true };
-  }
-
-  public async sendNativeCallOffer(params: {
-    targetJid: string;
-    isVideo: boolean;
-    callId?: string;
-  }): Promise<{ callId: string; mode: string }> {
-    const res = await this.sendNativeVideoCallOffer(params.targetJid, {
-      callId: params.callId,
-      isVideo: params.isVideo,
-    });
-    return {
-      callId: res.callId,
-      mode: 'MOCK_NATIVE_CALL_STANZA',
-    };
-  }
-
-  public async terminateNativeCall(params: {
-    targetJid: string;
-    callId: string;
-  }): Promise<void> {
-    await this.terminateNativeVideoCall(params.targetJid, params.callId);
   }
 
   public simulateIncomingMessage(rawMessage: Record<string, unknown>): void {

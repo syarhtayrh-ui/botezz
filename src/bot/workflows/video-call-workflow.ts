@@ -57,6 +57,7 @@ const CALL_STATE_ARABIC_LABELS: Record<RealCallState, string> = {
   REJECTED: '🚫 تم رفض المكالمة من الطرف الآخر (`REJECTED`)',
   TIMEOUT: '⏱️ انتهت مهلة الرنين دون رد (`TIMEOUT`)',
   FAILED: '❌ تعذر إتمام المكالمة (`FAILED`)',
+  MEDIA_FAILED: '❌ فشل بدء تدفق الصوت والفيديو عبر RTP/SRTP (`MEDIA_FAILED`)',
 };
 
 function formatFileSize(bytes: number): string {
@@ -592,9 +593,15 @@ export class VideoCallWorkflow {
       const stateLabel =
         CALL_STATE_ARABIC_LABELS[stream.callState] || stream.callState;
 
+      const isMediaActivelyStreaming =
+        stream.callState === 'MEDIA_STARTED' && stream.mediaStarted;
+      const headerLine = isMediaActivelyStreaming
+        ? '✅ *تم بدء المكالمة المرئية وبث الفيديو بنجاح*'
+        : '📞 *تم إرسال طلب مكالمة الفيديو وجاري الرنين وتأسيس قناة الوسائط*';
+
       return {
         text: [
-          '✅ *تم بدء المكالمة المرئية وبث الفيديو بنجاح*',
+          headerLine,
           '━━━━━━━━━━━━━━━━━━━━━━',
           `• *معرف المكالمة:* \`${stream.callId}\``,
           `• *معرف عقدة VoIP:* \`${stream.voipCallId || stream.messageId || stream.callId}\``,
@@ -604,6 +611,7 @@ export class VideoCallWorkflow {
           `• *طبقة الوسائط:* \`@hiroosy/baileys-lite/voip (${stream.resolutionPreset})\``,
           `• *ملف الفيديو:* \`${stream.videoFileName}\``,
           `• *الحالة الحالية:* ${stateLabel}`,
+          `• *حالة البث الفعلي (RTP/SRTP):* ${isMediaActivelyStreaming ? '🟢 نشط ومؤكد (`MEDIA_STARTED`)' : '⏳ بانتظار رد المستلم وبدء تدفق إطارات الصوت والفيديو'}`,
           '',
           stream.detailsArabic,
         ].join('\n'),

@@ -922,7 +922,7 @@ sudo journalctl -u whatsapp-telegram-bot.service -f`}</pre>
                   <strong>حجب البيانات الحساسة (Redaction):</strong> يقوم <span dir="ltr" className="text-sky-300">src/security/redaction.ts</span> بحجب توكن البوت، رموز الربط، والمفاتيح الخاصة، وتقنيع أرقام الهواتف تلقائياً.
                 </li>
                 <li>
-                  <strong>تنبيه البروتوكول غير الرسمي:</strong> مكتبة <span dir="ltr" className="text-sky-300">athanasia-baileys (github:AthanasiaCMD/athanasia-baileys)</span> هي تكامل غير رسمي لبروتوكول واتساب ويب؛ يجب أن يظل خادم EC2 قيد التشغيل لاستمرار عمل البوت، وقد تتطلب الجلسات إعادة ربط في حال تغيير بروتوكول واتساب.
+                  <strong>تنبيه البروتوكول غير الرسمي:</strong> مكتبة <span dir="ltr" className="text-sky-300">@hiroosy/baileys-lite@0.3.6</span> هي تكامل غير رسمي لبروتوكول واتساب ويب ومكالمات VoIP؛ يجب أن يظل خادم EC2 قيد التشغيل لاستمرار عمل البوت، وقد تتطلب الجلسات إعادة ربط في حال تغيير بروتوكول واتساب.
                 </li>
               </ul>
             </section>

@@ -157,7 +157,7 @@ test('Telegram Markdown safety utilities and error classification', () => {
   assert.ok(tgErr.userMessage.includes('/start'));
 });
 
-test('Athanasia Baileys exports and custom 8-char pairing code validation work accurately', async () => {
+test('@hiroosy/baileys-lite exports and custom 8-char pairing code validation work accurately', async () => {
   assert.equal(DisconnectReason.loggedOut, 401);
   assert.equal(DisconnectReason.restartRequired, 515);
   assert.deepEqual(Browsers.ubuntu('Chrome'), ['Ubuntu', 'Chrome', '22.04.4']);
@@ -175,8 +175,8 @@ test('Athanasia Baileys exports and custom 8-char pairing code validation work a
   assert.equal(randomCode.length, 8);
   assert.match(randomCode, /^[A-Z0-9]{8}$/);
 
-  // Verify real useMultiFileAuthState from athanasia-baileys initializes creds.json
-  const tmpAuthDir = fs.mkdtempSync(path.join(os.tmpdir(), 'athanasia-auth-test-'));
+  // Verify real useMultiFileAuthState from @hiroosy/baileys-lite initializes creds.json
+  const tmpAuthDir = fs.mkdtempSync(path.join(os.tmpdir(), 'hiroosy-auth-test-'));
   try {
     const { state, saveCreds } = await useMultiFileAuthState(tmpAuthDir);
     assert.ok(state.creds);

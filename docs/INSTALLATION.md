@@ -3,8 +3,8 @@
 ## System Requirements
 
 - **Operating System**: Ubuntu 24.04 LTS (or compatible Linux distribution)
-- **Node.js**: v20.0.0+ required by `athanasia-baileys` (`engine-requirements.js`), **v22.x LTS** recommended (uses Node's built-in `node:sqlite` engine)
-- **Git**: 2.34+ (**Required** during `npm install` because `athanasia-baileys` and its `libsignal` dependency are fetched directly from GitHub: `github:AthanasiaCMD/athanasia-baileys#2dce999d419dfc73afd86c0a478963e04aac41bc` and `github:AthanasiaCMD/libsignal-node`)
+- **Node.js**: v20.0.0+ required by `@hiroosy/baileys-lite`, **v22.x LTS** recommended (uses Node's built-in `node:sqlite` engine)
+- **FFmpeg**: `ffmpeg` and `ffprobe` required for real-time H.264/Opus VoIP video call media pipeline (`@hiroosy/baileys-lite/voip`)
 - **Disk Space**: Minimum 1 GB free for SQLite WAL files, isolated WhatsApp multi-file auth directories, and temporary media uploads.
 
 ---
@@ -18,7 +18,7 @@ sudo apt-get update && sudo apt-get upgrade -y
 sudo apt-get install -y curl git ca-certificates gnupg build-essential
 curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
 sudo apt-get install -y nodejs
-node -v   # Verify v22.x (must be >= 20.0.0 for athanasia-baileys)
+node -v   # Verify v22.x (must be >= 20.0.0 for @hiroosy/baileys-lite)
 git --version
 npm -v
 ```
@@ -43,7 +43,7 @@ This script:
 1. Verifies Node.js 20+/22+.
 2. Creates `./data/whatsapp-sessions` and `./data/tmp` with `0700` permissions.
 3. Creates `.env` from `.env.example` with `0600` permissions.
-4. Installs pinned dependencies (including `athanasia-baileys@1.0.0` from GitHub) and executes the automated unit & integration test suites.
+4. Installs pinned dependencies (including `@hiroosy/baileys-lite@0.3.6` from npm) and executes the automated unit & integration test suites.
 
 ### 4. Configure Environment Variables
 

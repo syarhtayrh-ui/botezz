@@ -7,7 +7,7 @@ import { AuditRepository } from './database/repositories/audit-repository';
 import { FunctionLabRepository } from './database/repositories/function-lab-repository';
 import { MessageSender, MediaProcessor } from './whatsapp/message-capabilities';
 import { SessionStore } from './whatsapp/session-store';
-import { AthanasiaBaileysSessionDriver } from './whatsapp/connection-manager';
+import { HiroosyBaileysSessionDriver } from './whatsapp/connection-manager';
 import { SessionManager } from './whatsapp/session-manager';
 import { SendMessageOperation } from './whatsapp/operations/send-message';
 import { SendMediaOperation } from './whatsapp/operations/send-media';
@@ -24,13 +24,13 @@ const log = createLogger('app');
 /**
  * Standalone Production Entrypoint (`npm run bot:start`).
  * Validates environment variables, initializes SQLite and migrations, restores authenticated
- * Athanasia Baileys WhatsApp sessions, starts the grammY Telegram Bot polling loop, and registers SIGINT/SIGTERM graceful shutdown.
+ * @hiroosy/baileys-lite WhatsApp sessions, starts the grammY Telegram Bot polling loop, and registers SIGINT/SIGTERM graceful shutdown.
  */
 export async function startStandaloneBotApplication(): Promise<void> {
   const config = validateEnv(process.env);
   const shutdownManager = new ShutdownManager();
 
-  log.info('Starting WhatsApp Multi-Session Management System (athanasia-baileys)...', {
+  log.info('Starting WhatsApp Multi-Session Management System (@hiroosy/baileys-lite)...', {
     nodeEnv: config.NODE_ENV,
     maxConcurrentTasks: config.MAX_CONCURRENT_TASKS,
   });
@@ -55,7 +55,7 @@ export async function startStandaloneBotApplication(): Promise<void> {
     auditRepo,
     sessionStore,
     (sessionId, authDir) =>
-      new AthanasiaBaileysSessionDriver(sessionId, authDir, messageSender)
+      new HiroosyBaileysSessionDriver(sessionId, authDir, messageSender)
   );
   shutdownManager.register('whatsapp-sessions', () =>
     sessionManager.shutdownAll()

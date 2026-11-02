@@ -564,7 +564,7 @@ export class FunctionRegistry {
         inputSchema: {
           declaredParameters: parsed.declaredParameters,
         },
-        requiredDependencies: ['athanasia-baileys', 'createSafeSock'],
+        requiredDependencies: ['@hiroosy/baileys-lite', 'createSafeSock'],
         supportsDryRun: true,
         supportsSimulation: true,
         isBuiltin: false,
@@ -585,7 +585,7 @@ export class FunctionRegistry {
       descriptionAr,
       sourceCode: parsed.normalizedCode,
       inputSchemaJson: JSON.stringify({ declaredParameters: parsed.declaredParameters }),
-      requiredDependencies: ['athanasia-baileys', 'createSafeSock'],
+      requiredDependencies: ['@hiroosy/baileys-lite', 'createSafeSock'],
       supportsDryRun: true,
       supportsSimulation: true,
       isBuiltin: false,
@@ -1417,7 +1417,7 @@ export function createProtocolBuilders(params: {
 /**
  * Isolated VM Function Executor (`FunctionExecutor`).
  * Never uses unrestricted `eval` or `new Function` in the host realm.
- * Uses `FunctionValidator` + `vm.Script` + `vm.createContext` with full `athanasia-baileys` capabilities,
+ * Uses `FunctionValidator` + `vm.Script` + `vm.createContext` with full `@hiroosy/baileys-lite` capabilities,
  * `SmartProtocolWrapper` anti-detection & delivery enrichment, `builders` toolkit,
  * cancellation support, dry-run/simulation interception, and cross-realm error classification.
  */

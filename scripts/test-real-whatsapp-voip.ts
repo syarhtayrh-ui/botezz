@@ -148,6 +148,7 @@ async function main(): Promise<void> {
     'call:ringing',
     'call:connecting',
     'call:connected',
+    'call:media-negotiating',
     'call:audio-started',
     'call:video-started',
     'call:media-started',
@@ -183,6 +184,7 @@ async function main(): Promise<void> {
   });
 
   console.log('\n[6] Call finished. Final state history:', stream.stateHistory.join(' -> '));
+  console.log('    - Outbound Media Evidence:', JSON.stringify(stream.outboundMediaEvidence || null));
   await service.shutdownAll();
   try {
     sock.end(undefined);

@@ -680,8 +680,8 @@ export interface CreateSandboxRequireOptions {
 
 /**
  * Creates a safe, intelligent `require(moduleName)` function for the Function Lab VM Sandbox.
- * - Supports `require('athanasia-baileys')`, `require('@whiskeysockets/baileys')`,
- *   `require('@adiwajshing/baileys')`, `require('baileys')`.
+ * - Supports `require('@hiroosy/baileys-lite')`, `require('@hiroosy/baileys-lite/voip')`,
+ *   `require('@whiskeysockets/baileys')`, `require('@adiwajshing/baileys')`, `require('baileys')`.
  * - Supports safe Node.js built-ins (`crypto`, `buffer`, `util`, `stream`, `events`, `url`, `path`, `zlib`, `querystring`).
  * - Provides a sandboxed virtual `fs` scoped to `./data/tmp/flab-sandbox` that prevents path traversal
  *   and automatically synthesizes valid media buffers (`JPEG`, `PNG`, `WebP`, `MP4`, `OGG`, `PDF`) if a script
@@ -896,7 +896,6 @@ export function createSandboxRequire(
     switch (clean) {
       case '@hiroosy/baileys-lite':
       case '@hiroosy/baileys-lite/voip':
-      case 'athanasia-baileys':
       case '@whiskeysockets/baileys':
       case '@adiwajshing/baileys':
       case 'baileys':
@@ -964,7 +963,7 @@ export function createSandboxRequire(
         };
       default:
         throw new Error(
-          `المكتبة (${clean}) غير مفعلة داخل بيئة Function Lab المعزولة. المكتبات المدعومة: athanasia-baileys, crypto, fs, buffer, path, zlib, util, stream, events, url, sharp, wa-sticker-formatter, axios.`
+          `المكتبة (${clean}) غير مفعلة داخل بيئة Function Lab المعزولة. المكتبات المدعومة: @hiroosy/baileys-lite, crypto, fs, buffer, path, zlib, util, stream, events, url, sharp, wa-sticker-formatter, axios.`
         );
     }
   };

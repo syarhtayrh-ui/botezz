@@ -287,7 +287,7 @@ export class SessionStore {
 
   /**
    * Cleans any leftover unregistered or corrupted pairing state before starting a fresh
-   * pairing flow so `athanasia-baileys` `validateConnection()` sees `creds.me === undefined`
+   * pairing flow so `@hiroosy/baileys-lite` `validateConnection()` sees `creds.me === undefined`
    * and sends `generateRegistrationNode` instead of `generateLoginNode`.
    */
   public resetUnregisteredAuthDir(sessionId: string, forceReset = false): string {

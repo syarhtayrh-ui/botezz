@@ -134,7 +134,7 @@ export interface AtomicAuthStateResult {
 }
 
 /**
- * Production-hardened, drop-in replacement for `useMultiFileAuthState` in `athanasia-baileys`.
+ * Production-hardened, drop-in replacement for `useMultiFileAuthState` in `@hiroosy/baileys-lite`.
  *
  * Key guarantees over the default library implementation:
  * 1. Atomic writes (`tmp` -> `fsync` -> `rename`) with `0o600` file permissions.

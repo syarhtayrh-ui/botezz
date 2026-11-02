@@ -10,14 +10,14 @@ import { ValidationError, RateLimitError } from '../utils/errors';
 
 export interface NormalizedPhoneResult {
   e164: string; // e.g. +966501234567
-  digits: string; // e.g. 966501234567 (digits only, required by athanasia-baileys requestPairingCode)
-  jid: string; // e.g. 966501234567@s.whatsapp.net (encoded via athanasia-baileys jidEncode)
+  digits: string; // e.g. 966501234567 (digits only, required by @hiroosy/baileys-lite requestPairingCode)
+  jid: string; // e.g. 966501234567@s.whatsapp.net (encoded via @hiroosy/baileys-lite jidEncode)
   masked: string; // e.g. +966*****4567
-  customPairingCode?: string; // Optional 8-character custom pairing code supported by athanasia-baileys
+  customPairingCode?: string; // Optional 8-character custom pairing code supported by @hiroosy/baileys-lite
 }
 
 /**
- * Validates an optional 8-character custom pairing code supported by athanasia-baileys:
+ * Validates an optional 8-character custom pairing code supported by @hiroosy/baileys-lite:
  * `await sock.requestPairingCode(phoneNumber, customCode)`
  */
 export function validateCustomPairingCode(rawCode?: string): string | undefined {
@@ -27,16 +27,16 @@ export function validateCustomPairingCode(rawCode?: string): string | undefined 
   const cleaned = rawCode.trim().replace(/-/g, '').toUpperCase();
   if (!/^[A-Z0-9]{8}$/.test(cleaned)) {
     throw new ValidationError(
-      'رمز الربط المخصص (Custom Pairing Code) في athanasia-baileys يجب أن يتكون من 8 أحرف/أرقام إنجليزية بالضبط (مثال: ATHANASA أو CODE1234).'
+      'رمز الربط المخصص (Custom Pairing Code) في @hiroosy/baileys-lite يجب أن يتكون من 8 أحرف/أرقام إنجليزية بالضبط (مثال: HIROOSY1 أو CODE1234).'
     );
   }
   return cleaned;
 }
 
 /**
- * Generates a cryptographically random 8-character Crockford Base32 pairing code for athanasia-baileys
+ * Generates a cryptographically random 8-character Crockford Base32 pairing code for @hiroosy/baileys-lite
  * when the administrator does not specify a custom code.
- * Matches the 32-character alphabet in `athanasia-baileys/lib/Utils/generics.js` (`bytesToCrockford`).
+ * Matches the 32-character alphabet in `@hiroosy/baileys-lite` (`bytesToCrockford`).
  */
 export function generateRandomPairingCode(): string {
   const alphabet = '123456789ABCDEFGHJKLMNPQRSTVWXYZ';
@@ -65,7 +65,7 @@ export function convertArabicIndicDigits(text: string): string {
 
 /**
  * Validates and normalizes an international phone number including country code.
- * Also supports optional second token for athanasia-baileys custom pairing code:
+ * Also supports optional second token for @hiroosy/baileys-lite custom pairing code:
  * e.g. "+966501234567", "00966501234567", "+٩٦٦٥٠١٢٣٤٥٦٧", or "+966501234567 MYCODE12"
  */
 export function normalizePhoneNumber(rawInput: string): NormalizedPhoneResult {
@@ -120,7 +120,7 @@ export interface NormalizedRecipient {
 
 /**
  * Validates and normalizes a WhatsApp recipient identifier (either phone number or JID)
- * using athanasia-baileys JID utilities.
+ * using @hiroosy/baileys-lite JID utilities.
  */
 export function validateRecipient(rawInput: string): NormalizedRecipient {
   if (!rawInput || typeof rawInput !== 'string') {

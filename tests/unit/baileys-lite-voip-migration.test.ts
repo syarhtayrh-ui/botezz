@@ -4,6 +4,10 @@ import fs from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
 import { EventEmitter } from 'node:events';
+import type {
+  VoipCallInstance,
+  WaCallMediaSessionLike,
+} from '@hiroosy/baileys-lite/voip';
 
 import {
   makeWASocket,
@@ -26,7 +30,11 @@ import {
   computeTargetVoipResolution,
 } from '../../src/whatsapp/voip-media-pipeline';
 import { RealVideoCallService } from '../../src/whatsapp/video-call-bridge';
-import { MockWhatsAppSessionDriver } from '../../src/whatsapp/connection-manager';
+import {
+  MockWhatsAppSessionDriver,
+  HiroosyBaileysSessionDriver,
+  BaileysSessionDriver,
+} from '../../src/whatsapp/connection-manager';
 import {
   MediaValidationError,
   VoipFailureError,
@@ -69,6 +77,200 @@ async function createConnectedMockDriver(
     onStatusChange: () => undefined,
   });
   return driver;
+}
+
+interface RealisticMockCallInstance extends EventEmitter {
+  callId: string;
+  target: string;
+  isVideoDowngraded: boolean;
+  hangupCalls: number;
+  mediaSession: WaCallMediaSessionLike;
+  hangup?: () => Promise<void>;
+  mute: () => void;
+  raiseHand: () => void;
+  shareScreen: () => void;
+  react: () => boolean;
+  upgradeToVideo: () => Promise<void>;
+  silent: () => Promise<boolean>;
+}
+
+/**
+ * Creates a realistic mock of `@hiroosy/baileys-lite/voip` matching `src/voip/index.js`,
+ * `src/voip/WaVoipCoordinator.js`, and `src/voip/call/WaCallMediaSession.js`.
+ *
+ * Key fidelity rules:
+ * - `Voip` is NOT an EventEmitter; its `.on`/`.off` methods delegate to `coordinator`
+ *   only after `listen()` is called.
+ * - `voip.call()` returns a `VoipCall` instance (`EventEmitter`) emitting
+ *   `'ringing'`, `'connected'`, `'ended'`, `'error'`.
+ * - `voip.coordinator.manager.calls` holds a `WaCallMediaSessionLike` entry per `callId`
+ *   with `audioSendCount`, `audioOctetsSent`, `videoSendCount`, `videoOctetsSent`, `videoIdrSendCount`.
+ */
+function createRealisticHiroosyVoipMock(options?: {
+  omitCallInstanceHangup?: boolean;
+}) {
+  const coordinatorEmitter = new EventEmitter();
+  const callsMap = new Map<string, WaCallMediaSessionLike>();
+  const createdCallInstances: RealisticMockCallInstance[] = [];
+  let listenCalls = 0;
+  let coordinatorDisposed = false;
+  let endCalls = 0;
+  const voipHangupCallIds: Array<string | undefined> = [];
+  const receivedPresets: string[] = [];
+
+  const coordinator = Object.assign(coordinatorEmitter, {
+    manager: {
+      calls: callsMap,
+    },
+    disposed: false,
+    dispose() {
+      coordinatorDisposed = true;
+      this.disposed = true;
+      callsMap.clear();
+      coordinatorEmitter.removeAllListeners();
+    },
+  });
+
+  const voipMock = {
+    coordinator: null as typeof coordinator | null,
+    get listenCalls() {
+      return listenCalls;
+    },
+    get coordinatorDisposed() {
+      return coordinatorDisposed;
+    },
+    get endCalls() {
+      return endCalls;
+    },
+    voipHangupCallIds,
+    receivedPresets,
+    createdCallInstances,
+    callsMap,
+    async listen() {
+      listenCalls += 1;
+      this.coordinator = coordinator;
+      return this;
+    },
+    on(event: string, listener: (...args: unknown[]) => void) {
+      if (!this.coordinator) {
+        throw new Error('Call listen() before subscribing to voip events.');
+      }
+      this.coordinator.on(event, listener);
+      return this;
+    },
+    off(event: string, listener: (...args: unknown[]) => void) {
+      this.coordinator?.off(event, listener);
+      return this;
+    },
+    async call(
+      jid: string,
+      _videoPath: string,
+      preset: string
+    ): Promise<VoipCallInstance> {
+      if (!this.coordinator) {
+        throw new Error('Call listen() before starting a call.');
+      }
+      const validPresets = ['240p', '360p', '480p', '720p', '1080p'];
+      if (!validPresets.includes(preset)) {
+        throw new Error(
+          `Unknown resolution "${preset}". Use one of: 240p, 360p, 480p, 720p, 1080p, or pass { width, height, frameRate } directly.`
+        );
+      }
+      receivedPresets.push(preset);
+      const callId = `HIROOSY_CALL_${createdCallInstances.length + 1}`;
+      const mediaSession: WaCallMediaSessionLike = {
+        callId,
+        peerJid: jid,
+        isVideo: true,
+        audioSendCount: 0,
+        audioOctetsSent: 0,
+        realAudioSendCount: 0,
+        videoSendCount: 0,
+        videoOctetsSent: 0,
+        videoIdrSendCount: 0,
+        firstPacketSent: false,
+        mediaFlowStarted: false,
+      };
+      callsMap.set(callId, mediaSession);
+
+      const callInstance = new EventEmitter() as RealisticMockCallInstance;
+      callInstance.callId = callId;
+      callInstance.target = jid;
+      callInstance.isVideoDowngraded = false;
+      callInstance.hangupCalls = 0;
+      callInstance.mediaSession = mediaSession;
+      callInstance.mute = () => undefined;
+      callInstance.raiseHand = () => undefined;
+      callInstance.shareScreen = () => undefined;
+      callInstance.react = () => true;
+      callInstance.upgradeToVideo = async () => undefined;
+      callInstance.silent = async () => false;
+
+      if (!options?.omitCallInstanceHangup) {
+        callInstance.hangup = async () => {
+          callInstance.hangupCalls += 1;
+          callsMap.delete(callId);
+        };
+      }
+
+      createdCallInstances.push(callInstance);
+      return callInstance as unknown as VoipCallInstance;
+    },
+    async hangup(callId?: string) {
+      voipHangupCallIds.push(callId);
+      if (callId) {
+        callsMap.delete(callId);
+      }
+    },
+    async end() {
+      endCalls += 1;
+      for (const inst of createdCallInstances) {
+        if (typeof inst.hangup === 'function') {
+          await inst.hangup();
+        }
+      }
+      callsMap.clear();
+    },
+  };
+
+  return {
+    voipMock,
+    coordinator,
+    callsMap,
+    createdCallInstances,
+    simulateOutboundRtpSrtpFrames(
+      callId: string,
+      counts?: {
+        audioSendCount?: number;
+        audioOctetsSent?: number;
+        videoSendCount?: number;
+        videoOctetsSent?: number;
+        videoIdrSendCount?: number;
+      }
+    ) {
+      const session = callsMap.get(callId);
+      if (!session) {
+        throw new Error(`No WaCallMediaSession found for ${callId}`);
+      }
+      session.firstPacketSent = true;
+      session.mediaFlowStarted = true;
+      if (counts?.audioSendCount !== undefined) {
+        session.audioSendCount = counts.audioSendCount;
+      }
+      if (counts?.audioOctetsSent !== undefined) {
+        session.audioOctetsSent = counts.audioOctetsSent;
+      }
+      if (counts?.videoSendCount !== undefined) {
+        session.videoSendCount = counts.videoSendCount;
+      }
+      if (counts?.videoOctetsSent !== undefined) {
+        session.videoOctetsSent = counts.videoOctetsSent;
+      }
+      if (counts?.videoIdrSendCount !== undefined) {
+        session.videoIdrSendCount = counts.videoIdrSendCount;
+      }
+    },
+  };
 }
 
 describe('@hiroosy/baileys-lite & Real WhatsApp VoIP Video Call Suite', () => {
@@ -120,6 +322,7 @@ describe('@hiroosy/baileys-lite & Real WhatsApp VoIP Video Call Suite', () => {
       assert.equal(typeof encodeSignedDeviceIdentity, 'function');
       assert.equal(typeof parseAndInjectE2ESessions, 'function');
       assert.equal(typeof getUSyncDevices, 'function');
+      assert.equal(HiroosyBaileysSessionDriver, BaileysSessionDriver);
     });
 
     it('wraps a raw socket into CompatibleWhatsAppSocket cleanly', () => {
@@ -330,8 +533,8 @@ describe('@hiroosy/baileys-lite & Real WhatsApp VoIP Video Call Suite', () => {
     });
   });
 
-  describe('Phase 6 & 7: RealVideoCallService State Machine & Strict Anti-PTV Guarantees', () => {
-    it('drives full call state machine (INITIATING -> RINGING -> CONNECTING -> CONNECTED -> MEDIA_NEGOTIATING -> MEDIA_STARTED -> MEDIA_STOPPED -> ENDED) and sends ZERO PTV/chat messages', async () => {
+  describe('Phase 6 & 7: RealVideoCallService State Machine & 17 Mandatory Operational Guarantees', () => {
+    it('drives full simulated state machine (INITIATING -> RINGING -> CONNECTING -> CONNECTED -> MEDIA_NEGOTIATING -> MEDIA_STARTED -> MEDIA_STOPPED -> ENDED) and sends ZERO PTV/chat messages', async () => {
       const service = new RealVideoCallService();
       const mockDriver = await createConnectedMockDriver('sess_voip_1');
 
@@ -365,7 +568,6 @@ describe('@hiroosy/baileys-lite & Real WhatsApp VoIP Video Call Suite', () => {
       assert.equal(stream.mediaStarted, true);
       assert.equal(stream.resolutionPreset, '360p');
 
-      // Strictly verify NO PTV or chat video message was ever sent!
       assert.equal(
         mockDriver.sentMediaCalls.length,
         0,
@@ -530,142 +732,389 @@ describe('@hiroosy/baileys-lite & Real WhatsApp VoIP Video Call Suite', () => {
       assert.equal(mockDriver.sentMediaCalls.length, 0);
     });
 
-    it('normalizes portrait resolution preset (360p_portrait -> 360p) when calling Voip.call and transitions through call:ringing -> call:connected -> call:ended with VoipCallInstance payloads while reusing Voip instance per session', async () => {
+    it('Tests 1, 2, 3, 4, 5, 6: retains VoipCallInstance, binds listeners directly to VoipCallInstance, transitions RINGING -> CONNECTED -> MEDIA_NEGOTIATING on connected, and ONLY transitions to MEDIA_STARTED after real outbound audio + video RTP/SRTP evidence', async () => {
       const service = new RealVideoCallService();
-      const compatReport = runBaileysCompatibilityProbe({
-        requireLiveSocket: false,
-      });
-      service.setCompatibilityOverride(compatReport);
+      service.setCompatibilityOverride(
+        runBaileysCompatibilityProbe({ requireLiveSocket: false })
+      );
 
       const rawSocket: Record<string, unknown> = {
         ev: new EventEmitter(),
         ws: { isOpen: true },
       };
-      service.attachSession('sess_real_voip_portrait', rawSocket);
+      service.attachSession('sess_real_voip_1_to_6', rawSocket);
 
-      // Inject a fake Voip instance onto the attached session context that mimics @hiroosy/baileys-lite/voip
-      const fakeVoipEmitter = new EventEmitter() as EventEmitter & {
-        listenCalls: number;
-        receivedPresets: string[];
-        hangupCalls: number;
-        listen: () => Promise<void>;
-        call: (
-          jid: string,
-          videoPath: string,
-          preset: string,
-          opts: Record<string, unknown>
-        ) => Promise<EventEmitter & { callId: string; jid: string }>;
-        hangup: () => Promise<void>;
-        coordinator: { disposed: boolean; dispose: () => void };
-      };
-      fakeVoipEmitter.listenCalls = 0;
-      fakeVoipEmitter.receivedPresets = [];
-      fakeVoipEmitter.hangupCalls = 0;
-      fakeVoipEmitter.coordinator = {
-        disposed: false,
-        dispose() {
-          this.disposed = true;
-        },
-      };
-      fakeVoipEmitter.listen = async () => {
-        fakeVoipEmitter.listenCalls += 1;
-      };
-      fakeVoipEmitter.hangup = async () => {
-        fakeVoipEmitter.hangupCalls += 1;
-      };
-      fakeVoipEmitter.call = async (jid, _videoPath, preset) => {
-        const validPresets = ['240p', '360p', '480p', '720p', '1080p'];
-        if (!validPresets.includes(preset)) {
-          throw new Error(
-            `Unknown resolution "${preset}". Use one of: 240p, 360p, 480p, 720p, 1080p, or pass { width, height, frameRate } directly.`
-          );
-        }
-        fakeVoipEmitter.receivedPresets.push(preset);
-        const callInstance = new EventEmitter() as EventEmitter & {
-          callId: string;
-          jid: string;
-        };
-        callInstance.callId = `HIROOSY_CALL_${fakeVoipEmitter.receivedPresets.length}`;
-        callInstance.jid = jid;
-        return callInstance;
-      };
-
+      const harness = createRealisticHiroosyVoipMock();
       const attachedMap = (
         service as unknown as {
           attachedSessions: Map<string, { voipInstance?: unknown }>;
         }
       ).attachedSessions;
-      const ctx = attachedMap.get('sess_real_voip_portrait')!;
-      ctx.voipInstance = fakeVoipEmitter;
+      attachedMap.get('sess_real_voip_1_to_6')!.voipInstance = harness.voipMock;
 
       const stream = await service.startVideoCall({
-        sessionId: 'sess_real_voip_portrait',
+        sessionId: 'sess_real_voip_1_to_6',
         socket: rawSocket,
         recipientJid: '966501234567@s.whatsapp.net',
         videoFilePath: validPortraitMp4,
         allowedRootDirs: [tmpDir],
       });
 
-      // Stream keeps '360p_portrait' for UI/assertions, while Voip.call received '360p'
+      // (1) voip.call() returns VoipCallInstance and it is stored on stream.voipCallInstance
+      assert.equal(harness.createdCallInstances.length, 1);
+      const callInst = harness.createdCallInstances[0]!;
+      assert.equal(stream.voipCallInstance, callInst);
+      assert.equal(stream.voipCallId, 'HIROOSY_CALL_1');
       assert.equal(stream.resolutionPreset, '360p_portrait');
-      assert.deepEqual(fakeVoipEmitter.receivedPresets, ['360p']);
-      assert.equal(fakeVoipEmitter.listenCalls, 1);
+      assert.deepEqual(harness.voipMock.receivedPresets, ['360p']);
+
+      // (2) Listeners ('ringing', 'connected', 'ended', 'error') are bound to VoipCallInstance itself
+      assert.equal(callInst.listenerCount('ringing'), 1);
+      assert.equal(callInst.listenerCount('connected'), 1);
+      assert.equal(callInst.listenerCount('ended'), 1);
+      assert.equal(callInst.listenerCount('error'), 1);
+
+      // (3) 'ringing' event on VoipCallInstance transitions state to RINGING
+      assert.equal(stream.callState, 'INITIATING');
+      callInst.emit('ringing');
       assert.equal(stream.callState, 'RINGING');
+      assert.equal(stream.mediaStarted, false);
 
-      // Emit 'call:ringing' then 'call:connected' with a VoipCallInstance payload ({ callId, jid })
-      fakeVoipEmitter.emit('call:ringing', {
-        callId: 'HIROOSY_CALL_1',
-        jid: '966501234567@s.whatsapp.net',
-      });
-      fakeVoipEmitter.emit('call:connected', {
-        callId: 'HIROOSY_CALL_1',
-        jid: '966501234567@s.whatsapp.net',
-      });
-      // Duplicate connected event should be idempotent
-      fakeVoipEmitter.emit('call:connected', {
-        callId: 'HIROOSY_CALL_1',
-        jid: '966501234567@s.whatsapp.net',
-      });
+      // (4) 'connected' event does NOT transition immediately to MEDIA_STARTED
+      callInst.emit('connected');
+      assert.equal(stream.callState, 'MEDIA_NEGOTIATING');
+      assert.equal(stream.audioStarted, false);
+      assert.equal(stream.videoStarted, false);
+      assert.equal(stream.mediaStarted, false);
 
-      assert.equal(stream.callState, 'MEDIA_STARTED');
+      // (5) No transition to MEDIA_STARTED when only audio (or zero video) packets have been sent
+      harness.simulateOutboundRtpSrtpFrames('HIROOSY_CALL_1', {
+        audioSendCount: 5,
+        audioOctetsSent: 800,
+        videoSendCount: 0,
+        videoOctetsSent: 0,
+        videoIdrSendCount: 0,
+      });
+      await new Promise((r) => setTimeout(r, 35));
+      assert.equal(stream.audioStarted, true);
+      assert.equal(stream.videoStarted, false);
+      assert.equal(stream.mediaStarted, false);
+      assert.equal(stream.callState, 'MEDIA_NEGOTIATING');
+
+      // (6) First outbound video + audio RTP/SRTP evidence transitions state to MEDIA_STARTED
+      harness.simulateOutboundRtpSrtpFrames('HIROOSY_CALL_1', {
+        audioSendCount: 12,
+        audioOctetsSent: 1920,
+        videoSendCount: 8,
+        videoOctetsSent: 9600,
+        videoIdrSendCount: 1,
+      });
+      await new Promise((r) => setTimeout(r, 35));
+
+      assert.equal(stream.videoStarted, true);
       assert.equal(stream.mediaStarted, true);
+      assert.equal(stream.callState, 'MEDIA_STARTED');
+      assert.ok(stream.outboundMediaEvidence);
+      assert.equal(stream.outboundMediaEvidence.audioPacketsSent, 12);
+      assert.equal(stream.outboundMediaEvidence.videoPacketsSent, 8);
+      assert.equal(stream.outboundMediaEvidence.videoKeyframesSent, 1);
 
-      // Emit 'call:ended' with VoipCallInstance payload
-      fakeVoipEmitter.emit('call:ended', {
-        callId: 'HIROOSY_CALL_1',
-        jid: '966501234567@s.whatsapp.net',
-        options: { reason: 'completed' },
+      await service.stopVideoCall('sess_real_voip_1_to_6', stream.callId);
+      service.detachSession('sess_real_voip_1_to_6');
+    });
+
+    it('Test 7: media failure / timeout before first frame transitions to FAILED, hangs up, and cleans up the call without claiming MEDIA_STARTED', async () => {
+      const service = new RealVideoCallService();
+      service.setCompatibilityOverride(
+        runBaileysCompatibilityProbe({ requireLiveSocket: false })
+      );
+
+      const rawSocket: Record<string, unknown> = {
+        ev: new EventEmitter(),
+        ws: { isOpen: true },
+      };
+      service.attachSession('sess_media_timeout', rawSocket);
+
+      const harness = createRealisticHiroosyVoipMock();
+      const attachedMap = (
+        service as unknown as {
+          attachedSessions: Map<string, { voipInstance?: unknown }>;
+        }
+      ).attachedSessions;
+      attachedMap.get('sess_media_timeout')!.voipInstance = harness.voipMock;
+
+      let mediaErrorFired = false;
+      service.on('call:media-error', () => {
+        mediaErrorFired = true;
       });
 
-      assert.equal(stream.callState, 'ENDED');
-      assert.deepEqual(stream.stateHistory, [
-        'INITIATING',
-        'RINGING',
-        'CONNECTING',
-        'CONNECTED',
-        'MEDIA_NEGOTIATING',
-        'MEDIA_STARTED',
-        'MEDIA_STOPPED',
-        'ENDED',
-      ]);
-
-      // Start a second call on the same session and verify Voip instance is reused (listen called only once)
-      const stream2 = await service.startVideoCall({
-        sessionId: 'sess_real_voip_portrait',
+      const stream = await service.startVideoCall({
+        sessionId: 'sess_media_timeout',
         socket: rawSocket,
         recipientJid: '966501234567@s.whatsapp.net',
-        videoFilePath: validPortraitMp4,
+        videoFilePath: validLandscapeMp4,
+        allowedRootDirs: [tmpDir],
+        mediaStartTimeoutMs: 70,
+      });
+
+      const callInst = harness.createdCallInstances[0]!;
+      callInst.emit('ringing');
+      callInst.emit('connected');
+
+      assert.equal(stream.callState, 'MEDIA_NEGOTIATING');
+      assert.equal(stream.mediaStarted, false);
+
+      // Wait for mediaStartTimeoutMs (70ms) to expire with zero outbound RTP/SRTP packets
+      await new Promise((r) => setTimeout(r, 120));
+
+      assert.equal(mediaErrorFired, true);
+      assert.equal(stream.callState, 'FAILED');
+      assert.equal(stream.mediaStarted, false);
+      assert.equal(stream.mediaFailed, true);
+      assert.ok(stream.failureReason?.includes('MEDIA_FAILED'));
+      assert.ok(!stream.stateHistory.includes('MEDIA_STARTED'));
+      assert.equal(callInst.hangupCalls, 1);
+      assert.equal(callInst.listenerCount('connected'), 0);
+
+      service.detachSession('sess_media_timeout');
+    });
+
+    it('Tests 8 & 9: calls call.hangup() on stopVideoCall, and falls back to voip.hangup(callId) when call.hangup is unavailable', async () => {
+      const service = new RealVideoCallService();
+      service.setCompatibilityOverride(
+        runBaileysCompatibilityProbe({ requireLiveSocket: false })
+      );
+
+      const rawSocket: Record<string, unknown> = {
+        ev: new EventEmitter(),
+        ws: { isOpen: true },
+      };
+
+      // (8) Primary path: callInstance.hangup() is invoked on stopVideoCall
+      service.attachSession('sess_hangup_primary', rawSocket);
+      const harnessPrimary = createRealisticHiroosyVoipMock();
+      const attachedMap = (
+        service as unknown as {
+          attachedSessions: Map<string, { voipInstance?: unknown }>;
+        }
+      ).attachedSessions;
+      attachedMap.get('sess_hangup_primary')!.voipInstance =
+        harnessPrimary.voipMock;
+
+      const stream1 = await service.startVideoCall({
+        sessionId: 'sess_hangup_primary',
+        socket: rawSocket,
+        recipientJid: '966501234567@s.whatsapp.net',
+        videoFilePath: validLandscapeMp4,
         allowedRootDirs: [tmpDir],
       });
-      assert.equal(fakeVoipEmitter.listenCalls, 1);
-      assert.equal(
-        fakeVoipEmitter.listenerCount('call:connected'),
-        1,
-        'Previous call listeners must be cleaned up when call ends'
+      const callInst1 = harnessPrimary.createdCallInstances[0]!;
+      callInst1.emit('ringing');
+
+      await service.stopVideoCall('sess_hangup_primary', stream1.callId);
+      assert.equal(callInst1.hangupCalls, 1);
+      assert.equal(harnessPrimary.voipMock.voipHangupCallIds.length, 0);
+      assert.equal(stream1.callState, 'ENDED');
+
+      // (9) Fallback path: when callInstance.hangup is unavailable, voip.hangup(callId) is invoked with callId
+      service.attachSession('sess_hangup_fallback', rawSocket);
+      const harnessFallback = createRealisticHiroosyVoipMock({
+        omitCallInstanceHangup: true,
+      });
+      attachedMap.get('sess_hangup_fallback')!.voipInstance =
+        harnessFallback.voipMock;
+
+      const stream2 = await service.startVideoCall({
+        sessionId: 'sess_hangup_fallback',
+        socket: rawSocket,
+        recipientJid: '966501234567@s.whatsapp.net',
+        videoFilePath: validLandscapeMp4,
+        allowedRootDirs: [tmpDir],
+      });
+      const callInst2 = harnessFallback.createdCallInstances[0]!;
+      callInst2.emit('ringing');
+
+      await service.stopVideoCall('sess_hangup_fallback', stream2.callId);
+      assert.deepEqual(harnessFallback.voipMock.voipHangupCallIds, [
+        'HIROOSY_CALL_1',
+      ]);
+      assert.equal(stream2.callState, 'ENDED');
+
+      service.detachSession('sess_hangup_primary');
+      service.detachSession('sess_hangup_fallback');
+    });
+
+    it('Tests 10, 11, 12, 13: detachSession ends active calls & disposes coordinator, starting a second call does not duplicate listeners, duplicate ended is idempotent, and error event transitions to FAILED safely', async () => {
+      const service = new RealVideoCallService();
+      service.setCompatibilityOverride(
+        runBaileysCompatibilityProbe({ requireLiveSocket: false })
       );
-      await service.stopVideoCall('sess_real_voip_portrait', stream2.callId);
-      service.detachSession('sess_real_voip_portrait');
-      assert.equal(fakeVoipEmitter.coordinator.disposed, true);
+
+      const rawSocket: Record<string, unknown> = {
+        ev: new EventEmitter(),
+        ws: { isOpen: true },
+      };
+      service.attachSession('sess_lifecycle_10_to_13', rawSocket);
+
+      const harness = createRealisticHiroosyVoipMock();
+      const attachedMap = (
+        service as unknown as {
+          attachedSessions: Map<string, { voipInstance?: unknown }>;
+        }
+      ).attachedSessions;
+      attachedMap.get('sess_lifecycle_10_to_13')!.voipInstance =
+        harness.voipMock;
+
+      // Call 1: test duplicate 'ended' event idempotency (Test 12)
+      const stream1 = await service.startVideoCall({
+        sessionId: 'sess_lifecycle_10_to_13',
+        socket: rawSocket,
+        recipientJid: '966501234567@s.whatsapp.net',
+        videoFilePath: validLandscapeMp4,
+        allowedRootDirs: [tmpDir],
+      });
+      const callInst1 = harness.createdCallInstances[0]!;
+      callInst1.emit('ringing');
+
+      let endedEventsCount = 0;
+      const onEnded = () => {
+        endedEventsCount += 1;
+      };
+      service.on('call:ended', onEnded);
+
+      callInst1.emit('ended', 'completed');
+      callInst1.emit('ended', 'completed'); // Duplicate ended event
+      await service.stopVideoCall('sess_lifecycle_10_to_13', stream1.callId); // Stop after ended
+
+      assert.equal(endedEventsCount, 1, 'ended transition must be idempotent');
+      assert.deepEqual(stream1.stateHistory, ['INITIATING', 'RINGING', 'ENDED']);
+      service.off('call:ended', onEnded);
+
+      // Call 2 on the same session: verify zero listener duplication (Test 11) and safe 'error' handling (Test 13)
+      const stream2 = await service.startVideoCall({
+        sessionId: 'sess_lifecycle_10_to_13',
+        socket: rawSocket,
+        recipientJid: '966501234567@s.whatsapp.net',
+        videoFilePath: validLandscapeMp4,
+        allowedRootDirs: [tmpDir],
+      });
+      const callInst2 = harness.createdCallInstances[1]!;
+
+      assert.equal(harness.voipMock.listenCalls, 1);
+      assert.equal(
+        harness.coordinator.listenerCount('call_state'),
+        1,
+        'Coordinator call_state listener must not be duplicated on second call'
+      );
+      assert.equal(callInst1.listenerCount('connected'), 0);
+      assert.equal(callInst2.listenerCount('connected'), 1);
+
+      // (13) Emit 'error' on VoipCallInstance -> transitions to FAILED without crashing process
+      callInst2.emit('ringing');
+      assert.doesNotThrow(() => {
+        callInst2.emit('error', new Error('SRTP DTLS transport failure'));
+      });
+      assert.equal(stream2.callState, 'FAILED');
+      assert.equal(callInst2.hangupCalls, 1);
+
+      // Call 3 on the same session: verify detachSession ends active call and disposes coordinator (Test 10)
+      const stream3 = await service.startVideoCall({
+        sessionId: 'sess_lifecycle_10_to_13',
+        socket: rawSocket,
+        recipientJid: '966501234567@s.whatsapp.net',
+        videoFilePath: validLandscapeMp4,
+        allowedRootDirs: [tmpDir],
+      });
+      const callInst3 = harness.createdCallInstances[2]!;
+      callInst3.emit('ringing');
+      assert.equal(stream3.callState, 'RINGING');
+
+      service.detachSession('sess_lifecycle_10_to_13');
+
+      assert.ok(callInst3.hangupCalls >= 1);
+      assert.equal(stream3.callState, 'ENDED');
+      assert.equal(harness.voipMock.coordinatorDisposed, true);
+    });
+
+    it('Tests 14, 15, 16, 17: verifies lockfile/package consistency, zero legacy fork references in bun.lock & package.json, zero legacy imports across src/ & scripts/, and zero PTV/chat-video/fake-offer fallbacks in video-call-bridge.ts', () => {
+      const rootDir = process.cwd();
+      const legacyForkName = ['athana', 'sia'].join('');
+      const legacyForkPkg = `${legacyForkName}-baileys`;
+      const legacyForkPattern = new RegExp(
+        `${legacyForkName}|${legacyForkName}cmd|github:${legacyForkName}|${legacyForkName}-libsignal`,
+        'i'
+      );
+
+      // (16) package.json and bun.lock consistency
+      const pkgJson = JSON.parse(
+        fs.readFileSync(path.join(rootDir, 'package.json'), 'utf8')
+      ) as {
+        dependencies?: Record<string, string>;
+        devDependencies?: Record<string, string>;
+      };
+      assert.equal(
+        pkgJson.dependencies?.['@hiroosy/baileys-lite'],
+        '0.3.6',
+        '@hiroosy/baileys-lite@0.3.6 must be the sole WhatsApp dependency in package.json'
+      );
+      assert.equal(pkgJson.dependencies?.[legacyForkPkg], undefined);
+      assert.equal(pkgJson.devDependencies?.[legacyForkPkg], undefined);
+
+      // (15) bun.lock contains zero legacy fork references
+      const bunLockContent = fs.readFileSync(
+        path.join(rootDir, 'bun.lock'),
+        'utf8'
+      );
+      assert.ok(
+        bunLockContent.includes('@hiroosy/baileys-lite@0.3.6'),
+        'bun.lock must resolve @hiroosy/baileys-lite@0.3.6'
+      );
+      assert.equal(
+        legacyForkPattern.test(bunLockContent),
+        false,
+        'bun.lock must NOT contain any legacy fork references'
+      );
+
+      // (14) video-call-bridge.ts never calls sendMessage({ video }), ptv: true, or sendNativeVideoCallOffer
+      const bridgeSource = fs.readFileSync(
+        path.join(rootDir, 'src/whatsapp/video-call-bridge.ts'),
+        'utf8'
+      );
+      assert.equal(
+        /sendMediaMessage|sendNativeVideoCallOffer|sendNativeCallOffer|ptv\s*:/.test(
+          bridgeSource
+        ),
+        false,
+        'video-call-bridge.ts must never invoke sendMediaMessage, ptv, or sendNativeVideoCallOffer'
+      );
+
+      // (17) All TypeScript files in src/ and scripts/ use @hiroosy/baileys-lite and contain zero legacy fork imports
+      const collectTsFiles = (dir: string): string[] => {
+        const entries = fs.readdirSync(dir, { withFileTypes: true });
+        const files: string[] = [];
+        for (const entry of entries) {
+          const full = path.join(dir, entry.name);
+          if (entry.isDirectory()) {
+            files.push(...collectTsFiles(full));
+          } else if (entry.isFile() && /\.(ts|tsx)$/.test(entry.name)) {
+            files.push(full);
+          }
+        }
+        return files;
+      };
+
+      const sourceFiles = [
+        ...collectTsFiles(path.join(rootDir, 'src')),
+        ...collectTsFiles(path.join(rootDir, 'scripts')),
+      ];
+      for (const file of sourceFiles) {
+        const content = fs.readFileSync(file, 'utf8');
+        assert.equal(
+          legacyForkPattern.test(content),
+          false,
+          `File ${path.relative(rootDir, file)} must not reference legacy fork package`
+        );
+      }
     });
 
     it('enforces multi-tenant isolation (IDOR prevention) in InboxHandler and StoriesHandler between Subscriber A and Subscriber B', async () => {
@@ -734,7 +1183,6 @@ describe('@hiroosy/baileys-lite & Real WhatsApp VoIP Video Call Suite', () => {
         fileSizeBytes: 31,
       });
 
-      // Subscriber B must NOT be able to view, download, or forward Subscriber A's message or status
       const viewByB = inboxHandler.viewMessage(subscriberB, msgRecord.id);
       assert.ok(viewByB.text.includes('لم يتم العثور على الرسالة'));
 
@@ -750,7 +1198,6 @@ describe('@hiroosy/baileys-lite & Real WhatsApp VoIP Video Call Suite', () => {
       );
       assert.equal(dlStatusByB.mediaAttachments, undefined);
 
-      // Subscriber A (the owner of the session) CAN view and download their own records
       const viewByA = inboxHandler.viewMessage(subscriberA, msgRecord.id);
       assert.ok(viewByA.text.includes('Secret message for Subscriber A'));
 

@@ -25,7 +25,7 @@
 - Files are written using generated UUID filenames (`upload_<uuid>.ext`) with mode `0600` inside `TEMP_UPLOAD_DIR`.
 - Files are never executed and are deleted automatically in the `finally` block as soon as the task finishes.
 
-## 5. Remaining Limitations of Local Storage & Unofficial Athanasia Baileys Protocol
+## 5. Remaining Limitations of Local Storage & Unofficial `@hiroosy/baileys-lite` Protocol
 
-- **Disk Encryption**: Because `athanasia-baileys` requires access to Signal session keys in `WHATSAPP_AUTH_DIR` to reconnect after restarts, you should enable full-disk encryption (AWS EBS encryption at rest) on the host server.
-- **Unofficial Protocol Risk**: `athanasia-baileys` (`github:AthanasiaCMD/athanasia-baileys`) implements the WhatsApp Web multi-device protocol unofficially. WhatsApp may change protocol handshakes, expire sessions, or restrict accounts that violate platform terms.
+- **Disk Encryption**: Because `@hiroosy/baileys-lite` requires access to Signal session keys in `WHATSAPP_AUTH_DIR` to reconnect after restarts, you should enable full-disk encryption (AWS EBS encryption at rest) on the host server.
+- **Unofficial Protocol Risk**: `@hiroosy/baileys-lite` (`@hiroosy/baileys-lite@0.3.6`) implements the WhatsApp Web multi-device and VoIP protocols unofficially. WhatsApp may change protocol handshakes, expire sessions, or restrict accounts that violate platform terms.

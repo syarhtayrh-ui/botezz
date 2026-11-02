@@ -2,6 +2,10 @@ import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
 import { EventEmitter } from 'node:events';
+import type {
+  VoipCallInstance,
+  WaCallMediaSessionLike,
+} from '@hiroosy/baileys-lite/voip';
 import { SessionManager } from './session-manager';
 import { AuditRepository } from '../database/repositories/audit-repository';
 import { WhatsAppSessionDriver } from './connection-manager';
@@ -24,7 +28,6 @@ import {
 } from './voip-media-pipeline';
 import { createMinimalMp4Buffer } from '../function-lab/media-sticker-toolkit';
 import {
-  ValidationError,
   WhatsAppConnectionError,
   VoipFailureError,
   MediaValidationError,
@@ -44,7 +47,8 @@ export type RealCallState =
   | 'ENDED'
   | 'REJECTED'
   | 'TIMEOUT'
-  | 'FAILED';
+  | 'FAILED'
+  | 'MEDIA_FAILED';
 
 export type NativeCallProtocolMode = 'HIROOSY_VOIP_VIDEO_CALL';
 
@@ -58,6 +62,20 @@ export interface VideoCallEnvironmentProbe {
   ffprobeAvailable: boolean;
   recommendedMode: VideoCallExecutionMode;
   compatibilityReport: CompatibilityReport;
+}
+
+export interface OutboundMediaEvidence {
+  audioPacketsSent: number;
+  audioOctetsSent: number;
+  videoPacketsSent: number;
+  videoOctetsSent: number;
+  videoKeyframesSent: number;
+  verifiedAt: string;
+  source:
+    | 'wa_call_media_session'
+    | 'call_instance_stats'
+    | 'explicit_media_event'
+    | 'mock_simulation';
 }
 
 export interface StartVideoCallRequest {
@@ -74,6 +92,7 @@ export interface StartVideoCallRequest {
   loopVideo?: boolean;
   maxDurationSeconds?: number;
   callTimeoutMs?: number;
+  mediaStartTimeoutMs?: number;
   actorTelegramId?: number;
   strictMediaValidation?: boolean;
   allowedRootDirs?: string[];
@@ -89,6 +108,7 @@ export interface StopVideoCallOptions {
 export interface ActiveVideoCallStream {
   callId: string;
   voipCallId?: string;
+  voipCallInstance?: VoipCallInstance;
   sessionId: string;
   recipientJid: string;
   recipientMasked: string;
@@ -104,6 +124,8 @@ export interface ActiveVideoCallStream {
   audioStarted: boolean;
   videoStarted: boolean;
   mediaStarted: boolean;
+  mediaFailed?: boolean;
+  outboundMediaEvidence?: OutboundMediaEvidence;
   resolutionPreset: VoipVideoResolutionPreset;
   mediaInspection?: VideoMediaInspectionResult;
   loopVideo: boolean;
@@ -123,18 +145,28 @@ interface AttachedSessionContext {
   compatibleSocket?: CompatibleWhatsAppSocket;
   voipInstance?: InstanceType<typeof Voip>;
   voipListening?: boolean;
+  activeCallInstances: Map<string, VoipCallInstance>;
   connectionListener?: (update: Record<string, unknown>) => void;
 }
+
+const TERMINAL_CALL_STATES: ReadonlySet<RealCallState> = new Set<RealCallState>([
+  'ENDED',
+  'REJECTED',
+  'TIMEOUT',
+  'FAILED',
+  'MEDIA_FAILED',
+]);
 
 /**
  * Real WhatsApp VoIP Video Call Service (`RealVideoCallService`) powered by `@hiroosy/baileys-lite/voip`.
  *
  * Strictly enforces:
- * - Zero fake PTV (`sendMediaMessage({ ptv: true })`) or chat video fallbacks.
- * - Zero repeated `<call><offer>` wave loops.
+ * - Zero chat video message or voice note fallbacks.
+ * - Zero synthetic `<call><offer>` wave loops.
  * - Full state machine:
  *   `INITIATING` -> `RINGING` -> `CONNECTING` -> `CONNECTED` -> `MEDIA_NEGOTIATING` ->
  *   `MEDIA_STARTED` -> `MEDIA_STOPPED` -> `ENDED` / `REJECTED` / `TIMEOUT` / `FAILED`.
+ * - Verified outbound RTP/SRTP audio & video packet evidence before transitioning to `MEDIA_STARTED`.
  * - Pre-call `CompatibilityProbe` check and `validateAndInspectVideoMedia` pipeline.
  */
 export class RealVideoCallService extends EventEmitter {
@@ -142,6 +174,8 @@ export class RealVideoCallService extends EventEmitter {
   private readonly activeStreams = new Map<string, ActiveVideoCallStream>();
   private readonly stopTimers = new Map<string, NodeJS.Timeout>();
   private readonly ringingTimeoutTimers = new Map<string, NodeJS.Timeout>();
+  private readonly mediaStartTimeoutTimers = new Map<string, NodeJS.Timeout>();
+  private readonly mediaMonitorIntervals = new Map<string, NodeJS.Timeout>();
   private readonly callListenerCleanups = new Map<string, () => void>();
   private compatibilityOverride?: CompatibilityReport;
 
@@ -150,6 +184,10 @@ export class RealVideoCallService extends EventEmitter {
     private readonly auditRepo?: AuditRepository
   ) {
     super();
+  }
+
+  private isTerminalState(state: RealCallState): boolean {
+    return TERMINAL_CALL_STATES.has(state);
   }
 
   /**
@@ -225,6 +263,7 @@ export class RealVideoCallService extends EventEmitter {
       driver,
       rawSocket,
       compatibleSocket,
+      activeCallInstances: new Map<string, VoipCallInstance>(),
     };
 
     const ev = rawSocket?.ev as
@@ -250,12 +289,64 @@ export class RealVideoCallService extends EventEmitter {
   }
 
   /**
-   * Detaches a session, stops any active calls on that session, and disposes VoIP resources.
+   * Detaches a session, terminates all active calls on that session, removes listeners,
+   * and disposes VoIP coordinator resources cleanly.
    */
   public detachSession(sessionId: string): void {
     const existing = this.attachedSessions.get(sessionId);
     if (!existing) return;
 
+    // 1. Terminate and clean up any active streams associated with this session
+    for (const stream of this.activeStreams.values()) {
+      if (stream.sessionId === sessionId) {
+        this.clearCallTimers(stream.callId);
+        const callInst = stream.voipCallInstance;
+        stream.voipCallInstance = undefined;
+        if (callInst && typeof callInst.hangup === 'function') {
+          try {
+            void callInst.hangup().catch(() => undefined);
+          } catch {
+            // Ignore hangup error on detach
+          }
+        } else if (
+          existing.voipInstance &&
+          typeof existing.voipInstance.hangup === 'function' &&
+          stream.voipCallId
+        ) {
+          try {
+            void existing.voipInstance.hangup(stream.voipCallId).catch(() => undefined);
+          } catch {
+            // Ignore fallback hangup error on detach
+          }
+        }
+        if (!this.isTerminalState(stream.callState)) {
+          if (stream.mediaStarted) {
+            this.transitionCallState(stream, 'MEDIA_STOPPED');
+          }
+          this.transitionCallState(stream, 'ENDED', 'session_detached');
+          this.emit('call:ended', {
+            callId: stream.callId,
+            sessionId,
+            state: 'ENDED',
+            reason: 'session_detached',
+          });
+        }
+      }
+    }
+
+    // 2. Hang up any remaining tracked VoipCallInstance objects on the session context
+    for (const callInst of existing.activeCallInstances.values()) {
+      if (typeof callInst.hangup === 'function') {
+        try {
+          void callInst.hangup().catch(() => undefined);
+        } catch {
+          // Ignore hangup error
+        }
+      }
+    }
+    existing.activeCallInstances.clear();
+
+    // 3. Remove socket connection.update listener
     const ev = existing.rawSocket?.ev as
       | {
           off?: (
@@ -276,18 +367,17 @@ export class RealVideoCallService extends EventEmitter {
       }
     }
 
+    // 4. End Voip client calls and dispose coordinator
     if (existing.voipInstance) {
-      try {
-        void existing.voipInstance.hangup().catch(() => undefined);
-      } catch {
-        // Ignore hangup errors on detach
+      if (typeof existing.voipInstance.end === 'function') {
+        try {
+          void existing.voipInstance.end().catch(() => undefined);
+        } catch {
+          // Ignore end errors on detach
+        }
       }
       try {
-        const coordinator = (
-          existing.voipInstance as unknown as {
-            coordinator?: { dispose?: () => void };
-          }
-        ).coordinator;
+        const coordinator = existing.voipInstance.coordinator;
         coordinator?.dispose?.();
       } catch {
         // Ignore coordinator dispose errors on detach
@@ -309,13 +399,21 @@ export class RealVideoCallService extends EventEmitter {
     if (failureReason) {
       stream.failureReason = failureReason;
     }
-    if (
-      nextState === 'ENDED' ||
-      nextState === 'REJECTED' ||
-      nextState === 'TIMEOUT' ||
-      nextState === 'FAILED'
-    ) {
+    if (this.isTerminalState(nextState)) {
       stream.endedAt = new Date().toISOString();
+    }
+  }
+
+  private clearMediaVerificationTimers(callId: string): void {
+    const mediaTimeout = this.mediaStartTimeoutTimers.get(callId);
+    if (mediaTimeout) {
+      clearTimeout(mediaTimeout);
+      this.mediaStartTimeoutTimers.delete(callId);
+    }
+    const monitorInterval = this.mediaMonitorIntervals.get(callId);
+    if (monitorInterval) {
+      clearInterval(monitorInterval);
+      this.mediaMonitorIntervals.delete(callId);
     }
   }
 
@@ -330,6 +428,7 @@ export class RealVideoCallService extends EventEmitter {
       clearTimeout(ringTimer);
       this.ringingTimeoutTimers.delete(callId);
     }
+    this.clearMediaVerificationTimers(callId);
     const cleanupListeners = this.callListenerCleanups.get(callId);
     if (cleanupListeners) {
       this.callListenerCleanups.delete(callId);
@@ -347,7 +446,7 @@ export class RealVideoCallService extends EventEmitter {
     for (const stream of this.activeStreams.values()) {
       if (
         stream.sessionId === sessionId &&
-        !['ENDED', 'REJECTED', 'TIMEOUT', 'FAILED'].includes(stream.callState)
+        !this.isTerminalState(stream.callState)
       ) {
         return stream;
       }
@@ -414,8 +513,12 @@ export class RealVideoCallService extends EventEmitter {
       600
     );
     const callTimeoutMs = Math.min(
-      Math.max(req.callTimeoutMs || 35_000, 100),
+      Math.max(req.callTimeoutMs || 35_000, 50),
       120_000
+    );
+    const mediaStartTimeoutMs = Math.min(
+      Math.max(req.mediaStartTimeoutMs || 12_000, 30),
+      60_000
     );
 
     const existing = this.getActiveStreamForSession(req.sessionId);
@@ -551,7 +654,7 @@ export class RealVideoCallService extends EventEmitter {
       maxDurationSeconds: maxDuration,
       startedAt: new Date().toISOString(),
       messageId: callId,
-      detailsArabic: `📞📹 مكالمة فيديو VoIP حقيقية عبر @hiroosy/baileys-lite (${mediaInspection.targetVoipResolution}) إلى (${recipientMasked}).`,
+      detailsArabic: `📞 جاري تهيئة مكالمة الفيديو عبر @hiroosy/baileys-lite/voip (${mediaInspection.targetVoipResolution}) إلى (${recipientMasked})...`,
     };
 
     this.activeStreams.set(callId, streamRecord);
@@ -580,6 +683,7 @@ export class RealVideoCallService extends EventEmitter {
         streamRecord,
         rawSocket,
         callTimeoutMs,
+        mediaStartTimeoutMs,
         maxDuration,
         actorTelegramId
       );
@@ -615,12 +719,177 @@ export class RealVideoCallService extends EventEmitter {
   }
 
   /**
-   * Executes a real VoIP video call over `@hiroosy/baileys-lite/voip` (`Voip` / `WaVoipCoordinator`).
+   * Resolves the underlying `WaCallMediaSession` for an active call from `@hiroosy/baileys-lite/voip`
+   * (`voip.coordinator.manager.calls.get(voipCallId)` or `callInstance.mediaSession`).
+   */
+  private resolveWaCallMediaSession(
+    stream: ActiveVideoCallStream,
+    voip: InstanceType<typeof Voip>,
+    callInstance?: VoipCallInstance
+  ): WaCallMediaSessionLike | undefined {
+    if (callInstance?.mediaSession && typeof callInstance.mediaSession === 'object') {
+      return callInstance.mediaSession;
+    }
+    const callInstanceAny = callInstance as unknown as {
+      activeCall?: { session?: WaCallMediaSessionLike };
+      _session?: WaCallMediaSessionLike;
+    } | undefined;
+    if (callInstanceAny?.activeCall?.session) {
+      return callInstanceAny.activeCall.session;
+    }
+    if (callInstanceAny?._session) {
+      return callInstanceAny._session;
+    }
+
+    const callsMap = voip.coordinator?.manager?.calls;
+    if (callsMap && typeof callsMap.get === 'function') {
+      if (stream.voipCallId) {
+        const byId = callsMap.get(stream.voipCallId);
+        if (byId) return byId;
+      }
+      for (const session of callsMap.values()) {
+        if (!stream.voipCallId || session?.callId === stream.voipCallId) {
+          return session;
+        }
+      }
+    }
+    return undefined;
+  }
+
+  /**
+   * Inspects real outbound RTP/SRTP audio and video packet counters on the active call session
+   * and transitions from `MEDIA_NEGOTIATING` to `MEDIA_STARTED` ONLY when real outbound media
+   * transmission is proven.
+   */
+  private evaluateOutboundMediaEvidence(
+    stream: ActiveVideoCallStream,
+    voip: InstanceType<typeof Voip>,
+    callInstance?: VoipCallInstance,
+    explicitStats?: {
+      audioSendCount?: number;
+      audioOctetsSent?: number;
+      videoSendCount?: number;
+      videoOctetsSent?: number;
+      videoIdrSendCount?: number;
+      source?: OutboundMediaEvidence['source'];
+    }
+  ): boolean {
+    if (
+      stream.callState !== 'MEDIA_NEGOTIATING' ||
+      stream.mediaStarted ||
+      this.isTerminalState(stream.callState)
+    ) {
+      return stream.mediaStarted;
+    }
+
+    const mediaSession = this.resolveWaCallMediaSession(stream, voip, callInstance);
+    const instanceStats =
+      typeof callInstance?.getMediaStats === 'function'
+        ? callInstance.getMediaStats()
+        : undefined;
+
+    const audioPackets =
+      explicitStats?.audioSendCount ??
+      instanceStats?.audioSendCount ??
+      mediaSession?.audioSendCount ??
+      mediaSession?.realAudioSendCount ??
+      0;
+    const audioOctets =
+      explicitStats?.audioOctetsSent ??
+      instanceStats?.audioOctetsSent ??
+      mediaSession?.audioOctetsSent ??
+      0;
+
+    const videoPackets =
+      explicitStats?.videoSendCount ??
+      instanceStats?.videoSendCount ??
+      mediaSession?.videoSendCount ??
+      mediaSession?.videoEngine?.accessUnitsSent ??
+      0;
+    const videoOctets =
+      explicitStats?.videoOctetsSent ??
+      instanceStats?.videoOctetsSent ??
+      mediaSession?.videoOctetsSent ??
+      0;
+    const videoKeyframes =
+      explicitStats?.videoIdrSendCount ??
+      instanceStats?.videoIdrSendCount ??
+      mediaSession?.videoIdrSendCount ??
+      (videoPackets > 0 ? 1 : 0);
+
+    const hasAudioEvidence = audioPackets > 0 && audioOctets > 0;
+    const hasVideoEvidence =
+      stream.callKind === 'voice' ||
+      (videoPackets > 0 && videoOctets > 0 && videoKeyframes > 0);
+
+    if (hasAudioEvidence && !stream.audioStarted) {
+      stream.audioStarted = true;
+      this.emit('call:audio-started', {
+        callId: stream.callId,
+        voipCallId: stream.voipCallId,
+        sessionId: stream.sessionId,
+        audioPacketsSent: audioPackets,
+        audioOctetsSent: audioOctets,
+        hasEmbeddedAudio: stream.mediaInspection?.hasAudioStream ?? false,
+      });
+    }
+
+    if (hasVideoEvidence && stream.callKind === 'video' && !stream.videoStarted) {
+      stream.videoStarted = true;
+      this.emit('call:video-started', {
+        callId: stream.callId,
+        voipCallId: stream.voipCallId,
+        sessionId: stream.sessionId,
+        videoPacketsSent: videoPackets,
+        videoOctetsSent: videoOctets,
+        videoKeyframesSent: videoKeyframes,
+        resolutionPreset: stream.resolutionPreset,
+      });
+    }
+
+    const bothReady =
+      stream.audioStarted &&
+      (stream.callKind === 'voice' || stream.videoStarted);
+
+    if (bothReady && !stream.mediaStarted) {
+      this.clearMediaVerificationTimers(stream.callId);
+      const evidenceSource: OutboundMediaEvidence['source'] =
+        explicitStats?.source ||
+        (instanceStats ? 'call_instance_stats' : 'wa_call_media_session');
+
+      stream.outboundMediaEvidence = {
+        audioPacketsSent: audioPackets,
+        audioOctetsSent: audioOctets,
+        videoPacketsSent: videoPackets,
+        videoOctetsSent: videoOctets,
+        videoKeyframesSent: videoKeyframes,
+        verifiedAt: new Date().toISOString(),
+        source: evidenceSource,
+      };
+      stream.mediaStarted = true;
+      this.transitionCallState(stream, 'MEDIA_STARTED');
+      stream.detailsArabic = `🟢 جاري بث الصوت والفيديو فعلياً عبر RTP/SRTP داخل مكالمة واتساب (${stream.resolutionPreset}) إلى (${stream.recipientMasked}).`;
+      this.emit('call:media-started', {
+        callId: stream.callId,
+        voipCallId: stream.voipCallId,
+        sessionId: stream.sessionId,
+        resolutionPreset: stream.resolutionPreset,
+        evidence: stream.outboundMediaEvidence,
+      });
+      return true;
+    }
+
+    return false;
+  }
+
+  /**
+   * Executes a real VoIP video call over `@hiroosy/baileys-lite/voip` (`Voip` / `VoipCall` / `WaVoipCoordinator`).
    */
   private async executeRealHiroosyVoipCallLifecycle(
     stream: ActiveVideoCallStream,
     rawSocket: Record<string, unknown>,
     callTimeoutMs: number,
+    mediaStartTimeoutMs: number,
     maxDurationSeconds: number,
     actorTelegramId: number
   ): Promise<void> {
@@ -641,34 +910,165 @@ export class RealVideoCallService extends EventEmitter {
       }
     }
 
-    const extractCallId = (infoOrInstance: unknown): string | undefined => {
-      if (!infoOrInstance || typeof infoOrInstance !== 'object') {
-        return stream.voipCallId;
+    if (!ctx || !ctx.voipListening) {
+      await voip.listen();
+      if (ctx) {
+        ctx.voipListening = true;
       }
-      const obj = infoOrInstance as { callId?: string; id?: string };
-      return obj.callId || obj.id || stream.voipCallId;
+    }
+
+    let callInstance: VoipCallInstance | undefined;
+
+    const isMatchingCallInfo = (info: unknown): boolean => {
+      if (!info || typeof info !== 'object') return true;
+      const cid =
+        (info as { callId?: string; id?: string }).callId ||
+        (info as { callId?: string; id?: string }).id;
+      if (!cid || !stream.voipCallId) return true;
+      return cid === stream.voipCallId;
     };
 
-    const extractEndReason = (infoOrInstance: unknown): string => {
-      if (!infoOrInstance || typeof infoOrInstance !== 'object') {
+    const recordVoipCallId = (cid?: string | null) => {
+      if (!cid) return;
+      stream.voipCallId = cid;
+      if (!stream.nativeStanzaCallIds.includes(cid)) {
+        stream.nativeStanzaCallIds.push(cid);
+      }
+      stream.messageId = cid;
+      if (ctx && callInstance) {
+        ctx.activeCallInstances.set(cid, callInstance);
+      }
+    };
+
+    const extractEndReason = (reasonOrInfo: unknown): string => {
+      if (typeof reasonOrInfo === 'string' && reasonOrInfo.trim()) {
+        return reasonOrInfo.trim().toLowerCase();
+      }
+      if (!reasonOrInfo || typeof reasonOrInfo !== 'object') {
         return 'ended';
       }
-      const obj = infoOrInstance as {
+      const obj = reasonOrInfo as {
         reason?: string;
+        endReason?: string;
         options?: { reason?: string };
       };
-      return String(obj.reason || obj.options?.reason || 'ended').toLowerCase();
+      return String(
+        obj.reason || obj.endReason || obj.options?.reason || 'ended'
+      ).toLowerCase();
     };
 
-    const handleRinging = (infoOrInstance?: unknown) => {
-      const cid = extractCallId(infoOrInstance);
-      if (cid && !stream.nativeStanzaCallIds.includes(cid)) {
-        stream.voipCallId = cid;
-        stream.nativeStanzaCallIds.push(cid);
-        stream.messageId = cid;
+    const hangupActiveCallSafely = async () => {
+      const inst = stream.voipCallInstance || callInstance;
+      stream.voipCallInstance = undefined;
+      if (ctx && stream.voipCallId) {
+        ctx.activeCallInstances.delete(stream.voipCallId);
+      }
+      if (inst && typeof inst.hangup === 'function') {
+        try {
+          await inst.hangup();
+          return;
+        } catch {
+          // Fall through to voip.hangup(callId)
+        }
+      }
+      if (voip && typeof voip.hangup === 'function' && stream.voipCallId) {
+        try {
+          await voip.hangup(stream.voipCallId);
+        } catch {
+          // Ignore fallback hangup error
+        }
+      }
+    };
+
+    const startOutboundMediaVerification = () => {
+      // Immediately check once in case media counters are already > 0
+      if (this.evaluateOutboundMediaEvidence(stream, voip, callInstance)) {
+        return;
+      }
+
+      this.clearMediaVerificationTimers(stream.callId);
+
+      const monitorInterval = setInterval(() => {
+        if (this.isTerminalState(stream.callState) || stream.mediaStarted) {
+          this.clearMediaVerificationTimers(stream.callId);
+          return;
+        }
+        this.evaluateOutboundMediaEvidence(stream, voip, callInstance);
+      }, 20);
+      if (typeof monitorInterval.unref === 'function') {
+        monitorInterval.unref();
+      }
+      this.mediaMonitorIntervals.set(stream.callId, monitorInterval);
+
+      const mediaTimeout = setTimeout(() => {
+        if (this.isTerminalState(stream.callState) || stream.mediaStarted) {
+          return;
+        }
+        // Final check right before declaring timeout
+        if (this.evaluateOutboundMediaEvidence(stream, voip, callInstance)) {
+          return;
+        }
+
+        const reason =
+          'MEDIA_FAILED: Outbound RTP/SRTP audio/video frames did not start within timeout';
+        log.error('Outbound media failed to start within timeout after call connected', {
+          callId: stream.callId,
+          voipCallId: stream.voipCallId,
+          sessionId: stream.sessionId,
+          audioStarted: stream.audioStarted,
+          videoStarted: stream.videoStarted,
+          mediaStartTimeoutMs,
+        });
+
+        stream.mediaFailed = true;
+        stream.detailsArabic =
+          '❌ تم الرد على المكالمة ولكن تعذر بدء بث الصوت والفيديو الفعلي (MEDIA_FAILED) خلال المهلة المحددة؛ تم إنهاء المكالمة وتنظيف الموارد.';
+        this.clearCallTimers(stream.callId);
+        this.transitionCallState(stream, 'FAILED', reason);
+
+        const mediaErr = new VoipFailureError(stream.detailsArabic, {
+          callId: stream.callId,
+          voipCallId: stream.voipCallId,
+          audioStarted: stream.audioStarted,
+          videoStarted: stream.videoStarted,
+          reason,
+        });
+
+        this.emit('call:media-error', {
+          callId: stream.callId,
+          voipCallId: stream.voipCallId,
+          sessionId: stream.sessionId,
+          error: mediaErr,
+          reason,
+        });
+        this.emit('call:ended', {
+          callId: stream.callId,
+          voipCallId: stream.voipCallId,
+          sessionId: stream.sessionId,
+          state: 'FAILED',
+          reason,
+        });
+
+        void hangupActiveCallSafely();
+      }, mediaStartTimeoutMs);
+
+      if (typeof mediaTimeout.unref === 'function') {
+        mediaTimeout.unref();
+      }
+      this.mediaStartTimeoutTimers.set(stream.callId, mediaTimeout);
+    };
+
+    const handleRinging = (info?: unknown) => {
+      if (!isMatchingCallInfo(info)) return;
+      if (info && typeof info === 'object') {
+        const cid =
+          (info as { callId?: string; id?: string }).callId ||
+          (info as { callId?: string; id?: string }).id;
+        recordVoipCallId(cid);
       }
       if (stream.callState === 'INITIATING') {
         this.transitionCallState(stream, 'RINGING');
+        stream.detailsArabic = `🔔 جاري الرنين الفعلي لدى المستلم (${stream.recipientMasked}) عبر @hiroosy/baileys-lite/voip؛ سيبدأ بث الصوت والفيديو فور الرد وتدفق حزم RTP/SRTP.`;
         this.emit('call:ringing', {
           callId: stream.callId,
           voipCallId: stream.voipCallId,
@@ -678,10 +1078,12 @@ export class RealVideoCallService extends EventEmitter {
       }
     };
 
-    const handleConnected = (infoOrInstance?: unknown) => {
+    const handleConnected = (info?: unknown) => {
+      if (!isMatchingCallInfo(info)) return;
       if (
+        stream.callState === 'MEDIA_NEGOTIATING' ||
         stream.callState === 'MEDIA_STARTED' ||
-        ['ENDED', 'REJECTED', 'TIMEOUT', 'FAILED'].includes(stream.callState)
+        this.isTerminalState(stream.callState)
       ) {
         return;
       }
@@ -692,11 +1094,11 @@ export class RealVideoCallService extends EventEmitter {
         this.ringingTimeoutTimers.delete(stream.callId);
       }
 
-      const cid = extractCallId(infoOrInstance);
-      if (cid && !stream.nativeStanzaCallIds.includes(cid)) {
-        stream.voipCallId = cid;
-        stream.nativeStanzaCallIds.push(cid);
-        stream.messageId = cid;
+      if (info && typeof info === 'object') {
+        const cid =
+          (info as { callId?: string; id?: string }).callId ||
+          (info as { callId?: string; id?: string }).id;
+        recordVoipCallId(cid);
       }
 
       if (stream.callState === 'INITIATING') {
@@ -724,43 +1126,41 @@ export class RealVideoCallService extends EventEmitter {
         sessionId: stream.sessionId,
       });
 
+      // Transition to MEDIA_NEGOTIATING and wait for real outbound RTP/SRTP audio+video evidence
       this.transitionCallState(stream, 'MEDIA_NEGOTIATING');
-      stream.audioStarted = true;
-      this.emit('call:audio-started', {
-        callId: stream.callId,
-        sessionId: stream.sessionId,
-        hasEmbeddedAudio: stream.mediaInspection?.hasAudioStream ?? false,
-      });
-
-      stream.videoStarted = true;
-      this.emit('call:video-started', {
-        callId: stream.callId,
-        sessionId: stream.sessionId,
-        resolutionPreset: stream.resolutionPreset,
-      });
-
-      stream.mediaStarted = true;
-      this.transitionCallState(stream, 'MEDIA_STARTED');
-      stream.detailsArabic = `🟢 جاري بث الصوت والفيديو فعلياً عبر RTP/SRTP داخل مكالمة واتساب (${stream.resolutionPreset}) إلى (${stream.recipientMasked}).`;
-      this.emit('call:media-started', {
+      stream.detailsArabic = `🎛️ تم الرد على المكالمة؛ جاري التفاوض والتحقق من بدء ضخ حزم الصوت والفيديو (RTP/SRTP)...`;
+      this.emit('call:media-negotiating', {
         callId: stream.callId,
         voipCallId: stream.voipCallId,
         sessionId: stream.sessionId,
-        resolutionPreset: stream.resolutionPreset,
       });
+
+      startOutboundMediaVerification();
     };
 
-    const handleEnded = (infoOrInstance?: unknown) => {
-      this.clearCallTimers(stream.callId);
-      const reason = extractEndReason(infoOrInstance);
+    const handleEnded = (reasonOrInfo?: unknown) => {
       if (
-        ['ENDED', 'REJECTED', 'TIMEOUT', 'FAILED'].includes(stream.callState)
+        reasonOrInfo &&
+        typeof reasonOrInfo === 'object' &&
+        !isMatchingCallInfo(reasonOrInfo)
       ) {
         return;
       }
+      this.clearCallTimers(stream.callId);
+      stream.voipCallInstance = undefined;
+      if (ctx && stream.voipCallId) {
+        ctx.activeCallInstances.delete(stream.voipCallId);
+      }
+
+      if (this.isTerminalState(stream.callState)) {
+        return;
+      }
+
+      const reason = extractEndReason(reasonOrInfo);
 
       if (reason.includes('reject') || reason.includes('busy')) {
         this.transitionCallState(stream, 'REJECTED', reason);
+        stream.detailsArabic = `🚫 تم رفض المكالمة أو الانشغال من الطرف الآخر (${reason}).`;
         this.emit('call:rejected', {
           callId: stream.callId,
           sessionId: stream.sessionId,
@@ -768,6 +1168,7 @@ export class RealVideoCallService extends EventEmitter {
         });
       } else if (reason.includes('timeout') || reason.includes('unanswered')) {
         this.transitionCallState(stream, 'TIMEOUT', reason);
+        stream.detailsArabic = `⏱️ انتهت مهلة الرنين دون رد من الطرف الآخر (${reason}).`;
         this.emit('call:timeout', {
           callId: stream.callId,
           sessionId: stream.sessionId,
@@ -778,6 +1179,7 @@ export class RealVideoCallService extends EventEmitter {
           this.transitionCallState(stream, 'MEDIA_STOPPED');
         }
         this.transitionCallState(stream, 'ENDED', reason);
+        stream.detailsArabic = `🛑 انتهت المكالمة المرئية (${reason}).`;
       }
 
       this.emit('call:ended', {
@@ -790,9 +1192,7 @@ export class RealVideoCallService extends EventEmitter {
 
     const handleError = (errInput: unknown) => {
       this.clearCallTimers(stream.callId);
-      if (
-        ['ENDED', 'REJECTED', 'TIMEOUT', 'FAILED'].includes(stream.callState)
-      ) {
+      if (this.isTerminalState(stream.callState)) {
         return;
       }
       const err =
@@ -806,7 +1206,13 @@ export class RealVideoCallService extends EventEmitter {
               )
             );
       const classification = classifyEngineeringFailure(err);
+      if (stream.mediaStarted) {
+        this.transitionCallState(stream, 'MEDIA_STOPPED');
+      } else {
+        stream.mediaFailed = true;
+      }
       this.transitionCallState(stream, 'FAILED', classification.summary);
+      stream.detailsArabic = `❌ تعذر إكمال المكالمة أو بث الوسائط: ${classification.summary}`;
       this.emit('call:media-error', {
         callId: stream.callId,
         sessionId: stream.sessionId,
@@ -819,44 +1225,109 @@ export class RealVideoCallService extends EventEmitter {
         state: 'FAILED',
         reason: classification.summary,
       });
+      void hangupActiveCallSafely();
     };
 
-    const voipEmitter = voip as unknown as EventEmitter;
-    voipEmitter.on('call:ringing', handleRinging);
-    voipEmitter.on('ringing', handleRinging);
-    voipEmitter.on('call:connected', handleConnected);
-    voipEmitter.on('connected', handleConnected);
-    voipEmitter.on('call:ended', handleEnded);
-    voipEmitter.on('ended', handleEnded);
-    voipEmitter.on('call:error', handleError);
-    voipEmitter.on('error', handleError);
-
-    let callInstanceEmitter: EventEmitter | undefined;
-    this.callListenerCleanups.set(stream.callId, () => {
-      if (typeof voipEmitter.off === 'function') {
-        voipEmitter.off('call:ringing', handleRinging);
-        voipEmitter.off('ringing', handleRinging);
-        voipEmitter.off('call:connected', handleConnected);
-        voipEmitter.off('connected', handleConnected);
-        voipEmitter.off('call:ended', handleEnded);
-        voipEmitter.off('ended', handleEnded);
-        voipEmitter.off('call:error', handleError);
-        voipEmitter.off('error', handleError);
+    // Official WaVoipCoordinator listeners (`call_state`, `call_ended`, `call_error`, `call_video_state`, `call_outbound_audio_finished`)
+    const coordinator = voip.coordinator;
+    const onCoordinatorCallState = (info: Record<string, unknown>) => {
+      if (!isMatchingCallInfo(info)) return;
+      const st = String(info?.state || '').toLowerCase();
+      if (st === 'ringing') {
+        handleRinging(info);
+      } else if (st === 'connected' || st === 'accepted') {
+        handleConnected(info);
+      } else if (st === 'ended' || st === 'rejected' || st === 'terminated') {
+        handleEnded(info);
       }
-      if (callInstanceEmitter && typeof callInstanceEmitter.off === 'function') {
-        callInstanceEmitter.off('ringing', handleRinging);
-        callInstanceEmitter.off('connected', handleConnected);
-        callInstanceEmitter.off('ended', handleEnded);
-        callInstanceEmitter.off('error', handleError);
+    };
+    const onCoordinatorCallEnded = (info: Record<string, unknown>) => {
+      if (!isMatchingCallInfo(info)) return;
+      handleEnded(info);
+    };
+    const onCoordinatorCallError = (err: unknown) => {
+      handleError(err);
+    };
+    const onCoordinatorVideoState = (
+      info: Record<string, unknown>,
+      videoState: unknown
+    ) => {
+      if (!isMatchingCallInfo(info)) return;
+      this.emit('call:peer-video-state', {
+        callId: stream.callId,
+        voipCallId: stream.voipCallId,
+        sessionId: stream.sessionId,
+        videoState,
+      });
+    };
+    const onCoordinatorOutboundAudioFinished = (
+      info: Record<string, unknown>
+    ) => {
+      if (!isMatchingCallInfo(info)) return;
+      this.emit('call:outbound-audio-finished', {
+        callId: stream.callId,
+        voipCallId: stream.voipCallId,
+        sessionId: stream.sessionId,
+      });
+    };
+
+    if (coordinator && typeof coordinator.on === 'function') {
+      coordinator.on('call_state', onCoordinatorCallState);
+      coordinator.on('call_ended', onCoordinatorCallEnded);
+      coordinator.on('call_error', onCoordinatorCallError);
+      coordinator.on('call_video_state', onCoordinatorVideoState);
+      coordinator.on(
+        'call_outbound_audio_finished',
+        onCoordinatorOutboundAudioFinished
+      );
+    }
+
+    // Explicit outbound media event handlers if emitted on callInstance
+    const onExplicitOutboundMedia = (payload?: Record<string, unknown>) => {
+      this.evaluateOutboundMediaEvidence(stream, voip, callInstance, {
+        audioSendCount:
+          typeof payload?.audioSendCount === 'number'
+            ? payload.audioSendCount
+            : undefined,
+        audioOctetsSent:
+          typeof payload?.audioOctetsSent === 'number'
+            ? payload.audioOctetsSent
+            : undefined,
+        videoSendCount:
+          typeof payload?.videoSendCount === 'number'
+            ? payload.videoSendCount
+            : undefined,
+        videoOctetsSent:
+          typeof payload?.videoOctetsSent === 'number'
+            ? payload.videoOctetsSent
+            : undefined,
+        videoIdrSendCount:
+          typeof payload?.videoIdrSendCount === 'number'
+            ? payload.videoIdrSendCount
+            : undefined,
+        source: 'explicit_media_event',
+      });
+    };
+
+    this.callListenerCleanups.set(stream.callId, () => {
+      if (coordinator && typeof coordinator.off === 'function') {
+        coordinator.off('call_state', onCoordinatorCallState);
+        coordinator.off('call_ended', onCoordinatorCallEnded);
+        coordinator.off('call_error', onCoordinatorCallError);
+        coordinator.off('call_video_state', onCoordinatorVideoState);
+        coordinator.off(
+          'call_outbound_audio_finished',
+          onCoordinatorOutboundAudioFinished
+        );
+      }
+      if (callInstance && typeof callInstance.off === 'function') {
+        callInstance.off('ringing', handleRinging);
+        callInstance.off('connected', handleConnected);
+        callInstance.off('ended', handleEnded);
+        callInstance.off('error', handleError);
+        callInstance.off('media_outbound_started', onExplicitOutboundMedia);
       }
     });
-
-    if (!ctx || !ctx.voipListening) {
-      await voip.listen();
-      if (ctx) {
-        ctx.voipListening = true;
-      }
-    }
 
     const normalizedVoipPreset = stream.resolutionPreset.replace(
       '_portrait',
@@ -873,16 +1344,16 @@ export class RealVideoCallService extends EventEmitter {
       }
     );
 
-    if (
-      callResult &&
-      typeof callResult === 'object' &&
-      typeof (callResult as unknown as EventEmitter).on === 'function'
-    ) {
-      callInstanceEmitter = callResult as unknown as EventEmitter;
-      callInstanceEmitter.on('ringing', handleRinging);
-      callInstanceEmitter.on('connected', handleConnected);
-      callInstanceEmitter.on('ended', handleEnded);
-      callInstanceEmitter.on('error', handleError);
+    if (callResult && typeof callResult === 'object') {
+      callInstance = callResult as VoipCallInstance;
+      stream.voipCallInstance = callInstance;
+      if (typeof callInstance.on === 'function') {
+        callInstance.on('ringing', handleRinging);
+        callInstance.on('connected', handleConnected);
+        callInstance.on('ended', handleEnded);
+        callInstance.on('error', handleError);
+        callInstance.on('media_outbound_started', onExplicitOutboundMedia);
+      }
     }
 
     const voipCallId =
@@ -890,22 +1361,15 @@ export class RealVideoCallService extends EventEmitter {
         ? callResult
         : callResult?.callId || (callResult as { id?: string } | undefined)?.id;
 
-    if (voipCallId) {
-      stream.voipCallId = voipCallId;
-      if (!stream.nativeStanzaCallIds.includes(voipCallId)) {
-        stream.nativeStanzaCallIds.push(voipCallId);
-      }
-      stream.messageId = voipCallId;
-    }
+    recordVoipCallId(voipCallId);
 
-    if (stream.callState === 'INITIATING') {
-      this.transitionCallState(stream, 'RINGING');
-      this.emit('call:ringing', {
-        callId: stream.callId,
-        voipCallId: stream.voipCallId,
-        sessionId: stream.sessionId,
-        recipientJid: stream.recipientJid,
-      });
+    // Note: Do NOT force transition to RINGING here unless `ringing` or `call_state`
+    // has fired, OR if `callResult` is a legacy string ID without event emitter support.
+    if (
+      stream.callState === 'INITIATING' &&
+      (!callInstance || typeof callInstance.on !== 'function')
+    ) {
+      handleRinging({ callId: voipCallId });
     }
 
     // Ringing timeout if recipient does not answer within callTimeoutMs
@@ -915,6 +1379,8 @@ export class RealVideoCallService extends EventEmitter {
         stream.callState === 'RINGING'
       ) {
         this.transitionCallState(stream, 'TIMEOUT', 'Call ringing timed out');
+        stream.detailsArabic =
+          '⏱️ انتهت مهلة الرنين دون رد من المستلم؛ تم إنهاء المكالمة وتنظيف الموارد.';
         this.emit('call:timeout', {
           callId: stream.callId,
           sessionId: stream.sessionId,
@@ -950,7 +1416,7 @@ export class RealVideoCallService extends EventEmitter {
 
   /**
    * Executes the deterministic VoIP state machine against `MockWhatsAppSessionDriver`
-   * during automated unit/integration tests without sending any fake PTV or chat video.
+   * during automated unit/integration tests.
    */
   private async executeMockVoipCallLifecycle(
     stream: ActiveVideoCallStream,
@@ -960,8 +1426,8 @@ export class RealVideoCallService extends EventEmitter {
     maxDurationSeconds: number,
     actorTelegramId: number
   ): Promise<void> {
-    if (typeof driver.sendNativeVideoCallOffer === 'function') {
-      const offerRes = await driver.sendNativeVideoCallOffer(
+    if (typeof driver.recordSimulatedVoipCallOffer === 'function') {
+      const offerRes = await driver.recordSimulatedVoipCallOffer(
         stream.recipientJid,
         {
           isVideo: stream.callKind === 'video',
@@ -970,17 +1436,10 @@ export class RealVideoCallService extends EventEmitter {
       stream.voipCallId = offerRes.callId;
       stream.nativeStanzaCallIds.push(offerRes.callId);
       stream.messageId = offerRes.callId;
-    } else if (typeof driver.sendNativeCallOffer === 'function') {
-      const offerRes = await driver.sendNativeCallOffer({
-        targetJid: stream.recipientJid,
-        isVideo: stream.callKind === 'video',
-      });
-      stream.voipCallId = offerRes.callId;
-      stream.nativeStanzaCallIds.push(offerRes.callId);
-      stream.messageId = offerRes.callId;
     }
 
     this.transitionCallState(stream, 'RINGING');
+    stream.detailsArabic = `🔔 جاري الرنين لدى المستلم (${stream.recipientMasked}) في بيئة المحاكاة...`;
     this.emit('call:ringing', {
       callId: stream.callId,
       voipCallId: stream.voipCallId,
@@ -1020,7 +1479,7 @@ export class RealVideoCallService extends EventEmitter {
   }
 
   /**
-   * Deterministically advances a ringing call through:
+   * Deterministically advances a simulated call through:
    * `CONNECTING` -> `CONNECTED` -> `MEDIA_NEGOTIATING` -> `MEDIA_STARTED`.
    */
   public simulateCallAnsweredAndMediaStarted(callId: string): void {
@@ -1064,6 +1523,15 @@ export class RealVideoCallService extends EventEmitter {
       resolutionPreset: stream.resolutionPreset,
     });
 
+    stream.outboundMediaEvidence = {
+      audioPacketsSent: 1,
+      audioOctetsSent: 160,
+      videoPacketsSent: 1,
+      videoOctetsSent: 1200,
+      videoKeyframesSent: 1,
+      verifiedAt: new Date().toISOString(),
+      source: 'mock_simulation',
+    };
     stream.mediaStarted = true;
     this.transitionCallState(stream, 'MEDIA_STARTED');
     stream.detailsArabic = `🟢 جاري بث الصوت والفيديو فعلياً عبر طبقة VoIP RTP/SRTP (${stream.resolutionPreset}) إلى (${stream.recipientMasked}).`;
@@ -1072,6 +1540,7 @@ export class RealVideoCallService extends EventEmitter {
       voipCallId: stream.voipCallId,
       sessionId: stream.sessionId,
       resolutionPreset: stream.resolutionPreset,
+      evidence: stream.outboundMediaEvidence,
     });
   }
 
@@ -1080,7 +1549,7 @@ export class RealVideoCallService extends EventEmitter {
    */
   public simulateCallRejected(callId: string, reason = 'rejected_by_peer'): void {
     const stream = this.activeStreams.get(callId);
-    if (!stream) return;
+    if (!stream || this.isTerminalState(stream.callState)) return;
     this.clearCallTimers(callId);
     this.transitionCallState(stream, 'REJECTED', reason);
     this.emit('call:rejected', {
@@ -1101,7 +1570,7 @@ export class RealVideoCallService extends EventEmitter {
    */
   public simulateCallTimeout(callId: string, reason = 'ring_timeout'): void {
     const stream = this.activeStreams.get(callId);
-    if (!stream) return;
+    if (!stream || this.isTerminalState(stream.callState)) return;
     this.clearCallTimers(callId);
     this.transitionCallState(stream, 'TIMEOUT', reason);
     this.emit('call:timeout', {
@@ -1127,9 +1596,10 @@ export class RealVideoCallService extends EventEmitter {
     for (const stream of this.activeStreams.values()) {
       if (
         stream.sessionId === sessionId &&
-        !['ENDED', 'REJECTED', 'TIMEOUT', 'FAILED'].includes(stream.callState)
+        !this.isTerminalState(stream.callState)
       ) {
         this.clearCallTimers(stream.callId);
+        stream.voipCallInstance = undefined;
         if (stream.mediaStarted) {
           this.transitionCallState(stream, 'MEDIA_STOPPED');
         }
@@ -1159,8 +1629,9 @@ export class RealVideoCallService extends EventEmitter {
   }
 
   /**
-   * Stops an active VoIP video call cleanly, hangs up the VoIP media session,
-   * and transitions through `MEDIA_STOPPED` -> `ENDED`.
+   * Stops an active VoIP video call cleanly, hangs up the VoIP media session
+   * (`callInstance.hangup()` first, falling back to `voip.hangup(voipCallId)`),
+   * and transitions through `MEDIA_STOPPED` -> `ENDED` idempotently.
    */
   public async stopVideoCall(
     sessionId: string,
@@ -1169,6 +1640,7 @@ export class RealVideoCallService extends EventEmitter {
     actorTelegramId = 0,
     explicitDriver?: WhatsAppSessionDriver
   ): Promise<ActiveVideoCallStream | undefined> {
+    void sessionId;
     return this.stopVideoCallStream(
       callId,
       actorTelegramId,
@@ -1206,11 +1678,36 @@ export class RealVideoCallService extends EventEmitter {
     this.clearCallTimers(callId);
 
     const attached = this.attachedSessions.get(stream.sessionId);
-    if (attached?.voipInstance) {
+    const callInstance = stream.voipCallInstance;
+    stream.voipCallInstance = undefined;
+    if (attached?.activeCallInstances && stream.voipCallId) {
+      attached.activeCallInstances.delete(stream.voipCallId);
+    }
+
+    if (callInstance && typeof callInstance.hangup === 'function') {
       try {
-        await attached.voipInstance.hangup();
+        await callInstance.hangup();
       } catch {
         // Ignore hangup error if already closed
+      }
+    } else if (
+      attached?.voipInstance &&
+      typeof attached.voipInstance.hangup === 'function' &&
+      stream.voipCallId
+    ) {
+      try {
+        await attached.voipInstance.hangup(stream.voipCallId);
+      } catch {
+        // Ignore fallback hangup error if already closed
+      }
+    } else if (
+      attached?.voipInstance &&
+      typeof attached.voipInstance.end === 'function'
+    ) {
+      try {
+        await attached.voipInstance.end();
+      } catch {
+        // Ignore end error
       }
     }
 
@@ -1219,24 +1716,15 @@ export class RealVideoCallService extends EventEmitter {
         explicitDriver ||
         attached?.driver ||
         this.sessionManager?.getDriver(stream.sessionId, actorTelegramId);
-      if (driver) {
+      if (driver && typeof driver.recordSimulatedVoipCallTermination === 'function') {
         for (const stanzaCallId of stream.nativeStanzaCallIds) {
-          if (typeof driver.terminateNativeVideoCall === 'function') {
-            await driver
-              .terminateNativeVideoCall(stream.recipientJid, stanzaCallId)
-              .catch(() => undefined);
-          } else if (typeof driver.terminateNativeCall === 'function') {
-            await driver
-              .terminateNativeCall({
-                targetJid: stream.recipientJid,
-                callId: stanzaCallId,
-              })
-              .catch(() => undefined);
-          }
+          await driver
+            .recordSimulatedVoipCallTermination(stream.recipientJid, stanzaCallId)
+            .catch(() => undefined);
         }
       }
     } catch {
-      // Ignore if session disconnected before termination stanza
+      // Ignore simulated termination error
     }
 
     if (
@@ -1251,13 +1739,12 @@ export class RealVideoCallService extends EventEmitter {
       }
     }
 
-    if (
-      !['ENDED', 'REJECTED', 'TIMEOUT', 'FAILED'].includes(stream.callState)
-    ) {
+    if (!this.isTerminalState(stream.callState)) {
       if (stream.mediaStarted) {
         this.transitionCallState(stream, 'MEDIA_STOPPED');
       }
       this.transitionCallState(stream, 'ENDED', reason);
+      stream.detailsArabic = `🛑 تم إنهاء المكالمة المرئية (${reason}).`;
       this.emit('call:ended', {
         callId: stream.callId,
         sessionId: stream.sessionId,
@@ -1300,7 +1787,6 @@ export class RealVideoCallService extends EventEmitter {
 }
 
 export {
-  RealVideoCallService as NativeVideoCallEngine,
   RealVideoCallService as UbuntuVideoCallBridge,
+  RealVideoCallService as NativeVideoCallEngine,
 };
-export { WhatsAppConnectionError };
