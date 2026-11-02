@@ -319,8 +319,28 @@ declare module '@hiroosy/baileys-lite' {
       listener: (payload: { chats: Array<{ id: string; [key: string]: unknown }> }) => void
     ): void;
     on(
+      event: 'chats.upsert',
+      listener: (chats: Array<{ id: string; [key: string]: unknown }>) => void
+    ): void;
+    on(
       event: 'contacts.set',
-      listener: (payload: { contacts: Record<string, unknown> }) => void
+      listener: (payload: { contacts: Record<string, unknown> | Array<{ id: string; [key: string]: unknown }> }) => void
+    ): void;
+    on(
+      event: 'contacts.upsert',
+      listener: (contacts: Array<{ id: string; [key: string]: unknown }>) => void
+    ): void;
+    on(
+      event: 'contacts.update',
+      listener: (updates: Array<{ id?: string; [key: string]: unknown }>) => void
+    ): void;
+    on(
+      event: 'messaging-history.set',
+      listener: (payload: {
+        chats?: Array<{ id: string; [key: string]: unknown }>;
+        contacts?: Array<{ id: string; [key: string]: unknown }>;
+        messages?: WAMessage[];
+      }) => void
     ): void;
     on(event: string, listener: (...args: any[]) => void): void;
     off(event: string, listener: (...args: any[]) => void): void;
@@ -411,7 +431,7 @@ declare module '@hiroosy/baileys-lite' {
       opts: { mediaType: string; fileEncSha256B64: string; timeoutMs?: number }
     ) => Promise<{ mediaUrl: string; directPath: string; handle?: string }>;
     generateMessageTag?(): string;
-    end(error?: Error): void;
+    end(error?: Error): Promise<void> | void;
     logout(msg?: string): Promise<void>;
     [key: string]: unknown;
   }
@@ -611,6 +631,17 @@ declare module '@hiroosy/baileys-lite/voip' {
     | '1080p'
     | VoipVideoConfig;
 
+  export type VoipMediaItemInput =
+    | string
+    | {
+        video?: string;
+        audio?: string;
+        autoAdvance?: boolean;
+        duration?: number;
+        durationMs?: number;
+        resolution?: VoipResolutionPreset;
+      };
+
   export interface WaCallMediaSessionLike {
     callId?: string;
     peerJid?: string;
@@ -700,7 +731,7 @@ declare module '@hiroosy/baileys-lite/voip' {
     listen(): Promise<this>;
     call(
       jid: string,
-      media?: string | string[] | null,
+      media?: VoipMediaItemInput | VoipMediaItemInput[] | null,
       resolution?: VoipResolutionPreset,
       options?: {
         autoEndCall?: boolean;
@@ -711,7 +742,7 @@ declare module '@hiroosy/baileys-lite/voip' {
     ): Promise<VoipCallInstance | string>;
     accept(
       callId: string,
-      media?: string | string[] | null,
+      media?: VoipMediaItemInput | VoipMediaItemInput[] | null,
       resolution?: VoipResolutionPreset,
       options?: Record<string, unknown>
     ): Promise<VoipCallInstance>;

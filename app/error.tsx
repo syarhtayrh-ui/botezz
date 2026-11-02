@@ -19,8 +19,13 @@ export default function AppErrorBoundary({
           حدث خطأ أثناء تحميل واجهة النظام
         </h2>
         <p className="text-sm text-slate-300 leading-relaxed">
-          {error?.message || 'تعذر إكمال الطلب الحالي. يرجى إعادة المحاولة.'}
+          تعذر إكمال الطلب الحالي بسبب خطأ داخلي عابر. يرجى إعادة المحاولة.
         </p>
+        {error?.digest && (
+          <p className="text-xs text-slate-500 font-mono" dir="ltr">
+            Ref: {error.digest}
+          </p>
+        )}
         <button
           type="button"
           onClick={() => reset()}

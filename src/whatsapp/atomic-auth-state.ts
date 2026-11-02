@@ -133,6 +133,17 @@ export interface AtomicAuthStateResult {
   recoveredFromBackup: boolean;
 }
 
+export function isValidCredsStructure(parsed: unknown): boolean {
+  if (!parsed || typeof parsed !== 'object') return false;
+  const obj = parsed as Record<string, unknown>;
+  return Boolean(
+    obj.noiseKey &&
+      typeof obj.noiseKey === 'object' &&
+      obj.signedIdentityKey &&
+      typeof obj.signedIdentityKey === 'object'
+  );
+}
+
 /**
  * Production-hardened, drop-in replacement for `useMultiFileAuthState` in `@hiroosy/baileys-lite`.
  *
@@ -160,9 +171,10 @@ export async function createAtomicMultiFileAuthState(
   const pendingWrites = new Set<Promise<unknown>>();
   const trackWrite = <T>(promise: Promise<T>): Promise<T> => {
     pendingWrites.add(promise);
-    void promise.finally(() => {
+    const cleanup = () => {
       pendingWrites.delete(promise);
-    });
+    };
+    promise.then(cleanup, cleanup);
     return promise;
   };
 
@@ -192,8 +204,12 @@ export async function createAtomicMultiFileAuthState(
         if (!trimmed) {
           throw new Error('Empty JSON file');
         }
+        const parsed = JSON.parse(trimmed, BufferJSON.reviver);
+        if (file === 'creds.json' && !isValidCredsStructure(parsed)) {
+          throw new Error('Incomplete or empty creds.json structure');
+        }
         return {
-          parsed: JSON.parse(trimmed, BufferJSON.reviver),
+          parsed,
           recoveredFromBackup: false,
         };
       } catch (primaryErr) {
@@ -204,6 +220,9 @@ export async function createAtomicMultiFileAuthState(
               const bakRaw = (await fs.promises.readFile(bakPath, 'utf-8')).trim();
               if (bakRaw) {
                 const recovered = JSON.parse(bakRaw, BufferJSON.reviver);
+                if (!isValidCredsStructure(recovered)) {
+                  throw new Error('Incomplete or empty creds.json.bak structure');
+                }
                 await atomicWriteJsonFile(filePath, bakRaw, false);
                 log.warn('Recovered corrupted creds.json from creds.json.bak', {
                   folder: path.basename(resolvedFolder),

@@ -17,8 +17,13 @@ export default function GlobalErrorBoundary({
             خطأ عام في تشغيل الواجهة
           </h2>
           <p className="text-sm text-slate-300 leading-relaxed">
-            {error?.message || 'حدث خطأ غير متوقع. يرجى تحديث الصفحة.'}
+            حدث خطأ غير متوقع أثناء عرض الواجهة. يرجى تحديث الصفحة والمحاولة مجدداً.
           </p>
+          {error?.digest && (
+            <p className="text-xs text-slate-500 font-mono" dir="ltr">
+              Ref: {error.digest}
+            </p>
+          )}
           <button
             type="button"
             onClick={() => reset()}

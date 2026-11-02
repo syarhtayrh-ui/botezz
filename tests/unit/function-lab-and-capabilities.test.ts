@@ -40,7 +40,7 @@ import { TelegramBotController } from '../../src/bot/bot';
 import { MockWhatsAppSessionDriver } from '../../src/whatsapp/connection-manager';
 
 test('Regression: AewCh Function Lab failure root causes (cross-realm VM errors, newline preservation, markdown fences, comments, and registry selection)', async () => {
-  // 1. Verify cross-realm V8 VM error extraction never collapses to generic "خطأ برمجي"
+  // 1. Verify cross-realm VM error extraction never collapses to generic "خطأ برمجي"
   const vmContext = vm.createContext({});
   let caughtVmError: unknown;
   try {
@@ -49,9 +49,17 @@ test('Regression: AewCh Function Lab failure root causes (cross-realm VM errors,
     caughtVmError = err;
   }
   assert.ok(caughtVmError);
-  // In Node.js V8, cross-realm VM errors are NOT `instanceof Error` in host realm
-  assert.equal(caughtVmError instanceof Error, false);
-  const extracted = extractCrossRealmErrorMessage(caughtVmError);
+  const extractedVm = extractCrossRealmErrorMessage(caughtVmError);
+  assert.equal(extractedVm.name, 'SyntaxError');
+  assert.notEqual(extractedVm.message, 'خطأ برمجي');
+
+  // Verify non-instanceof-Error cross-realm prototype object across both Node V8 and Bun JSC (BZ-033)
+  const crossRealmPrototypeError = Object.assign(Object.create(null), {
+    name: 'SyntaxError',
+    message: 'Unexpected token ;',
+  });
+  assert.equal(crossRealmPrototypeError instanceof Error, false);
+  const extracted = extractCrossRealmErrorMessage(crossRealmPrototypeError);
   assert.equal(extracted.name, 'SyntaxError');
   assert.notEqual(extracted.message, 'خطأ برمجي');
   assert.ok(extracted.message.includes('Unexpected token'));

@@ -52,12 +52,12 @@ export interface SessionRecord {
   id: string;
   label: string;
   masked_phone: string | null;
-  jid: string | null;
+  jid?: string | null;
   status: string;
-  auth_dir: string;
+  auth_dir?: string;
   reconnect_attempts: number;
   last_connected_at: string | null;
-  last_status_at: string;
+  last_status_at: string | null;
   last_error: string | null;
 }
 
@@ -94,6 +94,10 @@ export interface AuditLogRecord {
 
 export interface HarnessStateResponse {
   ok: boolean;
+  authRequired?: boolean;
+  isReadOnlyWebObserver?: boolean;
+  errorBanner?: string | null;
+  error?: string;
   environmentMode: string;
   validationIssues: string[];
   configuredAdminId: number;
@@ -129,20 +133,72 @@ export default function ControlCenterDashboard({
   const [simulatedUserId, setSimulatedUserId] = useState<number>(
     initialData.configuredAdminId
   );
-  const [errorBanner, setErrorBanner] = useState<string | null>(null);
+  const [errorBanner, setErrorBanner] = useState<string | null>(
+    initialData.errorBanner || initialData.error || null
+  );
+  const [isStale, setIsStale] = useState<boolean>(!initialData.ok);
+  const [adminSecretInput, setAdminSecretInput] = useState<string>('');
   const [sessionSearch, setSessionSearch] = useState<string>('');
 
   const fetchHarnessState = useCallback(async () => {
     try {
       const res = await fetch('/api/harness');
       const json = (await res.json()) as HarnessStateResponse;
-      if (json.ok) {
-        setData(json);
+      if (!res.ok || !json.ok) {
+        setIsStale(true);
+        setErrorBanner(
+          json.error ||
+            json.errorBanner ||
+            `تعذر تحديث حالة المنظومة (HTTP ${res.status}).`
+        );
+        if (res.status === 401 || json.authRequired) {
+          setData((prev) => ({
+            ...prev,
+            ok: false,
+            authRequired: true,
+          }));
+        }
+        return;
+      }
+      setIsStale(false);
+      setErrorBanner(null);
+      setData(json);
+      if (json.configuredAdminId && simulatedUserId === 0) {
+        setSimulatedUserId(json.configuredAdminId);
       }
     } catch {
-      setErrorBanner('تعذر الاتصال بخادم التطبيق المحلي.');
+      setIsStale(true);
+      setErrorBanner('تعذر الاتصال بخادم التطبيق المحلي. البيانات المعروضة قد لا تكون محدثة.');
     }
-  }, []);
+  }, [simulatedUserId]);
+
+  const handleAdminLogin = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!adminSecretInput.trim()) return;
+    setBusyAction(true);
+    setErrorBanner(null);
+    try {
+      const res = await fetch('/api/harness', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          action: 'login',
+          secret: adminSecretInput.trim(),
+        }),
+      });
+      const json = (await res.json()) as { ok?: boolean; error?: string };
+      if (!res.ok || !json.ok) {
+        setErrorBanner(json.error || 'فشل تسجيل الدخول بمفتاح الإدارة.');
+        return;
+      }
+      setAdminSecretInput('');
+      await fetchHarnessState();
+    } catch {
+      setErrorBanner('تعذر الاتصال بالخادم للتحقق من مفتاح الإدارة.');
+    } finally {
+      setBusyAction(false);
+    }
+  };
 
   const dispatchInteraction = async (
     type: 'callback' | 'text',
@@ -164,13 +220,19 @@ export default function ControlCenterDashboard({
       });
       const json = await res.json();
       if (!res.ok || !json.ok) {
+        setIsStale(res.status >= 500 || res.status === 401);
         setErrorBanner(json.error || 'تم رفض العملية.');
-        if (json.auditLogs) {
+        if (res.status === 401 || json.authRequired) {
+          setData((prev) => ({ ...prev, ok: false, authRequired: true }));
+        } else if (json.auditLogs) {
           setData((prev) => ({ ...prev, auditLogs: json.auditLogs }));
         }
       } else {
+        setIsStale(false);
         setData((prev) => ({
           ...prev,
+          ok: true,
+          authRequired: false,
           botView: json.botView,
           sessions: json.sessions,
           tasks: json.tasks,
@@ -179,6 +241,7 @@ export default function ControlCenterDashboard({
         }));
       }
     } catch {
+      setIsStale(true);
       setErrorBanner('حدث خطأ في الاتصال بالخادم أثناء تنفيذ الأمر.');
     } finally {
       setBusyAction(false);
@@ -335,11 +398,24 @@ export default function ControlCenterDashboard({
               بيئة الاختبار التفاعلية المدمجة + الخادم الخلفي الكامل (grammY + Baileys + SQLite)
             </h1>
             <p className="text-xs text-slate-300 leading-relaxed max-w-4xl">
-              هذه الواجهة متصلة مباشرة بمحرك <span dir="ltr" className="text-sky-300 font-semibold">TelegramBotController</span> وقاعدة بيانات SQLite الحقيقية (<span dir="ltr" className="text-sky-300">./data/app.sqlite</span>) باستخدام مشغل محاكاة حتمي (<span dir="ltr" className="text-sky-300">MockWhatsAppSessionDriver</span>) لمعاينة جميع القوائم والعمليات المتزامنة محلياً. لتشغيل خدمة بوت تيليجرام الحية والاتصال الفعلي بخوادم واتساب على الخادم، شغّل الأمر <span dir="ltr" className="text-emerald-300 font-semibold">npm run bot:start</span> بعد ضبط ملف <span dir="ltr" className="text-sky-300">.env</span>.
+              هذه الواجهة متصلة مباشرة بمحرك <span dir="ltr" className="text-sky-300 font-semibold">TelegramBotController</span> وقاعدة بيانات SQLite الحقيقية باستخدام مشغل محاكاة حتمي (<span dir="ltr" className="text-sky-300">MockWhatsAppSessionDriver</span>) لمعاينة جميع القوائم والعمليات المتزامنة محلياً. لتشغيل خدمة بوت تيليجرام الحية والاتصال الفعلي بخوادم واتساب على الخادم، شغّل الأمر <span dir="ltr" className="text-emerald-300 font-semibold">npm run bot:start</span> بعد ضبط ملف <span dir="ltr" className="text-sky-300">.env</span>.
             </p>
           </div>
 
           <div className="flex flex-wrap items-center gap-5 text-xs text-slate-300 shrink-0 tabular-nums">
+            <div>
+              <span className="text-slate-400">حالة الخادم: </span>
+              {data.health.status === 'UNAVAILABLE' || !data.ok ? (
+                <strong className="text-red-400">
+                  غير متاح ({data.health.status || 'UNAVAILABLE'})
+                </strong>
+              ) : isStale ? (
+                <strong className="text-amber-400">بيانات غير محدثة (STALE)</strong>
+              ) : (
+                <strong className="text-emerald-400">متصل (HEALTHY)</strong>
+              )}
+            </div>
+            <span aria-hidden="true">·</span>
             <div>
               <span className="text-slate-400">الجلسات المتصلة: </span>
               <strong className="text-emerald-400">
@@ -362,6 +438,40 @@ export default function ControlCenterDashboard({
             </button>
           </div>
         </section>
+
+        {/* Server-Side Admin Authentication Gate when DASHBOARD_API_SECRET is active */}
+        {data.authRequired && (
+          <section
+            aria-label="بوابة مصادقة المسؤول"
+            className="p-6 rounded-lg border border-amber-500/40 bg-slate-900/90 space-y-4"
+          >
+            <div className="flex items-center gap-3 text-amber-300">
+              <ShieldAlert className="w-5 h-5 shrink-0" />
+              <h2 className="text-sm font-bold">
+                مطلوب مصادقة المسؤول (DASHBOARD_API_SECRET)
+              </h2>
+            </div>
+            <p className="text-xs text-slate-300">
+              تم تفعيل حماية واجهة الويب على الخادم. يرجى إدخال مفتاح الإدارة السري لتسجيل الدخول عبر جلسة آمنة (HttpOnly Cookie).
+            </p>
+            <form onSubmit={handleAdminLogin} className="flex flex-wrap items-center gap-3">
+              <input
+                type="password"
+                value={adminSecretInput}
+                onChange={(e) => setAdminSecretInput(e.target.value)}
+                placeholder="أدخل قيمة DASHBOARD_API_SECRET..."
+                className="px-3 py-2 text-xs rounded border border-slate-700 bg-slate-950 text-white min-w-[260px]"
+              />
+              <button
+                type="submit"
+                disabled={busyAction}
+                className="px-4 py-2 text-xs font-semibold rounded bg-amber-400 text-slate-950 hover:bg-amber-300 disabled:opacity-50"
+              >
+                تسجيل الدخول الآمن
+              </button>
+            </form>
+          </section>
+        )}
 
         {/* Error Alert Banner if Unauthorized or Invalid Input */}
         {errorBanner && (
@@ -749,7 +859,9 @@ export default function ControlCenterDashboard({
                         </td>
                         <td className="py-3 px-3 text-slate-400">
                           <span dir="ltr">
-                            {s.last_status_at.slice(0, 19).replace('T', ' ')}
+                            {(s.last_status_at || '')
+                              .slice(0, 19)
+                              .replace('T', ' ')}
                           </span>
                         </td>
                       </tr>

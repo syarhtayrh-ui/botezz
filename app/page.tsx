@@ -1,65 +1,122 @@
+import { cookies, headers } from 'next/headers';
 import ControlCenterDashboard, {
   HarnessStateResponse,
 } from '../components/ControlCenterDashboard';
 import { getRuntimeHarness } from '../src/runtime-harness';
+import {
+  toClientSafeAuditDto,
+  toClientSafeSessionDto,
+  verifyWebRequestAuth,
+} from '../src/security/web-auth';
 
 export const dynamic = 'force-dynamic';
 
-const FALLBACK_INITIAL_DATA: HarnessStateResponse = {
-  ok: true,
-  environmentMode: 'LOCAL_SIMULATION_HARNESS',
-  validationIssues: [],
-  configuredAdminId: 100000001,
-  maxConcurrentTasks: 4,
-  taskTimeoutMs: 30000,
-  maxUploadSizeMb: 25,
-  botView: {
-    text: '👋 أهلاً بك في منظومة التحكم بجلسات واتساب عبر تيليجرام.\nاختر العملية المطلوبة من الأزرار التفاعلية أدناه:',
-    keyboard: [
-      [
-        { text: '📱 إدارة الجلسات', callbackData: 'nav:sessions' },
-        { text: '✉️ إرسال رسالة', callbackData: 'nav:send_message' },
-      ],
-      [
-        { text: '🎥 مكالمة فيديو (VoIP)', callbackData: 'nav:video_call' },
-        { text: '🧪 مختبر الوظائف', callbackData: 'nav:function_lab' },
-      ],
+function buildLockedInitialData(errorArabic?: string): HarnessStateResponse {
+  return {
+    ok: false,
+    authRequired: true,
+    environmentMode: 'AUTH_REQUIRED',
+    errorBanner:
+      errorArabic ||
+      'غير مصرح بالوصول إلى واجهة التحكم. يرجى تسجيل الدخول بمفتاح DASHBOARD_API_SECRET الصحيح.',
+    validationIssues: [],
+    configuredAdminId: 0,
+    maxConcurrentTasks: 0,
+    taskTimeoutMs: 0,
+    maxUploadSizeMb: 0,
+    botView: {
+      text: '🔒 *واجهة التحكم محمية*\nيرجى إدخال مفتاح الإدارة (`DASHBOARD_API_SECRET`) للمتابعة.',
+      keyboard: [],
+    },
+    sessions: [],
+    tasks: [],
+    auditLogs: [],
+    health: {
+      status: 'UNAUTHORIZED',
+      connectedSessions: 0,
+      totalSessions: 0,
+      runningTasks: 0,
+      pendingTasks: 0,
+      lastSuccessfulOperationAt: null,
+    },
+  };
+}
+
+function buildUnavailableInitialData(): HarnessStateResponse {
+  return {
+    ok: false,
+    authRequired: false,
+    environmentMode: 'BACKEND_UNAVAILABLE',
+    errorBanner:
+      'تعذر تهيئة الخادم الخلفي أو الاتصال بقاعدة البيانات المحلية (BACKEND_UNAVAILABLE).',
+    validationIssues: [
+      'تعذر تحميل حالة النظام من الخادم الخلفي أثناء التمهيد الأولي.',
     ],
-  },
-  sessions: [],
-  tasks: [],
-  auditLogs: [],
-  health: {
-    status: 'HEALTHY',
-    connectedSessions: 0,
-    totalSessions: 0,
-    runningTasks: 0,
-    pendingTasks: 0,
-    lastSuccessfulOperationAt: null,
-  },
-};
+    configuredAdminId: 0,
+    maxConcurrentTasks: 0,
+    taskTimeoutMs: 0,
+    maxUploadSizeMb: 0,
+    botView: {
+      text: '⚠️ *الخادم الخلفي غير متاح حالياً (UNAVAILABLE)*\nيرجى التحقق من سجلات النظام وقاعدة البيانات ثم إعادة المحاولة.',
+      keyboard: [],
+    },
+    sessions: [],
+    tasks: [],
+    auditLogs: [],
+    health: {
+      status: 'UNAVAILABLE',
+      connectedSessions: 0,
+      totalSessions: 0,
+      runningTasks: 0,
+      pendingTasks: 0,
+      lastSuccessfulOperationAt: null,
+    },
+  };
+}
 
 async function loadInitialData(): Promise<HarnessStateResponse> {
   try {
+    const reqHeaders = await headers();
+    const reqCookies = await cookies();
+    const auth = verifyWebRequestAuth({
+      headers: reqHeaders,
+      cookies: reqCookies,
+    });
+
+    if (!auth.authorized) {
+      return buildLockedInitialData(auth.errorArabic);
+    }
+  } catch {
+    // If called outside Next.js request context in unit tests, evaluate env auth directly
+    const auth = verifyWebRequestAuth();
+    if (!auth.authorized) {
+      return buildLockedInitialData(auth.errorArabic);
+    }
+  }
+
+  try {
     const harness = await getRuntimeHarness();
-    const sessions = harness.isLiveConfigured
+    const rawSessions = harness.isLiveConfigured
       ? harness.sessionRepo.listAll()
       : harness.sessionManager.listSessions();
+    const sessions = rawSessions.map(toClientSafeSessionDto);
     const tasks = harness.taskManager.listRecentTasks(15);
-    const auditLogs = harness.auditRepo.listRecent(20);
+    const auditLogs = harness.auditRepo.listRecent(20).map(toClientSafeAuditDto);
     const runnerStats = harness.taskManager.getRunnerStats();
 
     const initialData: HarnessStateResponse = {
       ok: true,
+      authRequired: false,
       environmentMode: harness.isLiveConfigured
         ? 'LIVE_ENV_CONFIGURED'
         : 'LOCAL_SIMULATION_HARNESS',
+      isReadOnlyWebObserver: harness.isReadOnlyWebObserver,
       validationIssues: harness.validationIssues,
       configuredAdminId: harness.config.TELEGRAM_ADMIN_ID,
       maxConcurrentTasks: harness.config.MAX_CONCURRENT_TASKS,
       taskTimeoutMs: harness.config.TASK_TIMEOUT_MS,
       maxUploadSizeMb: harness.config.MAX_UPLOAD_SIZE_MB,
-      botView: harness.lastBotView,
+      botView: harness.getFreshBotView(),
       sessions,
       tasks,
       auditLogs,
@@ -82,7 +139,7 @@ async function loadInitialData(): Promise<HarnessStateResponse> {
 
     return plainInitialData;
   } catch {
-    return structuredClone(FALLBACK_INITIAL_DATA);
+    return buildUnavailableInitialData();
   }
 }
 

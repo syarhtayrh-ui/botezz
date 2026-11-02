@@ -1,36 +1,28 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { getRuntimeHarness } from '../../../../src/runtime-harness';
+import { verifyWebRequestAuth } from '../../../../src/security/web-auth';
 import { toSafeArabicError } from '../../../../src/utils/errors';
 
-function isAuthorizedApiRequest(
-  req: NextRequest | undefined,
-  isLiveConfigured: boolean
-): boolean {
-  const configuredSecret = process.env.DASHBOARD_API_SECRET?.trim();
-  if (!isLiveConfigured || !configuredSecret) {
-    return true;
-  }
-  if (!req) {
-    return false;
-  }
-  const headerSecret = req.headers.get('x-api-secret')?.trim();
-  const bearerSecret = req.headers
-    .get('authorization')
-    ?.replace(/^Bearer\s+/i, '')
-    .trim();
-  return headerSecret === configuredSecret || bearerSecret === configuredSecret;
-}
-
 export async function GET(req: NextRequest) {
+  const auth = verifyWebRequestAuth({
+    headers: req?.headers,
+    cookies: req?.cookies,
+  });
+  if (!auth.authorized) {
+    return NextResponse.json(
+      {
+        ok: false,
+        authRequired: true,
+        error:
+          auth.errorArabic ||
+          'غير مصرح بالوصول إلى واجهة البرمجة (Unauthorized).',
+      },
+      { status: auth.status }
+    );
+  }
+
   try {
     const harness = await getRuntimeHarness();
-    if (!isAuthorizedApiRequest(req, harness.isLiveConfigured)) {
-      return NextResponse.json(
-        { ok: false, error: 'غير مصرح بالوصول إلى واجهة البرمجة (Unauthorized).' },
-        { status: 401 }
-      );
-    }
-
     const bridge = harness.controller.videoCallBridge;
     const callId = req.nextUrl.searchParams.get('callId');
     const sessionId = req.nextUrl.searchParams.get('sessionId') ?? undefined;
@@ -74,15 +66,25 @@ export async function GET(req: NextRequest) {
 }
 
 export async function POST(req: NextRequest) {
+  const auth = verifyWebRequestAuth({
+    headers: req?.headers,
+    cookies: req?.cookies,
+  });
+  if (!auth.authorized) {
+    return NextResponse.json(
+      {
+        ok: false,
+        authRequired: true,
+        error:
+          auth.errorArabic ||
+          'غير مصرح بالوصول إلى واجهة البرمجة (Unauthorized).',
+      },
+      { status: auth.status }
+    );
+  }
+
   try {
     const harness = await getRuntimeHarness();
-    if (!isAuthorizedApiRequest(req, harness.isLiveConfigured)) {
-      return NextResponse.json(
-        { ok: false, error: 'غير مصرح بالوصول إلى واجهة البرمجة (Unauthorized).' },
-        { status: 401 }
-      );
-    }
-
     const bridge = harness.controller.videoCallBridge;
     const body = (await req.json()) as {
       action?: 'start' | 'stop';

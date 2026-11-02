@@ -3,15 +3,20 @@ set -euo pipefail
 
 echo "=== WhatsApp Multi-Session Telegram Control System — Setup Script ==="
 
-# 1. Verify Node.js 22+ is installed
+# 1. Verify Node.js >= 22.13.0 LTS and built-in node:sqlite are available
 if ! command -v node >/dev/null 2>&1; then
-  echo "ERROR: Node.js is not installed. Please install Node.js 22 LTS first."
+  echo "ERROR: Node.js is not installed. Please install Node.js >= 22.13.0 LTS first."
   exit 1
 fi
 
 NODE_MAJOR=$(node -v | cut -d. -f1 | tr -d 'v')
 if [ "$NODE_MAJOR" -lt 22 ]; then
-  echo "ERROR: Node.js 22+ is required (found $(node -v))."
+  echo "ERROR: Node.js >= 22.13.0 LTS is required for built-in node:sqlite (found $(node -v))."
+  exit 1
+fi
+
+if ! node -e "require('node:sqlite')" >/dev/null 2>&1; then
+  echo "ERROR: Built-in 'node:sqlite' module is not available in $(node -v). Please upgrade to Node.js >= 22.13.0 LTS."
   exit 1
 fi
 

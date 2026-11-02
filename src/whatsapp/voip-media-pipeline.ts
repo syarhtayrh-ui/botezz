@@ -215,12 +215,37 @@ export async function validateAndInspectVideoMedia(
     );
   }
 
-  const resolvedPath = path.resolve(rawFilePath);
+  const lexicalPath = path.resolve(rawFilePath);
+
+  if (!fs.existsSync(lexicalPath)) {
+    throw new MediaValidationError(
+      'ملف الفيديو المحدد غير موجود على القرص.',
+      `Media failure: file not found at ${lexicalPath}`
+    );
+  }
+
+  let resolvedPath: string;
+  try {
+    resolvedPath = fs.realpathSync(lexicalPath);
+  } catch (err) {
+    throw new MediaValidationError(
+      'تعذر التحقق من المسار الحقيقي لملف الفيديو.',
+      `Media failure: realpath failed (${err instanceof Error ? err.message : String(err)})`
+    );
+  }
 
   if (options?.allowedRootDirs && options.allowedRootDirs.length > 0) {
     const insideAllowed = options.allowedRootDirs.some((rootDir) => {
-      const resolvedRoot = path.resolve(rootDir);
-      const rel = path.relative(resolvedRoot, resolvedPath);
+      const lexicalRoot = path.resolve(rootDir);
+      let canonicalRoot = lexicalRoot;
+      if (fs.existsSync(lexicalRoot)) {
+        try {
+          canonicalRoot = fs.realpathSync(lexicalRoot);
+        } catch {
+          canonicalRoot = lexicalRoot;
+        }
+      }
+      const rel = path.relative(canonicalRoot, resolvedPath);
       return !rel.startsWith('..') && !path.isAbsolute(rel);
     });
     if (!insideAllowed) {
@@ -229,13 +254,6 @@ export async function validateAndInspectVideoMedia(
         `Media failure: path ${resolvedPath} outside allowedRootDirs`
       );
     }
-  }
-
-  if (!fs.existsSync(resolvedPath)) {
-    throw new MediaValidationError(
-      'ملف الفيديو المحدد غير موجود على القرص.',
-      `Media failure: file not found at ${resolvedPath}`
-    );
   }
 
   let stat: fs.Stats;

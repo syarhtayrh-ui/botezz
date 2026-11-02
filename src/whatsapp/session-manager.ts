@@ -84,6 +84,7 @@ export interface LiveSessionVerification {
 export class SessionManager {
   private readonly drivers = new Map<string, WhatsAppSessionDriver>();
   private readonly connectionGenerations = new Map<string, number>();
+  private readonly sessionOperationChains = new Map<string, Promise<void>>();
   private readonly activePairingLocks = new Set<string>();
   private readonly activePhonePairingLocks = new Set<string>();
   private readonly reconnectTimers = new Map<string, NodeJS.Timeout>();
@@ -115,6 +116,26 @@ export class SessionManager {
     this.defaultAutoCompleteInMock = options?.defaultAutoCompleteInMock ?? true;
     this.configuredAdminId = options?.configuredAdminId ?? 0;
     this.onDisconnectAlert = options?.onDisconnectAlert;
+  }
+
+  private runSessionExclusive<T>(
+    sessionId: string,
+    fn: () => Promise<T>
+  ): Promise<T> {
+    const prev = this.sessionOperationChains.get(sessionId) ?? Promise.resolve();
+    const next = prev.then(fn, fn);
+    const tracked = next.then(
+      () => undefined,
+      () => undefined
+    );
+    this.sessionOperationChains.set(sessionId, tracked);
+    const cleanup = () => {
+      if (this.sessionOperationChains.get(sessionId) === tracked) {
+        this.sessionOperationChains.delete(sessionId);
+      }
+    };
+    tracked.then(cleanup, cleanup);
+    return next;
   }
 
   public setConfiguredAdminId(adminId: number): void {
@@ -348,132 +369,147 @@ export class SessionManager {
       sessionId = session.id;
     }
 
-    this.activePairingLocks.add(sessionId);
+    const targetSessionId = sessionId!;
+    this.activePairingLocks.add(targetSessionId);
     this.activePhonePairingLocks.add(normalized.digits);
 
-    try {
-      this.clearReconnectTimer(sessionId);
-      this.clearPairingTimer(sessionId);
-      await this.cleanupExistingDriver(sessionId);
+    return this.runSessionExclusive(targetSessionId, async () => {
+      try {
+        this.clearReconnectTimer(targetSessionId);
+        this.clearPairingTimer(targetSessionId);
+        await this.cleanupExistingDriver(targetSessionId);
 
-      // Reset any leftover unregistered `creds.json` so `validateConnection()` sees `creds.me === undefined`
-      // and sends `generateRegistrationNode` instead of `generateLoginNode`.
-      const authDir = this.sessionStore.resetUnregisteredAuthDir(sessionId, true);
-      const generation = this.nextGeneration(sessionId);
-      const driver = this.driverFactory(sessionId, authDir);
-      this.drivers.set(sessionId, driver);
+        // Reset any leftover unregistered `creds.json` so `validateConnection()` sees `creds.me === undefined`
+        // and sends `generateRegistrationNode` instead of `generateLoginNode`.
+        const authDir = this.sessionStore.resetUnregisteredAuthDir(
+          targetSessionId,
+          true
+        );
+        const generation = this.nextGeneration(targetSessionId);
+        const driver = this.driverFactory(targetSessionId, authDir);
+        this.drivers.set(targetSessionId, driver);
 
-      this.sessionRepo.updateStatus({
-        id: sessionId,
-        status: 'CONNECTING',
-        maskedPhone: normalized.masked,
-        jid: normalized.jid,
-        reconnectAttempts: 0,
-        lastDisconnectCode: null,
-        lastDisconnectReason: null,
-        healthStatus: 'UNKNOWN',
-        lastError: null,
-      });
-
-      await driver.connect({
-        onStatusChange: (evt) =>
-          this.handleDriverStatusUpdate(sessionId!, generation, evt),
-        onIncomingMessage: (msgEvt) => this.dispatchIncomingMessage(msgEvt),
-      });
-
-      const pairingCode = await driver.requestPairingCode(
-        normalized.digits,
-        effectiveCustomCode
-      );
-
-      // Upon generating the pairing code, the session is strictly in `PAIRING_PENDING`
-      // (awaiting user confirmation on the phone), NOT `CONNECTED`!
-      this.sessionRepo.updateStatus({
-        id: sessionId,
-        status: 'PAIRING_PENDING',
-        maskedPhone: normalized.masked,
-        jid: normalized.jid,
-        reconnectAttempts: 0,
-        lastError: null,
-      });
-
-      this.startPairingExpirationTimer(
-        sessionId,
-        generation,
-        pairingTimeoutMs ?? this.pairingTimeoutMs
-      );
-
-      // Only if running with MockWhatsAppSessionDriver AND `autoCompleteInMock` is enabled
-      // do we simulate immediate phone confirmation.
-      if (driver instanceof MockWhatsAppSessionDriver && autoCompleteInMock) {
-        this.sessionStore.writeMockAuthMarker(sessionId, normalized.masked, true);
-        driver.completeSimulatedPairing();
-      }
-
-      this.auditRepo.record({
-        actorTelegramId,
-        action: 'SESSION_PAIRING_INITIATED',
-        targetId: sessionId,
-        outcome: 'SUCCESS',
-        metadata: {
+        this.sessionRepo.updateStatus({
+          id: targetSessionId,
+          status: 'CONNECTING',
           maskedPhone: normalized.masked,
-          isMock: driver.isMock,
-          customCodeUsed: Boolean(effectiveCustomCode),
+          jid: normalized.jid,
+          reconnectAttempts: 0,
+          lastDisconnectCode: null,
+          lastDisconnectReason: null,
+          healthStatus: 'UNKNOWN',
+          lastError: null,
+        });
+
+        await driver.connect({
+          onStatusChange: (evt) =>
+            this.handleDriverStatusUpdate(targetSessionId, generation, evt),
+          onIncomingMessage: (msgEvt) => {
+            if (!this.isCurrentGeneration(targetSessionId, generation)) return;
+            this.dispatchIncomingMessage(msgEvt);
+          },
+        });
+
+        const pairingCode = await driver.requestPairingCode(
+          normalized.digits,
+          effectiveCustomCode
+        );
+
+        // Upon generating the pairing code, the session is strictly in `PAIRING_PENDING`
+        // (awaiting user confirmation on the phone), NOT `CONNECTED`!
+        this.sessionRepo.updateStatus({
+          id: targetSessionId,
+          status: 'PAIRING_PENDING',
+          maskedPhone: normalized.masked,
+          jid: normalized.jid,
+          reconnectAttempts: 0,
+          lastError: null,
+        });
+
+        this.startPairingExpirationTimer(
+          targetSessionId,
           generation,
-        },
-      });
+          pairingTimeoutMs ?? this.pairingTimeoutMs
+        );
 
-      const updatedSession = this.sessionRepo.findById(sessionId)!;
+        // Only if running with MockWhatsAppSessionDriver AND `autoCompleteInMock` is enabled
+        // do we simulate immediate phone confirmation.
+        if (driver instanceof MockWhatsAppSessionDriver && autoCompleteInMock) {
+          this.sessionStore.writeMockAuthMarker(
+            targetSessionId,
+            normalized.masked,
+            true
+          );
+          driver.completeSimulatedPairing();
+        }
 
-      return {
-        session: updatedSession,
-        pairingCode,
-        normalizedPhone: normalized.e164,
-        maskedPhone: normalized.masked,
-        isCustomCode: Boolean(effectiveCustomCode),
-        instructionsArabic:
-          'افتح تطبيق واتساب على هاتفك ⬅️ الأجهزة المرتبطة ⬅️ ربط جهاز ⬅️ الربط برقم الهاتف بدلاً من ذلك، ثم أدخل الرمز أعلاه.',
-      };
-    } catch (err) {
-      this.clearPairingTimer(sessionId);
-      await this.cleanupExistingDriver(sessionId);
-      this.sessionStore.resetUnregisteredAuthDir(sessionId, false);
+        this.auditRepo.record({
+          actorTelegramId,
+          action: 'SESSION_PAIRING_INITIATED',
+          targetId: targetSessionId,
+          outcome: 'SUCCESS',
+          metadata: {
+            maskedPhone: normalized.masked,
+            isMock: driver.isMock,
+            customCodeUsed: Boolean(effectiveCustomCode),
+            generation,
+          },
+        });
 
-      const safeErr = toSafeArabicError(err);
-      const sanitizedTechnicalReason = redactText(safeErr.sanitizedTechnicalMessage);
-      this.sessionRepo.updateStatus({
-        id: sessionId,
-        status: 'FAILED',
-        healthStatus: 'UNHEALTHY',
-        lastError: safeErr.userMessage,
-      });
-      this.auditRepo.record({
-        actorTelegramId,
-        action: 'SESSION_PAIRING_FAILED',
-        targetId: sessionId,
-        outcome: 'FAILURE',
-        metadata: {
+        const updatedSession = this.sessionRepo.findById(targetSessionId)!;
+
+        return {
+          session: updatedSession,
+          pairingCode,
+          normalizedPhone: normalized.e164,
+          maskedPhone: normalized.masked,
+          isCustomCode: Boolean(effectiveCustomCode),
+          instructionsArabic:
+            'افتح تطبيق واتساب على هاتفك ⬅️ الأجهزة المرتبطة ⬅️ ربط جهاز ⬅️ الربط برقم الهاتف بدلاً من ذلك، ثم أدخل الرمز أعلاه.',
+        };
+      } catch (err) {
+        this.clearPairingTimer(targetSessionId);
+        await this.cleanupExistingDriver(targetSessionId);
+        this.sessionStore.resetUnregisteredAuthDir(targetSessionId, false);
+
+        const safeErr = toSafeArabicError(err);
+        const sanitizedTechnicalReason = redactText(
+          safeErr.sanitizedTechnicalMessage
+        );
+        this.sessionRepo.updateStatus({
+          id: targetSessionId,
+          status: 'FAILED',
+          healthStatus: 'UNHEALTHY',
+          lastError: safeErr.userMessage,
+        });
+        this.auditRepo.record({
+          actorTelegramId,
+          action: 'SESSION_PAIRING_FAILED',
+          targetId: targetSessionId,
+          outcome: 'FAILURE',
+          metadata: {
+            category: safeErr.category,
+            reason: sanitizedTechnicalReason,
+          },
+        });
+        log.error('WhatsApp session pairing failed', {
+          sessionId: targetSessionId,
           category: safeErr.category,
-          reason: sanitizedTechnicalReason,
-        },
-      });
-      log.error('WhatsApp session pairing failed', {
-        sessionId,
-        category: safeErr.category,
-        error: sanitizedTechnicalReason,
-      });
+          error: sanitizedTechnicalReason,
+        });
 
-      if (err instanceof AppError) {
-        throw err;
+        if (err instanceof AppError) {
+          throw err;
+        }
+        throw new PairingError(
+          `فشل بدء عملية الربط: ${safeErr.userMessage}`,
+          sanitizedTechnicalReason
+        );
+      } finally {
+        this.activePairingLocks.delete(targetSessionId);
+        this.activePhonePairingLocks.delete(normalized.digits);
       }
-      throw new PairingError(
-        `فشل بدء عملية الربط: ${safeErr.userMessage}`,
-        sanitizedTechnicalReason
-      );
-    } finally {
-      this.activePairingLocks.delete(sessionId);
-      this.activePhonePairingLocks.delete(normalized.digits);
-    }
+    });
   }
 
   private handleDriverStatusUpdate(
@@ -768,22 +804,28 @@ export class SessionManager {
 
   private async restartAfterPairing(sessionId: string): Promise<void> {
     if (this.isShuttingDown) return;
-    const session = this.sessionRepo.findById(sessionId);
-    if (!session) return;
+    return this.runSessionExclusive(sessionId, async () => {
+      if (this.isShuttingDown) return;
+      const session = this.sessionRepo.findById(sessionId);
+      if (!session) return;
 
-    await this.cleanupExistingDriver(sessionId);
-    const generation = this.nextGeneration(sessionId);
-    const authDir = this.sessionStore.prepareSessionAuthDir(sessionId);
-    const driver = this.driverFactory(sessionId, authDir);
-    if (driver instanceof MockWhatsAppSessionDriver) {
-      driver.markRegistered(session.jid || undefined);
-    }
-    this.drivers.set(sessionId, driver);
+      await this.cleanupExistingDriver(sessionId);
+      const generation = this.nextGeneration(sessionId);
+      const authDir = this.sessionStore.prepareSessionAuthDir(sessionId);
+      const driver = this.driverFactory(sessionId, authDir);
+      if (driver instanceof MockWhatsAppSessionDriver) {
+        driver.markRegistered(session.jid || undefined);
+      }
+      this.drivers.set(sessionId, driver);
 
-    await driver.connect({
-      onStatusChange: (evt) =>
-        this.handleDriverStatusUpdate(sessionId, generation, evt),
-      onIncomingMessage: (msgEvt) => this.dispatchIncomingMessage(msgEvt),
+      await driver.connect({
+        onStatusChange: (evt) =>
+          this.handleDriverStatusUpdate(sessionId, generation, evt),
+        onIncomingMessage: (msgEvt) => {
+          if (!this.isCurrentGeneration(sessionId, generation)) return;
+          this.dispatchIncomingMessage(msgEvt);
+        },
+      });
     });
   }
 
@@ -916,26 +958,31 @@ export class SessionManager {
       }
 
       try {
-        await this.cleanupExistingDriver(session.id);
-        const generation = this.nextGeneration(session.id);
-        this.sessionRepo.updateStatus({
-          id: session.id,
-          status: 'RECOVERING',
-          healthStatus: 'DEGRADED',
-          reconnectAttempts: 0,
-          lastError: null,
-        });
+        await this.runSessionExclusive(session.id, async () => {
+          await this.cleanupExistingDriver(session.id);
+          const generation = this.nextGeneration(session.id);
+          this.sessionRepo.updateStatus({
+            id: session.id,
+            status: 'RECOVERING',
+            healthStatus: 'DEGRADED',
+            reconnectAttempts: 0,
+            lastError: null,
+          });
 
-        const driver = this.driverFactory(session.id, session.auth_dir);
-        if (driver instanceof MockWhatsAppSessionDriver) {
-          driver.markRegistered(session.jid || credInfo.meJid || undefined);
-        }
-        this.drivers.set(session.id, driver);
+          const driver = this.driverFactory(session.id, session.auth_dir);
+          if (driver instanceof MockWhatsAppSessionDriver) {
+            driver.markRegistered(session.jid || credInfo.meJid || undefined);
+          }
+          this.drivers.set(session.id, driver);
 
-        await driver.connect({
-          onStatusChange: (evt) =>
-            this.handleDriverStatusUpdate(session.id, generation, evt),
-          onIncomingMessage: (msgEvt) => this.dispatchIncomingMessage(msgEvt),
+          await driver.connect({
+            onStatusChange: (evt) =>
+              this.handleDriverStatusUpdate(session.id, generation, evt),
+            onIncomingMessage: (msgEvt) => {
+              if (!this.isCurrentGeneration(session.id, generation)) return;
+              this.dispatchIncomingMessage(msgEvt);
+            },
+          });
         });
         restoredCount++;
       } catch (err) {
@@ -978,86 +1025,93 @@ export class SessionManager {
   ): Promise<SessionRecord> {
     const session = this.assertSessionAccess(sessionId, actorTelegramId);
 
-    this.clearReconnectTimer(sessionId);
-    this.clearPairingTimer(sessionId);
+    return this.runSessionExclusive(sessionId, async () => {
+      this.clearReconnectTimer(sessionId);
+      this.clearPairingTimer(sessionId);
 
-    const credInfo = this.sessionStore.inspectCredentials(sessionId);
-    if (credInfo.corrupted) {
-      this.sessionRepo.updateStatus({
-        id: sessionId,
-        status: 'FAILED',
-        healthStatus: 'UNHEALTHY',
-        lastDisconnectReason: 'CORRUPTED_CREDENTIALS',
-        lastError:
-          credInfo.errorReason || 'ملف بيانات المصادقة تالف. يرجى إعادة ربط الجلسة.',
-      });
-      throw new WhatsAppConnectionError(
-        credInfo.errorReason || 'ملف بيانات المصادقة تالف. يرجى إعادة ربط الجلسة.'
-      );
-    }
+      const credInfo = this.sessionStore.inspectCredentials(sessionId);
+      if (credInfo.corrupted) {
+        this.sessionRepo.updateStatus({
+          id: sessionId,
+          status: 'FAILED',
+          healthStatus: 'UNHEALTHY',
+          lastDisconnectReason: 'CORRUPTED_CREDENTIALS',
+          lastError:
+            credInfo.errorReason ||
+            'ملف بيانات المصادقة تالف. يرجى إعادة ربط الجلسة.',
+        });
+        throw new WhatsAppConnectionError(
+          credInfo.errorReason ||
+            'ملف بيانات المصادقة تالف. يرجى إعادة ربط الجلسة.'
+        );
+      }
 
-    if (!credInfo.registered) {
-      this.sessionRepo.updateStatus({
-        id: sessionId,
-        status: 'DISCONNECTED',
-        healthStatus: 'UNKNOWN',
-        lastError:
-          'لا توجد بيانات مصادقة مكتملة لهذه الجلسة. يرجى استخدام خيار "إعادة الربط برقم هاتف".',
-      });
-      throw new WhatsAppConnectionError(
-        'لا يمكن إعادة الاتصال بجلسة لم تكمل عملية الربط والمصادقة. يرجى استخدام خيار "إعادة الربط برقم هاتف" أولاً.'
-      );
-    }
+      if (!credInfo.registered) {
+        this.sessionRepo.updateStatus({
+          id: sessionId,
+          status: 'DISCONNECTED',
+          healthStatus: 'UNKNOWN',
+          lastError:
+            'لا توجد بيانات مصادقة مكتملة لهذه الجلسة. يرجى استخدام خيار "إعادة الربط برقم هاتف".',
+        });
+        throw new WhatsAppConnectionError(
+          'لا يمكن إعادة الاتصال بجلسة لم تكمل عملية الربط والمصادقة. يرجى استخدام خيار "إعادة الربط برقم هاتف" أولاً.'
+        );
+      }
 
-    await this.cleanupExistingDriver(sessionId);
-    const generation = this.nextGeneration(sessionId);
-    const authDir = this.sessionStore.prepareSessionAuthDir(sessionId);
-
-    // Transition to RECONNECTING while keeping the current reconnect_attempts count
-    // (`reconnectAttempts` is only reset to 0 when the socket genuinely emits `CONNECTED`).
-    this.sessionRepo.updateStatus({
-      id: sessionId,
-      status: 'RECONNECTING',
-      healthStatus: 'DEGRADED',
-      lastError: null,
-    });
-
-    const driver = this.driverFactory(sessionId, authDir);
-    if (driver instanceof MockWhatsAppSessionDriver) {
-      driver.markRegistered(session.jid || credInfo.meJid || undefined);
-    }
-    this.drivers.set(sessionId, driver);
-
-    try {
-      await driver.connect({
-        onStatusChange: (evt) =>
-          this.handleDriverStatusUpdate(sessionId, generation, evt),
-        onIncomingMessage: (msgEvt) => this.dispatchIncomingMessage(msgEvt),
-      });
-    } catch (err) {
       await this.cleanupExistingDriver(sessionId);
-      const safeErr = toSafeArabicError(err);
+      const generation = this.nextGeneration(sessionId);
+      const authDir = this.sessionStore.prepareSessionAuthDir(sessionId);
+
+      // Transition to RECONNECTING while keeping the current reconnect_attempts count
+      // (`reconnectAttempts` is only reset to 0 when the socket genuinely emits `CONNECTED`).
       this.sessionRepo.updateStatus({
         id: sessionId,
-        status: 'DISCONNECTED',
+        status: 'RECONNECTING',
         healthStatus: 'DEGRADED',
-        lastError: safeErr.userMessage,
+        lastError: null,
       });
-      this.scheduleBoundedReconnect(sessionId);
-      throw err;
-    }
 
-    if (actorTelegramId > 0) {
-      this.auditRepo.record({
-        actorTelegramId,
-        action: 'SESSION_RECONNECTED',
-        targetId: sessionId,
-        outcome: 'SUCCESS',
-        metadata: { generation },
-      });
-    }
+      const driver = this.driverFactory(sessionId, authDir);
+      if (driver instanceof MockWhatsAppSessionDriver) {
+        driver.markRegistered(session.jid || credInfo.meJid || undefined);
+      }
+      this.drivers.set(sessionId, driver);
 
-    return this.getSession(sessionId)!;
+      try {
+        await driver.connect({
+          onStatusChange: (evt) =>
+            this.handleDriverStatusUpdate(sessionId, generation, evt),
+          onIncomingMessage: (msgEvt) => {
+            if (!this.isCurrentGeneration(sessionId, generation)) return;
+            this.dispatchIncomingMessage(msgEvt);
+          },
+        });
+      } catch (err) {
+        await this.cleanupExistingDriver(sessionId);
+        const safeErr = toSafeArabicError(err);
+        this.sessionRepo.updateStatus({
+          id: sessionId,
+          status: 'DISCONNECTED',
+          healthStatus: 'DEGRADED',
+          lastError: safeErr.userMessage,
+        });
+        this.scheduleBoundedReconnect(sessionId);
+        throw err;
+      }
+
+      if (actorTelegramId > 0) {
+        this.auditRepo.record({
+          actorTelegramId,
+          action: 'SESSION_RECONNECTED',
+          targetId: sessionId,
+          outcome: 'SUCCESS',
+          metadata: { generation },
+        });
+      }
+
+      return this.getSession(sessionId)!;
+    });
   }
 
   public async disconnectSession(
@@ -1066,56 +1120,60 @@ export class SessionManager {
   ): Promise<SessionRecord> {
     this.assertSessionAccess(sessionId, actorTelegramId);
 
-    this.clearReconnectTimer(sessionId);
-    this.clearPairingTimer(sessionId);
-    await this.cleanupExistingDriver(sessionId);
+    return this.runSessionExclusive(sessionId, async () => {
+      this.clearReconnectTimer(sessionId);
+      this.clearPairingTimer(sessionId);
+      await this.cleanupExistingDriver(sessionId);
 
-    const updated = this.sessionRepo.updateStatus({
-      id: sessionId,
-      status: 'DISCONNECTED',
-      reconnectAttempts: 0,
-      healthStatus: 'UNKNOWN',
-      lastError: 'تم قطع الاتصال يدوياً بواسطة المسؤول.',
-    });
-
-    if (actorTelegramId > 0) {
-      this.auditRepo.record({
-        actorTelegramId,
-        action: 'SESSION_DISCONNECTED',
-        targetId: sessionId,
-        outcome: 'SUCCESS',
+      const updated = this.sessionRepo.updateStatus({
+        id: sessionId,
+        status: 'DISCONNECTED',
+        reconnectAttempts: 0,
+        healthStatus: 'UNKNOWN',
+        lastError: 'تم قطع الاتصال يدوياً بواسطة المسؤول.',
       });
-    }
 
-    return updated!;
+      if (actorTelegramId > 0) {
+        this.auditRepo.record({
+          actorTelegramId,
+          action: 'SESSION_DISCONNECTED',
+          targetId: sessionId,
+          outcome: 'SUCCESS',
+        });
+      }
+
+      return updated!;
+    });
   }
 
   public async removeSession(sessionId: string, actorTelegramId = 0): Promise<void> {
     this.assertSessionAccess(sessionId, actorTelegramId);
 
-    this.clearReconnectTimer(sessionId);
-    this.clearPairingTimer(sessionId);
-    this.nextGeneration(sessionId);
+    return this.runSessionExclusive(sessionId, async () => {
+      this.clearReconnectTimer(sessionId);
+      this.clearPairingTimer(sessionId);
+      this.nextGeneration(sessionId);
 
-    const driver = this.drivers.get(sessionId);
-    if (driver) {
-      this.drivers.delete(sessionId);
-      try {
-        await driver.logout();
-      } catch {
-        // Ignore logout errors on removal
+      const driver = this.drivers.get(sessionId);
+      if (driver) {
+        this.drivers.delete(sessionId);
+        try {
+          await driver.logout();
+        } catch {
+          // Ignore logout errors on removal
+        }
       }
-    }
 
-    this.connectionGenerations.delete(sessionId);
-    this.sessionStore.removeSessionAuthDir(sessionId);
-    this.sessionRepo.deleteById(sessionId);
+      this.connectionGenerations.delete(sessionId);
+      this.sessionStore.removeSessionAuthDir(sessionId);
+      this.sessionRepo.deleteById(sessionId);
 
-    this.auditRepo.record({
-      actorTelegramId,
-      action: 'SESSION_REMOVED',
-      targetId: sessionId,
-      outcome: 'SUCCESS',
+      this.auditRepo.record({
+        actorTelegramId,
+        action: 'SESSION_REMOVED',
+        targetId: sessionId,
+        outcome: 'SUCCESS',
+      });
     });
   }
 

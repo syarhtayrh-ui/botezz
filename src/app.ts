@@ -22,11 +22,32 @@ import { createLogger } from './logging/logger';
 const log = createLogger('app');
 
 /**
+ * Verifies that the active Node.js runtime provides the built-in `node:sqlite` module
+ * (requires Node.js >= 22.5.0, recommended >= 22.13.0 LTS) (`BZ-016`).
+ */
+export async function assertSupportedNodeSqliteRuntime(
+  nodeVersion = process.versions.node
+): Promise<void> {
+  const parts = String(nodeVersion || '0.0.0')
+    .split('.')
+    .map((n) => parseInt(n, 10));
+  const major = parts[0] || 0;
+  const minor = parts[1] || 0;
+  if (major < 22 || (major === 22 && minor < 5)) {
+    throw new Error(
+      `Unsupported Node.js version v${nodeVersion}. Botezz requires Node.js >= 22.13.0 LTS with built-in node:sqlite support.`
+    );
+  }
+  await import('node:sqlite');
+}
+
+/**
  * Standalone Production Entrypoint (`npm run bot:start`).
  * Validates environment variables, initializes SQLite and migrations, restores authenticated
  * @hiroosy/baileys-lite WhatsApp sessions, starts the grammY Telegram Bot polling loop, and registers SIGINT/SIGTERM graceful shutdown.
  */
 export async function startStandaloneBotApplication(): Promise<void> {
+  await assertSupportedNodeSqliteRuntime();
   const config = validateEnv(process.env);
   const shutdownManager = new ShutdownManager();
 

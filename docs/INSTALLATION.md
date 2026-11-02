@@ -3,7 +3,7 @@
 ## System Requirements
 
 - **Operating System**: Ubuntu 24.04 LTS (or compatible Linux distribution)
-- **Node.js**: v20.0.0+ required by `@hiroosy/baileys-lite`, **v22.x LTS** recommended (uses Node's built-in `node:sqlite` engine)
+- **Node.js**: **v22.13.0+ LTS** required (uses Node's built-in `node:sqlite` engine and `@hiroosy/baileys-lite@0.3.6`)
 - **FFmpeg**: `ffmpeg` and `ffprobe` required for real-time H.264/Opus VoIP video call media pipeline (`@hiroosy/baileys-lite/voip`)
 - **Disk Space**: Minimum 1 GB free for SQLite WAL files, isolated WhatsApp multi-file auth directories, and temporary media uploads.
 
@@ -15,10 +15,10 @@
 
 ```bash
 sudo apt-get update && sudo apt-get upgrade -y
-sudo apt-get install -y curl git ca-certificates gnupg build-essential
+sudo apt-get install -y curl git ca-certificates gnupg build-essential ffmpeg
 curl -fsSL https://deb.nodesource.com/setup_22.x | sudo -E bash -
 sudo apt-get install -y nodejs
-node -v   # Verify v22.x (must be >= 20.0.0 for @hiroosy/baileys-lite)
+node -v   # Verify v22.13.0+ LTS (required for built-in node:sqlite)
 git --version
 npm -v
 ```
@@ -40,7 +40,7 @@ chmod +x scripts/setup.sh scripts/health-check.sh
 ```
 
 This script:
-1. Verifies Node.js 20+/22+.
+1. Verifies Node.js >= 22.13.0 LTS and built-in `node:sqlite`.
 2. Creates `./data/whatsapp-sessions` and `./data/tmp` with `0700` permissions.
 3. Creates `.env` from `.env.example` with `0600` permissions.
 4. Installs pinned dependencies (including `@hiroosy/baileys-lite@0.3.6` from npm) and executes the automated unit & integration test suites.

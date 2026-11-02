@@ -260,7 +260,7 @@ export interface CompatibleWhatsAppSocket {
   requestPairingCode(phoneNumber: string, customPairingCode?: string): Promise<string>;
   sendMessage: WASocket['sendMessage'];
   relayMessage: WASocket['relayMessage'];
-  end(error?: Error): void;
+  end(error?: Error): Promise<void> | void;
   logout(msg?: string): Promise<void>;
 }
 
@@ -350,7 +350,7 @@ export function toCompatibleWhatsAppSocket(
         ? sock.relayMessage.bind(sock)
         : (async () => '') as unknown as WASocket['relayMessage'],
     end(error?: Error) {
-      sock.end?.(error);
+      return sock.end?.(error);
     },
     async logout(msg?: string) {
       await sock.logout?.(msg);

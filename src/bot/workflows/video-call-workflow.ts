@@ -99,6 +99,33 @@ export class VideoCallWorkflow {
     return this.states.has(adminId);
   }
 
+  private releaseOwnedTempVideoFile(filePath?: string): void {
+    if (!filePath) return;
+    try {
+      const resolvedPath = path.resolve(filePath);
+      const resolvedTempDir = path.resolve(this.tempUploadDir);
+      const isInsideTempDir =
+        resolvedPath.startsWith(resolvedTempDir + path.sep) ||
+        path.dirname(resolvedPath) === resolvedTempDir;
+      if (!isInsideTempDir) return;
+
+      const baseName = path.basename(resolvedPath);
+      if (baseName.startsWith('synthetic_call_')) return;
+
+      const activeStreams = this.videoCallBridge.listActiveStreams();
+      const inUseByActiveCall = activeStreams.some(
+        (s) => s.videoFilePath && path.resolve(s.videoFilePath) === resolvedPath
+      );
+      if (inUseByActiveCall) return;
+
+      if (fs.existsSync(resolvedPath)) {
+        fs.unlinkSync(resolvedPath);
+      }
+    } catch {
+      // Ignore cleanup errors
+    }
+  }
+
   public cancel(adminId: number): void {
     const existing = this.states.get(adminId);
     if (existing?.activeCallId) {
@@ -107,15 +134,8 @@ export class VideoCallWorkflow {
         adminId,
         { autoCompleted: false, deleteFile: true }
       );
-    } else if (
-      existing?.videoFilePath &&
-      fs.existsSync(existing.videoFilePath)
-    ) {
-      try {
-        fs.unlinkSync(existing.videoFilePath);
-      } catch {
-        // Ignore cleanup error
-      }
+    } else if (existing?.videoFilePath) {
+      this.releaseOwnedTempVideoFile(existing.videoFilePath);
     }
     this.states.delete(adminId);
   }
@@ -128,6 +148,11 @@ export class VideoCallWorkflow {
     preselectedSessionId?: string,
     prefilledPhoneRaw?: string
   ): BotViewResponse {
+    const existing = this.states.get(adminId);
+    if (existing?.videoFilePath) {
+      this.releaseOwnedTempVideoFile(existing.videoFilePath);
+    }
+
     const connected = this.sessionManager.listConnectedSessions(adminId);
 
     if (connected.length === 0) {
@@ -301,16 +326,8 @@ export class VideoCallWorkflow {
     );
     fs.writeFileSync(filePath, upload.contentBuffer);
 
-    if (
-      state.videoFilePath &&
-      state.videoFilePath !== filePath &&
-      fs.existsSync(state.videoFilePath)
-    ) {
-      try {
-        fs.unlinkSync(state.videoFilePath);
-      } catch {
-        // Ignore unlink error
-      }
+    if (state.videoFilePath && state.videoFilePath !== filePath) {
+      this.releaseOwnedTempVideoFile(state.videoFilePath);
     }
 
     state.videoFilePath = filePath;
@@ -364,6 +381,10 @@ export class VideoCallWorkflow {
     }
 
     const { filePath, sizeBytes } = await this.createSampleVideoFile(adminId);
+
+    if (state.videoFilePath && state.videoFilePath !== filePath) {
+      this.releaseOwnedTempVideoFile(state.videoFilePath);
+    }
 
     state.videoFilePath = filePath;
     state.videoFileName = 'sample_call.mp4';
@@ -522,6 +543,9 @@ export class VideoCallWorkflow {
     if (!state) {
       return this.start(adminId);
     }
+    if (state.videoFilePath) {
+      this.releaseOwnedTempVideoFile(state.videoFilePath);
+    }
     state.videoFilePath = undefined;
     state.videoFileName = undefined;
     state.step = 'AWAITING_VIDEO';
@@ -554,6 +578,100 @@ export class VideoCallWorkflow {
     state.step = 'READY_TO_CALL';
     this.states.set(adminId, state);
     return this.confirmAndExecute(adminId);
+  }
+
+  public renderStreamStatusView(
+    stream: ReturnType<UbuntuVideoCallBridge['getCallStatus']> & object
+  ): BotViewResponse {
+    const stateLabel =
+      CALL_STATE_ARABIC_LABELS[stream.callState] || stream.callState;
+
+    const isMediaActivelyStreaming =
+      stream.callState === 'MEDIA_STARTED' && stream.mediaStarted;
+    const isTerminal =
+      stream.callState === 'ENDED' ||
+      stream.callState === 'REJECTED' ||
+      stream.callState === 'TIMEOUT' ||
+      stream.callState === 'FAILED' ||
+      stream.callState === 'MEDIA_STOPPED';
+
+    const executionMode =
+      (stream as { executionMode?: 'REAL_VOIP' | 'MOCK_SIMULATION' })
+        .executionMode || 'REAL_VOIP';
+    const isMockMode = executionMode === 'MOCK_SIMULATION';
+
+    const headerLine = isTerminal
+      ? `ℹ️ *حالة المكالمة المرئية (${stateLabel})*`
+      : isMediaActivelyStreaming
+        ? isMockMode
+          ? '🧪 *تم بدء المكالمة المرئية وبث الفيديو بنجاح (MOCK_SIMULATION)*'
+          : '✅ *تم بدء المكالمة المرئية وبث الفيديو بنجاح*'
+        : isMockMode
+          ? '🧪 *تم إنشاء جلسة محاكاة مكالمة الفيديو (MOCK_SIMULATION)*'
+          : '📞 *تم إرسال طلب مكالمة الفيديو وجاري الرنين وتأسيس قناة الوسائط*';
+
+    return {
+      text: [
+        headerLine,
+        '━━━━━━━━━━━━━━━━━━━━━━',
+        `• *معرف المكالمة:* \`${stream.callId}\``,
+        `• *معرف عقدة VoIP:* \`${stream.voipCallId || stream.messageId || stream.callId}\``,
+        `• *وضع التنفيذ:* ${isMockMode ? '🧪 محاكاة اختبارية (`MOCK_SIMULATION`)' : '🟢 اتصال VoIP حقيقي (`REAL_VOIP`)'}`,
+        `• *الجلسة:* \`${stream.sessionId}\``,
+        `• *المستلم:* \`${stream.recipientMasked}\``,
+        `• *نوع المكالمة:* \`${stream.callKind === 'video' ? 'فيديو 📹' : 'صوتية 🔊'}\``,
+        `• *طبقة الوسائط:* \`@hiroosy/baileys-lite/voip (${stream.resolutionPreset})\``,
+        `• *ملف الفيديو:* \`${stream.videoFileName}\``,
+        `• *الحالة الحالية:* ${stateLabel}`,
+        `• *حالة البث الفعلي (RTP/SRTP):* ${isMediaActivelyStreaming ? '🟢 نشط ومؤكد (`MEDIA_STARTED`)' : isTerminal ? '⏹️ متوقف / منتهي' : '⏳ بانتظار رد المستلم وبدء تدفق إطارات الصوت والفيديو'}`,
+        '',
+        stream.detailsArabic,
+      ].join('\n'),
+      keyboard: [
+        [
+          {
+            text: '🔁 إعادة الاتصال وبث الفيديو لنفس الرقم',
+            callbackData: 'wf_vcall:repeat_call',
+          },
+        ],
+        [
+          {
+            text: '🛑 إنهاء المكالمة وإيقاف البث',
+            callbackData: 'wf_vcall:stop',
+          },
+        ],
+        [
+          {
+            text: '👤 إرسال المكالمة لرقم آخر (بنفس الفيديو)',
+            callbackData: 'wf_vcall:change_recipient',
+          },
+        ],
+        [
+          {
+            text: '🎬 تغيير ملف الفيديو',
+            callbackData: 'wf_vcall:reupload',
+          },
+        ],
+        buildAppNavigationRow({
+          backCallback: 'menu:video_call',
+          refreshCallback: 'menu:video_call',
+        }),
+      ],
+    };
+  }
+
+  public renderLiveCallStatusView(adminId: number): BotViewResponse | undefined {
+    const state = this.states.get(adminId);
+    if (!state || state.step !== 'STREAMING_ACTIVE' || !state.activeCallId) {
+      return undefined;
+    }
+    const stream = this.videoCallBridge.getCallStatus(state.activeCallId);
+    if (!stream) {
+      return undefined;
+    }
+    state.callState = stream.callState;
+    this.states.set(adminId, state);
+    return this.renderStreamStatusView(stream);
   }
 
   /**
@@ -590,62 +708,7 @@ export class VideoCallWorkflow {
       state.step = 'STREAMING_ACTIVE';
       this.states.set(adminId, state);
 
-      const stateLabel =
-        CALL_STATE_ARABIC_LABELS[stream.callState] || stream.callState;
-
-      const isMediaActivelyStreaming =
-        stream.callState === 'MEDIA_STARTED' && stream.mediaStarted;
-      const headerLine = isMediaActivelyStreaming
-        ? '✅ *تم بدء المكالمة المرئية وبث الفيديو بنجاح*'
-        : '📞 *تم إرسال طلب مكالمة الفيديو وجاري الرنين وتأسيس قناة الوسائط*';
-
-      return {
-        text: [
-          headerLine,
-          '━━━━━━━━━━━━━━━━━━━━━━',
-          `• *معرف المكالمة:* \`${stream.callId}\``,
-          `• *معرف عقدة VoIP:* \`${stream.voipCallId || stream.messageId || stream.callId}\``,
-          `• *الجلسة:* \`${stream.sessionId}\``,
-          `• *المستلم:* \`${stream.recipientMasked}\``,
-          `• *نوع المكالمة:* \`${stream.callKind === 'video' ? 'فيديو 📹' : 'صوتية 🔊'}\``,
-          `• *طبقة الوسائط:* \`@hiroosy/baileys-lite/voip (${stream.resolutionPreset})\``,
-          `• *ملف الفيديو:* \`${stream.videoFileName}\``,
-          `• *الحالة الحالية:* ${stateLabel}`,
-          `• *حالة البث الفعلي (RTP/SRTP):* ${isMediaActivelyStreaming ? '🟢 نشط ومؤكد (`MEDIA_STARTED`)' : '⏳ بانتظار رد المستلم وبدء تدفق إطارات الصوت والفيديو'}`,
-          '',
-          stream.detailsArabic,
-        ].join('\n'),
-        keyboard: [
-          [
-            {
-              text: '🔁 إعادة الاتصال وبث الفيديو لنفس الرقم',
-              callbackData: 'wf_vcall:repeat_call',
-            },
-          ],
-          [
-            {
-              text: '🛑 إنهاء المكالمة وإيقاف البث',
-              callbackData: 'wf_vcall:stop',
-            },
-          ],
-          [
-            {
-              text: '👤 إرسال المكالمة لرقم آخر (بنفس الفيديو)',
-              callbackData: 'wf_vcall:change_recipient',
-            },
-          ],
-          [
-            {
-              text: '🎬 تغيير ملف الفيديو',
-              callbackData: 'wf_vcall:reupload',
-            },
-          ],
-          buildAppNavigationRow({
-            backCallback: 'menu:video_call',
-            refreshCallback: 'menu:video_call',
-          }),
-        ],
-      };
+      return this.renderStreamStatusView(stream);
     } catch (err) {
       const safeErr = toSafeArabicError(err);
       return {

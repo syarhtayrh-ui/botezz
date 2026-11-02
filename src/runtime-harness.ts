@@ -21,6 +21,7 @@ import { BotViewResponse } from './bot/workflows/pairing-workflow';
 export interface HarnessSingleton {
   config: AppConfig;
   isLiveConfigured: boolean;
+  isReadOnlyWebObserver: boolean;
   validationIssues: string[];
   db: AppDatabase;
   sessionRepo: SessionRepository;
@@ -30,6 +31,56 @@ export interface HarnessSingleton {
   settingsRepo: SettingsRepository;
   controller: TelegramBotController;
   lastBotView: BotViewResponse;
+  getFreshBotView: () => BotViewResponse;
+}
+
+const DESTRUCTIVE_SESSION_CALLBACK_PREFIXES = [
+  'sess:disconnect:',
+  'sess:remove:',
+  'sess:reconnect:',
+  'sess:repair:',
+  'sess:purge_inactive',
+  'sessions:delete:',
+  'sessions:remove:',
+  'sessions:disconnect:',
+  'menu:link_account',
+  'menu:add_account',
+  'menu:pair',
+];
+
+const DESTRUCTIVE_SESSION_COMMANDS = [
+  '/requestpair',
+  '/addsender',
+  '/resetsession',
+  '/delete',
+  '/disconnect',
+];
+
+export function isDestructiveLiveSessionAction(input: {
+  text?: string;
+  callbackData?: string;
+}): boolean {
+  const cb = input.callbackData?.trim() || '';
+  if (cb) {
+    if (
+      DESTRUCTIVE_SESSION_CALLBACK_PREFIXES.some(
+        (prefix) => cb === prefix || cb.startsWith(prefix)
+      )
+    ) {
+      return true;
+    }
+  }
+  const txt = input.text?.trim().toLowerCase() || '';
+  if (txt) {
+    if (
+      DESTRUCTIVE_SESSION_COMMANDS.some(
+        (cmd) => txt === cmd || txt.startsWith(`${cmd} `)
+      )
+    ) {
+      return true;
+    }
+  }
+  return false;
 }
 
 const globalForHarness = globalThis as unknown as {
@@ -39,7 +90,25 @@ const globalForHarness = globalThis as unknown as {
 
 async function createRuntimeHarness(): Promise<HarnessSingleton> {
   const { config, isLiveConfigured, validationIssues } = loadRuntimeConfig(process.env);
-  const db = new AppDatabase(config.DATABASE_PATH);
+  const isTestEnv = process.env.NODE_ENV === 'test';
+
+  // Isolate demo simulation database and auth directories from live production storage (BZ-015)
+  const effectiveDbPath =
+    !isLiveConfigured && !isTestEnv && !process.env.DATABASE_PATH
+      ? './data/demo-harness.sqlite'
+      : config.DATABASE_PATH;
+  const effectiveAuthDir =
+    !isLiveConfigured && !isTestEnv && !process.env.WHATSAPP_AUTH_DIR
+      ? './data/demo-whatsapp-sessions'
+      : config.WHATSAPP_AUTH_DIR;
+
+  const effectiveConfig: AppConfig = {
+    ...config,
+    DATABASE_PATH: effectiveDbPath,
+    WHATSAPP_AUTH_DIR: effectiveAuthDir,
+  };
+
+  const db = new AppDatabase(effectiveConfig.DATABASE_PATH);
 
   const sessionRepo = new SessionRepository(db);
   const taskRepo = new TaskRepository(db);
@@ -48,11 +117,11 @@ async function createRuntimeHarness(): Promise<HarnessSingleton> {
   const functionLabRepo = new FunctionLabRepository(db);
   const messageSender = new MessageSender(functionLabRepo);
   const mediaProcessor = new MediaProcessor({
-    maxMediaSizeMb: config.MAX_UPLOAD_SIZE_MB,
-    tempDir: config.TEMP_UPLOAD_DIR,
+    maxMediaSizeMb: effectiveConfig.MAX_UPLOAD_SIZE_MB,
+    tempDir: effectiveConfig.TEMP_UPLOAD_DIR,
   });
 
-  const sessionStore = new SessionStore(config.WHATSAPP_AUTH_DIR);
+  const sessionStore = new SessionStore(effectiveConfig.WHATSAPP_AUTH_DIR);
   const sessionManager = new SessionManager(
     sessionRepo,
     auditRepo,
@@ -81,8 +150,8 @@ async function createRuntimeHarness(): Promise<HarnessSingleton> {
 
   const taskRunner = new TaskRunner(
     taskRepo,
-    config.MAX_CONCURRENT_TASKS,
-    config.TASK_TIMEOUT_MS
+    effectiveConfig.MAX_CONCURRENT_TASKS,
+    effectiveConfig.TASK_TIMEOUT_MS
   );
   const taskManager = new TaskManager(taskRepo, auditRepo, taskRunner);
 
@@ -94,30 +163,30 @@ async function createRuntimeHarness(): Promise<HarnessSingleton> {
     if (sessionRepo.listAll().length === 0) {
       const s1 = sessionManager.createSession(
         'حساب العمليات الرئيسي (محاكاة)',
-        config.TELEGRAM_ADMIN_ID
+        effectiveConfig.TELEGRAM_ADMIN_ID
       );
       await sessionManager.initiatePairing({
         sessionId: s1.id,
         rawPhoneNumber: '+966501234567',
-        actorTelegramId: config.TELEGRAM_ADMIN_ID,
+        actorTelegramId: effectiveConfig.TELEGRAM_ADMIN_ID,
         autoCompleteInMock: true,
       });
 
       const s2 = sessionManager.createSession(
         'حساب مساندة العملاء (محاكاة)',
-        config.TELEGRAM_ADMIN_ID
+        effectiveConfig.TELEGRAM_ADMIN_ID
       );
       await sessionManager.initiatePairing({
         sessionId: s2.id,
         rawPhoneNumber: '+966558889999',
-        actorTelegramId: config.TELEGRAM_ADMIN_ID,
+        actorTelegramId: effectiveConfig.TELEGRAM_ADMIN_ID,
         autoCompleteInMock: true,
       });
     }
   }
 
   const controller = new TelegramBotController({
-    config,
+    config: effectiveConfig,
     sessionManager,
     taskManager,
     sendMessageOp,
@@ -129,15 +198,16 @@ async function createRuntimeHarness(): Promise<HarnessSingleton> {
 
   const rawInitialView = controller.startHandler.renderMainMenu({ isAdmin: true });
   const initialView = await controller.uiState.deliverView({
-    userId: config.TELEGRAM_ADMIN_ID,
+    userId: effectiveConfig.TELEGRAM_ADMIN_ID,
     view: rawInitialView,
     pendingWorkflow: 'NONE',
     preferEdit: false,
   });
 
   const instance: HarnessSingleton = {
-    config,
+    config: effectiveConfig,
     isLiveConfigured,
+    isReadOnlyWebObserver: isLiveConfigured,
     validationIssues,
     db,
     sessionRepo,
@@ -147,7 +217,28 @@ async function createRuntimeHarness(): Promise<HarnessSingleton> {
     settingsRepo,
     controller,
     lastBotView: initialView,
+    getFreshBotView() {
+      const liveCallView = controller.videoCallWorkflow.renderLiveCallStatusView(
+        effectiveConfig.TELEGRAM_ADMIN_ID
+      );
+      if (liveCallView) {
+        instance.lastBotView = liveCallView;
+      }
+      return instance.lastBotView;
+    },
   };
+
+  const syncLiveCallView = () => {
+    const liveCallView = controller.videoCallWorkflow.renderLiveCallStatusView(
+      effectiveConfig.TELEGRAM_ADMIN_ID
+    );
+    if (liveCallView) {
+      instance.lastBotView = liveCallView;
+    }
+  };
+
+  controller.videoCallBridge.on('call:state', syncLiveCallView);
+  controller.videoCallBridge.on('call:ended', syncLiveCallView);
 
   globalForHarness.__waTelegramHarness = instance;
   return instance;

@@ -44,9 +44,14 @@ export interface MediaBinariesStatus {
   ffprobeVersion?: string;
 }
 
+export type CompatibilityVerificationLevel =
+  | 'STATIC_EXPORTS_ONLY'
+  | 'LIVE_SOCKET_VERIFIED';
+
 export type CompatibilityReport = {
   libraryName: string;
   libraryVersion: string;
+  verificationLevel: CompatibilityVerificationLevel;
   baileysCompatible: boolean;
   baseBaileysCompatible: boolean;
   voipCompatible: boolean;
@@ -234,7 +239,8 @@ export function runBaileysCompatibilityProbe(
       ? Boolean(
           rawSock?.signalRepository &&
             typeof rawSock.signalRepository.jidToSignalProtocolAddress ===
-              'function'
+              'function' &&
+            typeof rawSock.signalRepository.injectE2ESession === 'function'
         )
       : !rawSock ||
         Boolean(
@@ -261,11 +267,9 @@ export function runBaileysCompatibilityProbe(
       (typeof rawSock.sendNode === 'function' &&
         typeof rawSock.query === 'function');
 
+  // BZ-026: VoipClient.registerIncomingHandler binds directly to `sock.ws.on('CB:call', ...)`
   const sockHasIncomingStanzaInterception = requireLiveSocket
-    ? Boolean(
-        (rawSock?.ws && typeof rawSock.ws.on === 'function') ||
-          (rawSock?.ev && typeof rawSock.ev.on === 'function')
-      )
+    ? Boolean(rawSock?.ws && typeof rawSock.ws.on === 'function')
     : !rawSock ||
       Boolean(
         (rawSock.ws && typeof rawSock.ws.on === 'function') ||
@@ -342,9 +346,15 @@ export function runBaileysCompatibilityProbe(
   const voipCompatible =
     baileysCompatible && Object.values(voipCapabilities).every(Boolean);
 
+  const verificationLevel: CompatibilityVerificationLevel =
+    rawSock && requireLiveSocket && voipCompatible
+      ? 'LIVE_SOCKET_VERIFIED'
+      : 'STATIC_EXPORTS_ONLY';
+
   return {
     libraryName: BAILEYS_LITE_LIBRARY_NAME,
     libraryVersion: BAILEYS_LITE_LIBRARY_VERSION,
+    verificationLevel,
     baileysCompatible,
     baseBaileysCompatible: baileysCompatible,
     voipCompatible,

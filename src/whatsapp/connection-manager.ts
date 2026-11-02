@@ -529,35 +529,107 @@ export class SessionMemoryStore {
       }
     };
 
-    const onChatsSet = ({ chats: newChats }: { chats: Array<{ id: string }> }) => {
+    const upsertChatsList = (newChats?: Array<{ id: string; [key: string]: unknown }>) => {
       if (!Array.isArray(newChats)) return;
       for (const chat of newChats) {
         if (chat?.id) {
-          this.chats.set(chat.id, chat);
+          const prev = this.chats.get(chat.id) || {};
+          this.chats.set(chat.id, { ...prev, ...chat });
         }
       }
+    };
+
+    const upsertContactsPayload = (
+      newContacts?:
+        | Record<string, unknown>
+        | Array<{ id?: string; [key: string]: unknown }>
+    ) => {
+      if (!newContacts || typeof newContacts !== 'object') return;
+      if (Array.isArray(newContacts)) {
+        for (const contact of newContacts) {
+          if (contact && typeof contact.id === 'string' && contact.id) {
+            const prev =
+              (this.contacts.get(contact.id) as Record<string, unknown> | undefined) ||
+              {};
+            this.contacts.set(contact.id, { ...prev, ...contact });
+          }
+        }
+        return;
+      }
+      for (const [id, contact] of Object.entries(newContacts)) {
+        if (contact && typeof contact === 'object' && 'id' in contact) {
+          const cObj = contact as { id?: string; [key: string]: unknown };
+          const key = typeof cObj.id === 'string' && cObj.id ? cObj.id : id;
+          const prev =
+            (this.contacts.get(key) as Record<string, unknown> | undefined) || {};
+          this.contacts.set(key, { ...prev, ...cObj });
+        } else {
+          this.contacts.set(id, contact);
+        }
+      }
+    };
+
+    const onChatsSet = ({ chats: newChats }: { chats: Array<{ id: string }> }) => {
+      upsertChatsList(newChats);
+    };
+
+    const onChatsUpsert = (newChats: Array<{ id: string }>) => {
+      upsertChatsList(newChats);
     };
 
     const onContactsSet = ({
       contacts: newContacts,
     }: {
-      contacts: Record<string, unknown>;
+      contacts: Record<string, unknown> | Array<{ id?: string; [key: string]: unknown }>;
     }) => {
-      if (!newContacts || typeof newContacts !== 'object') return;
-      for (const [id, contact] of Object.entries(newContacts)) {
-        this.contacts.set(id, contact);
+      upsertContactsPayload(newContacts);
+    };
+
+    const onContactsUpsert = (
+      newContacts: Array<{ id?: string; [key: string]: unknown }>
+    ) => {
+      upsertContactsPayload(newContacts);
+    };
+
+    const onContactsUpdate = (
+      updates: Array<{ id?: string; [key: string]: unknown }>
+    ) => {
+      upsertContactsPayload(updates);
+    };
+
+    const onMessagingHistorySet = (payload: {
+      chats?: Array<{ id: string; [key: string]: unknown }>;
+      contacts?: Array<{ id?: string; [key: string]: unknown }>;
+      messages?: Parameters<typeof onMessagesUpsert>[0]['messages'];
+    }) => {
+      if (payload?.chats) {
+        upsertChatsList(payload.chats);
+      }
+      if (payload?.contacts) {
+        upsertContactsPayload(payload.contacts);
+      }
+      if (Array.isArray(payload?.messages) && payload.messages.length > 0) {
+        onMessagesUpsert({ messages: payload.messages, type: 'append' });
       }
     };
 
     ev.on('messages.upsert', onMessagesUpsert);
     ev.on('chats.set', onChatsSet);
+    ev.on('chats.upsert', onChatsUpsert);
     ev.on('contacts.set', onContactsSet);
+    ev.on('contacts.upsert', onContactsUpsert);
+    ev.on('contacts.update', onContactsUpdate);
+    ev.on('messaging-history.set', onMessagingHistorySet);
 
     return () => {
       try {
         ev.off('messages.upsert', onMessagesUpsert);
         ev.off('chats.set', onChatsSet);
+        ev.off('chats.upsert', onChatsUpsert);
         ev.off('contacts.set', onContactsSet);
+        ev.off('contacts.upsert', onContactsUpsert);
+        ev.off('contacts.update', onContactsUpdate);
+        ev.off('messaging-history.set', onMessagingHistorySet);
       } catch {
         // Ignore cleanup errors
       }
@@ -990,7 +1062,9 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
   private credsSaveChain: Promise<void> = Promise.resolve();
   private flushAuthWrites: () => Promise<void> = async () => undefined;
   private wsOpen = false;
+  private authenticatedOpen = false;
   private handshakeReady = false;
+  private connectGeneration = 0;
   private lastCloseError: WhatsAppConnectionError | null = null;
   private lastCloseStatusCode: number | undefined;
   private resolvedWaVersion: [number, number, number] | undefined;
@@ -1105,13 +1179,17 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
   }
 
   public async connect(callbacks: ConnectionEventCallbacks): Promise<void> {
+    const myGen = ++this.connectGeneration;
     await this.disconnect();
+    if (myGen !== this.connectGeneration) return;
 
     const { state, saveCreds, flushPendingWrites, recoveredFromBackup } =
       await createAtomicMultiFileAuthState(this.authDir);
+    if (myGen !== this.connectGeneration) return;
     this.flushAuthWrites = flushPendingWrites;
 
     const resolvedVersionInfo = await resolveWhatsAppWebVersion();
+    if (myGen !== this.connectGeneration) return;
     const version = resolvedVersionInfo.version;
     this.resolvedWaVersion = version;
 
@@ -1139,6 +1217,7 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
     const silentPino = pino({ level: 'silent' });
     this.connectionState = 'CONNECTING';
     this.wsOpen = false;
+    this.authenticatedOpen = false;
     this.handshakeReady = false;
     this.lastCloseError = null;
     this.lastCloseStatusCode = undefined;
@@ -1178,8 +1257,15 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
       void enqueueSaveCreds()
         .then(() => this.flushAuthWrites())
         .then(() => {
-          // If Baileys finished uploading initial PreKeys and set `registered: true` while socket is open:
-          if (update?.registered === true && this.wsOpen && this.sock === sock) {
+          // Only promote to CONNECTED when the socket has genuinely reached an authenticated `connection === 'open'`
+          // (`this.authenticatedOpen === true`). During initial phone pairing (`qr`), `this.authenticatedOpen` is false,
+          // preventing premature `CONNECTED` before the mandatory post-pairing 515 restart (`BZ-002`, `R-001`).
+          if (
+            update?.registered === true &&
+            this.authenticatedOpen &&
+            this.wsOpen &&
+            this.sock === sock
+          ) {
             const rawJid = sock.user?.id || state.creds?.me?.id;
             const normalizedJid = rawJid ? jidNormalizedUser(rawJid) : undefined;
             if (normalizedJid && this.connectionState !== 'CONNECTED') {
@@ -1202,6 +1288,7 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
       // and WhatsApp server is ready to accept `link_code_companion_reg (stage="companion_hello")`.
       if (typeof qr === 'string' && qr.length > 0) {
         this.wsOpen = true;
+        this.authenticatedOpen = false;
         this.handshakeReady = true;
         this.lastCloseError = null;
         this.connectionState = 'AWAITING_PAIRING';
@@ -1213,10 +1300,11 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
       }
 
       // 2. User entered pairing code on phone and `CB:iq,,pair-success` succeeded (`isNewLogin: true`):
-      // CRITICAL: Do NOT mutate `creds.registered = true` here! Baileys needs `creds.registered === false`
-      // on the subsequent 515 reconnect (`connection === 'open'`) so `validateConnection` runs
-      // `uploadPreKeysToServerIfRequired()` + `sendPassiveIq('active')` before marking `registered: true`.
+      // CRITICAL: Do NOT mutate `creds.registered = true` or `this.authenticatedOpen = true` here!
+      // Baileys emits 515 (`restartRequired`) right after `companion_finish`, and only the post-515
+      // socket's `connection === 'open'` represents an authenticated live session.
       if (isNewLogin) {
+        this.authenticatedOpen = false;
         this.connectionState = 'AUTHENTICATING';
         const rawJid = sock.user?.id || sock.authState?.creds?.me?.id;
         const normalizedJid = rawJid ? jidNormalizedUser(rawJid) : undefined;
@@ -1251,6 +1339,7 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
 
         if (creds?.registered === true && normalizedJid) {
           // Fully registered & PreKeys already uploaded on server
+          this.authenticatedOpen = true;
           this.connectionState = 'CONNECTED';
           void enqueueSaveCreds()
             .then(() => this.flushAuthWrites())
@@ -1264,6 +1353,7 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
         } else if (creds?.account && normalizedJid && !creds.registered) {
           // Post-pairing 515 reconnect: `creds.account` is present, and Baileys is now finishing
           // `uploadPreKeysToServerIfRequired()` + `sendPassiveIq('active')`.
+          this.authenticatedOpen = true;
           this.connectionState = 'AUTHENTICATING';
           callbacks.onStatusChange({
             status: 'AUTHENTICATING',
@@ -1315,6 +1405,7 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
             }
           })();
         } else {
+          this.authenticatedOpen = false;
           this.connectionState = 'AWAITING_PAIRING';
           void enqueueSaveCreds()
             .then(() => this.flushAuthWrites())
@@ -1328,6 +1419,7 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
         }
       } else if (connection === 'close') {
         this.wsOpen = false;
+        this.authenticatedOpen = false;
         this.handshakeReady = false;
         this.connectionState = 'CLOSED';
         this.verifiedRecipientJids.clear();
@@ -1577,9 +1669,10 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
     }
 
     const executeRequest = async (): Promise<string> => {
+      let timerId: ReturnType<typeof setTimeout> | undefined;
       const resultPromise = sock.requestPairingCode(cleanDigits, codeToRequest);
-      const timeoutPromise = new Promise<never>((_, reject) =>
-        setTimeout(
+      const timeoutPromise = new Promise<never>((_, reject) => {
+        timerId = setTimeout(
           () =>
             reject(
               new TaskTimeoutError(
@@ -1587,9 +1680,18 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
               )
             ),
           30_000
-        )
-      );
-      return Promise.race([resultPromise, timeoutPromise]);
+        );
+        if (typeof timerId.unref === 'function') {
+          timerId.unref();
+        }
+      });
+      try {
+        return await Promise.race([resultPromise, timeoutPromise]);
+      } finally {
+        if (timerId !== undefined) {
+          clearTimeout(timerId);
+        }
+      }
     };
 
     let rawCode: string;
@@ -1923,7 +2025,9 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
     const creds = this.sock.authState?.creds;
     const rawMeId = this.sock.user?.id || creds?.me?.id;
     const meJid = rawMeId ? jidNormalizedUser(rawMeId) : undefined;
-    const isRegistered = Boolean((creds?.registered || creds?.account) && meJid);
+    const isRegistered = Boolean(
+      this.authenticatedOpen && (creds?.registered || creds?.account) && meJid
+    );
 
     return {
       socketActive: this.wsOpen && this.connectionState !== 'CLOSED',
@@ -2100,6 +2204,7 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
   public async disconnect(): Promise<void> {
     const wasOpen = this.wsOpen;
     this.wsOpen = false;
+    this.authenticatedOpen = false;
     this.handshakeReady = false;
     this.connectionState = 'CLOSED';
     this.verifiedRecipientJids.clear();
@@ -2110,16 +2215,17 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
       this.evCleanup();
       this.evCleanup = null;
     }
-    if (this.sock) {
-      if (wasOpen && typeof this.sock.sendPresenceUpdate === 'function') {
-        await this.sock.sendPresenceUpdate('unavailable').catch(() => undefined);
+    const sockToClose = this.sock;
+    this.sock = null;
+    if (sockToClose) {
+      if (wasOpen && typeof sockToClose.sendPresenceUpdate === 'function') {
+        await sockToClose.sendPresenceUpdate('unavailable').catch(() => undefined);
       }
       try {
-        this.sock.end(undefined);
+        await Promise.resolve(sockToClose.end(undefined)).catch(() => undefined);
       } catch {
         // Ignore socket close error
       }
-      this.sock = null;
     }
     await Promise.allSettled([this.credsSaveChain, this.flushAuthWrites()]);
   }
