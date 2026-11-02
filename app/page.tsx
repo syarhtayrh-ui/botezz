@@ -39,7 +39,7 @@ const FALLBACK_INITIAL_DATA: HarnessStateResponse = {
   },
 };
 
-export default async function HomePage() {
+async function loadInitialData(): Promise<HarnessStateResponse> {
   try {
     const harness = await getRuntimeHarness();
     const sessions = harness.isLiveConfigured
@@ -80,8 +80,13 @@ export default async function HomePage() {
       JSON.stringify(initialData)
     );
 
-    return <ControlCenterDashboard initialData={plainInitialData} />;
+    return plainInitialData;
   } catch {
-    return <ControlCenterDashboard initialData={FALLBACK_INITIAL_DATA} />;
+    return structuredClone(FALLBACK_INITIAL_DATA);
   }
+}
+
+export default async function HomePage() {
+  const initialData = await loadInitialData();
+  return <ControlCenterDashboard initialData={initialData} />;
 }
