@@ -1058,6 +1058,180 @@ test('Master Prompt Google Studio (Pillars 1-5): Media/Sticker Toolkit, Sandbox 
   }
 });
 
+test('Deep Status Downloader & Deep Message Inbox: all formats, zip fallback, edit tracking, and native WhatsApp forwarding', async () => {
+  const env = createUpgradeTestHarness();
+  try {
+    const ownerId = env.config.TELEGRAM_ADMIN_ID;
+    env.settingsRepo.setCooldownSeconds(0);
+
+    // 1. Setup connected session
+    const pairRes = await env.sessionManager.initiatePairing({
+      rawPhoneNumber: '+966501112233',
+      label: 'جلسة الفحص العميق',
+      actorTelegramId: ownerId,
+      autoCompleteInMock: true,
+    });
+    const sess = pairRes.session;
+    const mockDriver = env.sessionManager.getDriver(
+      sess.id,
+      ownerId
+    ) as MockWhatsAppSessionDriver;
+    assert.equal(sess.status, 'CONNECTED');
+
+    // 2. Deep Status Extraction: Status with rich Arabic diacritics caption
+    // 2. Deep Status Extraction: Status with rich Arabic diacritics caption
+    const arabicCaptionWithDiacritics = 'بِسْمِ اللَّهِ الرَّحْمَٰنِ الرَّحِيمِ — إعلان هامّ مع خطوط نادرة 🌟🚀 #تحديث';
+    const statusResult = await env.controller.statusDownloader.processStatusMessage({
+      sessionId: sess.id,
+      rawMessage: {
+        key: {
+          remoteJid: 'status@broadcast',
+          id: 'status_deep_arabic_1',
+          fromMe: false,
+          participant: '966501239999@s.whatsapp.net',
+        },
+        pushName: 'الناشر الرسمي',
+        messageTimestamp: Math.floor(Date.now() / 1000),
+        message: {
+          imageMessage: {
+            caption: arabicCaptionWithDiacritics,
+            mimetype: 'image/jpeg',
+            url: 'https://example.com/status.jpg',
+          },
+        },
+      },
+    });
+
+    assert.ok(statusResult);
+    assert.equal(statusResult.caption, arabicCaptionWithDiacritics);
+    assert.ok(fs.existsSync(statusResult.file_path));
+
+    // Verify companion caption .txt file was written
+    const statusDir = path.dirname(statusResult.file_path);
+    const descFiles = fs.readdirSync(statusDir).filter((f) => f.startsWith('status_desc_'));
+    assert.ok(descFiles.length > 0, 'Companion caption description file must exist');
+    const savedCaption = fs.readFileSync(path.join(statusDir, descFiles[0]!), 'utf-8');
+    assert.ok(savedCaption.includes(arabicCaptionWithDiacritics));
+
+    // 3. Deep Status Extraction: Corrupted/problematic image falls back to .zip archive
+    const zipStatusResult = await env.controller.statusDownloader.processStatusMessage({
+      sessionId: sess.id,
+      rawMessage: {
+        key: {
+          remoteJid: 'status@broadcast',
+          id: 'status_deep_corrupted_1',
+          fromMe: false,
+          participant: '966501239999@s.whatsapp.net',
+        },
+        pushName: 'الناشر مع صورة تالفة',
+        messageTimestamp: Math.floor(Date.now() / 1000),
+        message: {
+          imageMessage: {
+            caption: 'حالة صورة تالفة أو غير مكتملة المعالجة',
+            mimetype: 'image/unknown-raw',
+            jpegThumbnail: Buffer.from('corrupted-non-standard-bytes-for-zip-packaging'),
+          },
+        },
+      },
+    });
+
+    assert.ok(zipStatusResult);
+    assert.equal(zipStatusResult.archive_format, 'zip');
+    assert.ok(zipStatusResult.file_path.endsWith('.zip'));
+    assert.ok(fs.existsSync(zipStatusResult.file_path));
+    assert.ok(fs.statSync(zipStatusResult.file_path).size > 0);
+
+    // 4. Deep Inbox Message Extraction: Complex rare characters & long text
+    const longSpecialText = '💎 نص طويل جداً يحتوي على رموز نادرة 𝕭𝖔𝖙𝖊𝖟𝖟 𝖁𝟱 ورموز تعبيرية ⚡💫 وتشيكل كامل: الحَمْدُ لِلَّهِ رَبِّ العَالَمِينَ'.repeat(3);
+    const deepMsg = await env.controller.incomingMessageReceiver.processIncomingMessage({
+      sessionId: sess.id,
+      rawMessage: {
+        key: {
+          remoteJid: '966551122334@s.whatsapp.net',
+          id: 'wa_msg_deep_long_1',
+          fromMe: false,
+        },
+        pushName: 'العميل المميز',
+        messageTimestamp: Math.floor(Date.now() / 1000),
+        message: {
+          extendedTextMessage: {
+            text: longSpecialText,
+          },
+        },
+      },
+    });
+
+    assert.ok(deepMsg);
+    assert.equal(deepMsg.text_content, longSpecialText);
+    assert.notEqual(deepMsg.text_content, '(بدون نص)');
+    assert.ok(fs.existsSync(deepMsg.file_path!));
+
+    // 5. Message Edit Detection & Version Tracking (قبل التعديل / بعد التعديل)
+    const editedText = '💎 النص بعد التعديل: تم تصحيح البيان بالكامل مع إضافة توضيح جديد! ✅';
+    const editedMsgResult = await env.controller.incomingMessageReceiver.processIncomingMessage({
+      sessionId: sess.id,
+      rawMessage: {
+        key: {
+          remoteJid: '966551122334@s.whatsapp.net',
+          id: 'wa_msg_edit_protocol_1',
+          fromMe: false,
+        },
+        pushName: 'العميل المميز',
+        messageTimestamp: Math.floor(Date.now() / 1000) + 10,
+        message: {
+          protocolMessage: {
+            key: {
+              remoteJid: '966551122334@s.whatsapp.net',
+              id: 'wa_msg_deep_long_1',
+              fromMe: false,
+            },
+            type: 14, // MESSAGE_EDIT
+            editedMessage: {
+              conversation: editedText,
+            },
+          },
+        },
+      },
+    });
+
+    assert.ok(editedMsgResult);
+    assert.equal(editedMsgResult.id, deepMsg.id); // Same database record updated
+    assert.equal(editedMsgResult.is_edited, 1);
+    assert.equal(editedMsgResult.original_text, longSpecialText);
+    assert.equal(editedMsgResult.text_content, editedText);
+
+    // Verify inbox view displays the edit metadata
+    const messageDetailView = env.controller.inboxHandler.viewMessage(ownerId, deepMsg.id);
+    assert.ok(messageDetailView.text.includes('تم تعديل هذه الرسالة'));
+    assert.ok(messageDetailView.text.includes(editedText));
+    assert.ok(messageDetailView.text.includes(longSpecialText.slice(0, 100)));
+
+    // 6. Native WhatsApp Forwarding Workflow (inbox:fwd:<id> -> phone prompt -> execution)
+    // Check forward button present in viewMessage keyboard
+    const fwdBtn = messageDetailView.keyboard.flat().find((b) => b.callbackData === `inbox:fwd:${deepMsg.id}`);
+    assert.ok(fwdBtn, 'Forward button must be present in message details');
+
+    // Trigger forward prompt via callback query
+    const promptView = await env.controller.handleCallbackQuery(ownerId, `inbox:fwd:${deepMsg.id}`);
+    assert.ok(promptView.text.includes('إعادة توجيه الرسالة عبر واتساب'));
+    assert.equal(env.controller.getConversationMode(ownerId), 'INBOX_FORWARD');
+
+    // Enter destination phone number via text message
+    const forwardResponse = await env.controller.handleTextMessage(ownerId, '+966509988776');
+    assert.ok(forwardResponse.text.includes('تمت إعادة توجيه الرسالة بنجاح'));
+    assert.equal(env.controller.getConversationMode(ownerId), 'NONE');
+
+    // Verify MockWhatsAppSessionDriver received native forward invocation
+    assert.equal(mockDriver.forwardedMessages.length, 1);
+    const forwardedEntry = mockDriver.forwardedMessages[0]!;
+    assert.equal(forwardedEntry.targetJid, '966509988776@s.whatsapp.net');
+    assert.equal(forwardedEntry.isForwarded, true);
+    assert.ok(forwardedEntry.rawPayload);
+  } finally {
+    await env.cleanup();
+  }
+});
+
 
 
 

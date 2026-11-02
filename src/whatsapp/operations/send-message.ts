@@ -1,4 +1,4 @@
-import { isJidGroup, jidNormalizedUser } from 'athanasia-baileys';
+import { isJidGroup, jidNormalizedUser } from '../baileys-compat';
 import { SessionManager } from '../session-manager';
 import {
   validateRecipient,

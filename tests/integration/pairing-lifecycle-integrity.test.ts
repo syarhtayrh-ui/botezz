@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { DisconnectReason, useMultiFileAuthState } from 'athanasia-baileys';
+import { DisconnectReason, useMultiFileAuthState } from '../../src/whatsapp/baileys-compat';
 import { AppDatabase } from '../../src/database/database';
 import { SessionRepository } from '../../src/database/repositories/session-repository';
 import { TaskRepository } from '../../src/database/repositories/task-repository';
@@ -181,8 +181,8 @@ test('Section 17.أ: Pairing Code Generation — valid phone calls driver, inval
     const failedSessions = env.sessionManager.listSessions();
     assert.equal(failedSessions.length, 1);
     assert.equal(failedSessions[0].status, 'FAILED');
-    assert.NotEqual?.(failedSessions[0].status, 'PAIRING_PENDING');
-    assert.NotEqual?.(failedSessions[0].status, 'CONNECTED');
+    assert.notEqual(failedSessions[0].status, 'PAIRING_PENDING');
+    assert.notEqual(failedSessions[0].status, 'CONNECTED');
 
     // 3. When socket handshake is not ready (timeout), requestPairingCode fails cleanly without returning any code
     env.setNextDriverConfig({ shouldTimeoutHandshake: true });

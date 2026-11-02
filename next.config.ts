@@ -2,7 +2,7 @@ import type {NextConfig} from 'next';
 
 const nextConfig: NextConfig = {
   reactStrictMode: true,
-  serverExternalPackages: ['athanasia-baileys', 'pino'],
+  serverExternalPackages: ['@hiroosy/baileys-lite', 'werift', 'pino'],
   eslint: {
     ignoreDuringBuilds: true,
   },

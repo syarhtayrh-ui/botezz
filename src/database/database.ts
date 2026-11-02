@@ -45,6 +45,7 @@ export class AppDatabase {
 
     try {
       this.sqlite = new DatabaseSync(dbPath);
+      this.sqlite.exec('PRAGMA busy_timeout = 5000;');
       this.sqlite.exec('PRAGMA foreign_keys = ON;');
       if (dbPath !== ':memory:') {
         this.sqlite.exec('PRAGMA journal_mode = WAL;');
@@ -153,6 +154,45 @@ export class AppDatabase {
         insertStmt.run(MIGRATION_006_ID, new Date().toISOString());
       });
       log.info('Database migration applied', { migrationId: MIGRATION_006_ID });
+    }
+
+    this.ensureDeepArchivingColumns();
+  }
+
+  private ensureDeepArchivingColumns(): void {
+    const inCols = this.sqlite
+      .prepare('PRAGMA table_info(incoming_messages)')
+      .all() as Array<{ name: string }>;
+    const inColNames = new Set(inCols.map((c) => c.name));
+    if (!inColNames.has('is_edited')) {
+      this.sqlite.exec(
+        'ALTER TABLE incoming_messages ADD COLUMN is_edited INTEGER NOT NULL DEFAULT 0'
+      );
+    }
+    if (!inColNames.has('original_text')) {
+      this.sqlite.exec(
+        'ALTER TABLE incoming_messages ADD COLUMN original_text TEXT'
+      );
+    }
+    if (!inColNames.has('raw_payload')) {
+      this.sqlite.exec(
+        'ALTER TABLE incoming_messages ADD COLUMN raw_payload TEXT'
+      );
+    }
+
+    const statCols = this.sqlite
+      .prepare('PRAGMA table_info(captured_statuses)')
+      .all() as Array<{ name: string }>;
+    const statColNames = new Set(statCols.map((c) => c.name));
+    if (!statColNames.has('raw_payload')) {
+      this.sqlite.exec(
+        'ALTER TABLE captured_statuses ADD COLUMN raw_payload TEXT'
+      );
+    }
+    if (!statColNames.has('archive_format')) {
+      this.sqlite.exec(
+        "ALTER TABLE captured_statuses ADD COLUMN archive_format TEXT NOT NULL DEFAULT 'direct'"
+      );
     }
   }
 

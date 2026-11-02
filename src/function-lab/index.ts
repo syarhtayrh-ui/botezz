@@ -1,7 +1,7 @@
 import vm from 'node:vm';
 import crypto from 'node:crypto';
-import * as Baileys from 'athanasia-baileys';
 import {
+  Baileys,
   generateMessageIDV2,
   generateMessageID,
   generateWAMessageFromContent,
@@ -35,7 +35,7 @@ import {
   areJidsSameUser,
   AnyMessageContent,
   WASocket,
-} from 'athanasia-baileys';
+} from '../whatsapp/baileys-compat';
 
 export interface BinaryNode {
   tag: string;

@@ -14,7 +14,9 @@ import {
   WAMessage,
   AnyMessageContent,
   WASocket,
-} from 'athanasia-baileys';
+  BAILEYS_LITE_LIBRARY_NAME,
+  BAILEYS_LITE_LIBRARY_VERSION,
+} from './baileys-compat';
 import {
   DeliveryTrackingState,
   FunctionFailureCategory,
@@ -160,7 +162,7 @@ export interface NormalizedIncomingMessage {
 }
 
 export interface WhatsAppCapabilityMatrix {
-  libraryName: 'athanasia-baileys';
+  libraryName: '@hiroosy/baileys-lite' | 'athanasia-baileys';
   libraryVersion: string;
   textAndExtendedText: { supported: boolean; notesAr: string };
   quotedMessages: { supported: boolean; notesAr: string };
@@ -223,7 +225,7 @@ export interface WhatsAppCapabilityMatrix {
 
 /**
  * Inspects and reports the exact WhatsApp protocol capabilities supported by the installed
- * `athanasia-baileys` library and optionally a live socket instance.
+ * `@hiroosy/baileys-lite` library and optionally a live socket instance.
  */
 export class WhatsAppCapabilityAdapter {
   public getCapabilityMatrix(sock?: Partial<WASocket> | null): WhatsAppCapabilityMatrix {
@@ -234,8 +236,8 @@ export class WhatsAppCapabilityAdapter {
       !sock || typeof sock.groupToggleEphemeral === 'function';
 
     return {
-      libraryName: 'athanasia-baileys',
-      libraryVersion: '1.0.0',
+      libraryName: BAILEYS_LITE_LIBRARY_NAME,
+      libraryVersion: BAILEYS_LITE_LIBRARY_VERSION,
       textAndExtendedText: {
         supported: hasSendMessage,
         notesAr:

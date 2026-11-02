@@ -1,4 +1,4 @@
-declare module 'athanasia-baileys' {
+declare module '@hiroosy/baileys-lite' {
   import type { Logger } from 'pino';
 
   export enum DisconnectReason {
@@ -15,6 +15,13 @@ declare module 'athanasia-baileys' {
   }
 
   export type ParticipantAction = 'add' | 'remove' | 'promote' | 'demote';
+
+  export interface BinaryNode {
+    tag: string;
+    attrs: Record<string, string>;
+    content?: BinaryNode[] | Uint8Array | string;
+    [key: string]: unknown;
+  }
 
   export interface GroupParticipant {
     id: string;
@@ -83,6 +90,7 @@ declare module 'athanasia-baileys' {
     qr?: string;
     receivedPendingNotifications?: boolean;
     isOnline?: boolean;
+    reachoutTimeLock?: unknown;
   }
 
   export interface AuthenticationCreds {
@@ -93,6 +101,11 @@ declare module 'athanasia-baileys' {
       lid?: string;
       name?: string;
     };
+    account?: Record<string, unknown>;
+    noiseKey?: { public: Uint8Array; private: Uint8Array };
+    signedIdentityKey?: { public: Uint8Array; private: Uint8Array };
+    pairingEphemeralKeyPair?: { public: Uint8Array; private: Uint8Array };
+    advSecretKey?: string;
     platform?: string;
     device?: string;
     [key: string]: unknown;
@@ -117,7 +130,9 @@ declare module 'athanasia-baileys' {
       ids: string[]
     ): Promise<{ [id: string]: SignalDataTypeMap[T] }>;
     set(data: {
-      [C in keyof SignalDataTypeMap]?: { [id: string]: SignalDataTypeMap[C] | null | undefined };
+      [C in keyof SignalDataTypeMap]?: {
+        [id: string]: SignalDataTypeMap[C] | null | undefined;
+      };
     }): Promise<void>;
     clear?(): Promise<void>;
   }
@@ -125,6 +140,32 @@ declare module 'athanasia-baileys' {
   export interface AuthenticationState {
     creds: AuthenticationCreds;
     keys: SignalKeyStore;
+  }
+
+  export interface SignalRepository {
+    lidMapping?: {
+      getLIDForPN(pnJid: string): Promise<string | undefined>;
+      getPNForLID(lidJid: string): Promise<string | undefined>;
+      getLIDsForPNs(pnJids: string[]): Promise<Array<{ lid: string; pn: string }> | undefined>;
+      getPNsForLIDs(lidJids: string[]): Promise<Array<{ lid: string; pn: string }> | undefined>;
+      storeLIDPNMappings(mappings: Array<{ lid: string; pn: string }>): Promise<void>;
+    };
+    jidToSignalProtocolAddress(jid: string): string;
+    validateSession(jid: string): Promise<{ exists: boolean; reason?: string }>;
+    encryptMessage(params: {
+      jid: string;
+      data: Uint8Array | Buffer;
+    }): Promise<{ type: 'pkmsg' | 'msg' | string; ciphertext: Uint8Array | Buffer }>;
+    decryptMessage(params: {
+      jid: string;
+      type: 'pkmsg' | 'msg' | string;
+      ciphertext: Uint8Array | Buffer;
+    }): Promise<Uint8Array | Buffer>;
+    injectE2ESession?(params: { jid: string; session: unknown }): Promise<void>;
+    migrateSession?(fromJid: string, toJid: string): Promise<void>;
+    deleteSession?(jids: string[]): Promise<void>;
+    close?(): void;
+    [key: string]: unknown;
   }
 
   export const BufferJSON: {
@@ -151,12 +192,30 @@ declare module 'athanasia-baileys' {
         ptv?: boolean;
         viewOnce?: boolean;
       }
-    | { audio: Buffer; mimetype?: string; ptt?: boolean; seconds?: number; viewOnce?: boolean }
+    | {
+        audio: Buffer;
+        mimetype?: string;
+        ptt?: boolean;
+        seconds?: number;
+        viewOnce?: boolean;
+      }
     | { document: Buffer; mimetype: string; fileName?: string; caption?: string }
     | { sticker: Buffer; mimetype?: string; isAnimated?: boolean }
     | { stickerPack: Record<string, unknown> }
-    | { contacts: { displayName?: string; contacts?: Array<{ vcard: string; displayName?: string }> } }
-    | { location: { degreesLatitude: number; degreesLongitude: number; name?: string; address?: string } }
+    | {
+        contacts: {
+          displayName?: string;
+          contacts?: Array<{ vcard: string; displayName?: string }>;
+        };
+      }
+    | {
+        location: {
+          degreesLatitude: number;
+          degreesLongitude: number;
+          name?: string;
+          address?: string;
+        };
+      }
     | { poll: { name: string; values: string[]; selectableCount?: number } }
     | { react: { text: string; key: WAMessageKey } }
     | { edit: WAMessageKey; text: string }
@@ -214,8 +273,14 @@ declare module 'athanasia-baileys' {
   type Long = { toNumber(): number } | number;
 
   export interface BaileysEventEmitter {
-    on(event: 'creds.update', listener: (creds: Partial<AuthenticationCreds>) => void): void;
-    on(event: 'connection.update', listener: (update: Partial<ConnectionState>) => void): void;
+    on(
+      event: 'creds.update',
+      listener: (creds: Partial<AuthenticationCreds>) => void
+    ): void;
+    on(
+      event: 'connection.update',
+      listener: (update: Partial<ConnectionState>) => void
+    ): void;
     on(
       event: 'groups.update',
       listener: (updates: Partial<GroupMetadata>[]) => void
@@ -242,7 +307,12 @@ declare module 'athanasia-baileys' {
     ): void;
     on(
       event: 'messages.reaction',
-      listener: (reactions: Array<{ key: WAMessageKey; reaction: { key: WAMessageKey; text?: string | null } }>) => void
+      listener: (
+        reactions: Array<{
+          key: WAMessageKey;
+          reaction: { key: WAMessageKey; text?: string | null };
+        }>
+      ) => void
     ): void;
     on(
       event: 'chats.set',
@@ -252,6 +322,7 @@ declare module 'athanasia-baileys' {
       event: 'contacts.set',
       listener: (payload: { contacts: Record<string, unknown> }) => void
     ): void;
+    on(event: string, listener: (...args: any[]) => void): void;
     off(event: string, listener: (...args: any[]) => void): void;
   }
 
@@ -263,11 +334,13 @@ declare module 'athanasia-baileys' {
       name?: string;
     };
     authState: AuthenticationState;
+    signalRepository?: SignalRepository;
     ws?: {
       close(): void;
       isOpen?: boolean;
       on?(event: string, listener: (...args: any[]) => void): void;
       off?(event: string, listener: (...args: any[]) => void): void;
+      prependListener?(event: string, listener: (...args: any[]) => void): void;
     };
     waitForSocketOpen(): Promise<void>;
     requestPairingCode(phoneNumber: string, customPairingCode?: string): Promise<string>;
@@ -314,13 +387,25 @@ declare module 'athanasia-baileys' {
       key: string
     ): Promise<NewsletterMetadataResult | null>;
     onWhatsApp?(...jids: string[]): Promise<Array<{ jid: string; exists: boolean; lid?: string }>>;
+    getUSyncDevices?(
+      jids: string[],
+      useCache?: boolean,
+      ignoreZeroDevices?: boolean
+    ): Promise<Array<{ user: string; device: number; jid?: string }>>;
     fetchStatus?(...jids: string[]): Promise<unknown>;
-    profilePictureUrl?(jid: string, type?: 'preview' | 'image', timeoutMs?: number): Promise<string | undefined>;
+    profilePictureUrl?(
+      jid: string,
+      type?: 'preview' | 'image',
+      timeoutMs?: number
+    ): Promise<string | undefined>;
     updateProfileStatus?(status: string): Promise<void>;
     uploadPreKeysToServerIfRequired?(): Promise<void>;
     sendPassiveIq?(tag: string): Promise<void>;
-    sendNode?(frame: Record<string, unknown>): Promise<void>;
-    query?(node: Record<string, unknown>, timeoutMs?: number): Promise<Record<string, unknown>>;
+    sendNode?(frame: BinaryNode | Record<string, unknown>): Promise<void>;
+    query?(
+      node: BinaryNode | Record<string, unknown>,
+      timeoutMs?: number
+    ): Promise<BinaryNode>;
     waUploadToServer?: (
       filePath: string,
       opts: { mediaType: string; fileEncSha256B64: string; timeoutMs?: number }
@@ -340,6 +425,15 @@ declare module 'athanasia-baileys' {
       [key: string]: unknown;
     };
     export const WebMessageInfo: Record<string, unknown>;
+    export const ADVDeviceIdentity: {
+      encode(message: unknown): { finish(): Uint8Array };
+      decode(buffer: Uint8Array): unknown;
+    };
+    export const ADVSignedDeviceIdentity: {
+      encode(message: unknown): { finish(): Uint8Array };
+      decode(buffer: Uint8Array): unknown;
+      fromObject(obj: unknown): unknown;
+    };
   }
 
   export interface UserFacingSocketConfig {
@@ -365,6 +459,11 @@ declare module 'athanasia-baileys' {
 
   export const STORIES_JID: string;
   export const S_WHATSAPP_NET: string;
+  export const DEFAULT_CONNECTION_CONFIG: {
+    version: [number, number, number];
+    browser: [string, string, string];
+    [key: string]: unknown;
+  };
 
   export function useMultiFileAuthState(
     folder: string
@@ -401,6 +500,26 @@ declare module 'athanasia-baileys' {
   export function isPnUser(jid: string | undefined): boolean | undefined;
   export function areJidsSameUser(jid1: string | undefined, jid2: string | undefined): boolean;
 
+  export function getBinaryNodeChild(
+    node: BinaryNode | undefined,
+    childTag: string
+  ): BinaryNode | undefined;
+  export function getAllBinaryNodeChildren(node: BinaryNode | undefined): BinaryNode[];
+  export function getBinaryNodeChildren(
+    node: BinaryNode | undefined,
+    childTag: string
+  ): BinaryNode[];
+
+  export function encodeSignedDeviceIdentity(
+    account: unknown,
+    includeSignatureKey: boolean
+  ): Uint8Array;
+
+  export function parseAndInjectE2ESessions(
+    node: BinaryNode,
+    repository: SignalRepository
+  ): Promise<void>;
+
   export function getContentType(
     content: Record<string, unknown> | null | undefined
   ): string | undefined;
@@ -421,7 +540,11 @@ declare module 'athanasia-baileys' {
   ): Promise<Buffer | NodeJS.ReadableStream>;
 
   export function downloadContentFromMessage(
-    downloadable: { mediaKey?: Uint8Array | string | null; directPath?: string | null; url?: string | null },
+    downloadable: {
+      mediaKey?: Uint8Array | string | null;
+      directPath?: string | null;
+      url?: string | null;
+    },
     type: string,
     opts?: Record<string, unknown>
   ): Promise<AsyncIterable<Buffer>>;
@@ -459,6 +582,110 @@ declare module 'athanasia-baileys' {
 
   export function encodeWAMessage(message: proto.IMessage): Uint8Array;
 
+  export function getUSyncDevices(
+    jids: string[],
+    useCache?: boolean,
+    ignoreZeroDevices?: boolean
+  ): Promise<Array<{ user: string; device: number; jid?: string }>>;
+
   export function makeWASocket(config: UserFacingSocketConfig): WASocket;
   export default makeWASocket;
+}
+
+declare module '@hiroosy/baileys-lite/voip' {
+  import type { EventEmitter } from 'node:events';
+  import type { WASocket } from '@hiroosy/baileys-lite';
+
+  export interface VoipVideoConfig {
+    width: number;
+    height: number;
+    frameRate: number;
+    clockRate?: number;
+  }
+
+  export type VoipResolutionPreset =
+    | '240p'
+    | '360p'
+    | '360p_portrait'
+    | '480p'
+    | '480p_portrait'
+    | '720p'
+    | '720p_portrait'
+    | '1080p'
+    | VoipVideoConfig;
+
+  export interface VoipCallInstance extends EventEmitter {
+    readonly callId: string | null;
+    readonly target: string | null;
+    readonly isVideoDowngraded: boolean;
+    mute(value?: boolean): void;
+    raiseHand(value?: boolean): void;
+    shareScreen(value?: boolean): void;
+    react(emoji: string): boolean;
+    upgradeToVideo(): Promise<void>;
+    hangup(): Promise<void>;
+    silent(value?: boolean): Promise<boolean>;
+  }
+
+  export interface VoipCoordinatorLike {
+    startCall(options: {
+      peerJid: string;
+      isVideo?: boolean;
+      audioFile?: string;
+      videoConfig?: VoipVideoConfig;
+    }): Promise<string>;
+    acceptCall(callId: string): Promise<void>;
+    rejectCall(callId: string, reason?: string): Promise<void>;
+    endCall(callId: string, reason?: string): Promise<void>;
+    loadAudio(callId: string, audioPath: string): Promise<void>;
+    loadVideo(callId: string, videoPath: string): Promise<void>;
+    startVideoMidCall(callId: string): Promise<void>;
+    stopVideoMidCall(callId: string, options?: { keepSource?: boolean }): Promise<void>;
+    swapVideoSource(callId: string, videoPath: string): Promise<void>;
+    setMute(callId: string, muted: boolean): void;
+    getCall(callId: string): Record<string, unknown> | null;
+    getCalls(): Array<Record<string, unknown>>;
+    on(event: string, listener: (...args: any[]) => void): this;
+    off(event: string, listener: (...args: any[]) => void): this;
+    dispose(): void;
+  }
+
+  export default class Voip {
+    constructor(
+      conn: WASocket,
+      opts?: {
+        ffprobePath?: string;
+        voipLogLevel?: 'silent' | 'error' | 'warn' | 'info' | 'debug';
+        maxConcurrentCalls?: number;
+        tmpDir?: string;
+      }
+    );
+    readonly calls: VoipCallInstance[];
+    readonly maxConcurrentCalls: number;
+    readonly coordinator: VoipCoordinatorLike | null;
+    readonly incoming: Array<Record<string, unknown>>;
+    listen(): Promise<this>;
+    call(
+      jid: string,
+      media?: string | string[] | null,
+      resolution?: VoipResolutionPreset,
+      options?: {
+        autoEndCall?: boolean;
+        loop?: boolean;
+        autoDowngrade?: boolean;
+        startVideoOnFirst?: boolean;
+      }
+    ): Promise<VoipCallInstance | string>;
+    accept(
+      callId: string,
+      media?: string | string[] | null,
+      resolution?: VoipResolutionPreset,
+      options?: Record<string, unknown>
+    ): Promise<VoipCallInstance>;
+    reject(callId: string, reason?: string): Promise<void>;
+    hangup(callId?: string): Promise<void>;
+    end(force?: boolean): Promise<void>;
+    on(event: string, listener: (...args: any[]) => void): this;
+    off(event: string, listener: (...args: any[]) => void): this;
+  }
 }

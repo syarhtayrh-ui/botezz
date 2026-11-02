@@ -1,4 +1,4 @@
-import { isJidGroup, ParticipantAction } from 'athanasia-baileys';
+import { isJidGroup, ParticipantAction } from '../baileys-compat';
 import { SessionManager } from '../session-manager';
 import { GroupSummary } from '../connection-manager';
 import { AuditRepository } from '../../database/repositories/audit-repository';

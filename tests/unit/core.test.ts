@@ -42,7 +42,7 @@ import {
   jidNormalizedUser,
   isJidGroup,
   useMultiFileAuthState,
-} from 'athanasia-baileys';
+} from '../../src/whatsapp/baileys-compat';
 import { verifyTelegramAdmin } from '../../src/bot/middleware/authorization';
 import { ConcurrencyLimiter } from '../../src/tasks/concurrency';
 import { ShutdownManager as GracefulShutdown } from '../../src/utils/shutdown';

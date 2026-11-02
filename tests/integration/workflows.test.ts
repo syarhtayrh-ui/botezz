@@ -658,7 +658,7 @@ test('Application-Like Navigation (Back, Home, Refresh), Anti-Double-Tap Dedupli
     assert.notEqual(tap1.uiMeta?.deliveryMode, 'DUPLICATE_BLOCKED');
     assert.equal(tap2.uiMeta?.deliveryMode, 'DUPLICATE_BLOCKED');
     // Cooldown was only cycled ONCE (0 -> 3), not twice!
-    assert.NotEqual?.(env.settingsRepo.getCooldownSeconds(), beforeCooldown);
+    assert.notEqual(env.settingsRepo.getCooldownSeconds(), beforeCooldown);
     assert.equal(env.settingsRepo.getCooldownSeconds(), 3);
     // Reset cooldown to 0 for subsequent tests
     env.settingsRepo.setCooldownSeconds(0);

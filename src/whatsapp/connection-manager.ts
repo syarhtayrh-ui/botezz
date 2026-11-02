@@ -15,7 +15,11 @@ import makeWASocket, {
   GroupMetadata,
   ParticipantAction,
   AnyMessageContent,
-} from 'athanasia-baileys';
+  generateForwardMessageContent,
+  generateWAMessageFromContent,
+  toCompatibleWhatsAppSocket,
+  CompatibleWhatsAppSocket,
+} from './baileys-compat';
 
 export interface BinaryNode {
   tag: string;
@@ -623,6 +627,11 @@ export interface WhatsAppSessionDriver {
     options?: { callId?: string; isVideo?: boolean }
   ): Promise<{ callId: string }>;
   terminateNativeVideoCall(targetJid: string, callId: string): Promise<void>;
+  forwardMessage(
+    targetJid: string,
+    messagePayloadOrRaw: Record<string, unknown>,
+    options?: { forceForward?: boolean }
+  ): Promise<{ messageId: string; forwarded: boolean }>;
   sendNativeCallOffer?(params: {
     targetJid: string;
     isVideo: boolean;
@@ -651,6 +660,8 @@ export interface WhatsAppSessionDriver {
   executeTestFunction(
     params: TestFunctionExecutionParams
   ): Promise<TestFunctionExecutionResult>;
+  getCompatibleSocket?(): CompatibleWhatsAppSocket | null;
+  getRawSocket?(): WASocket | null;
   disconnect(): Promise<void>;
   logout(): Promise<void>;
 }
@@ -1498,6 +1509,15 @@ export class AthanasiaBaileysSessionDriver implements WhatsAppSessionDriver {
     return this.sock;
   }
 
+  public getRawSocket(): WASocket | null {
+    return this.sock;
+  }
+
+  public getCompatibleSocket(): CompatibleWhatsAppSocket | null {
+    if (!this.sock) return null;
+    return toCompatibleWhatsAppSocket(this.sock);
+  }
+
   /**
    * Initiates pairing code generation using `athanasia-baileys`'s `sock.requestPairingCode(phoneNumber, code?)`.
    * Explicitly waits for the Noise handshake (`validateConnection`) and `CB:iq,type:set,pair-device` (`qr` event)
@@ -2088,6 +2108,59 @@ export class AthanasiaBaileysSessionDriver implements WhatsAppSessionDriver {
     }
   }
 
+  public async forwardMessage(
+    targetJid: string,
+    messagePayloadOrRaw: Record<string, unknown>,
+    options?: { forceForward?: boolean }
+  ): Promise<{ messageId: string; forwarded: boolean }> {
+    const sock = this.ensureSocket();
+    if (this.connectionState !== 'CONNECTED' || !this.wsOpen) {
+      throw new WhatsAppConnectionError('الجلسة غير متصلة حالياً لإعادة التوجيه.');
+    }
+    const cleanJid = targetJid.includes('@')
+      ? targetJid
+      : `${targetJid.replace(/\D/g, '')}@s.whatsapp.net`;
+
+    const rawMessage = (messagePayloadOrRaw.rawMessage ||
+      messagePayloadOrRaw) as Record<string, unknown>;
+
+    let forwardContent: proto.IMessage | undefined;
+    try {
+      forwardContent = generateForwardMessageContent(
+        rawMessage as never,
+        options?.forceForward ?? true
+      );
+    } catch {
+      const text = String(
+        messagePayloadOrRaw.textContent ||
+          messagePayloadOrRaw.text_content ||
+          messagePayloadOrRaw.text ||
+          ''
+      );
+      forwardContent = {
+        extendedTextMessage: {
+          text,
+          contextInfo: {
+            isForwarded: true,
+            forwardingScore: 1,
+          },
+        },
+      };
+    }
+
+    const waMsg = generateWAMessageFromContent(cleanJid, forwardContent, {
+      userJid: sock.user?.id,
+    });
+    if (typeof sock.relayMessage === 'function') {
+      await sock.relayMessage(cleanJid, waMsg.message!, {
+        messageId: waMsg.key.id!,
+      });
+    } else {
+      await sock.sendMessage(cleanJid, { forward: rawMessage as never, forceForward: true });
+    }
+    return { messageId: waMsg.key.id!, forwarded: true };
+  }
+
   public async sendNativeCallOffer(params: {
     targetJid: string;
     isVideo: boolean;
@@ -2224,7 +2297,10 @@ export class AthanasiaBaileysSessionDriver implements WhatsAppSessionDriver {
   }
 }
 
-export { AthanasiaBaileysSessionDriver as BaileysSessionDriver };
+export {
+  AthanasiaBaileysSessionDriver as BaileysSessionDriver,
+  AthanasiaBaileysSessionDriver as HiroosyBaileysSessionDriver,
+};
 
 /**
  * Deterministic Mock / Simulation Driver for Automated Testing and Local Web Preview.
@@ -2780,6 +2856,35 @@ export class MockWhatsAppSessionDriver implements WhatsAppSessionDriver {
       targetJid,
       callId,
     });
+  }
+
+  public readonly forwardedMessages: Array<{
+    targetJid: string;
+    messageId: string;
+    isForwarded: boolean;
+    rawPayload: Record<string, unknown>;
+  }> = [];
+
+  public async forwardMessage(
+    targetJid: string,
+    messagePayloadOrRaw: Record<string, unknown>,
+    _options?: { forceForward?: boolean }
+  ): Promise<{ messageId: string; forwarded: boolean }> {
+    if (!this.connected || !this.registered) {
+      throw new WhatsAppConnectionError('الجلسة غير متصلة حالياً لإعادة التوجيه.');
+    }
+    const cleanJid = targetJid.includes('@')
+      ? targetJid
+      : `${targetJid.replace(/\D/g, '')}@s.whatsapp.net`;
+    const messageId = `sim_fwd_${Date.now()}`;
+    this.forwardedMessages.push({
+      targetJid: cleanJid,
+      messageId,
+      isForwarded: true,
+      rawPayload: messagePayloadOrRaw,
+    });
+    this.sentMessagesCount++;
+    return { messageId, forwarded: true };
   }
 
   public async sendNativeCallOffer(params: {

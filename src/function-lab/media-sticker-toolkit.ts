@@ -357,6 +357,97 @@ export type StickerPackZipResult = Buffer & {
 };
 
 /**
+ * Universal pure Node.js ZIP archive generator (`PK\x03\x04` + `PK\x01\x02` + `PK\x05\x06`).
+ * Bundles any list of named file Buffers into a clean, standard ZIP archive without external dependencies.
+ */
+export function createZipArchive(
+  files: Array<{ name: string; data: Buffer }>
+): Buffer {
+  const localParts: Buffer[] = [];
+  const centralParts: Buffer[] = [];
+  let offset = 0;
+
+  for (const file of files) {
+    const nameBuf = Buffer.from(file.name, 'utf8');
+    const crc = computeCrc32(file.data);
+    const size = file.data.length;
+
+    const localHeader = Buffer.alloc(30 + nameBuf.length);
+    localHeader.writeUInt32LE(0x04034b50, 0); // PK\x03\x04
+    localHeader.writeUInt16LE(20, 4); // Version needed
+    localHeader.writeUInt16LE(0, 6); // Flags
+    localHeader.writeUInt16LE(0, 8); // Store (0 = uncompressed)
+    localHeader.writeUInt16LE(0, 10); // Mod time
+    localHeader.writeUInt16LE(0, 12); // Mod date
+    localHeader.writeUInt32LE(crc, 14);
+    localHeader.writeUInt32LE(size, 18);
+    localHeader.writeUInt32LE(size, 22);
+    localHeader.writeUInt16LE(nameBuf.length, 26);
+    localHeader.writeUInt16LE(0, 28);
+    nameBuf.copy(localHeader, 30);
+
+    const centralHeader = Buffer.alloc(46 + nameBuf.length);
+    centralHeader.writeUInt32LE(0x02014b50, 0); // PK\x01\x02
+    centralHeader.writeUInt16LE(20, 4);
+    centralHeader.writeUInt16LE(20, 6);
+    centralHeader.writeUInt16LE(0, 8);
+    centralHeader.writeUInt16LE(0, 10);
+    centralHeader.writeUInt16LE(0, 12);
+    centralHeader.writeUInt16LE(0, 14);
+    centralHeader.writeUInt32LE(crc, 16);
+    centralHeader.writeUInt32LE(size, 20);
+    centralHeader.writeUInt32LE(size, 24);
+    centralHeader.writeUInt16LE(nameBuf.length, 28);
+    centralHeader.writeUInt16LE(0, 30);
+    centralHeader.writeUInt16LE(0, 32);
+    centralHeader.writeUInt16LE(0, 34);
+    centralHeader.writeUInt16LE(0, 36);
+    centralHeader.writeUInt32LE(0, 38);
+    centralHeader.writeUInt32LE(offset, 42);
+    nameBuf.copy(centralHeader, 46);
+
+    localParts.push(localHeader, file.data);
+    centralParts.push(centralHeader);
+    offset += localHeader.length + file.data.length;
+  }
+
+  const centralDirBuffer = Buffer.concat(centralParts);
+  const eocd = Buffer.alloc(22);
+  eocd.writeUInt32LE(0x06054b50, 0); // PK\x05\x06
+  eocd.writeUInt16LE(0, 4);
+  eocd.writeUInt16LE(0, 6);
+  eocd.writeUInt16LE(files.length, 8);
+  eocd.writeUInt16LE(files.length, 10);
+  eocd.writeUInt32LE(centralDirBuffer.length, 12);
+  eocd.writeUInt32LE(offset, 16);
+  eocd.writeUInt16LE(0, 20);
+
+  return Buffer.concat([...localParts, centralDirBuffer, eocd]);
+}
+
+/**
+ * Validates and repairs corrupted or raw WebP buffers (e.g., missing RIFF/WEBP container headers).
+ */
+export function repairOrWrapWebpBuffer(buffer: Buffer): Buffer {
+  if (!Buffer.isBuffer(buffer) || buffer.length === 0) {
+    return buffer;
+  }
+  if (
+    buffer.length >= 12 &&
+    buffer.toString('ascii', 0, 4) === 'RIFF' &&
+    buffer.toString('ascii', 8, 12) === 'WEBP'
+  ) {
+    return buffer;
+  }
+  // Check if buffer is raw VP8 or VP8X chunk missing RIFF container
+  const riff = Buffer.alloc(12);
+  riff.write('RIFF', 0, 'ascii');
+  riff.writeUInt32LE(buffer.length + 4, 4);
+  riff.write('WEBP', 8, 'ascii');
+  return Buffer.concat([riff, buffer]);
+}
+
+/**
  * Builds an uncompressed ZIP archive buffer (`PK\x03\x04` local headers + `PK\x01\x02` central directory + `PK\x05\x06` EOCD)
  * containing `tray.png` and `.webp` stickers, along with a complete WhatsApp `stickerPackMessage` descriptor.
  */
@@ -429,66 +520,7 @@ export function createStickerPackZip(
     ...stickerEntries.map((s) => ({ name: s.fileName, data: s.buffer })),
   ];
 
-  const localParts: Buffer[] = [];
-  const centralParts: Buffer[] = [];
-  let offset = 0;
-
-  for (const file of zipFiles) {
-    const nameBuf = Buffer.from(file.name, 'utf8');
-    const crc = computeCrc32(file.data);
-    const size = file.data.length;
-
-    const localHeader = Buffer.alloc(30 + nameBuf.length);
-    localHeader.writeUInt32LE(0x04034b50, 0); // PK\x03\x04
-    localHeader.writeUInt16LE(20, 4); // Version needed
-    localHeader.writeUInt16LE(0, 6); // Flags
-    localHeader.writeUInt16LE(0, 8); // Store (0 = uncompressed)
-    localHeader.writeUInt16LE(0, 10); // Mod time
-    localHeader.writeUInt16LE(0, 12); // Mod date
-    localHeader.writeUInt32LE(crc, 14);
-    localHeader.writeUInt32LE(size, 18);
-    localHeader.writeUInt32LE(size, 22);
-    localHeader.writeUInt16LE(nameBuf.length, 26);
-    localHeader.writeUInt16LE(0, 28);
-    nameBuf.copy(localHeader, 30);
-
-    const centralHeader = Buffer.alloc(46 + nameBuf.length);
-    centralHeader.writeUInt32LE(0x02014b50, 0); // PK\x01\x02
-    centralHeader.writeUInt16LE(20, 4);
-    centralHeader.writeUInt16LE(20, 6);
-    centralHeader.writeUInt16LE(0, 8);
-    centralHeader.writeUInt16LE(0, 10);
-    centralHeader.writeUInt16LE(0, 12);
-    centralHeader.writeUInt16LE(0, 14);
-    centralHeader.writeUInt32LE(crc, 16);
-    centralHeader.writeUInt32LE(size, 20);
-    centralHeader.writeUInt32LE(size, 24);
-    centralHeader.writeUInt16LE(nameBuf.length, 28);
-    centralHeader.writeUInt16LE(0, 30);
-    centralHeader.writeUInt16LE(0, 32);
-    centralHeader.writeUInt16LE(0, 34);
-    centralHeader.writeUInt16LE(0, 36);
-    centralHeader.writeUInt32LE(0, 38);
-    centralHeader.writeUInt32LE(offset, 42);
-    nameBuf.copy(centralHeader, 46);
-
-    localParts.push(localHeader, file.data);
-    centralParts.push(centralHeader);
-    offset += localHeader.length + file.data.length;
-  }
-
-  const centralDirBuffer = Buffer.concat(centralParts);
-  const eocd = Buffer.alloc(22);
-  eocd.writeUInt32LE(0x06054b50, 0); // PK\x05\x06
-  eocd.writeUInt16LE(0, 4);
-  eocd.writeUInt16LE(0, 6);
-  eocd.writeUInt16LE(zipFiles.length, 8);
-  eocd.writeUInt16LE(zipFiles.length, 10);
-  eocd.writeUInt32LE(centralDirBuffer.length, 12);
-  eocd.writeUInt32LE(offset, 16);
-  eocd.writeUInt16LE(0, 20);
-
-  const zipBuffer = Buffer.concat([...localParts, centralDirBuffer, eocd]);
+  const zipBuffer = createZipArchive(zipFiles);
   const fileSha256 = crypto.createHash('sha256').update(zipBuffer).digest();
   const fileEncSha256 = crypto
     .createHash('sha256')
@@ -862,6 +894,8 @@ export function createSandboxRequire(
   return (moduleName: string): unknown => {
     const clean = String(moduleName || '').trim();
     switch (clean) {
+      case '@hiroosy/baileys-lite':
+      case '@hiroosy/baileys-lite/voip':
       case 'athanasia-baileys':
       case '@whiskeysockets/baileys':
       case '@adiwajshing/baileys':

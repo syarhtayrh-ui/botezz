@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import vm from 'node:vm';
-import { STORIES_JID } from 'athanasia-baileys';
+import { STORIES_JID } from '../../src/whatsapp/baileys-compat';
 import { AppDatabase } from '../../src/database/database';
 import { MIGRATION_003_ID } from '../../src/database/migrations/003_function_lab_and_message_capabilities';
 import { FunctionLabRepository } from '../../src/database/repositories/function-lab-repository';

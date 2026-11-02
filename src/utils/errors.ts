@@ -12,11 +12,18 @@ export type ErrorCategory =
   | 'TASK_TIMEOUT'
   | 'RATE_LIMIT_EXCEEDED'
   | 'TELEGRAM_API_ERROR'
+  | 'API_MISMATCH'
+  | 'PROTOCOL_FAILURE'
+  | 'AUTH_FAILURE'
+  | 'NETWORK_FAILURE'
+  | 'VOIP_FAILURE'
+  | 'MEDIA_FAILURE'
   | 'INTERNAL_ERROR';
 
 export class AppError extends Error {
   public readonly category: ErrorCategory;
   public readonly arabicUserMessage: string;
+  public readonly userMessage: string;
   public readonly isOperational: boolean;
 
   constructor(
@@ -29,6 +36,7 @@ export class AppError extends Error {
     this.name = this.constructor.name;
     this.category = category;
     this.arabicUserMessage = redactText(arabicUserMessage);
+    this.userMessage = this.arabicUserMessage;
     this.isOperational = isOperational;
   }
 }
@@ -81,6 +89,33 @@ export class UnsupportedOperationError extends AppError {
     technicalMessage?: string
   ) {
     super('UNSUPPORTED_OPERATION', arabicMessage, technicalMessage);
+  }
+}
+
+export class VoipFailureError extends AppError {
+  constructor(
+    arabicMessage: string,
+    technicalMessageOrMeta?: string | Record<string, unknown>
+  ) {
+    const tech =
+      typeof technicalMessageOrMeta === 'string'
+        ? technicalMessageOrMeta
+        : technicalMessageOrMeta
+          ? JSON.stringify(technicalMessageOrMeta)
+          : undefined;
+    super('VOIP_FAILURE', arabicMessage, tech);
+  }
+}
+
+export class MediaValidationError extends AppError {
+  constructor(arabicMessage: string, technicalMessage?: string) {
+    super('MEDIA_FAILURE', arabicMessage, technicalMessage);
+  }
+}
+
+export class ApiMismatchError extends AppError {
+  constructor(arabicMessage: string, technicalMessage?: string) {
+    super('API_MISMATCH', arabicMessage, technicalMessage);
   }
 }
 

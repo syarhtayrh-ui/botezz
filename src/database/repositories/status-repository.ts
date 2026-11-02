@@ -37,6 +37,8 @@ export interface CapturedStatusRecord {
   size_bytes: number;
   forwarded_to_telegram: number;
   captured_at: string;
+  archive_format: string;
+  raw_payload: string | null;
 }
 
 export interface CreateCapturedStatusInput {
@@ -62,6 +64,8 @@ export interface CreateCapturedStatusInput {
   fileSize?: number;
   forwardedToTelegram?: boolean;
   capturedAt?: string;
+  archiveFormat?: string;
+  rawPayload?: string | null;
 }
 
 export interface StatusStats {
@@ -108,6 +112,8 @@ export class StatusRepository {
       size_bytes: fileSizeBytes,
       forwarded_to_telegram: Number(raw.forwarded_to_telegram ?? 0),
       captured_at: String(raw.captured_at || ''),
+      archive_format: String(raw.archive_format || 'direct'),
+      raw_payload: (raw.raw_payload as string | null) ?? null,
     };
   }
 
@@ -122,6 +128,7 @@ export class StatusRepository {
     const savedFilePath = input.savedFilePath || input.filePath || '';
     const savedFileName = input.savedFileName || input.fileName || 'status.png';
     const fileSizeBytes = input.fileSizeBytes ?? input.fileSize ?? 0;
+    const archiveFormat = input.archiveFormat || 'direct';
 
     this.db.sqlite
       .prepare(
@@ -130,8 +137,9 @@ export class StatusRepository {
           id, session_id, owner_telegram_id, wa_status_id,
           author_jid, author_phone, push_name, media_kind,
           caption, saved_file_path, saved_file_name, mime_type,
-          file_size_bytes, forwarded_to_telegram, captured_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          file_size_bytes, forwarded_to_telegram, captured_at,
+          archive_format, raw_payload
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `
       )
       .run(
@@ -149,7 +157,9 @@ export class StatusRepository {
         input.mimeType,
         fileSizeBytes,
         input.forwardedToTelegram ? 1 : 0,
-        capturedAt
+        capturedAt,
+        archiveFormat,
+        input.rawPayload ?? null
       );
 
     return this.findById(id)!;
@@ -157,6 +167,23 @@ export class StatusRepository {
 
   public insert(input: CreateCapturedStatusInput): CapturedStatusRecord {
     return this.recordStatus(input);
+  }
+
+  public findByWaStatusId(
+    waStatusId: string,
+    sessionId?: string
+  ): CapturedStatusRecord | undefined {
+    let sql = 'SELECT * FROM captured_statuses WHERE wa_status_id = ?';
+    const params: string[] = [waStatusId];
+    if (sessionId) {
+      sql += ' AND session_id = ?';
+      params.push(sessionId);
+    }
+    sql += ' ORDER BY captured_at DESC LIMIT 1';
+    const row = this.db.sqlite.prepare(sql).get(...params) as
+      | Record<string, unknown>
+      | undefined;
+    return row ? this.hydrateRow(row) : undefined;
   }
 
   public findById(

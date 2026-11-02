@@ -5,6 +5,8 @@ import {
 } from '../../database/repositories/inbox-repository';
 import { IncomingMessageReceiver } from '../../whatsapp/incoming-message-receiver';
 import { SessionManager } from '../../whatsapp/session-manager';
+import { validateRecipient } from '../../security/validation';
+import { toSafeArabicError } from '../../utils/errors';
 import {
   InlineButtonSpec,
   InlineKeyboardRows,
@@ -17,12 +19,21 @@ export type InboxFilterKind = 'ALL' | 'MEDIA' | 'STICKERS' | 'TEXT';
 
 export class InboxHandler {
   private readonly filterByAdmin = new Map<number, InboxFilterKind>();
+  private readonly forwardDrafts = new Map<number, string>();
 
   constructor(
     private readonly inboxRepo: InboxRepository,
     private readonly receiver: IncomingMessageReceiver,
     private readonly sessionManager: SessionManager
   ) {}
+
+  public cancel(adminId: number): void {
+    this.forwardDrafts.delete(adminId);
+  }
+
+  public hasPendingForward(adminId: number): boolean {
+    return this.forwardDrafts.has(adminId);
+  }
 
   private getFilter(adminId: number): InboxFilterKind {
     return this.filterByAdmin.get(adminId) || 'ALL';
@@ -139,15 +150,19 @@ export class InboxHandler {
 
     for (const rec of slice) {
       const icon = this.kindIcon(rec.kind);
-      const shortSender = (rec.sender_name || rec.sender_phone).slice(0, 16);
+      const shortSender = (rec.sender_name || rec.sender_phone).slice(0, 14);
       rows.push([
         {
           text: `${icon} ${shortSender} (${rec.file_name || rec.kind})`,
           callbackData: `inbox:view:${rec.id}`,
         },
         {
-          text: '⬇️ تحميل الملف',
+          text: '⬇️ تحميل',
           callbackData: `inbox:dl:${rec.id}`,
+        },
+        {
+          text: '↗️ توجيه',
+          callbackData: `inbox:fwd:${rec.id}`,
         },
       ]);
     }
@@ -234,27 +249,43 @@ export class InboxHandler {
       rec.file_path && fs.existsSync(rec.file_path)
     );
 
+    const detailLines = [
+      `${this.kindIcon(rec.kind)} *تفاصيل الرسالة الواردة المؤرشفة*`,
+      '━━━━━━━━━━━━━━━━━━━━━━',
+      `• *المعرف:* \`${escapeMarkdown(rec.id)}\``,
+      `• *الجلسة:* \`${escapeMarkdown(rec.session_id)}\``,
+      `• *المرسل:* ${escapeMarkdown(rec.sender_name || rec.sender_phone)} (\`${escapeMarkdown(rec.sender_phone)}\`)`,
+      `• *نوع الرسالة:* \`${escapeMarkdown(rec.kind)}\``,
+      `• *اسم الملف المحفوظ:* \`${escapeMarkdown(rec.file_name || 'N/A')}\``,
+      `• *نوع الملف (MIME):* \`${escapeMarkdown(rec.mime_type || 'N/A')}\``,
+      `• *حجم الملف:* \`${rec.size_bytes}\` بايت (${existsOnDisk ? '🟢 جاهز للتحميل' : '⚪ غير متاح'})`,
+      `• *التوقيت:* \`${escapeMarkdown(rec.received_at)}\``,
+    ];
+
+    if (rec.is_edited) {
+      detailLines.push('• *حالة التعديل:* ✏️ *تم تعديل هذه الرسالة من قبل المرسل*');
+      if (rec.original_text) {
+        detailLines.push(`• *النص الأصلي (قبل التعديل):* \`${escapeMarkdown(rec.original_text.slice(0, 300))}\``);
+      }
+    }
+
+    detailLines.push(
+      '',
+      `📝 *محتوى / وصف الرسالة${rec.is_edited ? ' (بعد التعديل)' : ''}:*`,
+      escapeMarkdown((rec.text_content || '(بدون نص)').slice(0, 800))
+    );
+
     return {
-      text: [
-        `${this.kindIcon(rec.kind)} *تفاصيل الرسالة الواردة المؤرشفة*`,
-        '━━━━━━━━━━━━━━━━━━━━━━',
-        `• *المعرف:* \`${escapeMarkdown(rec.id)}\``,
-        `• *الجلسة:* \`${escapeMarkdown(rec.session_id)}\``,
-        `• *المرسل:* ${escapeMarkdown(rec.sender_name || rec.sender_phone)} (\`${escapeMarkdown(rec.sender_phone)}\`)`,
-        `• *نوع الرسالة:* \`${escapeMarkdown(rec.kind)}\``,
-        `• *اسم الملف المحفوظ:* \`${escapeMarkdown(rec.file_name || 'N/A')}\``,
-        `• *نوع الملف (MIME):* \`${escapeMarkdown(rec.mime_type || 'N/A')}\``,
-        `• *حجم الملف:* \`${rec.size_bytes}\` بايت (${existsOnDisk ? '🟢 جاهز للتحميل' : '⚪ غير متاح'})`,
-        `• *التوقيت:* \`${escapeMarkdown(rec.received_at)}\``,
-        '',
-        '📝 *محتوى / وصف الرسالة:*',
-        escapeMarkdown((rec.text_content || '(بدون نص)').slice(0, 800)),
-      ].join('\n'),
+      text: detailLines.join('\n'),
       keyboard: [
         [
           {
-            text: '⬇️ إرسال وتحميل الملف الآن في تيليجرام',
+            text: '⬇️ تحميل الملف في تيليجرام',
             callbackData: `inbox:dl:${rec.id}`,
+          },
+          {
+            text: '↗️ توجيه لرقم آخر (Forward)',
+            callbackData: `inbox:fwd:${rec.id}`,
           },
         ],
         buildAppNavigationRow({
@@ -263,6 +294,262 @@ export class InboxHandler {
         }),
       ],
     };
+  }
+
+  public promptForward(adminId: number, recordId: string): BotViewResponse {
+    const rec = this.inboxRepo.findById(recordId);
+    if (!rec) {
+      return {
+        text: '⚠️ لم يتم العثور على الرسالة المراد إعادة توجيهها.',
+        keyboard: [
+          [
+            {
+              text: '🔙 العودة لقسم الرسائل الواردة',
+              callbackData: 'menu:inbox:page:1',
+            },
+          ],
+        ],
+      };
+    }
+
+    this.forwardDrafts.set(adminId, recordId);
+    const preview = (rec.text_content || rec.file_name || rec.kind).slice(0, 150);
+
+    return {
+      text: [
+        '↗️ *إعادة توجيه الرسالة عبر واتساب (Native WhatsApp Forward)*',
+        '━━━━━━━━━━━━━━━━━━━━━━',
+        `• *معرف الرسالة:* \`${escapeMarkdown(rec.id)}\``,
+        `• *المرسل الأصلي:* ${escapeMarkdown(rec.sender_name || rec.sender_phone)} (\`${escapeMarkdown(rec.sender_phone)}\`)`,
+        `• *نوع الرسالة:* \`${escapeMarkdown(rec.kind)}\``,
+        `• *المحتوى:* ${escapeMarkdown(preview)}`,
+        ...(rec.is_edited ? ['• *حالة الرسالة:* ✏️ تم تعديلها من قبل المرسل'] : []),
+        '',
+        '💬 *الرجاء إدخال رقم هاتف المستلم الدولي الآن:*',
+        '*(مثال: `+966501234567` أو `966501234567` أو معرف مجموعة `...@g.us`)*',
+        '',
+        '🛡️ *ملاحظة البروتوكول:* سيتم إرسال الرسالة كرسالة مُعاد توجيهها رسمياً (`isForwarded: true` مع عداد التوجيه `forwardingScore`) باستخدام مقبس واتساب وليس كرسالة نصية عادية منسوخة.',
+      ].join('\n'),
+      keyboard: [
+        [
+          {
+            text: '❌ إلغاء العملية',
+            callbackData: `inbox:view:${rec.id}`,
+          },
+        ],
+        buildAppNavigationRow({
+          backCallback: 'menu:inbox:page:1',
+          refreshCallback: `inbox:fwd:${rec.id}`,
+        }),
+      ],
+    };
+  }
+
+  public async executeForward(
+    adminId: number,
+    recipientRaw: string
+  ): Promise<BotViewResponse> {
+    const recordId = this.forwardDrafts.get(adminId);
+    if (!recordId) {
+      return {
+        text: '⚠️ انتهت مهلة جلسة إعادة التوجيه أو لم يتم تحديد رسالة. الرجاء اختيار الرسالة أولاً.',
+        keyboard: [
+          [
+            {
+              text: '📥 الانتقال لصندوق الرسائل الواردة',
+              callbackData: 'menu:inbox:page:1',
+            },
+          ],
+        ],
+      };
+    }
+
+    const rec = this.inboxRepo.findById(recordId);
+    if (!rec) {
+      this.forwardDrafts.delete(adminId);
+      return {
+        text: '⚠️ لم يتم العثور على سجل الرسالة في قاعدة البيانات.',
+        keyboard: [
+          [
+            {
+              text: '🔙 العودة لقسم الرسائل الواردة',
+              callbackData: 'menu:inbox:page:1',
+            },
+          ],
+        ],
+      };
+    }
+
+    let normalized;
+    try {
+      normalized = validateRecipient(recipientRaw);
+    } catch (err: unknown) {
+      return {
+        text: [
+          '⚠️ *رقم المستلم غير صحيح!*',
+          escapeMarkdown(
+            (err as Error)?.message ||
+              'تأكد من إدخال الرقم بصيغة دولية مع رمز الدولة.'
+          ),
+          '',
+          '💬 الرجاء إعادة إرسال الرقم بالصيغة الدولية (مثال: `+966501234567`):',
+        ].join('\n'),
+        keyboard: [
+          [
+            {
+              text: '❌ إلغاء التوجيه',
+              callbackData: `inbox:view:${rec.id}`,
+            },
+          ],
+        ],
+      };
+    }
+
+    this.forwardDrafts.delete(adminId);
+
+    // Find a connected session driver
+    let driver = null;
+    try {
+      driver = this.sessionManager.getDriver(rec.session_id, adminId);
+    } catch {
+      const connectedSessions = this.sessionManager.listConnectedSessions(adminId);
+      if (connectedSessions.length > 0) {
+        try {
+          driver = this.sessionManager.getDriver(connectedSessions[0]!.id, adminId);
+        } catch {
+          driver = null;
+        }
+      }
+    }
+
+    if (!driver) {
+      return {
+        text: [
+          '⚠️ *تعذر إتمام إعادة التوجيه:*',
+          'لا توجد جلسة واتساب متصلة حالياً لإرسال الرسالة من خلالها.',
+          'يرجى التأكد من ربط جلسة واتساب نشطة عبر القائمة الرئيسية.',
+        ].join('\n'),
+        keyboard: [
+          [
+            {
+              text: '📱 إدارة الجلسات',
+              callbackData: 'menu:sessions:page:1',
+            },
+          ],
+          buildAppNavigationRow({
+            backCallback: 'menu:inbox:page:1',
+            refreshCallback: `inbox:view:${rec.id}`,
+          }),
+        ],
+      };
+    }
+
+    let rawPayload: Record<string, unknown> | null = null;
+    if (rec.raw_payload) {
+      try {
+        const parsed = JSON.parse(rec.raw_payload);
+        if (parsed && typeof parsed === 'object') {
+          rawPayload = parsed as Record<string, unknown>;
+        }
+      } catch {
+        rawPayload = null;
+      }
+    }
+
+    const forwardPayload: Record<string, unknown> =
+      rawPayload || {
+        key: {
+          id: rec.wa_message_id,
+          remoteJid: rec.sender_jid,
+          fromMe: false,
+        },
+        message: {
+          conversation: rec.text_content || '',
+        },
+      };
+
+    try {
+      const fwdResult = await driver.forwardMessage(
+        normalized.jid,
+        forwardPayload,
+        {
+          forceForward: true,
+        }
+      );
+
+      if (fwdResult.forwarded || (fwdResult as { success?: boolean }).success) {
+        const msgId =
+          fwdResult.messageId ||
+          (fwdResult as { forwardedMessageId?: string }).forwardedMessageId ||
+          'N/A';
+        return {
+          text: [
+            '✅ *تمت إعادة توجيه الرسالة بنجاح عبر واتساب!*',
+            '━━━━━━━━━━━━━━━━━━━━━━',
+            `• *المستلم:* \`${escapeMarkdown(normalized.displayTarget)}\``,
+            `• *معرف الإرسال الجديد:* \`${escapeMarkdown(msgId)}\``,
+            `• *نوع الرسالة المُعاد توجيهها:* \`${escapeMarkdown(rec.kind)}\``,
+            `• *الجلسة المستخدمة:* \`${escapeMarkdown(driver.sessionId)}\``,
+            `• *علامة التوجيه:* 🟢 \`isForwarded: true\` (Forwarding Score: 1)`,
+          ].join('\n'),
+          keyboard: [
+            [
+              {
+                text: '📥 العودة لصندوق الوارد',
+                callbackData: 'menu:inbox:page:1',
+              },
+              {
+                text: '👁️ عرض تفاصيل الرسالة',
+                callbackData: `inbox:view:${rec.id}`,
+              },
+            ],
+            buildAppNavigationRow({
+              backCallback: 'menu:inbox:page:1',
+              refreshCallback: `inbox:view:${rec.id}`,
+            }),
+          ],
+        };
+      } else {
+        return {
+          text: [
+            '⚠️ *تعذر إرسال إعادة التوجيه:*',
+            escapeMarkdown(
+              (fwdResult as { error?: string }).error ||
+                'حدث خطأ غير متوقع أثناء معالجة مقبس واتساب.'
+            ),
+          ].join('\n'),
+          keyboard: [
+            [
+              {
+                text: '🔄 إعادة المحاولة',
+                callbackData: `inbox:fwd:${rec.id}`,
+              },
+              {
+                text: '🔙 العودة للتفاصيل',
+                callbackData: `inbox:view:${rec.id}`,
+              },
+            ],
+          ],
+        };
+      }
+    } catch (err: unknown) {
+      const safeErr = toSafeArabicError(err);
+      return {
+        text: ['⚠️ *خطأ أثناء إعادة التوجيه:*', safeErr.userMessage].join('\n'),
+        keyboard: [
+          [
+            {
+              text: '🔄 إعادة المحاولة',
+              callbackData: `inbox:fwd:${rec.id}`,
+            },
+            {
+              text: '🔙 العودة لقسم الرسائل',
+              callbackData: 'menu:inbox:page:1',
+            },
+          ],
+        ],
+      };
+    }
   }
 
   public downloadMessageFile(

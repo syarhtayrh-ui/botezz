@@ -34,13 +34,10 @@ export interface HarnessSingleton {
 
 const globalForHarness = globalThis as unknown as {
   __waTelegramHarness?: HarnessSingleton;
+  __waTelegramHarnessPromise?: Promise<HarnessSingleton>;
 };
 
-export async function getRuntimeHarness(): Promise<HarnessSingleton> {
-  if (globalForHarness.__waTelegramHarness) {
-    return globalForHarness.__waTelegramHarness;
-  }
-
+async function createRuntimeHarness(): Promise<HarnessSingleton> {
   const { config, isLiveConfigured, validationIssues } = loadRuntimeConfig(process.env);
   const db = new AppDatabase(config.DATABASE_PATH);
 
@@ -154,4 +151,17 @@ export async function getRuntimeHarness(): Promise<HarnessSingleton> {
 
   globalForHarness.__waTelegramHarness = instance;
   return instance;
+}
+
+export async function getRuntimeHarness(): Promise<HarnessSingleton> {
+  if (globalForHarness.__waTelegramHarness) {
+    return globalForHarness.__waTelegramHarness;
+  }
+  if (!globalForHarness.__waTelegramHarnessPromise) {
+    globalForHarness.__waTelegramHarnessPromise = createRuntimeHarness().catch((err) => {
+      globalForHarness.__waTelegramHarnessPromise = undefined;
+      throw err;
+    });
+  }
+  return globalForHarness.__waTelegramHarnessPromise;
 }

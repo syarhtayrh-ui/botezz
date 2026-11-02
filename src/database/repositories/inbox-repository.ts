@@ -46,6 +46,9 @@ export interface IncomingMessageRecord {
   size_bytes: number;
   forwarded_to_telegram: number;
   received_at: string;
+  is_edited: number;
+  original_text: string | null;
+  raw_payload: string | null;
 }
 
 export interface CreateIncomingMessageInput {
@@ -73,6 +76,9 @@ export interface CreateIncomingMessageInput {
   fileSize?: number;
   forwardedToTelegram?: boolean;
   receivedAt?: string;
+  isEdited?: boolean;
+  originalText?: string | null;
+  rawPayload?: string | null;
 }
 
 export interface InboxStats {
@@ -121,6 +127,9 @@ export class InboxRepository {
       size_bytes: fileSizeBytes,
       forwarded_to_telegram: Number(raw.forwarded_to_telegram ?? 0),
       received_at: String(raw.received_at || ''),
+      is_edited: Number(raw.is_edited ?? 0),
+      original_text: (raw.original_text as string | null) ?? null,
+      raw_payload: (raw.raw_payload as string | null) ?? null,
     };
   }
 
@@ -147,8 +156,9 @@ export class InboxRepository {
           id, session_id, owner_telegram_id, wa_message_id,
           sender_jid, sender_phone, push_name, is_group, group_jid,
           message_kind, text_content, saved_file_path, saved_file_name,
-          mime_type, file_size_bytes, forwarded_to_telegram, received_at
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          mime_type, file_size_bytes, forwarded_to_telegram, received_at,
+          is_edited, original_text, raw_payload
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `
       )
       .run(
@@ -168,7 +178,10 @@ export class InboxRepository {
         input.mimeType,
         fileSizeBytes,
         input.forwardedToTelegram ? 1 : 0,
-        receivedAt
+        receivedAt,
+        input.isEdited ? 1 : 0,
+        input.originalText ?? null,
+        input.rawPayload ?? null
       );
 
     return this.findById(id)!;
@@ -197,6 +210,63 @@ export class InboxRepository {
       return undefined;
     }
     return hydrated;
+  }
+
+  public findByWaMessageId(
+    waMessageId: string,
+    sessionId?: string
+  ): IncomingMessageRecord | undefined {
+    let sql = 'SELECT * FROM incoming_messages WHERE wa_message_id = ?';
+    const params: string[] = [waMessageId];
+    if (sessionId) {
+      sql += ' AND session_id = ?';
+      params.push(sessionId);
+    }
+    sql += ' ORDER BY received_at DESC LIMIT 1';
+    const row = this.db.sqlite.prepare(sql).get(...params) as
+      | Record<string, unknown>
+      | undefined;
+    return row ? this.hydrateRow(row) : undefined;
+  }
+
+  public updateEditedMessage(
+    id: string,
+    updates: {
+      textContent: string;
+      originalText?: string;
+      savedFilePath?: string;
+      savedFileName?: string;
+      fileSizeBytes?: number;
+    }
+  ): IncomingMessageRecord | undefined {
+    const existing = this.findById(id);
+    if (!existing) return undefined;
+
+    const origText = updates.originalText ?? existing.text_content ?? '';
+    const filePath = updates.savedFilePath ?? existing.saved_file_path;
+    const fileName = updates.savedFileName ?? existing.saved_file_name;
+    const sizeBytes = updates.fileSizeBytes ?? existing.file_size_bytes;
+
+    this.db.sqlite
+      .prepare(
+        `UPDATE incoming_messages
+         SET text_content = ?,
+             original_text = ?,
+             saved_file_path = ?,
+             saved_file_name = ?,
+             file_size_bytes = ?,
+             is_edited = 1
+         WHERE id = ?`
+      )
+      .run(updates.textContent, origText, filePath, fileName, sizeBytes, id);
+
+    return this.findById(id);
+  }
+
+  public updateRawPayload(id: string, rawPayload: string): void {
+    this.db.sqlite
+      .prepare('UPDATE incoming_messages SET raw_payload = ? WHERE id = ?')
+      .run(rawPayload, id);
   }
 
   public listForOwner(

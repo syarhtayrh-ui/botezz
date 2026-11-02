@@ -55,7 +55,8 @@ export type ConversationMode =
   | 'VIDEO_CALL'
   | 'GROUP'
   | 'TOOLS'
-  | 'SETTINGS';
+  | 'SETTINGS'
+  | 'INBOX_FORWARD';
 
 export interface TelegramControllerDeps {
   config: AppConfig;
@@ -242,6 +243,7 @@ export class TelegramBotController {
     this.videoCallWorkflow.cancel(adminId);
     this.toolsHandler.cancel(adminId);
     this.settingsHandler.cancel(adminId);
+    this.inboxHandler.cancel(adminId);
     this.activeConversationMode.set(adminId, 'NONE');
   }
 
@@ -650,6 +652,12 @@ export class TelegramBotController {
     if (callbackData.startsWith('inbox:view:')) {
       const id = callbackData.slice('inbox:view:'.length);
       return this.inboxHandler.viewMessage(actorUserId, id);
+    }
+    if (callbackData.startsWith('inbox:fwd:')) {
+      const id = callbackData.slice('inbox:fwd:'.length);
+      this.cancelAllWorkflowsForAdmin(actorUserId);
+      this.activeConversationMode.set(actorUserId, 'INBOX_FORWARD');
+      return this.inboxHandler.promptForward(actorUserId, id);
     }
     if (callbackData.startsWith('inbox:dl:')) {
       const id = callbackData.slice('inbox:dl:'.length);
@@ -1789,6 +1797,14 @@ export class TelegramBotController {
         actorUserId,
         nextStep === 'NONE' ? 'NONE' : 'SETTINGS'
       );
+      return response;
+    }
+
+    if (mode === 'INBOX_FORWARD') {
+      const response = await this.inboxHandler.executeForward(actorUserId, trimmed);
+      if (!this.inboxHandler.hasPendingForward(actorUserId)) {
+        this.activeConversationMode.set(actorUserId, 'NONE');
+      }
       return response;
     }
 

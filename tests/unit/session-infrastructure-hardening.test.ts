@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { DisconnectReason } from 'athanasia-baileys';
+import { DisconnectReason } from '../../src/whatsapp/baileys-compat';
 import { createAtomicMultiFileAuthState } from '../../src/whatsapp/atomic-auth-state';
 import { SessionStore } from '../../src/whatsapp/session-store';
 import {

@@ -1,5 +1,5 @@
 import fs from 'node:fs';
-import { isJidGroup, jidNormalizedUser, AnyMessageContent } from 'athanasia-baileys';
+import { isJidGroup, jidNormalizedUser, AnyMessageContent } from '../baileys-compat';
 import { SessionManager } from '../session-manager';
 import {
   validateRecipient,

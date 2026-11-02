@@ -4,7 +4,7 @@ import {
   jidEncode,
   jidNormalizedUser,
   isJidGroup,
-} from 'athanasia-baileys';
+} from '../whatsapp/baileys-compat';
 import { maskPhoneNumber } from './redaction';
 import { ValidationError, RateLimitError } from '../utils/errors';
 

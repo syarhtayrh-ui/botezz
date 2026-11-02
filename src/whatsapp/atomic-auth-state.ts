@@ -7,7 +7,7 @@ import {
   initAuthCreds,
   proto,
   SignalDataTypeMap,
-} from 'athanasia-baileys';
+} from './baileys-compat';
 import { createLogger } from '../logging/logger';
 
 const log = createLogger('atomic-auth-state');

@@ -8,14 +8,15 @@
     "start": "next start",
     "bot:start": "tsx src/app.ts",
     "diagnose:wa": "tsx scripts/diagnose-whatsapp-connection.ts",
+    "test:real-whatsapp-voip": "tsx scripts/test-real-whatsapp-voip.ts",
     "test": "tsx --test tests/unit/*.test.ts tests/integration/*.test.ts",
     "lint": "eslint .",
     "clean": "next clean"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",
+    "@hiroosy/baileys-lite": "0.3.6",
     "@hookform/resolvers": "^5.2.1",
-    "athanasia-baileys": "github:AthanasiaCMD/athanasia-baileys#2dce999d419dfc73afd86c0a478963e04aac41bc",
     "autoprefixer": "^10.4.21",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",

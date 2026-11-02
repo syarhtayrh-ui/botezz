@@ -7,7 +7,7 @@ import makeWASocket, {
   fetchLatestBaileysVersion,
   fetchLatestWaWebVersion,
   Browsers,
-} from 'athanasia-baileys';
+} from '../src/whatsapp/baileys-compat';
 import {
   resolveWhatsAppWebVersion,
   AthanasiaBaileysSessionDriver,
@@ -39,10 +39,10 @@ async function runIsolatedConnectionDiagnostic(): Promise<void> {
     );
   };
 
-  // Read installed athanasia-baileys package metadata
+  // Read installed @hiroosy/baileys-lite package metadata
   const pkgPath = path.resolve(
     process.cwd(),
-    'node_modules/athanasia-baileys/package.json'
+    'node_modules/@hiroosy/baileys-lite/package.json'
   );
   const pkgJson = JSON.parse(fs.readFileSync(pkgPath, 'utf-8')) as {
     name: string;

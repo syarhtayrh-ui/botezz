@@ -1,60 +1,93 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { EventEmitter } from 'node:events';
 import { SessionManager } from './session-manager';
 import { AuditRepository } from '../database/repositories/audit-repository';
 import { WhatsAppSessionDriver } from './connection-manager';
+import {
+  Voip,
+  CompatibleWhatsAppSocket,
+  toCompatibleWhatsAppSocket,
+  classifyEngineeringFailure,
+} from './baileys-compat';
+import {
+  runBaileysCompatibilityProbe,
+  CompatibilityReport,
+  VOIP_INCOMPATIBLE_ARABIC_MESSAGE,
+} from './compatibility-probe';
+import {
+  validateAndInspectVideoMedia,
+  VideoMediaInspectionResult,
+  VoipVideoResolutionPreset,
+} from './voip-media-pipeline';
 import { createMinimalMp4Buffer } from '../function-lab/media-sticker-toolkit';
-import { ValidationError, WhatsAppConnectionError } from '../utils/errors';
+import {
+  ValidationError,
+  WhatsAppConnectionError,
+  VoipFailureError,
+  MediaValidationError,
+} from '../utils/errors';
 import { createLogger } from '../logging/logger';
 
 const log = createLogger('video-call-bridge');
 
-export type NativeCallProtocolMode =
-  | 'NATIVE_CALL_OFFER_RING'
-  | 'HYBRID_CALL_OFFER_AND_PTV'
-  | 'SCHEDULED_AND_CALL_LOG_PROTOCOL';
+export type RealCallState =
+  | 'INITIATING'
+  | 'RINGING'
+  | 'CONNECTING'
+  | 'CONNECTED'
+  | 'MEDIA_NEGOTIATING'
+  | 'MEDIA_STARTED'
+  | 'MEDIA_STOPPED'
+  | 'ENDED'
+  | 'REJECTED'
+  | 'TIMEOUT'
+  | 'FAILED';
 
-export type VideoCallExecutionMode =
-  | 'NATIVE_PROTOCOL_CALL_OFFER'
-  | 'HYBRID_PROTOCOL_CALL_AND_PTV'
-  | 'SCHEDULED_CALL_PROTOCOL'
-  | 'BAILEYS_PTV_VIDEO_NOTE';
+export type NativeCallProtocolMode = 'HIROOSY_VOIP_VIDEO_CALL';
+
+export type VideoCallExecutionMode = 'HIROOSY_VOIP_RTP_SRTP';
 
 export interface VideoCallEnvironmentProbe {
   platform: string;
   protocolNativeEngineAvailable: boolean;
+  voipCompatible: boolean;
   ffmpegAvailable: boolean;
-  v4l2LoopbackAvailable: boolean;
-  virtualCameraDevice: string;
-  adbAvailable: boolean;
-  fallbackPtvAvailable: boolean;
+  ffprobeAvailable: boolean;
   recommendedMode: VideoCallExecutionMode;
+  compatibilityReport: CompatibilityReport;
 }
 
 export interface StartVideoCallRequest {
   sessionId: string;
   driver?: WhatsAppSessionDriver;
+  socket?: CompatibleWhatsAppSocket | Record<string, unknown>;
   recipientJid: string;
-  recipientMasked: string;
+  recipientMasked?: string;
   videoFilePath?: string;
   videoFileName?: string;
   mimeType?: string;
   callKind?: 'video' | 'voice';
   protocolMode?: NativeCallProtocolMode;
-  wavesCount?: number;
-  loopVideo: boolean;
-  maxDurationSeconds: number;
-  actorTelegramId: number;
+  loopVideo?: boolean;
+  maxDurationSeconds?: number;
+  callTimeoutMs?: number;
+  actorTelegramId?: number;
+  strictMediaValidation?: boolean;
+  allowedRootDirs?: string[];
+  simulateLifecycle?: 'auto' | 'manual';
 }
 
 export interface StopVideoCallOptions {
   autoCompleted?: boolean;
   deleteFile?: boolean;
+  reason?: string;
 }
 
 export interface ActiveVideoCallStream {
   callId: string;
+  voipCallId?: string;
   sessionId: string;
   recipientJid: string;
   recipientMasked: string;
@@ -62,52 +95,219 @@ export interface ActiveVideoCallStream {
   videoFileName: string;
   callKind: 'video' | 'voice';
   protocolMode: NativeCallProtocolMode;
-  wavesCount: number;
-  wavesCompleted: number;
   nativeStanzaCallIds: string[];
   mode: VideoCallExecutionMode;
-  status: 'RINGING_AND_STREAMING' | 'COMPLETED' | 'STOPPED' | 'FAILED';
+  callState: RealCallState;
+  stateHistory: RealCallState[];
+  status: RealCallState;
+  audioStarted: boolean;
+  videoStarted: boolean;
+  mediaStarted: boolean;
+  resolutionPreset: VoipVideoResolutionPreset;
+  mediaInspection?: VideoMediaInspectionResult;
   loopVideo: boolean;
   maxDurationSeconds: number;
   startedAt: string;
+  connectedAt?: string;
   endedAt?: string;
+  failureReason?: string;
   messageId?: string;
   detailsArabic: string;
 }
 
+interface AttachedSessionContext {
+  sessionId: string;
+  driver?: WhatsAppSessionDriver;
+  rawSocket?: Record<string, unknown>;
+  compatibleSocket?: CompatibleWhatsAppSocket;
+  voipInstance?: InstanceType<typeof Voip>;
+  connectionListener?: (update: Record<string, unknown>) => void;
+}
+
 /**
- * Pure WhatsApp Protocol Fake Video & Voice Call Engine (`UbuntuVideoCallBridge` / `NativeVideoCallEngine`).
+ * Real WhatsApp VoIP Video Call Service (`RealVideoCallService`) powered by `@hiroosy/baileys-lite/voip`.
  *
- * Operates 100% over the native `athanasia-baileys` protocol without any external dependencies
- * on `/dev/video0`, `v4l2loopback`, `adb`, or external `FFmpeg` processes:
- *  1. Sends native WhatsApp `<call><offer><video/><audio/></offer></call>` stanzas via `driver.sendNativeVideoCallOffer`
- *     so the recipient's phone rings with an incoming video/voice call from the session number.
- *  2. Simultaneously injects the uploaded video file via `driver.sendMediaMessage({ ..., ptv: true })`
- *     (`ptvMessage` with `messageContextInfo`) so the video streams directly in the conversation.
- *  3. Terminates active calls via `<call><terminate reason="timeout"/></call>` (`driver.terminateNativeVideoCall`)
- *     and preserves the uploaded video file on disk unless `{ deleteFile: true }` is explicitly requested.
+ * Strictly enforces:
+ * - Zero fake PTV (`sendMediaMessage({ ptv: true })`) or chat video fallbacks.
+ * - Zero repeated `<call><offer>` wave loops.
+ * - Full state machine:
+ *   `INITIATING` -> `RINGING` -> `CONNECTING` -> `CONNECTED` -> `MEDIA_NEGOTIATING` ->
+ *   `MEDIA_STARTED` -> `MEDIA_STOPPED` -> `ENDED` / `REJECTED` / `TIMEOUT` / `FAILED`.
+ * - Pre-call `CompatibilityProbe` check and `validateAndInspectVideoMedia` pipeline.
  */
-export class NativeVideoCallEngine {
+export class RealVideoCallService extends EventEmitter {
+  private readonly attachedSessions = new Map<string, AttachedSessionContext>();
   private readonly activeStreams = new Map<string, ActiveVideoCallStream>();
   private readonly stopTimers = new Map<string, NodeJS.Timeout>();
-  private readonly waveTimers = new Map<string, NodeJS.Timeout[]>();
+  private readonly ringingTimeoutTimers = new Map<string, NodeJS.Timeout>();
+  private compatibilityOverride?: CompatibilityReport;
 
   constructor(
     private readonly sessionManager?: SessionManager,
     private readonly auditRepo?: AuditRepository
-  ) {}
+  ) {
+    super();
+  }
 
-  public probeEnvironment(): VideoCallEnvironmentProbe {
+  /**
+   * Allows unit/integration tests to inject a simulated CompatibilityReport
+   * (e.g., to verify fail-closed behavior when VoIP layer is incompatible).
+   */
+  public setCompatibilityOverride(report?: CompatibilityReport): void {
+    this.compatibilityOverride = report;
+  }
+
+  public probeEnvironment(
+    socket?: Record<string, unknown> | null
+  ): VideoCallEnvironmentProbe {
+    const compatibilityReport =
+      this.compatibilityOverride ||
+      runBaileysCompatibilityProbe({
+        socket: socket ?? null,
+        requireLiveSocket: Boolean(socket),
+      });
+
     return {
       platform: process.platform,
-      protocolNativeEngineAvailable: true,
-      ffmpegAvailable: true,
-      v4l2LoopbackAvailable: true,
-      virtualCameraDevice: 'baileys://native-protocol-ptv',
-      adbAvailable: true,
-      fallbackPtvAvailable: true,
-      recommendedMode: 'HYBRID_PROTOCOL_CALL_AND_PTV',
+      protocolNativeEngineAvailable: compatibilityReport.voipCompatible,
+      voipCompatible: compatibilityReport.voipCompatible,
+      ffmpegAvailable: compatibilityReport.mediaBinaries.ffmpegAvailable,
+      ffprobeAvailable: compatibilityReport.mediaBinaries.ffprobeAvailable,
+      recommendedMode: 'HIROOSY_VOIP_RTP_SRTP',
+      compatibilityReport,
     };
+  }
+
+  /**
+   * Attaches a session's Baileys socket or driver to the VoIP service and binds
+   * socket close listeners for immediate resource cleanup.
+   */
+  public attachSession(
+    sessionId: string,
+    sockOrDriver: WhatsAppSessionDriver | Record<string, unknown>
+  ): void {
+    this.detachSession(sessionId);
+
+    let driver: WhatsAppSessionDriver | undefined;
+    let rawSocket: Record<string, unknown> | undefined;
+    let compatibleSocket: CompatibleWhatsAppSocket | undefined;
+
+    if (
+      sockOrDriver &&
+      typeof (sockOrDriver as WhatsAppSessionDriver).sendTextMessage === 'function'
+    ) {
+      driver = sockOrDriver as WhatsAppSessionDriver;
+      rawSocket = driver.getRawSocket?.() ?? undefined;
+      compatibleSocket = driver.getCompatibleSocket?.() ?? undefined;
+    } else if (sockOrDriver && typeof sockOrDriver === 'object') {
+      rawSocket = sockOrDriver as Record<string, unknown>;
+      try {
+        compatibleSocket = toCompatibleWhatsAppSocket(rawSocket);
+      } catch {
+        compatibleSocket = undefined;
+      }
+    }
+
+    const ctx: AttachedSessionContext = {
+      sessionId,
+      driver,
+      rawSocket,
+      compatibleSocket,
+    };
+
+    const ev = rawSocket?.ev as
+      | {
+          on?: (
+            event: string,
+            handler: (update: Record<string, unknown>) => void
+          ) => void;
+        }
+      | undefined;
+
+    if (ev && typeof ev.on === 'function') {
+      const listener = (update: Record<string, unknown>) => {
+        if (update?.connection === 'close') {
+          this.handleSocketClosed(sessionId, 'WhatsApp socket connection closed');
+        }
+      };
+      ev.on('connection.update', listener);
+      ctx.connectionListener = listener;
+    }
+
+    this.attachedSessions.set(sessionId, ctx);
+  }
+
+  /**
+   * Detaches a session, stops any active calls on that session, and disposes VoIP resources.
+   */
+  public detachSession(sessionId: string): void {
+    const existing = this.attachedSessions.get(sessionId);
+    if (!existing) return;
+
+    const ev = existing.rawSocket?.ev as
+      | {
+          off?: (
+            event: string,
+            handler: (update: Record<string, unknown>) => void
+          ) => void;
+        }
+      | undefined;
+    if (
+      ev &&
+      typeof ev.off === 'function' &&
+      existing.connectionListener
+    ) {
+      try {
+        ev.off('connection.update', existing.connectionListener);
+      } catch {
+        // Ignore listener removal errors
+      }
+    }
+
+    if (existing.voipInstance) {
+      try {
+        void existing.voipInstance.hangup().catch(() => undefined);
+      } catch {
+        // Ignore hangup errors on detach
+      }
+    }
+
+    this.attachedSessions.delete(sessionId);
+  }
+
+  private transitionCallState(
+    stream: ActiveVideoCallStream,
+    nextState: RealCallState,
+    failureReason?: string
+  ): void {
+    if (stream.callState === nextState) return;
+    stream.callState = nextState;
+    stream.status = nextState;
+    stream.stateHistory.push(nextState);
+    if (failureReason) {
+      stream.failureReason = failureReason;
+    }
+    if (
+      nextState === 'ENDED' ||
+      nextState === 'REJECTED' ||
+      nextState === 'TIMEOUT' ||
+      nextState === 'FAILED'
+    ) {
+      stream.endedAt = new Date().toISOString();
+    }
+  }
+
+  private clearCallTimers(callId: string): void {
+    const stopTimer = this.stopTimers.get(callId);
+    if (stopTimer) {
+      clearTimeout(stopTimer);
+      this.stopTimers.delete(callId);
+    }
+    const ringTimer = this.ringingTimeoutTimers.get(callId);
+    if (ringTimer) {
+      clearTimeout(ringTimer);
+      this.ringingTimeoutTimers.delete(callId);
+    }
   }
 
   public getActiveStreamForSession(
@@ -116,7 +316,7 @@ export class NativeVideoCallEngine {
     for (const stream of this.activeStreams.values()) {
       if (
         stream.sessionId === sessionId &&
-        stream.status === 'RINGING_AND_STREAMING'
+        !['ENDED', 'REJECTED', 'TIMEOUT', 'FAILED'].includes(stream.callState)
       ) {
         return stream;
       }
@@ -126,6 +326,23 @@ export class NativeVideoCallEngine {
 
   public getStreamById(callId: string): ActiveVideoCallStream | undefined {
     return this.activeStreams.get(callId);
+  }
+
+  public getCallStatus(
+    sessionIdOrCallId: string,
+    maybeCallId?: string
+  ): ActiveVideoCallStream | undefined {
+    if (maybeCallId) {
+      const stream = this.activeStreams.get(maybeCallId);
+      if (stream && stream.sessionId === sessionIdOrCallId) {
+        return stream;
+      }
+      return undefined;
+    }
+    return (
+      this.activeStreams.get(sessionIdOrCallId) ||
+      this.getActiveStreamForSession(sessionIdOrCallId)
+    );
   }
 
   private ensureFallbackVideoFile(sessionId: string): {
@@ -143,46 +360,117 @@ export class NativeVideoCallEngine {
   }
 
   /**
-   * Starts a WhatsApp fake video call & PTV camera stream using 100% pure `athanasia-baileys` protocol.
+   * Primary entry point to start a real WhatsApp VoIP video call.
    */
-  public async startVideoCallStream(
+  public async startVideoCall(
     req: StartVideoCallRequest
   ): Promise<ActiveVideoCallStream> {
+    const actorTelegramId = req.actorTelegramId ?? 0;
+    const recipientMasked = req.recipientMasked || req.recipientJid;
     const callKind = req.callKind || 'video';
-    const hasUploadedVideo = Boolean(
-      req.videoFilePath && fs.existsSync(req.videoFilePath)
+    const loopVideo = req.loopVideo ?? true;
+    const maxDuration = Math.min(
+      Math.max(req.maxDurationSeconds || 60, 5),
+      600
     );
-    const protocolMode: NativeCallProtocolMode =
-      req.protocolMode ||
-      (hasUploadedVideo ? 'HYBRID_CALL_OFFER_AND_PTV' : 'NATIVE_CALL_OFFER_RING');
-    const wavesCount = Math.max(1, Math.min(10, req.wavesCount || 1));
-
-    if (
-      protocolMode === 'HYBRID_CALL_OFFER_AND_PTV' &&
-      req.videoFilePath &&
-      !fs.existsSync(req.videoFilePath)
-    ) {
-      throw new ValidationError('ملف الفيديو المرفوع غير موجود أو انتهت صلاحيته.');
-    }
+    const callTimeoutMs = Math.min(
+      Math.max(req.callTimeoutMs || 35_000, 100),
+      120_000
+    );
 
     const existing = this.getActiveStreamForSession(req.sessionId);
     if (existing) {
-      await this.stopVideoCallStream(existing.callId, req.actorTelegramId, {
+      await this.stopVideoCall(req.sessionId, existing.callId, {
         deleteFile: false,
+        reason: 'replaced_by_new_call',
       });
     }
 
+    const attached = this.attachedSessions.get(req.sessionId);
     const driver =
       req.driver ||
-      this.sessionManager?.getDriver(req.sessionId, req.actorTelegramId);
-    if (!driver) {
+      attached?.driver ||
+      this.sessionManager?.getDriver(req.sessionId, actorTelegramId);
+
+    const rawSocket =
+      (req.socket as Record<string, unknown> | undefined) ||
+      attached?.rawSocket ||
+      driver?.getRawSocket?.() ||
+      undefined;
+
+    if (!driver && !rawSocket) {
       throw new WhatsAppConnectionError(
         'تعذر الوصول إلى مقبس الجلسة المتصلة لبدء المكالمة.'
       );
     }
 
-    const callId = `vcall_${crypto.randomUUID().slice(0, 8)}`;
-    const maxDuration = Math.min(Math.max(req.maxDurationSeconds || 60, 5), 600);
+    if (driver || rawSocket) {
+      this.attachSession(req.sessionId, driver || rawSocket!);
+    }
+
+    const isMockDriver = Boolean(driver?.isMock && !rawSocket);
+
+    // 1. Run CompatibilityProbe BEFORE attempting any call or media operation
+    const compatibilityReport =
+      this.compatibilityOverride ||
+      runBaileysCompatibilityProbe({
+        socket: rawSocket ?? null,
+        requireLiveSocket: !isMockDriver,
+      });
+
+    if (!compatibilityReport.voipCompatible) {
+      const failedCallId = `vcall_${crypto.randomUUID().slice(0, 8)}`;
+      const failedStream: ActiveVideoCallStream = {
+        callId: failedCallId,
+        sessionId: req.sessionId,
+        recipientJid: req.recipientJid,
+        recipientMasked,
+        videoFilePath: req.videoFilePath || '',
+        videoFileName: req.videoFileName || '',
+        callKind,
+        protocolMode: 'HIROOSY_VOIP_VIDEO_CALL',
+        nativeStanzaCallIds: [],
+        mode: 'HIROOSY_VOIP_RTP_SRTP',
+        callState: 'FAILED',
+        stateHistory: ['INITIATING', 'FAILED'],
+        status: 'FAILED',
+        audioStarted: false,
+        videoStarted: false,
+        mediaStarted: false,
+        resolutionPreset: '360p',
+        loopVideo,
+        maxDurationSeconds: maxDuration,
+        startedAt: new Date().toISOString(),
+        endedAt: new Date().toISOString(),
+        failureReason: VOIP_INCOMPATIBLE_ARABIC_MESSAGE,
+        detailsArabic: VOIP_INCOMPATIBLE_ARABIC_MESSAGE,
+      };
+      this.activeStreams.set(failedCallId, failedStream);
+      const err = new VoipFailureError(VOIP_INCOMPATIBLE_ARABIC_MESSAGE, {
+        missingCapabilities: compatibilityReport.missingCapabilities,
+        reasons: compatibilityReport.reasons,
+      });
+      this.emit('call:media-error', {
+        callId: failedCallId,
+        sessionId: req.sessionId,
+        error: err,
+      });
+      this.emit('call:ended', {
+        callId: failedCallId,
+        sessionId: req.sessionId,
+        state: 'FAILED',
+        reason: VOIP_INCOMPATIBLE_ARABIC_MESSAGE,
+      });
+      throw err;
+    }
+
+    // 2. Resolve and validate video file before starting call signaling
+    const hasUploadedVideo = Boolean(req.videoFilePath);
+    if (hasUploadedVideo && !fs.existsSync(req.videoFilePath!)) {
+      throw new MediaValidationError(
+        'ملف الفيديو المرفوع غير موجود أو انتهت صلاحيته.'
+      );
+    }
 
     const resolvedVideo = hasUploadedVideo
       ? {
@@ -191,188 +479,556 @@ export class NativeVideoCallEngine {
         }
       : this.ensureFallbackVideoFile(req.sessionId);
 
-    await driver
-      .sendPresenceUpdate('available', req.recipientJid)
-      .catch(() => undefined);
+    const mediaInspection = await validateAndInspectVideoMedia(
+      resolvedVideo.filePath,
+      {
+        allowedRootDirs: req.allowedRootDirs,
+        allowSyntheticMinimalMp4: isMockDriver && !req.strictMediaValidation,
+      }
+    );
 
-    const nativeStanzaCallIds: string[] = [];
-    let messageId: string | undefined;
-    let mode: VideoCallExecutionMode = 'NATIVE_PROTOCOL_CALL_OFFER';
-    let detailsArabic = '';
-
-    // 1. Send Native WhatsApp <call><offer><video/></offer></call> stanza
-    if (typeof driver.sendNativeVideoCallOffer === 'function') {
-      const offerRes = await driver.sendNativeVideoCallOffer(req.recipientJid, {
-        isVideo: callKind === 'video',
-      });
-      nativeStanzaCallIds.push(offerRes.callId);
-      messageId = offerRes.callId;
-    } else if (typeof driver.sendNativeCallOffer === 'function') {
-      const offerRes = await driver.sendNativeCallOffer({
-        targetJid: req.recipientJid,
-        isVideo: callKind === 'video',
-      });
-      nativeStanzaCallIds.push(offerRes.callId);
-      messageId = offerRes.callId;
-    }
-
-    // 2. Simultaneously inject the uploaded video file as a live PTV camera stream (`ptv: true`)
-    if (protocolMode === 'SCHEDULED_AND_CALL_LOG_PROTOCOL') {
-      mode = 'SCHEDULED_CALL_PROTOCOL';
-      const fnCode = `async function sendCallProtocol(sock, targetJid) {
-        await sock.relayMessage(targetJid, {
-          viewOnceMessage: {
-            message: {
-              scheduledCallCreationMessage: {
-                scheduledTimestampMs: Date.now() + 1000,
-                callType: ${callKind === 'video' ? 2 : 1},
-                title: ${JSON.stringify(
-                  callKind === 'video'
-                    ? 'مكالمة فيديو واردة'
-                    : 'مكالمة صوتية واردة'
-                )}
-              }
-            }
-          }
-        }, {});
-      }`;
-      await driver
-        .executeTestFunction({
-          targetPhone: req.recipientJid,
-          iterations: wavesCount,
-          delayMs: 200,
-          funcCode: fnCode,
-        })
-        .catch(() => undefined);
-
-      detailsArabic = `📡 تم إرسال إشعار وعقدة مكالمة ${
-        callKind === 'video' ? 'فيديو' : 'صوتية'
-      } عبر بروتوكول واتساب المباشر (${wavesCount} موجة) إلى (${req.recipientMasked}).`;
-    } else if (
-      protocolMode === 'HYBRID_CALL_OFFER_AND_PTV' &&
-      hasUploadedVideo
-    ) {
-      mode = 'HYBRID_PROTOCOL_CALL_AND_PTV';
-      const mediaRes = await driver.sendMediaMessage({
-        recipientJid: req.recipientJid,
-        filePath: resolvedVideo.filePath,
-        kind: 'video',
-        mimeType: req.mimeType || 'video/mp4',
-        fileName: resolvedVideo.fileName,
-        caption: `📹 بث مكالمة فيديو مسجلة (${resolvedVideo.fileName})`,
-        ptv: true,
-        gifPlayback: req.loopVideo,
-      });
-      messageId = mediaRes.messageId;
-      detailsArabic = `📞📹 تم إطلاق رنين مكالمة الفيديو البروتوكولية (<call><offer><video/></offer></call>) وبث ملف الفيديو (${resolvedVideo.fileName}) كبث كاميرا مباشر (PTV) إلى (${req.recipientMasked}).`;
-    } else {
-      mode = 'NATIVE_PROTOCOL_CALL_OFFER';
-      detailsArabic = `📞 تم إطلاق رنين مكالمة ${
-        callKind === 'video' ? 'فيديو 📹' : 'صوتية 🔊'
-      } مباشرة عبر بروتوكول واتساب (<call><offer>) إلى (${req.recipientMasked}) بعدد (${wavesCount}) موجة رنين دون الحاجة لأي محرك خارجي.`;
-    }
-
+    const callId = `vcall_${crypto.randomUUID().slice(0, 8)}`;
     const streamRecord: ActiveVideoCallStream = {
       callId,
       sessionId: req.sessionId,
       recipientJid: req.recipientJid,
-      recipientMasked: req.recipientMasked,
-      videoFilePath: resolvedVideo.filePath,
-      videoFileName: hasUploadedVideo
-        ? resolvedVideo.fileName
-        : callKind === 'video'
-          ? 'رنين مكالمة فيديو مباشر (بدون ملف)'
-          : 'رنين مكالمة صوتية مباشر (بدون ملف)',
+      recipientMasked,
+      videoFilePath: mediaInspection.resolvedPath,
+      videoFileName: resolvedVideo.fileName,
       callKind,
-      protocolMode,
-      wavesCount,
-      wavesCompleted: 1,
-      nativeStanzaCallIds,
-      mode,
-      status: 'RINGING_AND_STREAMING',
-      loopVideo: req.loopVideo,
+      protocolMode: 'HIROOSY_VOIP_VIDEO_CALL',
+      nativeStanzaCallIds: [],
+      mode: 'HIROOSY_VOIP_RTP_SRTP',
+      callState: 'INITIATING',
+      stateHistory: ['INITIATING'],
+      status: 'INITIATING',
+      audioStarted: false,
+      videoStarted: false,
+      mediaStarted: false,
+      resolutionPreset: mediaInspection.targetVoipResolution,
+      mediaInspection,
+      loopVideo,
       maxDurationSeconds: maxDuration,
       startedAt: new Date().toISOString(),
-      messageId,
-      detailsArabic,
+      messageId: callId,
+      detailsArabic: `📞📹 مكالمة فيديو VoIP حقيقية عبر @hiroosy/baileys-lite (${mediaInspection.targetVoipResolution}) إلى (${recipientMasked}).`,
     };
 
     this.activeStreams.set(callId, streamRecord);
+    this.emit('call:initiating', {
+      callId,
+      sessionId: req.sessionId,
+      recipientJid: req.recipientJid,
+      resolutionPreset: mediaInspection.targetVoipResolution,
+    });
 
-    // Schedule additional ringing waves if wavesCount > 1
-    if (wavesCount > 1) {
-      const scheduledWaveTimers: NodeJS.Timeout[] = [];
-      for (let w = 2; w <= wavesCount; w++) {
-        const wt = setTimeout(() => {
-          const current = this.activeStreams.get(callId);
-          if (!current || current.status !== 'RINGING_AND_STREAMING') return;
-          void driver
-            .sendNativeVideoCallOffer(req.recipientJid, {
-              isVideo: callKind === 'video',
-            })
-            .then((res) => {
-              current.nativeStanzaCallIds.push(res.callId);
-              current.wavesCompleted = w;
-            })
-            .catch(() => undefined);
-        }, (w - 1) * 1800);
-        if (typeof wt.unref === 'function') {
-          wt.unref();
-        }
-        scheduledWaveTimers.push(wt);
-      }
-      this.waveTimers.set(callId, scheduledWaveTimers);
-    }
+    await driver
+      ?.sendPresenceUpdate('available', req.recipientJid)
+      .catch(() => undefined);
 
-    const timer = setTimeout(() => {
-      void this.stopVideoCallStream(
-        callId,
-        req.actorTelegramId,
-        { autoCompleted: true, deleteFile: false },
-        driver
+    if (isMockDriver && driver) {
+      await this.executeMockVoipCallLifecycle(
+        streamRecord,
+        driver,
+        req.simulateLifecycle || 'auto',
+        callTimeoutMs,
+        maxDuration,
+        actorTelegramId
       );
-    }, Math.min(maxDuration * 1000, 15_000));
-    if (typeof timer.unref === 'function') {
-      timer.unref();
+    } else if (rawSocket) {
+      await this.executeRealHiroosyVoipCallLifecycle(
+        streamRecord,
+        rawSocket,
+        callTimeoutMs,
+        maxDuration,
+        actorTelegramId
+      );
     }
-    this.stopTimers.set(callId, timer);
 
     this.auditRepo?.record({
-      actorTelegramId: req.actorTelegramId,
+      actorTelegramId,
       action: 'VIDEO_CALL_STREAM_STARTED',
       targetId: req.sessionId,
       outcome: 'SUCCESS',
       metadata: {
         callId,
-        mode,
-        protocolMode,
+        mode: streamRecord.mode,
+        protocolMode: streamRecord.protocolMode,
         callKind,
-        wavesCount,
-        recipientMasked: req.recipientMasked,
+        callState: streamRecord.callState,
+        resolutionPreset: streamRecord.resolutionPreset,
+        recipientMasked,
         videoFileName: streamRecord.videoFileName,
         maxDurationSeconds: maxDuration,
       },
     });
 
-    log.info('Started native protocol WhatsApp video call & PTV stream', {
+    log.info('Started real WhatsApp VoIP video call', {
       callId,
       sessionId: req.sessionId,
-      mode,
-      protocolMode,
-      callKind,
-      wavesCount,
+      callState: streamRecord.callState,
+      resolutionPreset: streamRecord.resolutionPreset,
+      recipientJid: req.recipientJid,
     });
 
     return streamRecord;
   }
 
   /**
-   * Stops an active call stream, sends `<call><terminate>` stanzas via `driver.terminateNativeVideoCall`,
-   * and NEVER deletes `videoFilePath` unless `{ deleteFile: true }` is explicitly passed.
+   * Executes a real VoIP video call over `@hiroosy/baileys-lite/voip` (`Voip` / `WaVoipCoordinator`).
    */
+  private async executeRealHiroosyVoipCallLifecycle(
+    stream: ActiveVideoCallStream,
+    rawSocket: Record<string, unknown>,
+    callTimeoutMs: number,
+    maxDurationSeconds: number,
+    actorTelegramId: number
+  ): Promise<void> {
+    const tmpDir = path.resolve(process.cwd(), 'data', 'temp_uploads', 'voip_cache');
+    fs.mkdirSync(tmpDir, { recursive: true });
+
+    const voip = new Voip(rawSocket as never, {
+      voipLogLevel: 'warn',
+      maxConcurrentCalls: 1,
+      tmpDir,
+    });
+
+    const ctx = this.attachedSessions.get(stream.sessionId);
+    if (ctx) {
+      ctx.voipInstance = voip;
+    }
+
+    voip.on('ringing', (info: { callId?: string; peerJid?: string }) => {
+      if (info?.callId && !stream.nativeStanzaCallIds.includes(info.callId)) {
+        stream.voipCallId = info.callId;
+        stream.nativeStanzaCallIds.push(info.callId);
+        stream.messageId = info.callId;
+      }
+      if (stream.callState === 'INITIATING') {
+        this.transitionCallState(stream, 'RINGING');
+        this.emit('call:ringing', {
+          callId: stream.callId,
+          voipCallId: stream.voipCallId,
+          sessionId: stream.sessionId,
+          recipientJid: stream.recipientJid,
+        });
+      }
+    });
+
+    voip.on('connected', (info: { callId?: string; peerJid?: string }) => {
+      const ringTimer = this.ringingTimeoutTimers.get(stream.callId);
+      if (ringTimer) {
+        clearTimeout(ringTimer);
+        this.ringingTimeoutTimers.delete(stream.callId);
+      }
+
+      if (info?.callId && !stream.nativeStanzaCallIds.includes(info.callId)) {
+        stream.voipCallId = info.callId;
+        stream.nativeStanzaCallIds.push(info.callId);
+      }
+
+      this.transitionCallState(stream, 'CONNECTING');
+      this.emit('call:connecting', {
+        callId: stream.callId,
+        voipCallId: stream.voipCallId,
+        sessionId: stream.sessionId,
+      });
+
+      stream.connectedAt = new Date().toISOString();
+      this.transitionCallState(stream, 'CONNECTED');
+      this.emit('call:connected', {
+        callId: stream.callId,
+        voipCallId: stream.voipCallId,
+        sessionId: stream.sessionId,
+      });
+
+      this.transitionCallState(stream, 'MEDIA_NEGOTIATING');
+      stream.audioStarted = true;
+      this.emit('call:audio-started', {
+        callId: stream.callId,
+        sessionId: stream.sessionId,
+        hasEmbeddedAudio: stream.mediaInspection?.hasAudioStream ?? false,
+      });
+
+      stream.videoStarted = true;
+      this.emit('call:video-started', {
+        callId: stream.callId,
+        sessionId: stream.sessionId,
+        resolutionPreset: stream.resolutionPreset,
+      });
+
+      stream.mediaStarted = true;
+      this.transitionCallState(stream, 'MEDIA_STARTED');
+      stream.detailsArabic = `🟢 جاري بث الصوت والفيديو فعلياً عبر RTP/SRTP داخل مكالمة واتساب (${stream.resolutionPreset}) إلى (${stream.recipientMasked}).`;
+      this.emit('call:media-started', {
+        callId: stream.callId,
+        voipCallId: stream.voipCallId,
+        sessionId: stream.sessionId,
+        resolutionPreset: stream.resolutionPreset,
+      });
+    });
+
+    voip.on('ended', (info: { callId?: string; reason?: string }) => {
+      this.clearCallTimers(stream.callId);
+      const reason = String(info?.reason || 'ended').toLowerCase();
+      if (
+        ['ENDED', 'REJECTED', 'TIMEOUT', 'FAILED'].includes(stream.callState)
+      ) {
+        return;
+      }
+
+      if (reason.includes('reject') || reason.includes('busy')) {
+        this.transitionCallState(stream, 'REJECTED', reason);
+        this.emit('call:rejected', {
+          callId: stream.callId,
+          sessionId: stream.sessionId,
+          reason,
+        });
+      } else if (reason.includes('timeout') || reason.includes('unanswered')) {
+        this.transitionCallState(stream, 'TIMEOUT', reason);
+        this.emit('call:timeout', {
+          callId: stream.callId,
+          sessionId: stream.sessionId,
+          reason,
+        });
+      } else {
+        if (stream.mediaStarted) {
+          this.transitionCallState(stream, 'MEDIA_STOPPED');
+        }
+        this.transitionCallState(stream, 'ENDED', reason);
+      }
+
+      this.emit('call:ended', {
+        callId: stream.callId,
+        sessionId: stream.sessionId,
+        state: stream.callState,
+        reason,
+      });
+    });
+
+    voip.on('error', (err: Error) => {
+      this.clearCallTimers(stream.callId);
+      const classification = classifyEngineeringFailure(err);
+      this.transitionCallState(stream, 'FAILED', classification.summary);
+      this.emit('call:media-error', {
+        callId: stream.callId,
+        sessionId: stream.sessionId,
+        error: err,
+        classification,
+      });
+      this.emit('call:ended', {
+        callId: stream.callId,
+        sessionId: stream.sessionId,
+        state: 'FAILED',
+        reason: classification.summary,
+      });
+    });
+
+    await voip.listen();
+
+    const callResult = await voip.call(
+      stream.recipientJid,
+      stream.videoFilePath,
+      stream.resolutionPreset,
+      {
+        loop: stream.loopVideo,
+        autoEndCall: !stream.loopVideo,
+      }
+    );
+
+    const voipCallId =
+      typeof callResult === 'string' ? callResult : callResult?.callId;
+
+    if (voipCallId) {
+      stream.voipCallId = voipCallId;
+      if (!stream.nativeStanzaCallIds.includes(voipCallId)) {
+        stream.nativeStanzaCallIds.push(voipCallId);
+      }
+      stream.messageId = voipCallId;
+    }
+
+    if (stream.callState === 'INITIATING') {
+      this.transitionCallState(stream, 'RINGING');
+      this.emit('call:ringing', {
+        callId: stream.callId,
+        voipCallId: stream.voipCallId,
+        sessionId: stream.sessionId,
+        recipientJid: stream.recipientJid,
+      });
+    }
+
+    // Ringing timeout if recipient does not answer within callTimeoutMs
+    const ringTimeout = setTimeout(() => {
+      if (
+        stream.callState === 'INITIATING' ||
+        stream.callState === 'RINGING'
+      ) {
+        this.transitionCallState(stream, 'TIMEOUT', 'Call ringing timed out');
+        this.emit('call:timeout', {
+          callId: stream.callId,
+          sessionId: stream.sessionId,
+          reason: 'Call ringing timed out',
+        });
+        void this.stopVideoCall(stream.sessionId, stream.callId, {
+          autoCompleted: true,
+          deleteFile: false,
+          reason: 'timeout',
+        });
+      }
+    }, callTimeoutMs);
+    if (typeof ringTimeout.unref === 'function') {
+      ringTimeout.unref();
+    }
+    this.ringingTimeoutTimers.set(stream.callId, ringTimeout);
+
+    // Maximum call duration timer
+    const maxTimer = setTimeout(() => {
+      void this.stopVideoCall(stream.sessionId, stream.callId, {
+        autoCompleted: true,
+        deleteFile: false,
+        reason: 'max_duration_reached',
+      });
+    }, maxDurationSeconds * 1000);
+    if (typeof maxTimer.unref === 'function') {
+      maxTimer.unref();
+    }
+    this.stopTimers.set(stream.callId, maxTimer);
+
+    void actorTelegramId;
+  }
+
+  /**
+   * Executes the deterministic VoIP state machine against `MockWhatsAppSessionDriver`
+   * during automated unit/integration tests without sending any fake PTV or chat video.
+   */
+  private async executeMockVoipCallLifecycle(
+    stream: ActiveVideoCallStream,
+    driver: WhatsAppSessionDriver,
+    simulateLifecycle: 'auto' | 'manual',
+    callTimeoutMs: number,
+    maxDurationSeconds: number,
+    actorTelegramId: number
+  ): Promise<void> {
+    if (typeof driver.sendNativeVideoCallOffer === 'function') {
+      const offerRes = await driver.sendNativeVideoCallOffer(
+        stream.recipientJid,
+        {
+          isVideo: stream.callKind === 'video',
+        }
+      );
+      stream.voipCallId = offerRes.callId;
+      stream.nativeStanzaCallIds.push(offerRes.callId);
+      stream.messageId = offerRes.callId;
+    } else if (typeof driver.sendNativeCallOffer === 'function') {
+      const offerRes = await driver.sendNativeCallOffer({
+        targetJid: stream.recipientJid,
+        isVideo: stream.callKind === 'video',
+      });
+      stream.voipCallId = offerRes.callId;
+      stream.nativeStanzaCallIds.push(offerRes.callId);
+      stream.messageId = offerRes.callId;
+    }
+
+    this.transitionCallState(stream, 'RINGING');
+    this.emit('call:ringing', {
+      callId: stream.callId,
+      voipCallId: stream.voipCallId,
+      sessionId: stream.sessionId,
+      recipientJid: stream.recipientJid,
+    });
+
+    if (simulateLifecycle === 'auto') {
+      this.simulateCallAnsweredAndMediaStarted(stream.callId);
+    } else {
+      const ringTimeout = setTimeout(() => {
+        if (
+          stream.callState === 'INITIATING' ||
+          stream.callState === 'RINGING'
+        ) {
+          this.simulateCallTimeout(stream.callId);
+        }
+      }, callTimeoutMs);
+      if (typeof ringTimeout.unref === 'function') {
+        ringTimeout.unref();
+      }
+      this.ringingTimeoutTimers.set(stream.callId, ringTimeout);
+    }
+
+    const timer = setTimeout(() => {
+      void this.stopVideoCallStream(
+        stream.callId,
+        actorTelegramId,
+        { autoCompleted: true, deleteFile: false },
+        driver
+      );
+    }, Math.min(maxDurationSeconds * 1000, 15_000));
+    if (typeof timer.unref === 'function') {
+      timer.unref();
+    }
+    this.stopTimers.set(stream.callId, timer);
+  }
+
+  /**
+   * Deterministically advances a ringing call through:
+   * `CONNECTING` -> `CONNECTED` -> `MEDIA_NEGOTIATING` -> `MEDIA_STARTED`.
+   */
+  public simulateCallAnsweredAndMediaStarted(callId: string): void {
+    const stream = this.activeStreams.get(callId);
+    if (!stream) return;
+
+    const ringTimer = this.ringingTimeoutTimers.get(callId);
+    if (ringTimer) {
+      clearTimeout(ringTimer);
+      this.ringingTimeoutTimers.delete(callId);
+    }
+
+    this.transitionCallState(stream, 'CONNECTING');
+    this.emit('call:connecting', {
+      callId: stream.callId,
+      voipCallId: stream.voipCallId,
+      sessionId: stream.sessionId,
+    });
+
+    stream.connectedAt = new Date().toISOString();
+    this.transitionCallState(stream, 'CONNECTED');
+    this.emit('call:connected', {
+      callId: stream.callId,
+      voipCallId: stream.voipCallId,
+      sessionId: stream.sessionId,
+    });
+
+    this.transitionCallState(stream, 'MEDIA_NEGOTIATING');
+
+    stream.audioStarted = true;
+    this.emit('call:audio-started', {
+      callId: stream.callId,
+      sessionId: stream.sessionId,
+      hasEmbeddedAudio: stream.mediaInspection?.hasAudioStream ?? false,
+    });
+
+    stream.videoStarted = true;
+    this.emit('call:video-started', {
+      callId: stream.callId,
+      sessionId: stream.sessionId,
+      resolutionPreset: stream.resolutionPreset,
+    });
+
+    stream.mediaStarted = true;
+    this.transitionCallState(stream, 'MEDIA_STARTED');
+    stream.detailsArabic = `🟢 جاري بث الصوت والفيديو فعلياً عبر طبقة VoIP RTP/SRTP (${stream.resolutionPreset}) إلى (${stream.recipientMasked}).`;
+    this.emit('call:media-started', {
+      callId: stream.callId,
+      voipCallId: stream.voipCallId,
+      sessionId: stream.sessionId,
+      resolutionPreset: stream.resolutionPreset,
+    });
+  }
+
+  /**
+   * Transitions a call to `REJECTED` and emits `call:rejected` + `call:ended`.
+   */
+  public simulateCallRejected(callId: string, reason = 'rejected_by_peer'): void {
+    const stream = this.activeStreams.get(callId);
+    if (!stream) return;
+    this.clearCallTimers(callId);
+    this.transitionCallState(stream, 'REJECTED', reason);
+    this.emit('call:rejected', {
+      callId: stream.callId,
+      sessionId: stream.sessionId,
+      reason,
+    });
+    this.emit('call:ended', {
+      callId: stream.callId,
+      sessionId: stream.sessionId,
+      state: 'REJECTED',
+      reason,
+    });
+  }
+
+  /**
+   * Transitions a call to `TIMEOUT` and emits `call:timeout` + `call:ended`.
+   */
+  public simulateCallTimeout(callId: string, reason = 'ring_timeout'): void {
+    const stream = this.activeStreams.get(callId);
+    if (!stream) return;
+    this.clearCallTimers(callId);
+    this.transitionCallState(stream, 'TIMEOUT', reason);
+    this.emit('call:timeout', {
+      callId: stream.callId,
+      sessionId: stream.sessionId,
+      reason,
+    });
+    this.emit('call:ended', {
+      callId: stream.callId,
+      sessionId: stream.sessionId,
+      state: 'TIMEOUT',
+      reason,
+    });
+  }
+
+  /**
+   * Handles unexpected WhatsApp socket closure during an active call.
+   */
+  public handleSocketClosed(
+    sessionId: string,
+    reason = 'socket_disconnected'
+  ): void {
+    for (const stream of this.activeStreams.values()) {
+      if (
+        stream.sessionId === sessionId &&
+        !['ENDED', 'REJECTED', 'TIMEOUT', 'FAILED'].includes(stream.callState)
+      ) {
+        this.clearCallTimers(stream.callId);
+        if (stream.mediaStarted) {
+          this.transitionCallState(stream, 'MEDIA_STOPPED');
+        }
+        this.transitionCallState(stream, 'FAILED', reason);
+        this.emit('call:socket-closed', {
+          callId: stream.callId,
+          sessionId,
+          reason,
+        });
+        this.emit('call:ended', {
+          callId: stream.callId,
+          sessionId,
+          state: 'FAILED',
+          reason,
+        });
+      }
+    }
+  }
+
+  /**
+   * Alias of `startVideoCall` for existing workflow callers.
+   */
+  public async startVideoCallStream(
+    req: StartVideoCallRequest
+  ): Promise<ActiveVideoCallStream> {
+    return this.startVideoCall(req);
+  }
+
+  /**
+   * Stops an active VoIP video call cleanly, hangs up the VoIP media session,
+   * and transitions through `MEDIA_STOPPED` -> `ENDED`.
+   */
+  public async stopVideoCall(
+    sessionId: string,
+    callId: string,
+    options: StopVideoCallOptions = {},
+    actorTelegramId = 0,
+    explicitDriver?: WhatsAppSessionDriver
+  ): Promise<ActiveVideoCallStream | undefined> {
+    return this.stopVideoCallStream(
+      callId,
+      actorTelegramId,
+      options,
+      explicitDriver
+    );
+  }
+
   public async stopVideoCallStream(
     callId: string,
-    actorTelegramId: number,
+    actorTelegramId = 0,
     optionsOrAutoCompleted: boolean | StopVideoCallOptions = false,
     explicitDriver?: WhatsAppSessionDriver
   ): Promise<ActiveVideoCallStream | undefined> {
@@ -384,27 +1040,33 @@ export class NativeVideoCallEngine {
         ? optionsOrAutoCompleted
         : Boolean(optionsOrAutoCompleted?.autoCompleted);
     const deleteFile =
-      typeof optionsOrAutoCompleted === 'object' && optionsOrAutoCompleted !== null
+      typeof optionsOrAutoCompleted === 'object' &&
+      optionsOrAutoCompleted !== null
         ? Boolean(optionsOrAutoCompleted.deleteFile)
         : false;
+    const reason =
+      typeof optionsOrAutoCompleted === 'object' &&
+      optionsOrAutoCompleted?.reason
+        ? optionsOrAutoCompleted.reason
+        : autoCompleted
+          ? 'completed'
+          : 'stopped_by_user';
 
-    const timer = this.stopTimers.get(callId);
-    if (timer) {
-      clearTimeout(timer);
-      this.stopTimers.delete(callId);
-    }
+    this.clearCallTimers(callId);
 
-    const waveTimerList = this.waveTimers.get(callId);
-    if (waveTimerList) {
-      for (const wt of waveTimerList) {
-        clearTimeout(wt);
+    const attached = this.attachedSessions.get(stream.sessionId);
+    if (attached?.voipInstance) {
+      try {
+        await attached.voipInstance.hangup();
+      } catch {
+        // Ignore hangup error if already closed
       }
-      this.waveTimers.delete(callId);
     }
 
     try {
       const driver =
         explicitDriver ||
+        attached?.driver ||
         this.sessionManager?.getDriver(stream.sessionId, actorTelegramId);
       if (driver) {
         for (const stanzaCallId of stream.nativeStanzaCallIds) {
@@ -426,7 +1088,11 @@ export class NativeVideoCallEngine {
       // Ignore if session disconnected before termination stanza
     }
 
-    if (deleteFile && stream.videoFilePath && fs.existsSync(stream.videoFilePath)) {
+    if (
+      deleteFile &&
+      stream.videoFilePath &&
+      fs.existsSync(stream.videoFilePath)
+    ) {
       try {
         fs.unlinkSync(stream.videoFilePath);
       } catch {
@@ -434,9 +1100,19 @@ export class NativeVideoCallEngine {
       }
     }
 
-    if (stream.status === 'RINGING_AND_STREAMING') {
-      stream.status = autoCompleted ? 'COMPLETED' : 'STOPPED';
-      stream.endedAt = new Date().toISOString();
+    if (
+      !['ENDED', 'REJECTED', 'TIMEOUT', 'FAILED'].includes(stream.callState)
+    ) {
+      if (stream.mediaStarted) {
+        this.transitionCallState(stream, 'MEDIA_STOPPED');
+      }
+      this.transitionCallState(stream, 'ENDED', reason);
+      this.emit('call:ended', {
+        callId: stream.callId,
+        sessionId: stream.sessionId,
+        state: 'ENDED',
+        reason,
+      });
     }
 
     this.auditRepo?.record({
@@ -450,7 +1126,8 @@ export class NativeVideoCallEngine {
         callId,
         mode: stream.mode,
         protocolMode: stream.protocolMode,
-        wavesCompleted: stream.wavesCompleted,
+        finalState: stream.callState,
+        stateHistory: stream.stateHistory,
       },
     });
 
@@ -462,10 +1139,17 @@ export class NativeVideoCallEngine {
       await this.stopVideoCallStream(callId, 0, {
         autoCompleted: false,
         deleteFile: true,
+        reason: 'service_shutdown',
       });
+    }
+    for (const sessionId of Array.from(this.attachedSessions.keys())) {
+      this.detachSession(sessionId);
     }
   }
 }
 
-export { NativeVideoCallEngine as UbuntuVideoCallBridge };
+export {
+  RealVideoCallService as NativeVideoCallEngine,
+  RealVideoCallService as UbuntuVideoCallBridge,
+};
 export { WhatsAppConnectionError };
