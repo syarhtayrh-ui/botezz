@@ -5,8 +5,10 @@ import {
   formatSessionStatusArabic,
 } from '../keyboards/session-menu';
 import { buildAppNavigationRow, InlineKeyboardRows } from '../keyboards/main-menu';
+import { renderBreadcrumb } from '../keyboards/ui-theme';
 import { BotViewResponse } from '../workflows/pairing-workflow';
 import { toSafeArabicError } from '../../utils/errors';
+import { escapeMarkdown } from '../../utils/markdown';
 
 export class SessionsHandler {
   constructor(private readonly sessionManager: SessionManager) {}
@@ -21,6 +23,7 @@ export class SessionsHandler {
     if (sessions.length === 0) {
       return {
         text:
+          `${renderBreadcrumb(['🏠 الرئيسية', '📋 إدارة الجلسات'])}\n` +
           `📋 *إدارة الجلسات*\n\n` +
           `لا توجد أي جلسات واتساب مرتبطة حالياً. اضغط على "ربط جلسة جديدة" للبدء.`,
         keyboard: rows,
@@ -31,6 +34,7 @@ export class SessionsHandler {
 
     return {
       text:
+        `${renderBreadcrumb(['🏠 الرئيسية', '📋 إدارة الجلسات'])}\n` +
         `📋 *إدارة الجلسات المرتبطة* (صفحة ${currentPage} من ${totalPages})\n` +
         `إجمالي الجلسات: *${sessions.length}*\n\n` +
         `اختر جلسة لعرض تفاصيلها أو إدارتها:`,
@@ -81,7 +85,7 @@ export class SessionsHandler {
             .slice(0, 8)
             .map(
               (s) =>
-                `• ${formatSessionStatusArabic(s.status)} — *${s.label}* (\`${s.masked_phone || s.id}\`)`
+                `• ${formatSessionStatusArabic(s.status)} — *${escapeMarkdown(s.label)}* (\`${s.masked_phone || s.id}\`)`
             )
             .join('\n');
 
@@ -118,6 +122,7 @@ export class SessionsHandler {
 
     return {
       text:
+        `${renderBreadcrumb(['🏠 الرئيسية', '📡 حالة الجلسات'])}\n` +
         `📡 *لوحة حالة الجلسات الحية (Session Status Overview)*\n` +
         `━━━━━━━━━━━━━━━━━━\n` +
         `🟢 *متصلة ونشطة (Active):* \`${active.length}\`\n` +
@@ -176,9 +181,14 @@ export class SessionsHandler {
             ? `🔴 غير سليمة (${health.score}/100)`
             : `⚪ غير محددة (${health.score}/100)`;
 
+    const safeLabel = escapeMarkdown(sess.label);
+    const safeReason = escapeMarkdown(sess.last_disconnect_reason || 'غير محدد');
+    const safeLastError = sess.last_error ? escapeMarkdown(sess.last_error) : '';
+
     return {
       text:
-        `📱 *تفاصيل الجلسة:* ${sess.label}\n\n` +
+        `${renderBreadcrumb(['🏠 الرئيسية', '📋 الجلسات', safeLabel])}\n` +
+        `📱 *تفاصيل الجلسة:* ${safeLabel}\n\n` +
         `🆔 المعرف الداخلي: \`${sess.id}\`\n` +
         `📞 رقم الهاتف المقنع: \`${sess.masked_phone || 'غير مقترن بعد'}\`\n` +
         `📡 حالة الاتصال: ${formatSessionStatusArabic(sess.status)}\n` +
@@ -188,8 +198,8 @@ export class SessionsHandler {
         `🔢 جيل الاتصال (Epoch): \`#${connectionGeneration}\`\n` +
         `🕒 آخر تحديث للحالة: \`${sess.last_status_at}\`\n` +
         `🔁 محاولات إعادة الاتصال: ${sess.reconnect_attempts}\n` +
-        `${sess.last_disconnect_code ? `📟 آخر كود انقطاع: \`${sess.last_disconnect_code}\` (${sess.last_disconnect_reason || 'غير محدد'})\n` : ''}` +
-        `${sess.last_error ? `⚠️ آخر ملاحظة/خطأ: ${sess.last_error}\n` : ''}\n` +
+        `${sess.last_disconnect_code ? `📟 آخر كود انقطاع: \`${sess.last_disconnect_code}\` (${safeReason})\n` : ''}` +
+        `${safeLastError ? `⚠️ آخر ملاحظة/خطأ: ${safeLastError}\n` : ''}\n` +
         `_بيانات المصادقة محفوظة في مجلد معزول ومحمية ولا تُعرض في تيليجرام._`,
       keyboard: buildSessionDetailKeyboard(sess),
       toastText: `📱 ${sess.label}`,
@@ -263,7 +273,7 @@ export class SessionsHandler {
     return {
       text:
         `⚠️ *تأكيد حذف الجلسة نهائياً*\n\n` +
-        `هل أنت متأكد من حذف الجلسة *${sess.label}* (\`${sess.id}\`)؟\n` +
+        `هل أنت متأكد من حذف الجلسة *${escapeMarkdown(sess.label)}* (\`${sess.id}\`)؟\n` +
         `سيتم تسجيل الخروج وحذف مجلد المصادقة المحلي الخاص بها نهائياً.`,
       keyboard: [
         [
@@ -315,9 +325,20 @@ export class SessionsHandler {
 
   public renderConfirmPurgeInactive(actorUserId?: number): BotViewResponse {
     const allSessions = this.sessionManager.listSessions(actorUserId);
-    const inactive = allSessions.filter(
-      (s) => s.status !== 'CONNECTED' && s.status !== 'AUTHENTICATED'
-    );
+    const inactive = allSessions.filter((s) => {
+      if (s.status === 'CONNECTED' || s.status === 'AUTHENTICATED') {
+        return false;
+      }
+      if (typeof actorUserId === 'number') {
+        try {
+          this.sessionManager.assertSessionAccess(s.id, actorUserId);
+          return true;
+        } catch {
+          return false;
+        }
+      }
+      return true;
+    });
 
     if (inactive.length === 0) {
       return {
@@ -338,7 +359,10 @@ export class SessionsHandler {
         `سيتم حذف *${inactive.length}* جلسة غير متصلة/فاشلة وإزالة مجلدات المصادقة الخاصة بها دون المساس بالجلسات المتصلة:\n` +
         inactive
           .slice(0, 6)
-          .map((s) => `• *${s.label}* (\`${s.id}\` - ${formatSessionStatusArabic(s.status)})`)
+          .map(
+            (s) =>
+              `• *${escapeMarkdown(s.label)}* (\`${s.id}\` - ${formatSessionStatusArabic(s.status)})`
+          )
           .join('\n') +
         `\n\nهل تؤكد الحذف النهائي؟`,
       keyboard: [
@@ -355,15 +379,25 @@ export class SessionsHandler {
         }),
       ],
       toastText: '⚠️ يرجى تأكيد تنظيف الجلسات غير المتصلة',
+      route: 'sess:confirm_purge_inactive',
     };
   }
 
   public async handlePurgeInactive(adminId: number): Promise<BotViewResponse> {
     const allSessions = this.sessionManager.listSessions(adminId);
-    const inactive = allSessions.filter(
-      (s) => s.status !== 'CONNECTED' && s.status !== 'AUTHENTICATED'
-    );
+    const inactive = allSessions.filter((s) => {
+      if (s.status === 'CONNECTED' || s.status === 'AUTHENTICATED') {
+        return false;
+      }
+      try {
+        this.sessionManager.assertSessionAccess(s.id, adminId);
+        return true;
+      } catch {
+        return false;
+      }
+    });
     for (const sess of inactive) {
+      this.sessionManager.assertSessionAccess(sess.id, adminId);
       await this.sessionManager.removeSession(sess.id, adminId);
     }
     return {

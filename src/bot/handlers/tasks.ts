@@ -6,8 +6,10 @@ import {
   formatTaskStatusArabic,
   formatOperationTypeArabic,
 } from '../keyboards/task-menu';
+import { renderBreadcrumb } from '../keyboards/ui-theme';
 import { BotViewResponse } from '../workflows/pairing-workflow';
 import { toSafeArabicError } from '../../utils/errors';
+import { escapeMarkdown } from '../../utils/markdown';
 
 export class TasksHandler {
   constructor(
@@ -29,18 +31,24 @@ export class TasksHandler {
     if (tasks.length === 0) {
       return {
         text:
+          `${renderBreadcrumb(['🏠 الرئيسية', '📊 مراقبة المهام'])}\n` +
           `📊 *مراقبة المهام (Task Monitor)*\n\n` +
           `لا توجد مهام مسجلة بعد. عند إرسال رسائل أو الانضمام لمجموعات، ستظهر حالة كل مهمة هنا.`,
         keyboard: rows,
+        toastText: '📊 لا توجد مهام مسجلة بعد',
+        route: `menu:tasks:page:${currentPage}`,
       };
     }
 
     return {
       text:
+        `${renderBreadcrumb(['🏠 الرئيسية', '📊 مراقبة المهام'])}\n` +
         `📊 *مراقبة المهام المتزامنة* (صفحة ${currentPage} من ${totalPages})\n` +
         `إجمالي المهام الأخيرة: *${tasks.length}*\n\n` +
         `اختر مهمة لعرض النتائج التفصيلية لكل جلسة:`,
       keyboard: rows,
+      toastText: `📊 مراقبة المهام (صفحة ${currentPage}/${totalPages})`,
+      route: `menu:tasks:page:${currentPage}`,
     };
   }
 
@@ -54,6 +62,7 @@ export class TasksHandler {
       return {
         text: '⚠️ لم يتم العثور على المهمة المطلوبة أو غير مصرح لك بالوصول إليها.',
         keyboard: [[{ text: '🔙 رجوع لقائمة المهام', callbackData: 'menu:tasks:page:1' }]],
+        toastText: '⚠️ المهمة غير موجودة أو غير مصرح بها',
       };
     }
 
@@ -68,22 +77,26 @@ export class TasksHandler {
           : r.status === 'PENDING'
           ? '⏳'
           : '❌';
-      return `${icon} \`${r.session_id}\`: ${
+      const detailText = escapeMarkdown(
         r.result_summary || r.error_message || r.status
-      }`;
+      );
+      return `${icon} \`${r.session_id}\`: ${detailText}`;
     });
 
     return {
       text:
+        `${renderBreadcrumb(['🏠 الرئيسية', '📊 المهام', task.id])}\n` +
         `📊 *تفاصيل المهمة:* \`${task.id}\`\n\n` +
         `⚡ نوع العملية: ${formatOperationTypeArabic(task.operation_type)}\n` +
         `🎯 الهدف: \`${task.target_summary}\`\n` +
         `📌 الحالة: ${formatTaskStatusArabic(task.status)}\n` +
         `🕒 وقت الإنشاء: \`${task.created_at}\`\n` +
         `${task.completed_at ? `🏁 وقت الانتهاء: \`${task.completed_at}\`\n` : ''}` +
-        `${task.error_summary ? `⚠️ الملخص: ${task.error_summary}\n` : ''}\n` +
+        `${task.error_summary ? `⚠️ الملخص: ${escapeMarkdown(task.error_summary)}\n` : ''}\n` +
         `*النتائج التفصيلية لكل جلسة:*\n${resultLines.join('\n')}`,
       keyboard: buildTaskDetailKeyboard(task),
+      toastText: `📊 المهمة ${task.id}`,
+      route: `task:view:${task.id}`,
     };
   }
 

@@ -193,15 +193,40 @@ export class StoriesHandler {
     return {
       text: lines.join('\n'),
       keyboard: rows,
+      toastText: `📸 حالات واتساب (صفحة ${safePage}/${totalPages})`,
+      route: `menu:stories:page:${safePage}`,
     };
+  }
+
+  private canAccessRecord(
+    adminId: number,
+    rec: { session_id: string; owner_telegram_id: number } | undefined
+  ): boolean {
+    if (!rec) return false;
+    const isOwner = this.sessionManager.isOwner(adminId);
+    if (isOwner) return true;
+    if (rec.owner_telegram_id > 0 && rec.owner_telegram_id !== adminId) {
+      return false;
+    }
+    try {
+      this.sessionManager.assertSessionAccess(rec.session_id, adminId);
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   public downloadStatus(adminId: number, recordId: string): BotViewResponse {
     const isOwner = this.sessionManager.isOwner(adminId);
     const rec = this.statusRepo.findById(recordId, adminId, isOwner);
-    if (!rec || !rec.file_path || !fs.existsSync(rec.file_path)) {
+    if (
+      !rec ||
+      !this.canAccessRecord(adminId, rec) ||
+      !rec.file_path ||
+      !fs.existsSync(rec.file_path)
+    ) {
       return {
-        text: '⚠️ ملف هذه الحالة غير موجود على القرص.',
+        text: '⚠️ ملف هذه الحالة غير موجود على القرص أو غير مصرح لك بالوصول إليه.',
         keyboard: [
           [
             {
@@ -210,6 +235,7 @@ export class StoriesHandler {
             },
           ],
         ],
+        toastText: '⚠️ الحالة غير موجودة أو غير مصرح بها',
       };
     }
 
@@ -237,7 +263,12 @@ export class StoriesHandler {
     );
 
     const attachments = list
-      .filter((r) => r.file_path && fs.existsSync(r.file_path))
+      .filter(
+        (r) =>
+          this.canAccessRecord(adminId, r) &&
+          r.file_path &&
+          fs.existsSync(r.file_path)
+      )
       .map((r) => this.statusDownloader.toTelegramAttachment(r));
 
     const view = this.renderStoriesMenu(adminId, 1);

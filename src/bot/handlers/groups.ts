@@ -7,7 +7,9 @@ import {
   InlineButtonSpec,
   buildAppNavigationRow,
 } from '../keyboards/main-menu';
+import { renderBreadcrumb } from '../keyboards/ui-theme';
 import { toSafeArabicError } from '../../utils/errors';
+import { escapeMarkdown } from '../../utils/markdown';
 
 export class GroupsHandler {
   constructor(
@@ -41,6 +43,7 @@ export class GroupsHandler {
 
     return {
       text:
+        `${renderBreadcrumb(['🏠 الرئيسية', '👥 إدارة المجموعات'])}\n` +
         `👥 *إدارة المجموعات (Group Management)*\n\n` +
         (connected.length > 0
           ? `اختر الجلسة المتصلة لعرض المجموعات المتاحة وإدارتها:`
@@ -109,13 +112,14 @@ export class GroupsHandler {
       const summaryLines = slice
         .map(
           (g) =>
-            `• *${g.subject}* — ${g.isBotAdmin ? '🛡️ مشرف' : '👤 عضو'} (${g.size} مشارك)`
+            `• *${escapeMarkdown(g.subject)}* — ${g.isBotAdmin ? '🛡️ مشرف' : '👤 عضو'} (${g.size} مشارك)`
         )
         .join('\n');
 
       return {
         text:
-          `👥 *المجموعات المتاحة للجلسة (${sessionId})*\n` +
+          `${renderBreadcrumb(['🏠 الرئيسية', '👥 المجموعات', escapeMarkdown(sessionId)])}\n` +
+          `👥 *المجموعات المتاحة للجلسة (${escapeMarkdown(sessionId)})*\n` +
           `عدد المجموعات: *${groups.length}* (صفحة ${currentPage}/${totalPages})\n\n` +
           `${summaryLines}\n\n` +
           `اختر مجموعة لعرض تفاصيلها، المشاركين، أو تنفيذ إجراءات الإدارة:`,

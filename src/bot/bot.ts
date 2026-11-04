@@ -121,6 +121,15 @@ export class TelegramBotController {
   public readonly statusDownloader: StatusDownloaderService;
   public readonly inboxHandler: InboxHandler;
   public readonly storiesHandler: StoriesHandler;
+  public onCallRecordingReady?: (
+    ownerTelegramId: number,
+    attachment: {
+      kind: 'video';
+      filePath: string;
+      fileName: string;
+      caption?: string;
+    }
+  ) => void;
 
   private activeConversationMode = new Map<number, ConversationMode>();
 
@@ -158,6 +167,48 @@ export class TelegramBotController {
       deps.auditRepo,
       deps.config.TEMP_UPLOAD_DIR,
       deps.config.MAX_UPLOAD_SIZE_MB
+    );
+
+    this.videoCallBridge.on(
+      'call:recording-ready',
+      (payload: {
+        callId: string;
+        actorTelegramId?: number;
+        stream?: NonNullable<
+          ReturnType<UbuntuVideoCallBridge['getCallStatus']>
+        >;
+      }) => {
+        // Defer by one turn so synchronous `stopActiveCall` can attach the recording to its view response first
+        setImmediate(() => {
+          const stream = payload?.stream;
+          if (!stream || stream.recordingDeliveredToTelegram) {
+            return;
+          }
+          const attachment =
+            this.videoCallWorkflow.buildRecordingAttachment(stream);
+          if (!attachment) {
+            return;
+          }
+          stream.recordingDeliveredToTelegram = true;
+          const targetAdminId =
+            stream.actorTelegramId && stream.actorTelegramId > 0
+              ? stream.actorTelegramId
+              : deps.config.TELEGRAM_ADMIN_ID;
+          if (targetAdminId > 0) {
+            this.uiState
+              .getOrCreateSession(targetAdminId)
+              .sentAttachments.push(attachment);
+          }
+          if (this.onCallRecordingReady && stream.recordedVideoPath) {
+            this.onCallRecordingReady(targetAdminId, {
+              kind: 'video',
+              filePath: stream.recordedVideoPath,
+              fileName: attachment.fileName,
+              caption: attachment.caption,
+            });
+          }
+        });
+      }
     );
 
     const appDb = (deps.auditRepo as unknown as { db: ConstructorParameters<typeof InboxRepository>[0] }).db;
@@ -521,6 +572,19 @@ export class TelegramBotController {
       this.activeConversationMode.set(actorUserId, 'MESSAGE');
       return this.messagingHandler.startSendText(actorUserId);
     }
+    if (callbackData.startsWith('wf_msg:recent:')) {
+      const target = callbackData.slice('wf_msg:recent:'.length);
+      this.activeConversationMode.set(actorUserId, 'MESSAGE');
+      return this.messageWorkflow.handleTextInput(actorUserId, target);
+    }
+    if (callbackData === 'wf_msg:edit_text') {
+      this.activeConversationMode.set(actorUserId, 'MESSAGE');
+      return this.messageWorkflow.promptEditText(actorUserId);
+    }
+    if (callbackData === 'wf_msg:edit_recipient') {
+      this.activeConversationMode.set(actorUserId, 'MESSAGE');
+      return this.messageWorkflow.promptEditRecipient(actorUserId);
+    }
     if (callbackData.startsWith('wf_msg:toggle_sess:')) {
       const sessId = callbackData.slice('wf_msg:toggle_sess:'.length);
       return this.messageWorkflow.toggleSession(actorUserId, sessId);
@@ -547,6 +611,23 @@ export class TelegramBotController {
       this.cancelAllWorkflowsForAdmin(actorUserId);
       this.activeConversationMode.set(actorUserId, 'MEDIA');
       return this.mediaHandler.startSendMedia(actorUserId);
+    }
+    if (callbackData.startsWith('wf_media:recent:')) {
+      const target = callbackData.slice('wf_media:recent:'.length);
+      this.activeConversationMode.set(actorUserId, 'MEDIA');
+      return this.mediaWorkflow.handleRecipientInput(actorUserId, target);
+    }
+    if (callbackData === 'wf_media:edit_recipient') {
+      this.activeConversationMode.set(actorUserId, 'MEDIA');
+      return this.mediaWorkflow.promptEditRecipient(actorUserId);
+    }
+    if (callbackData === 'wf_media:edit_file') {
+      this.activeConversationMode.set(actorUserId, 'MEDIA');
+      return this.mediaWorkflow.promptEditFile(actorUserId);
+    }
+    if (callbackData === 'wf_media:back_sessions') {
+      this.activeConversationMode.set(actorUserId, 'MEDIA');
+      return this.mediaWorkflow.renderSessionSelection(actorUserId);
     }
     if (callbackData === 'wf_media:sample:pdf') {
       return this.mediaHandler.attachSampleFile(actorUserId, 'pdf');
@@ -578,6 +659,25 @@ export class TelegramBotController {
       this.activeConversationMode.set(actorUserId, 'VIDEO_CALL');
       return this.videoCallWorkflow.start(actorUserId);
     }
+    if (callbackData.startsWith('wf_vcall:start_sess:')) {
+      const sessId = callbackData.slice('wf_vcall:start_sess:'.length);
+      this.cancelAllWorkflowsForAdmin(actorUserId);
+      this.activeConversationMode.set(actorUserId, 'VIDEO_CALL');
+      return this.videoCallWorkflow.start(actorUserId, sessId);
+    }
+    if (callbackData.startsWith('wf_vcall:recent:')) {
+      const target = callbackData.slice('wf_vcall:recent:'.length);
+      const res = await this.videoCallWorkflow.handleRecipientInput(
+        actorUserId,
+        target
+      );
+      const nextStep = this.videoCallWorkflow.getState(actorUserId)?.step;
+      this.activeConversationMode.set(
+        actorUserId,
+        nextStep === 'STREAMING_ACTIVE' ? 'NONE' : 'VIDEO_CALL'
+      );
+      return res;
+    }
     if (callbackData === 'wf_vcall:instant_ring_video') {
       this.activeConversationMode.set(actorUserId, 'NONE');
       return this.videoCallWorkflow.startInstantCallRing(actorUserId, 'video');
@@ -606,6 +706,24 @@ export class TelegramBotController {
     if (callbackData === 'wf_vcall:toggle_loop') {
       this.activeConversationMode.set(actorUserId, 'VIDEO_CALL');
       return this.videoCallWorkflow.toggleLoop(actorUserId);
+    }
+    if (callbackData === 'wf_vcall:toggle_record') {
+      this.activeConversationMode.set(actorUserId, 'VIDEO_CALL');
+      return this.videoCallWorkflow.toggleRecordCall(actorUserId);
+    }
+    if (
+      callbackData === 'wf_vcall:download_recording' ||
+      callbackData.startsWith('wf_vcall:download_recording:')
+    ) {
+      const explicitCallId = callbackData.startsWith(
+        'wf_vcall:download_recording:'
+      )
+        ? callbackData.slice('wf_vcall:download_recording:'.length)
+        : undefined;
+      return this.videoCallWorkflow.downloadLastRecording(
+        actorUserId,
+        explicitCallId
+      );
     }
     if (callbackData === 'wf_vcall:cycle_duration') {
       this.activeConversationMode.set(actorUserId, 'VIDEO_CALL');
@@ -1041,11 +1159,6 @@ export class TelegramBotController {
   }
 
   /**
-   * Processes incoming text messages or commands after verifying the numeric Telegram admin ID.
-   * Reuses and edits the active menu message whenever practical, and only routes non-command text
-   * to a workflow when a workflow state is explicitly active.
-   */
-  /**
    * Dedicated first-class handler for Telegram /start and /menu commands.
    * Cancels any pending workflows, resets navigation history, and ALWAYS delivers
    * a fresh, prominent main-menu message at the current scroll position of the chat
@@ -1209,7 +1322,8 @@ export class TelegramBotController {
     const view = await this.routeTextMessageInternal(
       actorUserId,
       text,
-      repliedText
+      repliedText,
+      options?.chatId
     );
     const sess = this.uiState.getOrCreateSession(actorUserId);
     const preferEdit = sess.activeMessageId !== undefined;
@@ -1226,7 +1340,8 @@ export class TelegramBotController {
   private async routeTextMessageInternal(
     actorUserId: number,
     text: string,
-    repliedText?: string
+    repliedText?: string,
+    chatId?: number
   ): Promise<BotViewResponse> {
     const trimmed = text.trim();
     const parts = trimmed.split(/\s+/);
@@ -1686,6 +1801,20 @@ export class TelegramBotController {
       }
 
       if (command === '/claim') {
+        const claimGroups = this.deps.settingsRepo.listClaimGroups();
+        const isInRegisteredClaimGroup =
+          chatId !== undefined &&
+          chatId !== null &&
+          chatId !== actorUserId &&
+          claimGroups.some((g) => g.groupId === String(chatId));
+
+        if (!isOwner && !isInRegisteredClaimGroup) {
+          return {
+            text: '🚫 أمر `/claim` متاح فقط داخل مجموعات التفعيل المعتمدة.',
+            keyboard: [buildBackCancelRow('menu:main')],
+          };
+        }
+
         const entry = this.deps.settingsRepo.addPremiumSubscription(
           String(actorUserId),
           30,
@@ -1708,6 +1837,8 @@ export class TelegramBotController {
     }
 
     const mode = this.getConversationMode(actorUserId);
+    const buttonStepGuidanceBanner =
+      'ℹ️ *يرجى استخدام الأزرار التفاعلية أدناه للمتابعة أو الضغط على ❌ إلغاء.*';
 
     if (mode === 'PAIRING') {
       const res = await this.pairingWorkflow.handlePhoneInput(actorUserId, trimmed);
@@ -1718,6 +1849,21 @@ export class TelegramBotController {
     }
 
     if (mode === 'MESSAGE') {
+      const state = this.messageWorkflow.getState(actorUserId);
+      if (state?.step === 'SELECTING_SESSIONS') {
+        const currentView = this.messageWorkflow.renderSessionSelection(actorUserId);
+        return {
+          ...currentView,
+          text: `${buttonStepGuidanceBanner}\n\n${currentView.text}`,
+        };
+      }
+      if (state?.step === 'AWAITING_CONFIRMATION') {
+        const currentView = this.messageWorkflow.proceedToConfirmation(actorUserId);
+        return {
+          ...currentView,
+          text: `${buttonStepGuidanceBanner}\n\n${currentView.text}`,
+        };
+      }
       return this.messageWorkflow.handleTextInput(actorUserId, trimmed);
     }
 
@@ -1725,6 +1871,20 @@ export class TelegramBotController {
       const state = this.mediaWorkflow.getState(actorUserId);
       if (state?.step === 'AWAITING_RECIPIENT') {
         return this.mediaWorkflow.handleRecipientInput(actorUserId, trimmed);
+      }
+      if (state?.step === 'SELECTING_SESSIONS') {
+        const currentView = this.mediaWorkflow.renderSessionSelection(actorUserId);
+        return {
+          ...currentView,
+          text: `${buttonStepGuidanceBanner}\n\n${currentView.text}`,
+        };
+      }
+      if (state?.step === 'AWAITING_CONFIRMATION') {
+        const currentView = this.mediaWorkflow.proceedToConfirmation(actorUserId);
+        return {
+          ...currentView,
+          text: `${buttonStepGuidanceBanner}\n\n${currentView.text}`,
+        };
       }
     }
 
@@ -1763,14 +1923,57 @@ export class TelegramBotController {
 
     if (mode === 'GROUP') {
       const state = this.groupWorkflow.getState(actorUserId);
-      if (state?.mode === 'JOIN_GROUP' && state.step === 'AWAITING_LINK') {
-        return this.groupWorkflow.handleJoinLinkInput(actorUserId, trimmed);
+      if (state?.mode === 'JOIN_GROUP') {
+        if (state.step === 'AWAITING_LINK') {
+          return this.groupWorkflow.handleJoinLinkInput(actorUserId, trimmed);
+        }
+        if (state.step === 'SELECTING_SESSIONS') {
+          const currentView =
+            this.groupWorkflow.renderJoinSessionSelection(actorUserId);
+          return {
+            ...currentView,
+            text: `${buttonStepGuidanceBanner}\n\n${currentView.text}`,
+          };
+        }
+        if (state.step === 'AWAITING_CONFIRMATION') {
+          const currentView =
+            this.groupWorkflow.proceedJoinConfirmation(actorUserId);
+          return {
+            ...currentView,
+            text: `${buttonStepGuidanceBanner}\n\n${currentView.text}`,
+          };
+        }
       }
-      if (
-        state?.mode === 'MANAGE_GROUP' &&
-        state.step === 'AWAITING_PARTICIPANT_PHONE'
-      ) {
-        return this.groupWorkflow.handleParticipantPhoneInput(actorUserId, trimmed);
+      if (state?.mode === 'MANAGE_GROUP') {
+        if (state.step === 'AWAITING_PARTICIPANT_PHONE') {
+          return this.groupWorkflow.handleParticipantPhoneInput(
+            actorUserId,
+            trimmed
+          );
+        }
+        if (state.step === 'AWAITING_ACTION_CONFIRMATION') {
+          const shortId = this.groupWorkflow.registerGroupRef(
+            state.sessionId,
+            state.groupJid
+          );
+          return {
+            text:
+              `${buttonStepGuidanceBanner}\n\n` +
+              `⚠️ *تأكيد إجراء إداري على المجموعة*\n\n` +
+              `📌 المجموعة: *${state.groupSubject}*\n` +
+              `🆔 الجلسة: \`${state.sessionId}\`\n` +
+              `⚡ الإجراء: \`${state.action}\``,
+            keyboard: [
+              [
+                {
+                  text: '✅ تأكيد التنفيذ',
+                  callbackData: 'wf_grp:confirm_action',
+                },
+                { text: '❌ إلغاء', callbackData: `gv:${shortId}` },
+              ],
+            ],
+          };
+        }
       }
     }
 
@@ -1908,6 +2111,19 @@ export function createGrammyBot(
     ).catch((err) => {
       log.warn('Failed auto-forwarding captured status to Telegram', {
         recordId: record.id,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    });
+  };
+
+  controller.onCallRecordingReady = (ownerTelegramId, attachment) => {
+    void forwardCapturedAttachmentToTelegram(
+      ownerTelegramId,
+      attachment,
+      () => undefined
+    ).catch((err) => {
+      log.warn('Failed auto-forwarding recorded VoIP video call to Telegram', {
+        fileName: attachment.fileName,
         error: err instanceof Error ? err.message : String(err),
       });
     });

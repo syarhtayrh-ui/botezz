@@ -7,8 +7,8 @@ import { createLogger } from '../../logging/logger';
 const log = createLogger('auth-middleware');
 
 const OWNER_ONLY_PATTERNS = [
-  /^(?:text|message):\/(?:addpremium|addprem|delpremium|delprem|addgcpremium|delgcpremium|listprem|addgb|delgb|listgb|setcooldown|admin|settings|controls|cekall)\b/i,
-  /^callback:(?:menu:admin|menu:settings|menu:subscriptions|menu:audit:|tools:cekall|sub:|settings:|sess:confirm_purge_inactive|sess:purge_inactive)/i,
+  /^(?:text|message):\/(?:addpremium|addprem|delpremium|delprem|addgcpremium|delgcpremium|listprem|addgb|delgb|listgb|setcooldown|admin|settings|controls|cekall|resetsession|delpair|settfmax|settfdelay|settfscope)\b/i,
+  /^callback:(?:menu:admin|menu:settings|menu:subscriptions|menu:audit:|tools:cekall|tools:tf_|sub:|settings:)/i,
 ];
 
 export function isOwnerOnlyAction(actionDescription: string): boolean {
@@ -67,15 +67,17 @@ export function verifyTelegramAdmin(params: {
     !requireOwnerOnly &&
     !isOwnerOnlyAction(actionDescription)
   ) {
-    // Allow /claim inside registered claim groups
+    // Allow /claim ONLY inside a registered claim group (never in private chat)
     if (
       /^text:\/claim\b/i.test(actionDescription) ||
       /^message:\/claim\b/i.test(actionDescription)
     ) {
       const claimGroups = settingsRepo.listClaimGroups();
       if (
-        (chatId && claimGroups.some((g) => g.groupId === String(chatId))) ||
-        claimGroups.length > 0
+        chatId !== undefined &&
+        chatId !== null &&
+        chatId !== candidateUserId &&
+        claimGroups.some((g) => g.groupId === String(chatId))
       ) {
         return;
       }

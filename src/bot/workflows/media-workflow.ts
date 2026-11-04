@@ -10,9 +10,16 @@ import {
 } from '../../security/validation';
 import { buildMultiSessionSelectorKeyboard } from '../keyboards/session-menu';
 import { buildBackCancelRow } from '../keyboards/main-menu';
+import {
+  renderBreadcrumb,
+  renderStepProgressBar,
+  recordRecentRecipient,
+  buildRecentRecipientsRows,
+} from '../keyboards/ui-theme';
 import { formatTaskStatusArabic } from '../keyboards/task-menu';
 import { BotViewResponse } from './pairing-workflow';
 import { toSafeArabicError } from '../../utils/errors';
+import { escapeMarkdown } from '../../utils/markdown';
 
 export type MediaWorkflowStep =
   | 'AWAITING_RECIPIENT'
@@ -64,11 +71,65 @@ export class MediaWorkflow {
       selectedSessionIds: [],
     });
 
+    const recentRows = buildRecentRecipientsRows(adminId, 'wf_media:recent:');
+
     return {
       text:
+        `${renderBreadcrumb(['🏠 الرئيسية', '📎 إرسال وسائط أو ملف'])}\n` +
+        `${renderStepProgressBar(1, 4, 'تحديد المستلم')}\n\n` +
         `📎 *إرسال وسائط أو ملف (صورة / مستند / فيديو / صوت)*\n\n` +
         `الخطوة 1 من 4: الرجاء إرسال رقم هاتف المستلم مع رمز الدولة (مثال: \`+966559876543\`) أو معرف المجموعة:`,
-      keyboard: [buildBackCancelRow('menu:main')],
+      keyboard: [...recentRows, buildBackCancelRow('menu:main')],
+      toastText: '📎 أرسل رقم المستلم أو اختر من القائمة',
+    };
+  }
+
+  public promptEditRecipient(adminId: number): BotViewResponse {
+    const state = this.states.get(adminId);
+    if (!state) {
+      return this.start(adminId);
+    }
+    state.step = 'AWAITING_RECIPIENT';
+    const recentRows = buildRecentRecipientsRows(adminId, 'wf_media:recent:');
+    return {
+      text:
+        `${renderBreadcrumb(['🏠 الرئيسية', '📎 إرسال ملف', '👤 تعديل المستلم'])}\n` +
+        `${renderStepProgressBar(1, 4, 'تعديل رقم المستلم')}\n\n` +
+        `👤 *تعديل رقم المستلم*\n` +
+        `المستلم الحالي: \`${state.recipientDisplay || 'غير محدد'}\`\n\n` +
+        `أرسل الآن رقم الهاتف الدولي الجديد أو اختر من القائمة أدناه:`,
+      keyboard: [...recentRows, buildBackCancelRow('menu:main')],
+      toastText: '👤 أرسل رقم المستلم الجديد',
+    };
+  }
+
+  public promptEditFile(adminId: number): BotViewResponse {
+    const state = this.states.get(adminId);
+    if (!state || !state.recipientJid) {
+      return this.start(adminId);
+    }
+    state.step = 'AWAITING_FILE';
+    return {
+      text:
+        `${renderBreadcrumb(['🏠 الرئيسية', '📎 إرسال ملف', '📎 تغيير الملف'])}\n` +
+        `${renderStepProgressBar(2, 4, 'رفع الملف الجديد')}\n\n` +
+        `📎 *تغيير الملف المرفق*\n` +
+        `المستلم: \`${state.recipientDisplay}\`\n\n` +
+        `الرجاء رفع الملف الجديد (أو اختيار ملف تجريبي من الأزرار أدناه):`,
+      keyboard: [
+        [
+          {
+            text: '📄 إرفاق مستند PDF تجريبي (تقرير.pdf)',
+            callbackData: 'wf_media:sample:pdf',
+          },
+          {
+            text: '🖼️ إرفاق صورة PNG تجريبية (شعار.png)',
+            callbackData: 'wf_media:sample:png',
+          },
+        ],
+        buildBackCancelRow('menu:main'),
+      ],
+      toastText: '📎 ارفع الملف الجديد الآن',
     };
   }
 
@@ -80,10 +141,18 @@ export class MediaWorkflow {
       const normalized = validateRecipient(rawRecipient);
       state.recipientJid = normalized.jid;
       state.recipientDisplay = normalized.displayTarget;
+      recordRecentRecipient(adminId, normalized.displayTarget);
+
+      if (state.mediaFile && state.selectedSessionIds.length > 0) {
+        return this.proceedToConfirmation(adminId);
+      }
+
       state.step = 'AWAITING_FILE';
 
       return {
         text:
+          `${renderBreadcrumb(['🏠 الرئيسية', '📎 إرسال وسائط أو ملف'])}\n` +
+          `${renderStepProgressBar(2, 4, 'رفع الملف المطلوب')}\n\n` +
           `✅ *تم تحديد المستلم:* \`${normalized.displayTarget}\`\n\n` +
           `الخطوة 2 من 4: الرجاء رفع الملف المطلوب (أو اختيار ملف تجريبي آمن من الأزرار أدناه للاختبار الفوري).\n` +
           `الحد الأقصى المسموح به: *${this.maxUploadSizeMb} ميجابايت*.`,
@@ -103,9 +172,10 @@ export class MediaWorkflow {
       };
     } catch (err) {
       const safeErr = toSafeArabicError(err);
+      const recentRows = buildRecentRecipientsRows(adminId, 'wf_media:recent:');
       return {
         text: `⚠️ ${safeErr.userMessage}`,
-        keyboard: [buildBackCancelRow('menu:main')],
+        keyboard: [...recentRows, buildBackCancelRow('menu:main')],
       };
     }
   }
@@ -136,12 +206,21 @@ export class MediaWorkflow {
 
       fs.writeFileSync(validated.safeFilePath, params.contentBuffer, { mode: 0o600 });
 
+      if (
+        state.mediaFile?.safeFilePath &&
+        state.mediaFile.safeFilePath !== validated.safeFilePath
+      ) {
+        this.sendMediaOp.cleanupTempFile(state.mediaFile.safeFilePath);
+      }
+
       state.mediaFile = validated;
       state.caption = params.caption;
       state.step = 'SELECTING_SESSIONS';
-      state.selectedSessionIds = this.sessionManager
-        .listConnectedSessions(adminId)
-        .map((s) => s.id);
+      if (state.selectedSessionIds.length === 0) {
+        state.selectedSessionIds = this.sessionManager
+          .listConnectedSessions(adminId)
+          .map((s) => s.id);
+      }
 
       return this.renderSessionSelection(adminId);
     } catch (err) {
@@ -192,11 +271,14 @@ export class MediaWorkflow {
     const state = this.states.get(adminId);
     if (!state || !state.mediaFile) return this.start(adminId);
 
+    state.step = 'SELECTING_SESSIONS';
     return {
       text:
+        `${renderBreadcrumb(['🏠 الرئيسية', '📎 إرسال ملف', '📡 الجلسات'])}\n` +
+        `${renderStepProgressBar(3, 4, 'اختيار الجلسات المرسِلة')}\n\n` +
         `📎 *اختيار الجلسات لإرسال الملف*\n` +
         `المستلم: \`${state.recipientDisplay}\`\n` +
-        `الملف: \`${state.mediaFile.safeOriginalName}\` (${state.mediaFile.kind})\n\n` +
+        `الملف: \`${escapeMarkdown(state.mediaFile.safeOriginalName)}\` (${state.mediaFile.kind})\n\n` +
         `الخطوة 3 من 4: حدد الجلسات المطلوبة:`,
       keyboard: buildMultiSessionSelectorKeyboard({
         sessions: this.sessionManager.listSessions(adminId),
@@ -225,14 +307,17 @@ export class MediaWorkflow {
 
     state.step = 'AWAITING_CONFIRMATION';
     const sizeKb = Math.max(1, Math.round(state.mediaFile.sizeBytes / 1024));
+    const safeCaption = state.caption ? escapeMarkdown(state.caption) : 'بدون';
 
     return {
       text:
+        `${renderBreadcrumb(['🏠 الرئيسية', '📎 إرسال ملف', '✅ التأكيد'])}\n` +
+        `${renderStepProgressBar(4, 4, 'مراجعة وتأكيد الإرسال')}\n\n` +
         `📋 *ملخص تأكيد إرسال ملف/وسائط*\n\n` +
         `👤 *المستلم:* \`${state.recipientDisplay}\`\n` +
-        `📎 *اسم الملف:* \`${state.mediaFile.safeOriginalName}\`\n` +
+        `📎 *اسم الملف:* \`${escapeMarkdown(state.mediaFile.safeOriginalName)}\`\n` +
         `🏷️ *النوع والحجم:* \`${state.mediaFile.mimeType}\` (${sizeKb} KB)\n` +
-        `📝 *التسمية التوضيحية:* ${state.caption || 'بدون'}\n` +
+        `📝 *التسمية التوضيحية:* ${safeCaption}\n` +
         `🔢 *عدد الجلسات:* ${state.selectedSessionIds.length}\n\n` +
         `_سيتم حذف النسخة المؤقتة من الخادم تلقائياً فور انتهاء المهمة._`,
       keyboard: [
@@ -240,6 +325,11 @@ export class MediaWorkflow {
           { text: '✅ تأكيد إرسال الملف', callbackData: 'wf_media:confirm_execute' },
           { text: '❌ إلغاء وحذف الملف المؤقت', callbackData: 'workflow:cancel' },
         ],
+        [
+          { text: '👤 تعديل المستلم', callbackData: 'wf_media:edit_recipient' },
+          { text: '📎 تغيير الملف', callbackData: 'wf_media:edit_file' },
+        ],
+        [{ text: '🔙 تعديل الجلسات المحددة', callbackData: 'wf_media:back_sessions' }],
       ],
     };
   }
@@ -277,7 +367,8 @@ export class MediaWorkflow {
 
       const perSessionLines = task.results.map((r) => {
         const icon = r.status === 'SUCCESS' ? '✅' : '❌';
-        return `${icon} \`${r.session_id}\`: ${r.result_summary || r.error_message}`;
+        const detail = escapeMarkdown(r.result_summary || r.error_message || r.status);
+        return `${icon} \`${r.session_id}\`: ${detail}`;
       });
 
       return {

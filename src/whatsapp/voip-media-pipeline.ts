@@ -226,7 +226,7 @@ export async function validateAndInspectVideoMedia(
 
   let resolvedPath: string;
   try {
-    resolvedPath = fs.realpathSync(lexicalPath);
+    resolvedPath = await fs.promises.realpath(lexicalPath);
   } catch (err) {
     throw new MediaValidationError(
       'تعذر التحقق من المسار الحقيقي لملف الفيديو.',
@@ -235,19 +235,23 @@ export async function validateAndInspectVideoMedia(
   }
 
   if (options?.allowedRootDirs && options.allowedRootDirs.length > 0) {
-    const insideAllowed = options.allowedRootDirs.some((rootDir) => {
+    let insideAllowed = false;
+    for (const rootDir of options.allowedRootDirs) {
       const lexicalRoot = path.resolve(rootDir);
       let canonicalRoot = lexicalRoot;
       if (fs.existsSync(lexicalRoot)) {
         try {
-          canonicalRoot = fs.realpathSync(lexicalRoot);
+          canonicalRoot = await fs.promises.realpath(lexicalRoot);
         } catch {
           canonicalRoot = lexicalRoot;
         }
       }
       const rel = path.relative(canonicalRoot, resolvedPath);
-      return !rel.startsWith('..') && !path.isAbsolute(rel);
-    });
+      if (!rel.startsWith('..') && !path.isAbsolute(rel)) {
+        insideAllowed = true;
+        break;
+      }
+    }
     if (!insideAllowed) {
       throw new MediaValidationError(
         'تم رفض مسار ملف الفيديو لأنه يقع خارج المجلدات المسموح بها أمنياً.',

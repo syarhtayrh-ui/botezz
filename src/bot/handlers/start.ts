@@ -2,6 +2,10 @@ import {
   buildMainMenuKeyboard,
   buildAppNavigationRow,
 } from '../keyboards/main-menu';
+import {
+  renderBreadcrumb,
+  renderSessionHealthPill,
+} from '../keyboards/ui-theme';
 import { BotViewResponse } from '../workflows/pairing-workflow';
 import { SessionManager } from '../../whatsapp/session-manager';
 import { TaskManager } from '../../tasks/task-manager';
@@ -42,13 +46,29 @@ export class StartHandler {
     const connectedCount = sessions.filter(
       (s) => s.status === 'CONNECTED' || s.status === 'AUTHENTICATED'
     ).length;
+    const pairingCount = sessions.filter(
+      (s) =>
+        s.status === 'PAIRING_PENDING' ||
+        s.status === 'WAITING_FOR_PAIRING' ||
+        s.status === 'INITIALIZING'
+    ).length;
+    const inactiveCount = Math.max(
+      0,
+      sessions.length - connectedCount - pairingCount
+    );
+    const stats = this.taskManager.getRunnerStats();
 
     return {
       text:
         (options?.noticeBanner ? `${options.noticeBanner}\n━━━━━━━━━━━━━━━━━━\n` : '') +
-        `👋 *مرحباً بك في لوحة التحكم المركزية لجلسات واتساب*\n\n` +
-        `📱 إجمالي الجلسات المسجلة: *${sessions.length}* (المتصل منها: *${connectedCount}*)\n` +
-        `⏱️ مدة التشغيل: \`${formatRuntime()}\` | الذاكرة: \`${formatMemory()}\`\n` +
+        `${renderBreadcrumb(['🏠 الرئيسية'])}\n` +
+        `👋 *مرحباً بك في لوحة التحكم المركزية لجلسات واتساب*\n` +
+        `━━━━━━━━━━━━━━━━━━\n` +
+        `📡 *حالة الجلسات:* ${renderSessionHealthPill(connectedCount, sessions.length)}\n` +
+        `   └ 🟢 المتصلة: *${connectedCount}* | 🟡 قيد الربط: *${pairingCount}* | 🔴 غير المتصلة: *${inactiveCount}*\n` +
+        `🔄 *المهام المتزامنة:* نشطة *${stats.active}/${stats.max}* | ⏳ الطابور: *${stats.queued}*\n` +
+        `⏱️ *مدة التشغيل:* \`${formatRuntime()}\` | 💾 *الذاكرة:* \`${formatMemory()}\`\n` +
+        `━━━━━━━━━━━━━━━━━━\n` +
         `⚡ اختر العملية المطلوبة من القائمة التفاعلية أدناه:`,
       keyboard: buildMainMenuKeyboard({ isAdmin }),
       toastText: '🏠 القائمة الرئيسية',
@@ -66,6 +86,7 @@ export class StartHandler {
 
     return {
       text:
+        `${renderBreadcrumb(['🏠 الرئيسية', '🛡️ لوحة المشرف'])}\n` +
         `🛡️ *لوحة تحكم المشرف العام (Admin Controls)*\n` +
         `━━━━━━━━━━━━━━━━━━\n` +
         `📱 *الجلسات:* ${connectedCount} متصلة / ${inactiveCount} غير متصلة\n` +

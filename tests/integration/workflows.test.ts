@@ -875,3 +875,240 @@ test('Issue 1 Verification: WhatsApp number pairing supports Arabic numerals, 00
   }
 });
 
+test('TG-BUG-01..12 & UX Verification: Security guards, IDOR prevention, Markdown escaping, state-machine safety, quick edit buttons, and recent recipients', async () => {
+  const env = createTestEnvironment();
+  const ownerId = env.config.TELEGRAM_ADMIN_ID;
+  const subA = 888000111;
+  const subB = 888000222;
+  const outsiderId = 999000333;
+
+  try {
+    // Register claim group and two premium subscribers
+    env.settingsRepo.addClaimGroup('-100555666777', 'Claim Group');
+    env.settingsRepo.addPremiumSubscription(String(subA), 30, 'USER');
+    env.settingsRepo.addPremiumSubscription(String(subB), 30, 'USER');
+
+    // [TG-BUG-01] Outsider CANNOT run /claim in private chat even when claimGroups exist
+    await assert.rejects(
+      () =>
+        env.controller.handleTextMessage(outsiderId, '/claim', undefined, {
+          chatId: outsiderId,
+        }),
+      /غير مصرح/
+    );
+
+    // [TG-BUG-01] Outsider CAN run /claim inside the registered claim group
+    const claimRes = await env.controller.handleTextMessage(
+      outsiderId,
+      '/claim',
+      undefined,
+      { chatId: -100555666777 }
+    );
+    assert.ok(claimRes.text.includes('تم تفعيل اشتراكك لمدة 30 يوماً'));
+
+    // [TG-BUG-02] Subscriber CANNOT run owner-only /resetsession or settfmax
+    await assert.rejects(
+      () => env.controller.handleTextMessage(subA, '/resetsession'),
+      /غير مصرح/
+    );
+    await assert.rejects(
+      () => env.controller.handleTextMessage(subA, '/settfmax 10'),
+      /غير مصرح/
+    );
+
+    // Create isolated sessions for subA and subB
+    const pairA = await env.sessionManager.initiatePairing({
+      rawPhoneNumber: '+966501111111',
+      actorTelegramId: subA,
+    });
+
+    const pairB = await env.sessionManager.initiatePairing({
+      rawPhoneNumber: '+966502222222',
+      actorTelegramId: subB,
+    });
+    await new Promise((r) => setTimeout(r, 35));
+
+    // [TG-BUG-02] purgeInactive only purges sessions owned by the caller
+    const sessAInactive = env.sessionManager.createSession('غير متصلة A', subA);
+    const sessBInactive = env.sessionManager.createSession('غير متصلة B', subB);
+
+    const purgePreviewA = await env.controller.handleCallbackQuery(
+      subA,
+      'sess:confirm_purge_inactive',
+      { skipDuplicateCheck: true }
+    );
+    assert.ok(purgePreviewA.text.includes('سيتم حذف *1* جلسة غير متصلة'));
+    await env.controller.handleCallbackQuery(subA, 'sess:purge_inactive', {
+      skipDuplicateCheck: true,
+    });
+    // subA's inactive session was purged, while subB's inactive session must still exist!
+    assert.equal(env.sessionManager.getSession(sessAInactive.id, subA), undefined);
+    assert.ok(env.sessionManager.getSession(sessBInactive.id, subB));
+
+    // [TG-BUG-03] IDOR protection in InboxHandler & StoriesHandler across tenants
+    await env.controller.inboxHandler.simulateBatch(subA);
+    const subAInboxItems = env.controller.inboxRepo.listForOwner(
+      subA,
+      false,
+      undefined,
+      5
+    );
+    assert.ok(subAInboxItems.length > 0);
+    const subAMsgId = subAInboxItems[0]!.id;
+
+    const idorInboxView = await env.controller.handleCallbackQuery(
+      subB,
+      `inbox:view:${subAMsgId}`,
+      { skipDuplicateCheck: true }
+    );
+    assert.ok(idorInboxView.text.includes('غير مصرح لك بالوصول'));
+
+    const idorInboxDl = await env.controller.handleCallbackQuery(
+      subB,
+      `inbox:dl:${subAMsgId}`,
+      { skipDuplicateCheck: true }
+    );
+    assert.ok(idorInboxDl.text.includes('غير مصرح لك بالوصول'));
+
+    await env.controller.storiesHandler.simulateBatch(subA);
+    const subAStories = env.controller.statusRepo.listForOwner(
+      subA,
+      false,
+      undefined,
+      5
+    );
+    assert.ok(subAStories.length > 0);
+    const subAStoryId = subAStories[0]!.id;
+
+    const idorStoryDl = await env.controller.handleCallbackQuery(
+      subB,
+      `stories:dl:${subAStoryId}`,
+      { skipDuplicateCheck: true }
+    );
+    assert.ok(idorStoryDl.text.includes('غير مصرح لك بالوصول'));
+
+    // [TG-BUG-04] GroupWorkflow per-admin isolation (no cross-user lastActiveGroup leak)
+    await env.controller.groupWorkflow.renderGroupDetails(
+      pairA.session.id,
+      '120363041001@g.us',
+      subA
+    );
+    const resolvedForSubB = env.controller.groupWorkflow.resolveGroupRef(
+      'unknown_short_id',
+      subB
+    );
+    assert.equal(resolvedForSubB, undefined);
+
+    // [TG-BUG-06] GroupWorkflow.handleParticipantPhoneInput immediate validation
+    await env.controller.groupWorkflow.initiateGroupAction({
+      adminId: subA,
+      sessionId: pairA.session.id,
+      groupJid: '120363041001@g.us',
+      action: 'ADD_PARTICIPANT',
+    });
+    const badPhoneRes = env.controller.groupWorkflow.handleParticipantPhoneInput(
+      subA,
+      'not-a-phone'
+    );
+    assert.ok(badPhoneRes.text.includes('رقم العضو غير صالح'));
+    assert.equal(
+      env.controller.groupWorkflow.getState(subA)?.step,
+      'AWAITING_PARTICIPANT_PHONE'
+    );
+
+    const goodPhoneRes = env.controller.groupWorkflow.handleParticipantPhoneInput(
+      subA,
+      '+966509998877'
+    );
+    assert.ok(goodPhoneRes.text.includes('تأكيد إجراء إداري على المجموعة'));
+    assert.equal(
+      env.controller.groupWorkflow.getState(subA)?.step,
+      'AWAITING_ACTION_CONFIRMATION'
+    );
+
+    // [TG-BUG-05, TG-BUG-06, TG-BUG-12] MessageWorkflow Markdown escaping, button-step guidance, quick edit buttons & recent recipients
+    await env.controller.handleCallbackQuery(ownerId, 'menu:send_text', {
+      skipDuplicateCheck: true,
+    });
+    // Create an owner session first
+    await env.sessionManager.initiatePairing({
+      rawPhoneNumber: '+966507777777',
+      actorTelegramId: ownerId,
+    });
+    await new Promise((r) => setTimeout(r, 35));
+
+    await env.controller.handleCallbackQuery(ownerId, 'menu:send_text', {
+      skipDuplicateCheck: true,
+    });
+    await env.controller.handleTextMessage(ownerId, '+966508889999');
+    await env.controller.handleTextMessage(
+      ownerId,
+      'Hello _world_ *bold* [link] `code`'
+    );
+    // Now in SELECTING_SESSIONS: sending arbitrary text should show button guidance banner without resetting workflow
+    const guidanceView = await env.controller.handleTextMessage(
+      ownerId,
+      'random text while selecting sessions'
+    );
+    assert.ok(
+      guidanceView.text.includes('يرجى استخدام الأزرار التفاعلية أدناه للمتابعة')
+    );
+
+    const confirmView = await env.controller.handleCallbackQuery(
+      ownerId,
+      'wf_msg:proceed_confirm',
+      { skipDuplicateCheck: true }
+    );
+    assert.ok(confirmView.text.includes('تأكيد إرسال الرسالة النصية'));
+    // Verify quick edit buttons exist on confirmation screen (TG-BUG-12)
+    const confirmCallbacks = confirmView.keyboard
+      .flat()
+      .map((b) => b.callbackData);
+    assert.ok(confirmCallbacks.includes('wf_msg:edit_text'));
+    assert.ok(confirmCallbacks.includes('wf_msg:edit_recipient'));
+
+    // Click wf_msg:edit_text and update message body directly to confirmation
+    const editPrompt = await env.controller.handleCallbackQuery(
+      ownerId,
+      'wf_msg:edit_text',
+      { skipDuplicateCheck: true }
+    );
+    assert.ok(editPrompt.text.includes('تعديل نص الرسالة'));
+    const updatedConfirm = await env.controller.handleTextMessage(
+      ownerId,
+      'الرسالة المعدلة بنجاح'
+    );
+    assert.ok(updatedConfirm.text.includes('الرسالة المعدلة بنجاح'));
+
+    // [TG-BUG-09] MediaWorkflow temp file cleanup on re-upload
+    await env.controller.handleCallbackQuery(ownerId, 'menu:send_media', {
+      skipDuplicateCheck: true,
+    });
+    await env.controller.handleTextMessage(ownerId, '+966508889999');
+    await env.controller.handleMediaUpload(ownerId, {
+      originalFilename: 'first_file.txt',
+      mimeType: 'text/plain',
+      sizeBytes: 12,
+      contentBuffer: Buffer.from('first upload'),
+    });
+    const firstFilePath =
+      env.controller.mediaWorkflow.getState(ownerId)?.mediaFile?.safeFilePath;
+    assert.ok(firstFilePath && fs.existsSync(firstFilePath));
+
+    await env.controller.handleCallbackQuery(ownerId, 'wf_media:edit_file', {
+      skipDuplicateCheck: true,
+    });
+    await env.controller.handleMediaUpload(ownerId, {
+      originalFilename: 'second_file.txt',
+      mimeType: 'text/plain',
+      sizeBytes: 13,
+      contentBuffer: Buffer.from('second upload'),
+    });
+    // First temp file must be cleaned up on re-upload!
+    assert.equal(fs.existsSync(firstFilePath!), false);
+  } finally {
+    await env.cleanup();
+  }
+});
+
+

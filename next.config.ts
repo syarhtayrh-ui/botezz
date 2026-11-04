@@ -1,8 +1,8 @@
 import type {NextConfig} from 'next';
 
-const nextConfig: NextConfig = {
+const createNextConfig = (phase: string): NextConfig => ({
   reactStrictMode: true,
-  distDir: process.env.NODE_ENV === 'development' ? '.next-dev' : '.next',
+  distDir: phase === 'phase-development-server' ? '.next-dev' : '.next',
   devIndicators: false,
   experimental: {
     devtoolSegmentExplorer: false,
@@ -40,6 +40,7 @@ const nextConfig: NextConfig = {
     }
     return config;
   },
-};
+});
 
-export default nextConfig;
+export default createNextConfig;
+

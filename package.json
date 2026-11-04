@@ -4,14 +4,15 @@
   "private": true,
   "scripts": {
     "dev": "rm -rf .next-dev && next dev",
-    "build": "next build",
-    "start": "next start",
+    "build": "NODE_ENV=production next build",
+    "start": "NODE_ENV=production next start",
     "bot:start": "tsx src/app.ts",
     "diagnose:wa": "tsx scripts/diagnose-whatsapp-connection.ts",
     "test:real-whatsapp-voip": "tsx scripts/test-real-whatsapp-voip.ts",
     "test": "tsx --test tests/unit/*.test.ts tests/integration/*.test.ts",
+    "typecheck": "tsc --noEmit",
     "lint": "eslint .",
-    "clean": "node -e \"const fs=require('node:fs');for(const d of['.next','.next-dev'])fs.rmSync(d,{recursive:true,force:true});\""
+    "clean": "node -e \"const fs=require('node:fs');for(const d of['.next','.next-dev','tsconfig.tsbuildinfo'])fs.rmSync(d,{recursive:true,force:true});\""
   },
   "engines": {
     "node": ">=22.13.0"

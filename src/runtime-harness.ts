@@ -95,11 +95,11 @@ async function createRuntimeHarness(): Promise<HarnessSingleton> {
   // Isolate demo simulation database and auth directories from live production storage (BZ-015)
   const effectiveDbPath =
     !isLiveConfigured && !isTestEnv && !process.env.DATABASE_PATH
-      ? './data/demo-harness.sqlite'
+      ? './data/harness_demo.db'
       : config.DATABASE_PATH;
   const effectiveAuthDir =
     !isLiveConfigured && !isTestEnv && !process.env.WHATSAPP_AUTH_DIR
-      ? './data/demo-whatsapp-sessions'
+      ? './data/harness_sessions'
       : config.WHATSAPP_AUTH_DIR;
 
   const effectiveConfig: AppConfig = {

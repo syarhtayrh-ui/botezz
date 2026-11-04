@@ -226,15 +226,35 @@ export class InboxHandler {
     return {
       text: lines.join('\n'),
       keyboard: rows,
+      toastText: `📥 الرسائل الواردة (صفحة ${safePage}/${totalPages})`,
+      route: `menu:inbox:page:${safePage}`,
     };
+  }
+
+  private canAccessRecord(
+    adminId: number,
+    rec: { session_id: string; owner_telegram_id: number } | undefined
+  ): boolean {
+    if (!rec) return false;
+    const isOwner = this.sessionManager.isOwner(adminId);
+    if (isOwner) return true;
+    if (rec.owner_telegram_id > 0 && rec.owner_telegram_id !== adminId) {
+      return false;
+    }
+    try {
+      this.sessionManager.assertSessionAccess(rec.session_id, adminId);
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   public viewMessage(adminId: number, recordId: string): BotViewResponse {
     const isOwner = this.sessionManager.isOwner(adminId);
     const rec = this.inboxRepo.findById(recordId, adminId, isOwner);
-    if (!rec) {
+    if (!rec || !this.canAccessRecord(adminId, rec)) {
       return {
-        text: '⚠️ لم يتم العثور على الرسالة المطلوبة.',
+        text: '⚠️ لم يتم العثور على الرسالة المطلوبة أو غير مصرح لك بالوصول إليها.',
         keyboard: [
           [
             {
@@ -243,6 +263,7 @@ export class InboxHandler {
             },
           ],
         ],
+        toastText: '⚠️ الرسالة غير موجودة أو غير مصرح بها',
       };
     }
 
@@ -294,15 +315,17 @@ export class InboxHandler {
           refreshCallback: `inbox:view:${rec.id}`,
         }),
       ],
+      toastText: `📩 رسالة من ${rec.sender_phone}`,
+      route: `inbox:view:${rec.id}`,
     };
   }
 
   public promptForward(adminId: number, recordId: string): BotViewResponse {
     const isOwner = this.sessionManager.isOwner(adminId);
     const rec = this.inboxRepo.findById(recordId, adminId, isOwner);
-    if (!rec) {
+    if (!rec || !this.canAccessRecord(adminId, rec)) {
       return {
-        text: '⚠️ لم يتم العثور على الرسالة المراد إعادة توجيهها.',
+        text: '⚠️ لم يتم العثور على الرسالة المراد إعادة توجيهها أو غير مصرح لك بالوصول إليها.',
         keyboard: [
           [
             {
@@ -311,6 +334,7 @@ export class InboxHandler {
             },
           ],
         ],
+        toastText: '⚠️ غير مصرح أو غير موجودة',
       };
     }
 
@@ -344,6 +368,7 @@ export class InboxHandler {
           refreshCallback: `inbox:fwd:${rec.id}`,
         }),
       ],
+      toastText: '↗️ أرسل رقم الهاتف لإعادة التوجيه',
     };
   }
 
@@ -368,10 +393,10 @@ export class InboxHandler {
 
     const isOwner = this.sessionManager.isOwner(adminId);
     const rec = this.inboxRepo.findById(recordId, adminId, isOwner);
-    if (!rec) {
+    if (!rec || !this.canAccessRecord(adminId, rec)) {
       this.forwardDrafts.delete(adminId);
       return {
-        text: '⚠️ لم يتم العثور على سجل الرسالة في قاعدة البيانات.',
+        text: '⚠️ لم يتم العثور على سجل الرسالة في قاعدة البيانات أو غير مصرح لك بالوصول إليها.',
         keyboard: [
           [
             {
@@ -511,6 +536,7 @@ export class InboxHandler {
               refreshCallback: `inbox:view:${rec.id}`,
             }),
           ],
+          toastText: '✅ تمت إعادة توجيه الرسالة بنجاح',
         };
       } else {
         return {
@@ -561,9 +587,14 @@ export class InboxHandler {
   ): BotViewResponse {
     const isOwner = this.sessionManager.isOwner(adminId);
     const rec = this.inboxRepo.findById(recordId, adminId, isOwner);
-    if (!rec || !rec.file_path || !fs.existsSync(rec.file_path)) {
+    if (
+      !rec ||
+      !this.canAccessRecord(adminId, rec) ||
+      !rec.file_path ||
+      !fs.existsSync(rec.file_path)
+    ) {
       return {
-        text: '⚠️ ملف هذه الرسالة غير موجود على القرص.',
+        text: '⚠️ ملف هذه الرسالة غير موجود على القرص أو غير مصرح لك بالوصول إليه.',
         keyboard: [
           [
             {
@@ -572,6 +603,7 @@ export class InboxHandler {
             },
           ],
         ],
+        toastText: '⚠️ الملف غير موجود أو غير مصرح به',
       };
     }
 

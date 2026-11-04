@@ -238,6 +238,47 @@ export function toSafeArabicError(err: unknown): {
     };
   }
 
+  // 5. Media / FFmpeg / FFprobe / File errors (P0-B)
+  if (
+    lower.includes('ffmpeg') ||
+    lower.includes('ffprobe') ||
+    lower.includes('enoent') ||
+    lower.includes('media file not found') ||
+    lower.includes('file not found')
+  ) {
+    const cleanReason = redactText(rawMessage).slice(0, 180);
+    return {
+      category: 'MEDIA_FAILURE',
+      userMessage: `تعذر تجهيز أو قراءة ملف الفيديو/الصوت للبث عبر المكالمة (${cleanReason}).`,
+      sanitizedTechnicalMessage: redactText(rawMessage),
+    };
+  }
+
+  // 6. VoIP / Call / Relay / SRTP / Capacity errors (P0-B)
+  if (
+    lower.includes('max concurrent calls') ||
+    lower.includes('maximum concurrent calls') ||
+    lower.includes('not connected') ||
+    lower.includes('peer lid') ||
+    lower.includes('resolvepeerlid') ||
+    lower.includes('voip') ||
+    lower.includes('srtp') ||
+    lower.includes('relay') ||
+    lower.includes('call')
+  ) {
+    const cleanReason = redactText(rawMessage).slice(0, 180);
+    const specificArabic =
+      lower.includes('max concurrent calls') ||
+      lower.includes('maximum concurrent calls')
+        ? `توجد مكالمة سابقة قيد الإغلاق أو بلغت الجلسة الحد الأقصى للمكالمات المتزامنة (${cleanReason}).`
+        : `فشل في طبقة مكالمات واتساب VoIP (${cleanReason}).`;
+    return {
+      category: 'VOIP_FAILURE',
+      userMessage: specificArabic,
+      sanitizedTechnicalMessage: redactText(rawMessage),
+    };
+  }
+
   if (err instanceof Error) {
     return {
       category: 'INTERNAL_ERROR',

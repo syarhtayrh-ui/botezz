@@ -92,7 +92,9 @@ export function isNavigableRoute(callbackData: string): boolean {
     callbackData.startsWith('sess:view:') ||
     callbackData.startsWith('sess:confirm_') ||
     callbackData.startsWith('grp:list:') ||
+    callbackData.startsWith('grp:list_page:') ||
     callbackData.startsWith('grp:view:') ||
+    callbackData.startsWith('gv:') ||
     callbackData.startsWith('task:view:') ||
     callbackData === 'settings:view_access' ||
     callbackData === 'tools:ceksender' ||
@@ -103,8 +105,15 @@ export function isNavigableRoute(callbackData: string): boolean {
     callbackData === 'tools:prompt_channel' ||
     callbackData === 'tools:prompt_ip' ||
     callbackData === 'tools:prompt_shortlink' ||
+    callbackData === 'tools:flab_catalog' ||
+    callbackData === 'tools:flab_scenarios' ||
+    callbackData === 'tools:flab_run_scenarios' ||
+    callbackData === 'tools:flab_capabilities' ||
     callbackData.startsWith('inbox:view:') ||
+    callbackData.startsWith('inbox:dl:') ||
     callbackData.startsWith('inbox:filter:') ||
+    callbackData.startsWith('stories:dl:') ||
+    callbackData.startsWith('stories:dlc:') ||
     callbackData.startsWith('stories:filter:')
   );
 }
@@ -261,6 +270,8 @@ export class BotUiStateManager {
   /**
    * Delivers a BotViewResponse over a Telegram transport (or simulated transport)
    * by editing the active menu message in-place whenever possible.
+   * When mediaAttachments are present on a real transport, sends attachments first
+   * and then anchors the interactive control panel at the bottom of the chat.
    */
   public async deliverView(params: {
     userId: number;
@@ -272,82 +283,14 @@ export class BotUiStateManager {
     const { userId, view, pendingWorkflow, preferEdit, transport } = params;
     const sess = this.getOrCreateSession(userId);
     const nextKeyboardJson = JSON.stringify(view.keyboard);
+    const hasAttachments =
+      Array.isArray(view.mediaAttachments) && view.mediaAttachments.length > 0;
+    const shouldReanchorBelowMedia =
+      hasAttachments && Boolean(transport?.sendMediaAttachment);
 
     let deliveryMode: UiDeliveryMode = 'NEW_MESSAGE';
 
-    if (preferEdit && sess.activeMessageId !== undefined) {
-      const sameText = sess.lastText === view.text;
-      const sameKeyboard = sess.lastKeyboardJson === nextKeyboardJson;
-
-      if (sameText && sameKeyboard) {
-        // Text and keyboard are both identical -> try editMessageText if transport provided
-        // so Telegram "message is not modified" is also handled gracefully, or mark NOT_MODIFIED
-        if (transport) {
-          try {
-            await transport.editMessageText(
-              sess.activeMessageId,
-              view.text,
-              view.keyboard
-            );
-          } catch (err) {
-            if (!isMessageNotModifiedError(err)) {
-              throw err;
-            }
-          }
-        }
-        sess.stats.notModifiedCount += 1;
-        deliveryMode = 'NOT_MODIFIED';
-      } else if (sameText && !sameKeyboard) {
-        // Only the inline keyboard changed -> use editMessageReplyMarkup!
-        try {
-          if (transport) {
-            await transport.editMessageReplyMarkup(
-              sess.activeMessageId,
-              view.keyboard
-            );
-          }
-          sess.lastKeyboardJson = nextKeyboardJson;
-          sess.stats.editedMarkupCount += 1;
-          deliveryMode = 'EDIT_MARKUP';
-        } catch (err) {
-          if (isMessageNotModifiedError(err)) {
-            sess.stats.notModifiedCount += 1;
-            deliveryMode = 'NOT_MODIFIED';
-          } else {
-            // Fallback to editMessageText or new message
-            deliveryMode = await this.fallbackEditOrSend(
-              sess,
-              view,
-              nextKeyboardJson,
-              transport
-            );
-          }
-        }
-      } else {
-        // Message text changed -> use editMessageText!
-        deliveryMode = await this.fallbackEditOrSend(
-          sess,
-          view,
-          nextKeyboardJson,
-          transport
-        );
-      }
-    } else {
-      // No active menu message exists yet -> send initial message and store its ID
-      if (transport) {
-        const sent = await transport.sendNewMessage(view.text, view.keyboard);
-        sess.activeMessageId = sent.messageId;
-      } else {
-        this.nextSimulatedMessageId += 1;
-        sess.activeMessageId = this.nextSimulatedMessageId;
-      }
-      sess.lastText = view.text;
-      sess.lastKeyboardJson = nextKeyboardJson;
-      sess.stats.sentCount += 1;
-      deliveryMode = 'NEW_MESSAGE';
-    }
-
-    if (Array.isArray(view.mediaAttachments) && view.mediaAttachments.length > 0) {
+    if (hasAttachments && view.mediaAttachments) {
       for (const att of view.mediaAttachments) {
         sess.sentAttachments.push(att);
         if (sess.sentAttachments.length > 100) {
@@ -366,6 +309,76 @@ export class BotUiStateManager {
           }
         }
       }
+    }
+
+    if (
+      preferEdit &&
+      sess.activeMessageId !== undefined &&
+      !shouldReanchorBelowMedia
+    ) {
+      const sameText = sess.lastText === view.text;
+      const sameKeyboard = sess.lastKeyboardJson === nextKeyboardJson;
+
+      if (sameText && sameKeyboard) {
+        if (transport) {
+          try {
+            await transport.editMessageText(
+              sess.activeMessageId,
+              view.text,
+              view.keyboard
+            );
+          } catch (err) {
+            if (!isMessageNotModifiedError(err)) {
+              throw err;
+            }
+          }
+        }
+        sess.stats.notModifiedCount += 1;
+        deliveryMode = 'NOT_MODIFIED';
+      } else if (sameText && !sameKeyboard) {
+        try {
+          if (transport) {
+            await transport.editMessageReplyMarkup(
+              sess.activeMessageId,
+              view.keyboard
+            );
+          }
+          sess.lastKeyboardJson = nextKeyboardJson;
+          sess.stats.editedMarkupCount += 1;
+          deliveryMode = 'EDIT_MARKUP';
+        } catch (err) {
+          if (isMessageNotModifiedError(err)) {
+            sess.stats.notModifiedCount += 1;
+            deliveryMode = 'NOT_MODIFIED';
+          } else {
+            deliveryMode = await this.fallbackEditOrSend(
+              sess,
+              view,
+              nextKeyboardJson,
+              transport
+            );
+          }
+        }
+      } else {
+        deliveryMode = await this.fallbackEditOrSend(
+          sess,
+          view,
+          nextKeyboardJson,
+          transport
+        );
+      }
+    } else {
+      if (transport) {
+        const sent = await transport.sendNewMessage(view.text, view.keyboard);
+        sess.activeMessageId = sent.messageId;
+      } else {
+        this.nextSimulatedMessageId += 1;
+        sess.activeMessageId = this.nextSimulatedMessageId;
+      }
+      sess.lastText = view.text;
+      sess.lastKeyboardJson = nextKeyboardJson;
+      sess.stats.sentCount += 1;
+      deliveryMode = 'NEW_MESSAGE';
     }
 
     const enriched: BotViewResponse = {

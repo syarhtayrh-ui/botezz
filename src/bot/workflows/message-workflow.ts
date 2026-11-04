@@ -4,9 +4,16 @@ import { SendMessageOperation } from '../../whatsapp/operations/send-message';
 import { validateRecipient, validateMessageText } from '../../security/validation';
 import { buildMultiSessionSelectorKeyboard } from '../keyboards/session-menu';
 import { buildBackCancelRow } from '../keyboards/main-menu';
+import {
+  renderBreadcrumb,
+  renderStepProgressBar,
+  recordRecentRecipient,
+  buildRecentRecipientsRows,
+} from '../keyboards/ui-theme';
 import { formatTaskStatusArabic } from '../keyboards/task-menu';
 import { BotViewResponse } from './pairing-workflow';
 import { toSafeArabicError } from '../../utils/errors';
+import { escapeMarkdown } from '../../utils/markdown';
 
 export type MessageWorkflowStep =
   | 'AWAITING_RECIPIENT'
@@ -74,12 +81,58 @@ export class MessageWorkflow {
       selectedSessionIds: [],
     });
 
+    const recentRows = buildRecentRecipientsRows(adminId, 'wf_msg:recent:');
+
     return {
       text:
+        `${renderBreadcrumb(['🏠 الرئيسية', '✉️ إرسال رسالة نصية'])}\n` +
+        `${renderStepProgressBar(1, 4, 'تحديد المستلم')}\n\n` +
         `✉️ *إرسال رسالة نصية عبر جلسة أو عدة جلسات*\n\n` +
         `الخطوة 1 من 4: الرجاء إرسال رقم هاتف المستلم مع رمز الدولة (مثال: \`+966559876543\`) أو معرف المجموعة (\`...g.us\`).\n` +
         `💡 _يمكنك أيضاً إدخال عدة أرقام أو مجموعات (حتى ${MAX_RECIPIENTS_PER_BATCH} مستلماً) مفصولة بفاصلة أو سطر جديد:_`,
+      keyboard: [...recentRows, buildBackCancelRow('menu:main')],
+      toastText: '✉️ أرسل رقم المستلم أو اختر من الأرقام الأخيرة',
+    };
+  }
+
+  public promptEditText(adminId: number): BotViewResponse {
+    const state = this.states.get(adminId);
+    if (!state || !state.recipientJid) {
+      return this.start(adminId);
+    }
+    state.step = 'AWAITING_TEXT';
+    const currentPreview = state.messageText
+      ? escapeMarkdown(state.messageText.slice(0, 120))
+      : '—';
+    return {
+      text:
+        `${renderBreadcrumb(['🏠 الرئيسية', '✉️ إرسال رسالة', '✏️ تعديل النص'])}\n` +
+        `${renderStepProgressBar(2, 4, 'تعديل نص الرسالة')}\n\n` +
+        `✏️ *تعديل نص الرسالة*\n` +
+        `👤 المستلم المحدد: \`${state.recipientDisplay}\`\n` +
+        `📝 النص الحالي: ${currentPreview}\n\n` +
+        `أرسل الآن نص الرسالة الجديد:`,
       keyboard: [buildBackCancelRow('menu:main')],
+      toastText: '✏️ أرسل نص الرسالة الجديد',
+    };
+  }
+
+  public promptEditRecipient(adminId: number): BotViewResponse {
+    const state = this.states.get(adminId);
+    if (!state) {
+      return this.start(adminId);
+    }
+    state.step = 'AWAITING_RECIPIENT';
+    const recentRows = buildRecentRecipientsRows(adminId, 'wf_msg:recent:');
+    return {
+      text:
+        `${renderBreadcrumb(['🏠 الرئيسية', '✉️ إرسال رسالة', '👤 تعديل المستلم'])}\n` +
+        `${renderStepProgressBar(1, 4, 'تعديل رقم المستلم')}\n\n` +
+        `👤 *تعديل رقم المستلم*\n` +
+        `المستلم الحالي: \`${state.recipientDisplay || 'غير محدد'}\`\n\n` +
+        `أرسل الآن رقم الهاتف الدولي الجديد أو اختر من القائمة أدناه:`,
+      keyboard: [...recentRows, buildBackCancelRow('menu:main')],
+      toastText: '👤 أرسل رقم المستلم الجديد',
     };
   }
 
@@ -113,6 +166,9 @@ export class MessageWorkflow {
 
         const jids = Array.from(uniqueMap.keys());
         const displays = Array.from(uniqueMap.values());
+        for (const disp of displays.slice(0, 4)) {
+          recordRecentRecipient(adminId, disp);
+        }
 
         state.recipientJids = jids;
         state.recipientJid = jids[0];
@@ -120,19 +176,27 @@ export class MessageWorkflow {
           displays.length === 1
             ? displays[0]
             : `${displays.slice(0, 3).join(', ')}${displays.length > 3 ? ` (+${displays.length - 3} آخرين)` : ''} [الإجمالي: ${displays.length}]`;
+
+        if (state.messageText && state.selectedSessionIds.length > 0) {
+          return this.proceedToConfirmation(adminId);
+        }
+
         state.step = 'AWAITING_TEXT';
 
         return {
           text:
+            `${renderBreadcrumb(['🏠 الرئيسية', '✉️ إرسال رسالة نصية'])}\n` +
+            `${renderStepProgressBar(2, 4, 'إدخال نص الرسالة')}\n\n` +
             `✅ *تم تحديد المستلم (${jids.length}):* \`${state.recipientDisplay}\`\n\n` +
             `الخطوة 2 من 4: الرجاء إرسال نص الرسالة المراد إرسالها:`,
           keyboard: [buildBackCancelRow('menu:main')],
         };
       } catch (err) {
         const safeErr = toSafeArabicError(err);
+        const recentRows = buildRecentRecipientsRows(adminId, 'wf_msg:recent:');
         return {
           text: `⚠️ ${safeErr.userMessage}\nالرجاء إرسال رقم هاتف دولي صحيح (أو قائمة أرقام مفصولة بفاصلة أو سطر جديد):`,
-          keyboard: [buildBackCancelRow('menu:main')],
+          keyboard: [...recentRows, buildBackCancelRow('menu:main')],
         };
       }
     }
@@ -141,8 +205,12 @@ export class MessageWorkflow {
       try {
         const validText = validateMessageText(text);
         state.messageText = validText;
-        state.step = 'SELECTING_SESSIONS';
 
+        if (state.selectedSessionIds.length > 0) {
+          return this.proceedToConfirmation(adminId);
+        }
+
+        state.step = 'SELECTING_SESSIONS';
         const connectedIds = this.sessionManager
           .listConnectedSessions(adminId)
           .map((s) => s.id);
@@ -200,6 +268,7 @@ export class MessageWorkflow {
     const state = this.states.get(adminId);
     if (!state) return this.start(adminId);
 
+    state.step = 'SELECTING_SESSIONS';
     const sessions = this.sessionManager.listSessions(adminId);
     if (sessions.length === 0) {
       return {
@@ -213,6 +282,8 @@ export class MessageWorkflow {
 
     return {
       text:
+        `${renderBreadcrumb(['🏠 الرئيسية', '✉️ إرسال رسالة نصية', '📡 الجلسات'])}\n` +
+        `${renderStepProgressBar(3, 4, 'اختيار الجلسات المرسِلة')}\n\n` +
         `✉️ *اختيار الجلسات للإرسال المتزامن*\n` +
         `المستلم: \`${state.recipientDisplay}\`\n\n` +
         `الخطوة 3 من 4: اختر جلسة واحدة أو عدة جلسات لتنفيذ العملية بالتوازي:`,
@@ -242,17 +313,20 @@ export class MessageWorkflow {
     }
 
     state.step = 'AWAITING_CONFIRMATION';
-    const preview =
+    const rawPreview =
       state.messageText.length > 180
         ? `${state.messageText.slice(0, 180)}...`
         : state.messageText;
+    const safePreview = escapeMarkdown(rawPreview);
     const recipientCount = state.recipientJids?.length ?? 1;
 
     return {
       text:
+        `${renderBreadcrumb(['🏠 الرئيسية', '✉️ إرسال رسالة نصية', '✅ التأكيد'])}\n` +
+        `${renderStepProgressBar(4, 4, 'مراجعة وتأكيد الإرسال')}\n\n` +
         `📋 *ملخص تأكيد إرسال الرسالة النصية*\n\n` +
         `👤 *المستلم (${recipientCount}):* \`${state.recipientDisplay}\`\n` +
-        `📝 *معاينة الرسالة:*\n${preview}\n\n` +
+        `📝 *معاينة الرسالة:*\n${safePreview}\n\n` +
         `🔢 *عدد الجلسات المحددة:* ${state.selectedSessionIds.length}\n` +
         `🆔 *معرفات الجلسات:* \`${state.selectedSessionIds.join(', ')}\`\n\n` +
         `هل تؤكد بدء التنفيذ المتزامن للمهمة؟`,
@@ -260,6 +334,10 @@ export class MessageWorkflow {
         [
           { text: '✅ تأكيد الإرسال الآن', callbackData: 'wf_msg:confirm_execute' },
           { text: '❌ إلغاء العملية', callbackData: 'workflow:cancel' },
+        ],
+        [
+          { text: '✏️ تعديل نص الرسالة', callbackData: 'wf_msg:edit_text' },
+          { text: '👤 تعديل المستلم', callbackData: 'wf_msg:edit_recipient' },
         ],
         [{ text: '🔙 تعديل الجلسات المحددة', callbackData: 'wf_msg:back_sessions' }],
       ],
@@ -315,7 +393,7 @@ export class MessageWorkflow {
 
       const perSessionLines = task.results.map((r) => {
         const icon = r.status === 'SUCCESS' ? '✅' : r.status === 'CANCELLED' ? '🚫' : '❌';
-        const detail = r.result_summary || r.error_message || r.status;
+        const detail = escapeMarkdown(r.result_summary || r.error_message || r.status);
         return `${icon} \`${r.session_id}\`: ${detail}`;
       });
 

@@ -85,7 +85,7 @@ export function buildSessionManagementKeyboard(params: {
   ]);
 
   rows.push([
-    { text: '☑️ تحديد عدة جلسات لعملية', callbackData: 'menu:send_text' },
+    { text: '✉️ إرسال جماعي متعدد الجلسات', callbackData: 'menu:send_text' },
     { text: '🧹 تنظيف غير المتصل', callbackData: 'sess:confirm_purge_inactive' },
   ]);
 
@@ -107,8 +107,14 @@ export function buildSessionDetailKeyboard(session: SessionRecord): InlineKeyboa
 
   if (session.status === 'CONNECTED' || session.status === 'AUTHENTICATED') {
     rows.push([
-      { text: '🔌 قطع اتصال الجلسة', callbackData: `sess:disconnect:${session.id}` },
+      {
+        text: '📹 مكالمة فيديو من الجلسة',
+        callbackData: `wf_vcall:start_sess:${session.id}`,
+      },
       { text: '👥 مجموعات هذه الجلسة', callbackData: `grp:list:${session.id}` },
+    ]);
+    rows.push([
+      { text: '🔌 قطع اتصال الجلسة', callbackData: `sess:disconnect:${session.id}` },
     ]);
   } else if (
     session.status === 'REQUIRES_REPAIR' ||

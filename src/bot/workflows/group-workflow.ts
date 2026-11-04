@@ -5,12 +5,20 @@ import {
   GroupOperations,
   GroupManagementActionType,
 } from '../../whatsapp/operations/group-operations';
-import { validateGroupInviteLink } from '../../security/validation';
+import {
+  validateGroupInviteLink,
+  normalizePhoneNumber,
+} from '../../security/validation';
 import { buildMultiSessionSelectorKeyboard } from '../keyboards/session-menu';
 import { buildBackCancelRow, InlineKeyboardRows } from '../keyboards/main-menu';
 import { formatTaskStatusArabic } from '../keyboards/task-menu';
+import {
+  renderBreadcrumb,
+  renderStepProgressBar,
+} from '../keyboards/ui-theme';
 import { BotViewResponse } from './pairing-workflow';
 import { toSafeArabicError } from '../../utils/errors';
+import { escapeMarkdown } from '../../utils/markdown';
 
 export interface JoinGroupWorkflowState {
   mode: 'JOIN_GROUP';
@@ -50,7 +58,6 @@ export class GroupWorkflow {
     number,
     { sessionId: string; groupJid: string; shortId: string }
   >();
-  private lastActiveGroup?: { sessionId: string; groupJid: string; shortId: string };
 
   constructor(
     private readonly sessionManager: SessionManager,
@@ -77,12 +84,6 @@ export class GroupWorkflow {
     if (adminId !== undefined) {
       const active = this.activeGroupByAdmin.get(adminId);
       if (active) return { sessionId: active.sessionId, groupJid: active.groupJid };
-    }
-    if (this.lastActiveGroup) {
-      return {
-        sessionId: this.lastActiveGroup.sessionId,
-        groupJid: this.lastActiveGroup.groupJid,
-      };
     }
     return undefined;
   }
@@ -124,12 +125,17 @@ export class GroupWorkflow {
       selectedSessionIds: [],
     });
 
+    const breadcrumb = renderBreadcrumb(['الرئيسية', 'الانضمام لمجموعة']);
+    const progress = renderStepProgressBar(1, 3, 'إرسال رابط الدعوة');
+
     return {
       text:
+        `${breadcrumb}\n${progress}\n` +
         `🔗 *الانضمام إلى مجموعة واتساب عبر رابط دعوة*\n\n` +
         `الخطوة 1 من 3: الرجاء إرسال رابط دعوة المجموعة بالصيغة الرسمية:\n` +
         `\`https://chat.whatsapp.com/AbCdEfGhIjKlMnOpQrSt12\``,
       keyboard: [buildBackCancelRow('menu:main')],
+      route: 'menu:join_group',
     };
   }
 
@@ -154,6 +160,8 @@ export class GroupWorkflow {
       return {
         text: `⚠️ ${safeErr.userMessage}`,
         keyboard: [buildBackCancelRow('menu:main')],
+        route: 'menu:join_group',
+        toastText: safeErr.userMessage,
       };
     }
   }
@@ -197,8 +205,12 @@ export class GroupWorkflow {
     const state = this.states.get(adminId);
     if (!state || state.mode !== 'JOIN_GROUP') return this.startJoinGroup(adminId);
 
+    const breadcrumb = renderBreadcrumb(['الرئيسية', 'الانضمام لمجموعة']);
+    const progress = renderStepProgressBar(2, 3, 'اختيار الجلسات');
+
     return {
       text:
+        `${breadcrumb}\n${progress}\n` +
         `🔗 *اختيار الجلسات للانضمام إلى المجموعة*\n` +
         `الرابط: \`${state.inviteLink}\`\n\n` +
         `الخطوة 2 من 3: اختر الجلسات التي تريد ضمها للمجموعة:`,
@@ -207,6 +219,7 @@ export class GroupWorkflow {
         selectedIds: state.selectedSessionIds,
         workflowPrefix: 'wf_join',
       }),
+      route: 'menu:join_group',
     };
   }
 
@@ -224,12 +237,18 @@ export class GroupWorkflow {
           selectedIds: state.selectedSessionIds,
           workflowPrefix: 'wf_join',
         }),
+        route: 'menu:join_group',
+        toastText: '⚠️ اختر جلسة واحدة على الأقل',
       };
     }
 
     state.step = 'AWAITING_CONFIRMATION';
+    const breadcrumb = renderBreadcrumb(['الرئيسية', 'الانضمام لمجموعة']);
+    const progress = renderStepProgressBar(3, 3, 'المراجعة والتأكيد');
+
     return {
       text:
+        `${breadcrumb}\n${progress}\n` +
         `📋 *تأكيد الانضمام إلى المجموعة*\n\n` +
         `🔗 *رابط الدعوة:* \`${state.inviteLink}\`\n` +
         `🔢 *عدد الجلسات المحددة:* ${state.selectedSessionIds.length}\n` +
@@ -241,6 +260,7 @@ export class GroupWorkflow {
           { text: '❌ إلغاء', callbackData: 'workflow:cancel' },
         ],
       ],
+      route: 'menu:join_group',
     };
   }
 
@@ -270,7 +290,10 @@ export class GroupWorkflow {
 
       const lines = task.results.map((r) => {
         const icon = r.status === 'SUCCESS' ? '✅' : '❌';
-        return `${icon} \`${r.session_id}\`: ${r.result_summary || r.error_message}`;
+        const summaryText = escapeMarkdown(
+          r.result_summary || r.error_message || '—'
+        );
+        return `${icon} \`${r.session_id}\`: ${summaryText}`;
       });
 
       return {
@@ -280,12 +303,16 @@ export class GroupWorkflow {
           `📌 الحالة: ${formatTaskStatusArabic(task.status)}\n\n` +
           `*النتائج لكل جلسة:*\n${lines.join('\n')}`,
         keyboard: [[{ text: '🔙 القائمة الرئيسية', callbackData: 'menu:main' }]],
+        route: 'menu:main',
+        toastText: '✅ تم تنفيذ الانضمام للمجموعة',
       };
     } catch (err) {
       const safeErr = toSafeArabicError(err);
       return {
         text: `❌ ${safeErr.userMessage}`,
         keyboard: [[{ text: '🔙 القائمة الرئيسية', callbackData: 'menu:main' }]],
+        route: 'menu:main',
+        toastText: safeErr.userMessage,
       };
     }
   }
@@ -301,7 +328,6 @@ export class GroupWorkflow {
       const group = await this.groupOps.getGroupDetails(sessionId, groupJid);
       const shortId = this.registerGroupRef(sessionId, groupJid);
       const activeEntry = { sessionId, groupJid, shortId };
-      this.lastActiveGroup = activeEntry;
       if (adminId !== undefined) {
         this.activeGroupByAdmin.set(adminId, activeEntry);
       }
@@ -359,21 +385,33 @@ export class GroupWorkflow {
         { text: '🔙 رجوع لقائمة المجموعات', callbackData: `grp:list:${sessionId}` },
       ]);
 
+      const safeSubject = escapeMarkdown(group.subject || group.jid);
+      const safeDesc = escapeMarkdown(group.desc || 'لا يوجد');
+      const breadcrumb = renderBreadcrumb([
+        'الرئيسية',
+        'المجموعات',
+        safeSubject.slice(0, 22),
+      ]);
+
       return {
         text:
-          `👥 *تفاصيل المجموعة:* ${group.subject}\n\n` +
+          `${breadcrumb}\n` +
+          `👥 *تفاصيل المجموعة:* ${safeSubject}\n\n` +
           `🆔 المعرف: \`${group.jid}\`\n` +
           `👥 عدد الأعضاء: ${group.size}\n` +
           `🛡️ صلاحية الجلسة: ${adminBadge}\n` +
-          `📝 الوصف: ${group.desc || 'لا يوجد'}\n\n` +
+          `📝 الوصف: ${safeDesc}\n\n` +
           `*أبرز المشاركين:*\n${participantPreview}`,
         keyboard: rows,
+        route: `gv:${shortId}`,
       };
     } catch (err) {
       const safeErr = toSafeArabicError(err);
       return {
         text: `⚠️ ${safeErr.userMessage}`,
         keyboard: [[{ text: '🔙 القائمة الرئيسية', callbackData: 'menu:main' }]],
+        route: 'menu:groups',
+        toastText: safeErr.userMessage,
       };
     }
   }
@@ -390,7 +428,7 @@ export class GroupWorkflow {
       const group = await this.groupOps.getGroupDetails(sessionId, groupJid);
       const shortId = this.registerGroupRef(sessionId, groupJid);
       this.activeGroupByAdmin.set(adminId, { sessionId, groupJid, shortId });
-      this.lastActiveGroup = { sessionId, groupJid, shortId };
+      const safeSubject = escapeMarkdown(group.subject || groupJid);
 
       if (action === 'GET_INVITE_LINK') {
         const resultMsg = await this.groupOps.executeAdminGroupAction({
@@ -409,6 +447,8 @@ export class GroupWorkflow {
               },
             ],
           ],
+          route: `gv:${shortId}`,
+          toastText: '🔗 تم استخراج رابط الدعوة',
         };
       }
 
@@ -424,7 +464,7 @@ export class GroupWorkflow {
         return {
           text:
             `⚠️ *تأكيد إجراء حساس (مغادرة مجموعة)*\n\n` +
-            `📌 المجموعة المستهدفة: *${group.subject}*\n` +
+            `📌 المجموعة المستهدفة: *${safeSubject}*\n` +
             `🆔 الجلسة: \`${sessionId}\`\n` +
             `⚡ الإجراء: مغادرة المجموعة نهائياً\n\n` +
             `هل أنت متأكد من رغبتك في المغادرة؟`,
@@ -434,6 +474,7 @@ export class GroupWorkflow {
               { text: '❌ إلغاء', callbackData: `gv:${shortId}` },
             ],
           ],
+          route: `gv:${shortId}`,
         };
       }
 
@@ -457,7 +498,7 @@ export class GroupWorkflow {
       return {
         text:
           `👥 *${actionArabic[action]}*\n` +
-          `المجموعة: *${group.subject}*\n\n` +
+          `المجموعة: *${safeSubject}*\n\n` +
           `الرجاء إرسال رقم هاتف العضو المستهدف مع رمز الدولة (مثال: \`+966553334444\`):`,
         keyboard: [
           [
@@ -467,44 +508,86 @@ export class GroupWorkflow {
             },
           ],
         ],
+        route: `gv:${shortId}`,
       };
     } catch (err) {
       const safeErr = toSafeArabicError(err);
       return {
         text: `⚠️ ${safeErr.userMessage}`,
         keyboard: [[{ text: '🔙 القائمة الرئيسية', callbackData: 'menu:main' }]],
+        route: 'menu:groups',
+        toastText: safeErr.userMessage,
       };
     }
   }
 
   public handleParticipantPhoneInput(adminId: number, rawPhone: string): BotViewResponse {
     const state = this.states.get(adminId);
-    if (!state || state.mode !== 'MANAGE_GROUP') {
-      return this.startJoinGroup(adminId);
+    if (
+      !state ||
+      state.mode !== 'MANAGE_GROUP' ||
+      !state.sessionId ||
+      !state.groupJid ||
+      !state.action
+    ) {
+      return {
+        text: '⚠️ لا توجد عملية إدارة مجموعة نشطة حالياً.',
+        keyboard: [
+          [{ text: '👥 إدارة المجموعات', callbackData: 'menu:groups' }],
+          buildBackCancelRow('menu:main'),
+        ],
+        route: 'menu:groups',
+      };
     }
 
-    state.targetPhone = rawPhone.trim();
-    state.step = 'AWAITING_ACTION_CONFIRMATION';
     const shortId = this.registerGroupRef(state.sessionId, state.groupJid);
+    const safeSubject = escapeMarkdown(state.groupSubject || state.groupJid);
 
-    return {
-      text:
-        `⚠️ *تأكيد إجراء إداري على المجموعة*\n\n` +
-        `📌 المجموعة: *${state.groupSubject}*\n` +
-        `🆔 الجلسة: \`${state.sessionId}\`\n` +
-        `⚡ الإجراء: \`${state.action}\`\n` +
-        `📱 العضو المستهدف: \`${state.targetPhone}\`\n\n` +
-        `هل تؤكد تنفيذ هذا الإجراء وتسجيله في سجل التدقيق؟`,
-      keyboard: [
-        [
-          { text: '✅ تأكيد التنفيذ', callbackData: 'wf_grp:confirm_action' },
-          {
-            text: '❌ إلغاء',
-            callbackData: `gv:${shortId}`,
-          },
+    try {
+      const normalized = normalizePhoneNumber(rawPhone);
+      state.targetPhone = normalized.e164;
+      state.step = 'AWAITING_ACTION_CONFIRMATION';
+
+      return {
+        text:
+          `⚠️ *تأكيد إجراء إداري على المجموعة*\n\n` +
+          `📌 المجموعة: *${safeSubject}*\n` +
+          `🆔 الجلسة: \`${state.sessionId}\`\n` +
+          `⚡ الإجراء: \`${state.action}\`\n` +
+          `📱 العضو المستهدف: \`${state.targetPhone}\`\n\n` +
+          `هل تؤكد تنفيذ هذا الإجراء وتسجيله في سجل التدقيق؟`,
+        keyboard: [
+          [
+            { text: '✅ تأكيد التنفيذ', callbackData: 'wf_grp:confirm_action' },
+            {
+              text: '❌ إلغاء',
+              callbackData: `gv:${shortId}`,
+            },
+          ],
         ],
-      ],
-    };
+        route: `gv:${shortId}`,
+      };
+    } catch (err) {
+      const safeErr = toSafeArabicError(err);
+      state.step = 'AWAITING_PARTICIPANT_PHONE';
+      return {
+        text:
+          `⚠️ *رقم العضو غير صالح*\n` +
+          `${safeErr.userMessage}\n\n` +
+          `📌 المجموعة: *${safeSubject}*\n` +
+          `يرجى إعادة إرسال رقم هاتف العضو بالصيغة الدولية الصحيحة (مثال: \`+966553334444\`):`,
+        keyboard: [
+          [
+            {
+              text: '🔙 إلغاء والعودة للمجموعة',
+              callbackData: `gv:${shortId}`,
+            },
+          ],
+        ],
+        route: `gv:${shortId}`,
+        toastText: safeErr.userMessage,
+      };
+    }
   }
 
   public async confirmGroupAction(adminId: number): Promise<BotViewResponse> {
@@ -513,6 +596,7 @@ export class GroupWorkflow {
       return {
         text: 'لا توجد عملية مجموعة معلقة للتأكيد.',
         keyboard: [[{ text: '🔙 القائمة الرئيسية', callbackData: 'menu:main' }]],
+        route: 'menu:groups',
       };
     }
 
@@ -535,6 +619,8 @@ export class GroupWorkflow {
           [{ text: '👥 العودة لقائمة المجموعات', callbackData: `grp:list:${sessionId}` }],
           [{ text: '🔙 القائمة الرئيسية', callbackData: 'menu:main' }],
         ],
+        route: `grp:list:${sessionId}`,
+        toastText: '✅ تم تنفيذ الإجراء بنجاح',
       };
     } catch (err) {
       const safeErr = toSafeArabicError(err);
@@ -548,6 +634,8 @@ export class GroupWorkflow {
             },
           ],
         ],
+        route: `gv:${shortId}`,
+        toastText: safeErr.userMessage,
       };
     }
   }

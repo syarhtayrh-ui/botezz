@@ -16,8 +16,18 @@ import {
   buildBackCancelRow,
   buildAppNavigationRow,
 } from '../keyboards/main-menu';
-import { BotViewResponse } from './pairing-workflow';
+import {
+  renderBreadcrumb,
+  renderStepProgressBar,
+  recordRecentRecipient,
+  buildRecentRecipientsRows,
+} from '../keyboards/ui-theme';
+import {
+  BotViewResponse,
+  TelegramMediaAttachment,
+} from './pairing-workflow';
 import { toSafeArabicError, ValidationError } from '../../utils/errors';
+import { escapeMarkdown } from '../../utils/markdown';
 
 export type VideoCallStep =
   | 'AWAITING_VIDEO'
@@ -40,6 +50,7 @@ export interface VideoCallWorkflowState {
   protocolMode: NativeCallProtocolMode;
   wavesCount: number;
   loopVideo: boolean;
+  recordCall: boolean;
   maxDurationSeconds: number;
   activeCallId?: string;
   callState?: RealCallState;
@@ -159,6 +170,7 @@ export class VideoCallWorkflow {
       this.cancel(adminId);
       return {
         text: [
+          renderBreadcrumb(['الرئيسية', 'مكالمة فيديو VoIP']),
           '📹 *بدء مكالمة فيديو VoIP حقيقية (بث الفيديو والصوت داخل المكالمة)*',
           '━━━━━━━━━━━━━━━━━━━━━━',
           '⚠️ *لا توجد جلسات متصلة حالياً*',
@@ -169,6 +181,7 @@ export class VideoCallWorkflow {
           [{ text: '📲 ربط جلسة جديدة', callbackData: 'menu:link_account' }],
           buildBackCancelRow('menu:main'),
         ],
+        route: 'menu:video_call',
       };
     }
 
@@ -202,13 +215,16 @@ export class VideoCallWorkflow {
       protocolMode: 'HIROOSY_VOIP_VIDEO_CALL',
       wavesCount: 1,
       loopVideo: true,
+      recordCall: true,
       maxDurationSeconds: 60,
     });
 
     const lines = [
+      renderBreadcrumb(['الرئيسية', 'مكالمة فيديو VoIP']),
+      renderStepProgressBar(1, 2, 'رفع ملف الفيديو للبث'),
       '📹 *بدء مكالمة فيديو VoIP حقيقية (بث الفيديو والصوت داخل المكالمة)*',
       '━━━━━━━━━━━━━━━━━━━━━━',
-      `• *الجلسة النشطة:* ${defaultSession.label} (\`${defaultSession.id}\`)`,
+      `• *الجلسة النشطة:* ${escapeMarkdown(defaultSession.label)} (\`${defaultSession.id}\`)`,
       `• *محرك الاتصال:* \`@hiroosy/baileys-lite/voip (RTP/SRTP)\``,
       ...(recipientDisplay
         ? [`• *المستلم المحدد مسبقاً:* \`${recipientDisplay}\``]
@@ -228,6 +244,7 @@ export class VideoCallWorkflow {
         ],
         buildBackCancelRow('menu:main'),
       ],
+      route: 'menu:video_call',
     };
   }
 
@@ -244,6 +261,11 @@ export class VideoCallWorkflow {
     const sizeFormatted = formatFileSize(state.sizeBytes || 0);
 
     const rows: InlineKeyboardRows = [];
+
+    const recentRows = buildRecentRecipientsRows(adminId, 'wf_vcall:recent:');
+    if (recentRows.length > 0) {
+      rows.push(...recentRows);
+    }
 
     if (connected.length > 1) {
       const sessionBtns: InlineButtonSpec[] = connected.slice(0, 3).map((s) => ({
@@ -266,6 +288,13 @@ export class VideoCallWorkflow {
 
     rows.push([
       {
+        text: `🔴 تسجيل المكالمة (الطرفين): ${state.recordCall !== false ? 'مفعل ✅' : 'معطل ❌'}`,
+        callbackData: 'wf_vcall:toggle_record',
+      },
+    ]);
+
+    rows.push([
+      {
         text: '🎬 تغيير ملف الفيديو',
         callbackData: 'wf_vcall:reupload',
       },
@@ -275,16 +304,20 @@ export class VideoCallWorkflow {
 
     return {
       text: [
-        `✅ *تم استلام وتجهيز ملف الفيديو للبث بنجاح:* \`${state.videoFileName}\` (\`${sizeFormatted}\`)`,
+        renderBreadcrumb(['الرئيسية', 'مكالمة فيديو VoIP']),
+        renderStepProgressBar(2, 2, 'إدخال رقم المستلم وبدء الاتصال'),
+        `✅ *تم استلام وتجهيز ملف الفيديو للبث بنجاح:* \`${state.videoFileName || 'video.mp4'}\` (\`${sizeFormatted}\`)`,
         '━━━━━━━━━━━━━━━━━━━━━━',
         `• *الجلسة المحددة:* \`${state.selectedSessionId}\``,
         `• *طبقة الاتصال:* \`VoIP H.264 + MLow RTP/SRTP\``,
         `• *تكرار البث (Loop):* ${state.loopVideo ? 'مفعل ✅' : 'معطل ❌'}`,
+        `• *تسجيل المكالمة ثنائي الاتجاه:* ${state.recordCall !== false ? 'مفعل ✅ (كاميرا وصوت المستلم + البوت)' : 'معطل ❌'}`,
         `• *المدة القصوى للمكالمة:* \`${state.maxDurationSeconds} ثانية\``,
         '',
         'الخطوة 2 من 2: *الرجاء إرسال الرقم المستهدف الآن* مع رمز الدولة الدولي (مثال: `+966501234567`) ليبدأ الاتصال وبث الفيديو فوراً:',
       ].join('\n'),
       keyboard: rows,
+      route: 'menu:video_call',
     };
   }
 
@@ -358,7 +391,8 @@ export class VideoCallWorkflow {
       await generatePlayableVoipMp4File(filePath, {
         width: 640,
         height: 360,
-        durationSeconds: 3,
+        frameRate: 15,
+        durationSeconds: 10,
         includeAudio: true,
       });
     } catch {
@@ -428,6 +462,7 @@ export class VideoCallWorkflow {
       state.recipientJid = normalized.jid;
       state.recipientDigits = normalized.digits;
       state.recipientDisplay = normalized.e164;
+      recordRecentRecipient(adminId, normalized.e164);
 
       if (!state.videoFilePath || !fs.existsSync(state.videoFilePath)) {
         const { filePath, sizeBytes } = await this.createSampleVideoFile(adminId);
@@ -451,7 +486,12 @@ export class VideoCallWorkflow {
           '',
           'يرجى إعادة إرسال رقم الهاتف بالصيغة الدولية الصحيحة (مثال: `+966501234567`):',
         ].join('\n'),
-        keyboard: [buildBackCancelRow('menu:main')],
+        keyboard: [
+          ...buildRecentRecipientsRows(adminId, 'wf_vcall:recent:'),
+          buildBackCancelRow('menu:main'),
+        ],
+        route: 'menu:video_call',
+        toastText: safeErr.userMessage,
       };
     }
   }
@@ -469,6 +509,18 @@ export class VideoCallWorkflow {
       return this.start(adminId);
     }
     state.loopVideo = !state.loopVideo;
+    this.states.set(adminId, state);
+    return state.videoFilePath
+      ? this.renderAwaitingRecipientStep(adminId)
+      : this.start(adminId, state.selectedSessionId);
+  }
+
+  public toggleRecordCall(adminId: number): BotViewResponse {
+    const state = this.states.get(adminId);
+    if (!state) {
+      return this.start(adminId);
+    }
+    state.recordCall = state.recordCall === false ? true : false;
     this.states.set(adminId, state);
     return state.videoFilePath
       ? this.renderAwaitingRecipientStep(adminId)
@@ -610,6 +662,60 @@ export class VideoCallWorkflow {
           ? '🧪 *تم إنشاء جلسة محاكاة مكالمة الفيديو (MOCK_SIMULATION)*'
           : '📞 *تم إرسال طلب مكالمة الفيديو وجاري الرنين وتأسيس قناة الوسائط*';
 
+    const recordingStatusLabel =
+      stream.recordingStatus === 'RECORDING'
+        ? '🔴 قيد التسجيل ثنائي الاتجاه (`RECORDING`)'
+        : stream.recordingStatus === 'FINALIZING'
+          ? '⏳ جاري دمج وحفظ ملف التسجيل (`FINALIZING`)'
+          : stream.recordingStatus === 'READY'
+            ? `✅ جاهز (\`${stream.recordedVideoFileName || 'recording.mp4'}\`)`
+            : stream.recordingStatus === 'DISABLED'
+              ? '⚪ معطل (`DISABLED`)'
+              : '⚠️ تعذر الحفظ (`FAILED`)';
+
+    const keyboardRows: InlineKeyboardRows = [
+      [
+        {
+          text: '🔁 إعادة الاتصال وبث الفيديو لنفس الرقم',
+          callbackData: 'wf_vcall:repeat_call',
+        },
+      ],
+      [
+        {
+          text: '🛑 إنهاء المكالمة وإيقاف البث',
+          callbackData: 'wf_vcall:stop',
+        },
+      ],
+    ];
+
+    if (stream.recordingStatus === 'READY' && stream.recordedVideoPath) {
+      keyboardRows.push([
+        {
+          text: '📥 إرسال ملف تسجيل المكالمة (.mp4)',
+          callbackData: `wf_vcall:download_recording:${stream.callId}`,
+        },
+      ]);
+    }
+
+    keyboardRows.push(
+      [
+        {
+          text: '👤 إرسال المكالمة لرقم آخر (بنفس الفيديو)',
+          callbackData: 'wf_vcall:change_recipient',
+        },
+      ],
+      [
+        {
+          text: '🎬 تغيير ملف الفيديو',
+          callbackData: 'wf_vcall:reupload',
+        },
+      ],
+      buildAppNavigationRow({
+        backCallback: 'menu:video_call',
+        refreshCallback: 'menu:video_call',
+      })
+    );
+
     return {
       text: [
         headerLine,
@@ -624,39 +730,13 @@ export class VideoCallWorkflow {
         `• *ملف الفيديو:* \`${stream.videoFileName}\``,
         `• *الحالة الحالية:* ${stateLabel}`,
         `• *حالة البث الفعلي (RTP/SRTP):* ${isMediaActivelyStreaming ? '🟢 نشط ومؤكد (`MEDIA_STARTED`)' : isTerminal ? '⏹️ متوقف / منتهي' : '⏳ بانتظار رد المستلم وبدء تدفق إطارات الصوت والفيديو'}`,
+        `• *تسجيل المكالمة (Two-Way):* ${recordingStatusLabel}`,
+        `• *إطارات كاميرا المستلم الملتقطة:* \`${stream.inboundVideoFramesRecorded ?? 0} إطار (${stream.inboundVideoPacketsReceived ?? 0} حزمة RTP)\``,
+        `• *حزم صوت المستلم الملتقطة:* \`${stream.inboundAudioPacketsReceived ?? 0} حزمة\``,
         '',
         stream.detailsArabic,
       ].join('\n'),
-      keyboard: [
-        [
-          {
-            text: '🔁 إعادة الاتصال وبث الفيديو لنفس الرقم',
-            callbackData: 'wf_vcall:repeat_call',
-          },
-        ],
-        [
-          {
-            text: '🛑 إنهاء المكالمة وإيقاف البث',
-            callbackData: 'wf_vcall:stop',
-          },
-        ],
-        [
-          {
-            text: '👤 إرسال المكالمة لرقم آخر (بنفس الفيديو)',
-            callbackData: 'wf_vcall:change_recipient',
-          },
-        ],
-        [
-          {
-            text: '🎬 تغيير ملف الفيديو',
-            callbackData: 'wf_vcall:reupload',
-          },
-        ],
-        buildAppNavigationRow({
-          backCallback: 'menu:video_call',
-          refreshCallback: 'menu:video_call',
-        }),
-      ],
+      keyboard: keyboardRows,
     };
   }
 
@@ -672,6 +752,77 @@ export class VideoCallWorkflow {
     state.callState = stream.callState;
     this.states.set(adminId, state);
     return this.renderStreamStatusView(stream);
+  }
+
+  public buildRecordingAttachment(
+    stream: NonNullable<ReturnType<UbuntuVideoCallBridge['getCallStatus']>>
+  ): TelegramMediaAttachment | undefined {
+    if (
+      stream.recordingStatus !== 'READY' ||
+      !stream.recordedVideoPath ||
+      !fs.existsSync(stream.recordedVideoPath)
+    ) {
+      return undefined;
+    }
+    try {
+      const stat = fs.statSync(stream.recordedVideoPath);
+      const fileName =
+        stream.recordedVideoFileName ||
+        path.basename(stream.recordedVideoPath);
+      const sizeStr = formatFileSize(
+        stream.recordedVideoSizeBytes || stat.size
+      );
+      return {
+        kind: 'video',
+        filePath: stream.recordedVideoPath,
+        fileName,
+        mimeType: 'video/mp4',
+        caption: [
+          '🎬 *تسجيل المكالمة المرئية ثنائي الاتجاه (Two-Way VoIP Call Recording)*',
+          '━━━━━━━━━━━━━━━━━━━━━━',
+          `• *معرف المكالمة:* \`${stream.callId}\``,
+          `• *المستلم:* \`${stream.recipientMasked}\``,
+          `• *مدة التسجيل:* \`${stream.recordedDurationSeconds ?? 1} ثانية\``,
+          `• *حجم الملف:* \`${sizeStr}\``,
+          `• *كاميرا المستلم:* ${stream.remoteCameraCaptured ? `🟢 تم التقاطها (${stream.inboundVideoFramesRecorded} إطار)` : '⚪ غير مفعلة / صوت فقط + فيديو البوت'}`,
+          `• *حزم صوت المستلم:* \`${stream.inboundAudioPacketsReceived} حزمة\``,
+        ].join('\n'),
+      };
+    } catch {
+      return undefined;
+    }
+  }
+
+  public downloadLastRecording(
+    adminId: number,
+    explicitCallId?: string
+  ): BotViewResponse {
+    const state = this.states.get(adminId);
+    const callId = explicitCallId || state?.activeCallId;
+    const stream = callId
+      ? this.videoCallBridge.getCallStatus(callId)
+      : this.videoCallBridge.listCompletedStreams()[0];
+
+    if (!stream || stream.recordingStatus !== 'READY' || !stream.recordedVideoPath) {
+      return {
+        text: '⚠️ *لا يوجد ملف تسجيل متاح لهذه المكالمة حالياً.*',
+        keyboard: [buildBackCancelRow('menu:video_call')],
+      };
+    }
+
+    const attachment = this.buildRecordingAttachment(stream);
+    return {
+      text: [
+        '📥 *تم تجهيز وإرفاق ملف تسجيل المكالمة المرئية بنجاح*',
+        '━━━━━━━━━━━━━━━━━━━━━━',
+        `• *معرف المكالمة:* \`${stream.callId}\``,
+        `• *اسم الملف:* \`${stream.recordedVideoFileName}\``,
+        `• *إطارات كاميرا المستلم:* \`${stream.inboundVideoFramesRecorded}\``,
+        `• *حزم صوت المستلم:* \`${stream.inboundAudioPacketsReceived}\``,
+      ].join('\n'),
+      keyboard: [buildBackCancelRow('menu:video_call')],
+      mediaAttachments: attachment ? [attachment] : undefined,
+    };
   }
 
   /**
@@ -699,6 +850,7 @@ export class VideoCallWorkflow {
         callKind: state.callKind,
         protocolMode: 'HIROOSY_VOIP_VIDEO_CALL',
         loopVideo: state.loopVideo,
+        recordCall: state.recordCall !== false,
         maxDurationSeconds: state.maxDurationSeconds,
         actorTelegramId: adminId,
       });
@@ -753,39 +905,73 @@ export class VideoCallWorkflow {
       { autoCompleted: false, deleteFile: false }
     );
 
+    const mediaAttachments: TelegramMediaAttachment[] = [];
+    if (stopped && !stopped.recordingDeliveredToTelegram) {
+      const recordingAttachment = this.buildRecordingAttachment(stopped);
+      if (recordingAttachment) {
+        stopped.recordingDeliveredToTelegram = true;
+        mediaAttachments.push(recordingAttachment);
+      }
+    }
+
+    const keyboardRows: InlineKeyboardRows = [
+      [
+        {
+          text: '🔁 إعادة الاتصال وبث الفيديو لنفس الرقم',
+          callbackData: 'wf_vcall:repeat_call',
+        },
+      ],
+    ];
+
+    if (stopped?.recordingStatus === 'READY' && stopped.recordedVideoPath) {
+      keyboardRows.push([
+        {
+          text: '📥 إعادة إرسال ملف تسجيل المكالمة (.mp4)',
+          callbackData: `wf_vcall:download_recording:${stopped.callId}`,
+        },
+      ]);
+    }
+
+    keyboardRows.push(
+      [
+        {
+          text: '👤 إرسال المكالمة لرقم آخر (بنفس الفيديو)',
+          callbackData: 'wf_vcall:change_recipient',
+        },
+      ],
+      [
+        {
+          text: '🎬 تغيير ملف الفيديو',
+          callbackData: 'wf_vcall:reupload',
+        },
+      ],
+      buildAppNavigationRow({
+        backCallback: 'menu:main',
+        refreshCallback: 'menu:video_call',
+      })
+    );
+
     return {
       text: [
         '🛑 *تم إنهاء المكالمة المرئية وإيقاف البث بنجاح*',
         '━━━━━━━━━━━━━━━━━━━━━━',
         `• *معرف المكالمة:* \`${stopped?.callId || callId}\``,
         `• *المستلم:* \`${stopped?.recipientMasked || state?.recipientDisplay || '—'}\``,
-        `• *ملف الفيديو المحفوظ:* \`${state?.videoFileName || stopped?.videoFileName || '—'}\``,
+        `• *ملف الفيديو المرسل:* \`${state?.videoFileName || stopped?.videoFileName || '—'}\``,
         `• *الحالة النهائية:* \`${stopped?.callState || stopped?.status || 'ENDED'}\``,
+        ...(stopped?.recordingEnabled
+          ? [
+              `• *حالة تسجيل المكالمة:* \`${stopped.recordingStatus}\``,
+              ...(stopped.recordedVideoFileName
+                ? [`• *ملف تسجيل المكالمة:* \`${stopped.recordedVideoFileName}\``]
+                : []),
+              `• *إطارات كاميرا المستلم المسجلة:* \`${stopped.inboundVideoFramesRecorded ?? 0} إطار\``,
+              `• *حزم صوت المستلم المسجلة:* \`${stopped.inboundAudioPacketsReceived ?? 0} حزمة\``,
+            ]
+          : []),
       ].join('\n'),
-      keyboard: [
-        [
-          {
-            text: '🔁 إعادة الاتصال وبث الفيديو لنفس الرقم',
-            callbackData: 'wf_vcall:repeat_call',
-          },
-        ],
-        [
-          {
-            text: '👤 إرسال المكالمة لرقم آخر (بنفس الفيديو)',
-            callbackData: 'wf_vcall:change_recipient',
-          },
-        ],
-        [
-          {
-            text: '🎬 تغيير ملف الفيديو',
-            callbackData: 'wf_vcall:reupload',
-          },
-        ],
-        buildAppNavigationRow({
-          backCallback: 'menu:main',
-          refreshCallback: 'menu:video_call',
-        }),
-      ],
+      keyboard: keyboardRows,
+      ...(mediaAttachments.length > 0 ? { mediaAttachments } : {}),
     };
   }
 }

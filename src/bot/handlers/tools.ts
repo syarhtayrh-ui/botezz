@@ -31,6 +31,8 @@ import {
   validateShortlinkTargetUrl,
 } from '../../security/validation';
 import { toSafeArabicError } from '../../utils/errors';
+import { escapeMarkdown } from '../../utils/markdown';
+import { renderBreadcrumb } from '../keyboards/ui-theme';
 
 export type ToolsInputStep =
   | 'NONE'
@@ -526,6 +528,8 @@ export class ToolsHandler {
           },
         ],
       ],
+      toastText: '🧪 مختبر الدوال المخصصة',
+      route: 'tools:prompt_testfunction',
     };
   }
 
@@ -1691,22 +1695,26 @@ export class ToolsHandler {
 
       return {
         text:
+          `${renderBreadcrumb(['🏠 الرئيسية', '🛠️ الأدوات', '📡 فحص قناة'])}\n` +
           `📡 *بيانات قناة واتساب (WhatsApp Channel Metadata)*\n` +
           `━━━━━━━━━━━━━━━━━━\n` +
           `🆔 *معرف القناة (JID):* \`${meta.id}\`\n` +
-          `📛 *اسم القناة:* ${meta.name}\n` +
+          `📛 *اسم القناة:* ${escapeMarkdown(meta.name)}\n` +
           `👥 *عدد المتابعين:* ${meta.subscribers.toLocaleString('en-US')}\n` +
           `📊 *الحالة:* \`${meta.state}\`\n` +
           `✅ *التوثيق:* ${meta.verified ? 'موثقة (VERIFIED)' : 'غير موثقة'}\n` +
           `🔗 *الرابط:* \`${normalizedUrl}\`\n` +
           `📱 *تم الاستعلام عبر الجلسة:* \`${activeSession.id}\`` +
-          (meta.description ? `\n📝 *الوصف:* ${meta.description.slice(0, 200)}` : ''),
+          (meta.description
+            ? `\n📝 *الوصف:* ${escapeMarkdown(meta.description.slice(0, 200))}`
+            : ''),
         keyboard: [
           [
             { text: '📡 فحص قناة أخرى', callbackData: 'tools:prompt_channel' },
             { text: '🔙 قائمة الأدوات', callbackData: 'menu:tools' },
           ],
         ],
+        toastText: `📡 ${meta.name}`,
       };
     } catch (err) {
       const safeErr = toSafeArabicError(err);
@@ -1765,7 +1773,7 @@ export class ToolsHandler {
       }
 
       return (
-        `${startIdx + idx + 1}. *${sess.label}* (\`${sess.id}\`)\n` +
+        `${startIdx + idx + 1}. *${escapeMarkdown(sess.label)}* (\`${sess.id}\`)\n` +
         `   📌 الحالة: ${formatSessionStatusArabic(sess.status)}\n` +
         `   📱 الرقم المقنع: \`${sess.masked_phone || 'غير مقترن'}\`\n` +
         `   ${socketSummary}`

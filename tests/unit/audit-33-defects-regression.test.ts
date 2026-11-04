@@ -30,8 +30,13 @@ import {
 import {
   instrumentMediaSessionInstance,
   instrumentAudioEngineInstance,
+  instrumentVideoEngineInstance,
   hasVerifiedRelayMediaAcceptance,
+  splitAnnexBNalus,
+  groupAnnexBToFrameAccessUnits,
+  listenWithTrackedSocketCleanup,
   type InstrumentedAudioEngine,
+  type InstrumentedVideoEngine,
 } from '../../src/whatsapp/voip-runtime-patch';
 import { RealVideoCallService } from '../../src/whatsapp/video-call-bridge';
 import { VideoCallWorkflow } from '../../src/bot/workflows/video-call-workflow';
@@ -40,7 +45,11 @@ import { SessionRepository } from '../../src/database/repositories/session-repos
 import { AuditRepository } from '../../src/database/repositories/audit-repository';
 import { SessionStore } from '../../src/whatsapp/session-store';
 import { SessionManager } from '../../src/whatsapp/session-manager';
-import { MediaValidationError } from '../../src/utils/errors';
+import {
+  MediaValidationError,
+  VoipFailureError,
+  toSafeArabicError,
+} from '../../src/utils/errors';
 import { assertSupportedNodeSqliteRuntime } from '../../src/app';
 
 describe('Audit 33 Defects (BZ-001 through BZ-033) Behavioral Regression Suite', () => {
@@ -677,4 +686,201 @@ describe('Audit 33 Defects (BZ-001 through BZ-033) Behavioral Regression Suite',
       db.close();
     }
   });
+
+  it('P0-A: packages H.264 Annex-B Access Units per RFC 6184 with identical frame timestamp, M=0 on SPS/PPS, and M=1 only on last VCL packet', async () => {
+    const startCode = Buffer.from([0x00, 0x00, 0x00, 0x01]);
+    const aud = Buffer.from([0x09, 0xf0]);
+    const sps = Buffer.from([0x67, 0x42, 0xc0, 0x1e, 0xda, 0x02, 0x80, 0xb6]);
+    const pps = Buffer.from([0x68, 0xce, 0x3c, 0x80]);
+    const sei = Buffer.from([0x06, 0x05, 0x04, 0xde, 0xad, 0xbe, 0xef, 0x80]);
+    // Create an IDR slice > 900 bytes to exercise FU-A fragmentation (type 28)
+    const idrPayload = Buffer.alloc(1500, 0xaa);
+    idrPayload[0] = 0x65; // NalRefIdc=3, Type=5 (IDR)
+    const slicePayload = Buffer.from([0x41, 0x9a, 0x22, 0x33, 0x44]); // Type=1 (Non-IDR)
+
+    const annexBChunk = Buffer.concat([
+      startCode,
+      aud,
+      startCode,
+      sps,
+      startCode,
+      pps,
+      startCode,
+      sei,
+      startCode,
+      idrPayload,
+      startCode,
+      aud,
+      startCode,
+      slicePayload,
+    ]);
+
+    const nalus = splitAnnexBNalus(annexBChunk);
+    assert.equal(nalus.length, 7);
+
+    // Verify WaVideoEngine Access Unit grouping groups AUD+SPS+PPS+SEI+IDR into Frame 1 and AUD+Slice into Frame 2
+    const emittedFrames: Uint8Array[] = [];
+    const videoEngineMock: InstrumentedVideoEngine = {
+      width: 640,
+      height: 360,
+      frameRate: 15,
+      frameDurationMs: 1000 / 15,
+      bitrateKbps: 280,
+      running: true,
+      videoPath: sampleMp4,
+      videoLoop: true,
+      waitingForKeyFrame: false,
+      sourceKind: 'file',
+      pending: new Uint8Array(0),
+      accessUnitsSent: 0,
+      bytesEncoded: 0,
+      emitAccessUnit(frameAu: Uint8Array) {
+        emittedFrames.push(frameAu);
+      },
+    };
+    instrumentVideoEngineInstance(videoEngineMock);
+    videoEngineMock.handleChunk!(annexBChunk);
+    assert.equal(
+      emittedFrames.length,
+      2,
+      'P0-A: Annex-B chunk with 2 VCL slices must emit exactly 2 complete frame Access Units'
+    );
+    assert.deepEqual(
+      splitAnnexBNalus(emittedFrames[0]).map((n) => n[0] & 0x1f),
+      [9, 7, 8, 6, 5]
+    );
+    assert.deepEqual(
+      splitAnnexBNalus(emittedFrames[1]).map((n) => n[0] & 0x1f),
+      [9, 1]
+    );
+
+    // Verify WaCallMediaSession RFC 6184 RTP packaging
+    const sentPayloads: Uint8Array[] = [];
+    const mediaSessionMock: WaCallMediaSessionLike & Record<string, unknown> = {
+      ended: false,
+      videoStreaming: true,
+      videoSeq: 100,
+      videoTimestamp: 90_000,
+      videoSsrc: 0x11223344,
+      videoSendCount: 0,
+      videoOctetsSent: 0,
+      videoIdrSendCount: 0,
+      videoEngine: { running: true, accessUnitsSent: 0 },
+      sctpRelay: {
+        hasConnection: () => true,
+        broadcast: (pkt: ArrayBuffer | Uint8Array | Buffer) => {
+          const u8 =
+            pkt instanceof Uint8Array
+              ? pkt
+              : new Uint8Array(pkt as ArrayBuffer);
+          sentPayloads.push(new Uint8Array(u8));
+          return 1;
+        },
+      },
+    };
+
+    const instrumented = instrumentMediaSessionInstance(mediaSessionMock)!;
+    // Frame 1: AUD + SPS + PPS + SEI + 1500B IDR (SPS + PPS + 2 FU-A packets = 4 RTP packets)
+    const frame1Buffer = Buffer.concat([
+      startCode,
+      aud,
+      startCode,
+      sps,
+      startCode,
+      pps,
+      startCode,
+      sei,
+      startCode,
+      idrPayload,
+    ]);
+    await (
+      instrumented as unknown as {
+        sendVideoAccessUnit: (au: Buffer) => Promise<void>;
+      }
+    ).sendVideoAccessUnit(frame1Buffer);
+
+    const sentPackets = instrumented.sentVideoRtpPackets ?? [];
+    assert.equal(
+      sentPackets.length,
+      4,
+      'P0-A: Frame 1 must produce 4 RTP packets (SPS, PPS, and 2 FU-A fragments; AUD/SEI dropped)'
+    );
+
+    const frame1Timestamps = sentPackets.map((pkt) => pkt.timestamp);
+    const frame1Markers = sentPackets.map((pkt) => pkt.marker);
+    const frame1NalTypes = sentPackets.map((pkt) => pkt. payload[0] & 0x1f);
+
+    assert.deepEqual(
+      frame1Timestamps,
+      [90_000, 90_000, 90_000, 90_000],
+      'P0-A: SPS, PPS, and all IDR FU-A fragments of the same frame must share the exact same RTP timestamp'
+    );
+    assert.deepEqual(
+      frame1Markers,
+      [false, false, false, true],
+      'P0-A: RTP Marker bit M=1 must be set ONLY on the last fragment of the VCL IDR slice (M=0 on SPS/PPS)'
+    );
+    assert.deepEqual(
+      frame1NalTypes,
+      [7, 8, 28, 28],
+      'P0-A: SPS (7) and PPS (8) must be single NALUs, and large IDR must be FU-A (28) without start codes'
+    );
+
+    // Verify timestamp incremented by 90000 / 15 = 6000 for Frame 2
+    assert.equal(mediaSessionMock.videoTimestamp, 96_000);
+  });
+
+  it('P0-B: tears down VoIP session cleanly between consecutive calls and classifies VoIP/Media errors into Arabic diagnostics', async () => {
+    const rawSocketEv = new EventEmitter();
+    // Simulate an unrelated connection listener already on rawSocket.ev
+    const baseConnListener = () => {};
+    rawSocketEv.on('connection.update', baseConnListener);
+
+    let addedVoipConnListener: ((...args: unknown[]) => void) | undefined;
+    const voipFake = {
+      listen: async () => {
+        addedVoipConnListener = () => {};
+        rawSocketEv.on('connection.update', addedVoipConnListener);
+      },
+    };
+
+    const cleanup = await listenWithTrackedSocketCleanup(voipFake, {
+      ev: rawSocketEv,
+    });
+    assert.equal(
+      rawSocketEv.listenerCount('connection.update'),
+      2,
+      'P0-B: voip.listen() adds its connection.update listener'
+    );
+    cleanup();
+    assert.equal(
+      rawSocketEv.listenerCount('connection.update'),
+      1,
+      'P0-B: cleanup function removes the exact connection.update listener added during voip.listen()'
+    );
+
+    // Verify diagnostic Arabic error classification in toSafeArabicError
+    const concurrentErr = toSafeArabicError(
+      new Error('Maximum concurrent calls reached (1)')
+    );
+    assert.equal(
+      concurrentErr.userMessage.includes('حدث خطأ غير متوقع'),
+      false,
+      'P0-B: Maximum concurrent calls reached must not return generic unexpected error'
+    );
+    assert.equal(
+      concurrentErr.userMessage.includes('الحد الأقصى للمكالمات'),
+      true
+    );
+
+    const voipFailureErr = toSafeArabicError(
+      new VoipFailureError('فشل تهيئة مسار المكالمة الصوتية/المرئية')
+    );
+    assert.equal(
+      voipFailureErr.userMessage,
+      'فشل تهيئة مسار المكالمة الصوتية/المرئية'
+    );
+  });
 });
+
+

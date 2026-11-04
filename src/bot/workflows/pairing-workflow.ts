@@ -4,6 +4,10 @@ import {
   buildBackCancelRow,
   buildAppNavigationRow,
 } from '../keyboards/main-menu';
+import {
+  renderBreadcrumb,
+  renderStepProgressBar,
+} from '../keyboards/ui-theme';
 import { formatSessionStatusArabic } from '../keyboards/session-menu';
 import { ValidationError, toSafeArabicError } from '../../utils/errors';
 import { escapeMarkdown } from '../../utils/markdown';
@@ -76,9 +80,11 @@ export class PairingWorkflow {
         });
         return {
           text:
+            `${renderBreadcrumb(['🏠 الرئيسية', '📋 الجلسات', '📲 إعادة الربط'])}\n` +
+            `${renderStepProgressBar(1, 2, 'إدخال رقم الهاتف الدولي')}\n\n` +
             `📲 *إعادة ربط الجلسة:* ${escapeMarkdown(sess.label)}\n\n` +
             `الرجاء إرسال رقم هاتف واتساب مع رمز الدولة الدولي (مثال: \`+966501234567\`)\n` +
-            `أو إرسال الرقم متبوعاً برمز ربط مخصص من 8 أحرف/أرقام تدعمه مكتبة @hiroosy/baileys-lite (مثال: \`+966501234567 MYCODE12\`):`,
+            `أو إرسال الرقم متبوعاً برمز ربط مخصص من 8 أحرف/أرقام تدعمه مكتبة \`@hiroosy/baileys-lite@0.3.6\` (مثال: \`+966501234567 MYCODE12\`):`,
           keyboard: [
             [
               {
@@ -103,7 +109,9 @@ export class PairingWorkflow {
 
     return {
       text:
-        `📲 *ربط حساب واتساب جديد (@hiroosy/baileys-lite)*\n\n` +
+        `${renderBreadcrumb(['🏠 الرئيسية', '📲 ربط حساب واتساب'])}\n` +
+        `${renderStepProgressBar(1, 2, 'إدخال رقم الهاتف الدولي')}\n\n` +
+        `📲 *ربط حساب واتساب جديد (@hiroosy/baileys-lite@0.3.6)*\n\n` +
         `الرجاء إرسال رقم الهاتف مع رمز الدولة الدولي (مثال: \`+966501234567\`)\n` +
         `💡 _اختياري:_ يمكنك إرفاق رمز ربط مخصص من 8 أحرف/أرقام بعد المسافة (مثال: \`+966501234567 MYCODE12\`).\n` +
         `_ملاحظة أمنية: لن يتم إنشاء الجلسة إلا بعد التحقق من صحة رقم الهاتف، ولن يطلب منك البوت أبداً رمز تحقق SMS._`,
@@ -268,8 +276,10 @@ export class PairingWorkflow {
 
       return {
         text:
+          `${renderBreadcrumb(['🏠 الرئيسية', '📲 ربط حساب واتساب', '🔑 رمز الربط'])}\n` +
+          `${renderStepProgressBar(2, 2, 'إدخال رمز الربط في واتساب')}\n\n` +
           `✅ *تم توليد رمز الربط وحالة الجلسة الآن:* ${formatSessionStatusArabic(result.session.status)}\n\n` +
-          `🆔 معرف الجلسة: \`${result.session.id}\` (\`${result.session.label}\`)\n` +
+          `🆔 معرف الجلسة: \`${result.session.id}\` (*${escapeMarkdown(result.session.label)}*)\n` +
           `📱 الرقم المقترن: \`${result.maskedPhone}\`\n` +
           `🔑 رمز الربط (Pairing Code): \`${result.pairingCode}\`\n\n` +
           `📌 *خطوات الإدخال في تطبيق واتساب:*\n${result.instructionsArabic}\n\n` +
