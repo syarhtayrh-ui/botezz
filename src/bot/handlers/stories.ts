@@ -11,7 +11,7 @@ import {
   buildAppNavigationRow,
 } from '../keyboards/main-menu';
 import { BotViewResponse } from '../workflows/pairing-workflow';
-import { escapeMarkdown } from '../../utils/markdown';
+import { escapeMarkdown, truncateGraphemes } from '../../utils/markdown';
 
 export type StoriesFilterKind = 'ALL' | 'IMAGE' | 'VIDEO' | 'AUDIO' | 'TEXT';
 
@@ -104,7 +104,7 @@ export class StoriesHandler {
           rec.sender_name || rec.sender_phone || 'جهة اتصال'
         );
         const cap = escapeMarkdown(
-          (rec.caption || rec.file_name || rec.media_kind).slice(0, 45)
+          truncateGraphemes(rec.caption || rec.file_name || rec.media_kind, 45)
         );
         lines.push(
           `${(safePage - 1) * pageSize + idx + 1}. ${icon} *${sender}* (\`${escapeMarkdown(rec.sender_phone)}\`)\n   └ 📁 \`${escapeMarkdown(rec.file_name || 'status')}\` — ${cap}`
@@ -116,7 +116,10 @@ export class StoriesHandler {
 
     for (const rec of slice) {
       const icon = this.kindIcon(rec.media_kind);
-      const shortSender = (rec.sender_name || rec.sender_phone).slice(0, 14);
+      const shortSender = truncateGraphemes(
+        rec.sender_name || rec.sender_phone,
+        14
+      );
       const cleanDigits = rec.sender_phone.replace(/\D/g, '').slice(0, 15);
       rows.push([
         {

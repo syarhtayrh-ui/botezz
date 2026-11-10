@@ -41,3 +41,26 @@ export function isMarkdownEntityError(err: unknown): boolean {
     lower.includes('parse mode')
   );
 }
+
+/**
+ * Safely truncates a string by Unicode grapheme clusters (or code points fallback)
+ * and strips any orphaned UTF-16 surrogates so emojis are never split in half.
+ */
+export function truncateGraphemes(text: string, maxGraphemes: number): string {
+  if (!text) return '';
+  const sanitized = text.replace(
+    /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g,
+    ''
+  );
+  if (typeof Intl !== 'undefined' && typeof Intl.Segmenter === 'function') {
+    const segmenter = new Intl.Segmenter('ar', { granularity: 'grapheme' });
+    const segments: string[] = [];
+    for (const item of segmenter.segment(sanitized)) {
+      if (segments.length >= maxGraphemes) break;
+      segments.push(item.segment);
+    }
+    return segments.join('').trim();
+  }
+  return Array.from(sanitized).slice(0, maxGraphemes).join('').trim();
+}
+

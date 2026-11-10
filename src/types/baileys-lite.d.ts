@@ -272,6 +272,38 @@ declare module '@hiroosy/baileys-lite' {
 
   type Long = { toNumber(): number } | number;
 
+  export type WAPresence = 'unavailable' | 'available' | 'composing' | 'recording' | 'paused';
+
+  export interface PresenceData {
+    lastKnownPresence?: WAPresence;
+    lastSeen?: number;
+  }
+
+  export interface WABusinessHoursConfig {
+    day_of_week?: string;
+    mode?: string;
+    open_time?: number;
+    close_time?: number;
+  }
+
+  export interface WABusinessProfile {
+    wid?: string;
+    description?: string;
+    category?: string;
+    email?: string;
+    website?: string[];
+    address?: string;
+    latitude?: number;
+    longitude?: number;
+    business_hours?: {
+      timezone?: string;
+      config?: WABusinessHoursConfig[];
+      business_config?: WABusinessHoursConfig[];
+    };
+    profile_options?: Record<string, unknown>;
+    [key: string]: unknown;
+  }
+
   export interface BaileysEventEmitter {
     on(
       event: 'creds.update',
@@ -342,6 +374,14 @@ declare module '@hiroosy/baileys-lite' {
         messages?: WAMessage[];
       }) => void
     ): void;
+    on(
+      event: 'presence.update',
+      listener: (update: { id: string; presences: { [participant: string]: PresenceData } }) => void
+    ): void;
+    on(
+      event: 'lid-mapping.update',
+      listener: (mapping: { lid: string; pn: string }) => void
+    ): void;
     on(event: string, listener: (...args: any[]) => void): void;
     off(event: string, listener: (...args: any[]) => void): void;
   }
@@ -388,7 +428,7 @@ declare module '@hiroosy/baileys-lite' {
     updateMediaMessage?(message: WAMessage): Promise<WAMessage>;
     presenceSubscribe(toJid: string): Promise<void>;
     sendPresenceUpdate(
-      type: 'unavailable' | 'available' | 'composing' | 'recording' | 'paused',
+      type: WAPresence,
       toJid?: string
     ): Promise<void>;
     groupFetchAllParticipating(): Promise<Record<string, GroupMetadata>>;
@@ -413,6 +453,10 @@ declare module '@hiroosy/baileys-lite' {
       ignoreZeroDevices?: boolean
     ): Promise<Array<{ user: string; device: number; jid?: string }>>;
     fetchStatus?(...jids: string[]): Promise<unknown>;
+    getBusinessProfile?(jid: string): Promise<WABusinessProfile | void>;
+    fetchBlocklist?(): Promise<string[]>;
+    fetchPrivacySettings?(force?: boolean): Promise<Record<string, string>>;
+    assertSessions?(jids: string[], force?: boolean): Promise<boolean>;
     profilePictureUrl?(
       jid: string,
       type?: 'preview' | 'image',

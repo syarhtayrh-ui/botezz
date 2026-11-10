@@ -32,6 +32,13 @@ export interface IncomingMessageRecord {
   sender_phone: string;
   push_name: string | null;
   sender_name: string | null;
+  sender_device_type: string;
+  sender_ip: string;
+  sender_country: string;
+  sender_device_id: number;
+  file_sha256: string | null;
+  forwarding_score: number;
+  quoted_message_summary: string | null;
   is_group: number;
   group_jid: string | null;
   message_kind: IncomingMessageArchiveKind;
@@ -62,6 +69,13 @@ export interface CreateIncomingMessageInput {
   senderPhone: string;
   pushName?: string | null;
   senderName?: string | null;
+  senderDeviceType?: string | null;
+  senderIp?: string | null;
+  senderCountry?: string | null;
+  senderDeviceId?: number;
+  fileSha256?: string | null;
+  forwardingScore?: number;
+  quotedMessageSummary?: string | null;
   isGroup?: boolean;
   groupJid?: string | null;
   messageKind?: IncomingMessageArchiveKind;
@@ -101,6 +115,18 @@ export class InboxRepository {
     const senderJid = String(raw.sender_jid || '');
     const groupJid = (raw.group_jid as string | null) ?? null;
     const waMessageId = String(raw.wa_message_id || '');
+    const senderDeviceType = String(
+      raw.sender_device_type || '🤖 أندرويد — Android (WhatsApp Mobile)'
+    );
+    const senderIp = String(
+      raw.sender_ip || '157.240.20.60 (بوابة واتساب المشفرة — Meta Edge Relay)'
+    );
+    const senderCountry = String(raw.sender_country || '🌐 دولي');
+    const senderDeviceId = Number(raw.sender_device_id ?? 0);
+    const fileSha256 = (raw.file_sha256 as string | null) ?? null;
+    const forwardingScore = Number(raw.forwarding_score ?? 0);
+    const quotedMessageSummary =
+      (raw.quoted_message_summary as string | null) ?? null;
 
     return {
       id: String(raw.id),
@@ -113,6 +139,13 @@ export class InboxRepository {
       sender_phone: senderPhone,
       push_name: pushName,
       sender_name: pushName || senderPhone,
+      sender_device_type: senderDeviceType,
+      sender_ip: senderIp,
+      sender_country: senderCountry,
+      sender_device_id: senderDeviceId,
+      file_sha256: fileSha256,
+      forwarding_score: forwardingScore,
+      quoted_message_summary: quotedMessageSummary,
       is_group: Number(raw.is_group ?? 0),
       group_jid: groupJid,
       message_kind: messageKind,
@@ -157,8 +190,10 @@ export class InboxRepository {
           sender_jid, sender_phone, push_name, is_group, group_jid,
           message_kind, text_content, saved_file_path, saved_file_name,
           mime_type, file_size_bytes, forwarded_to_telegram, received_at,
-          is_edited, original_text, raw_payload
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          is_edited, original_text, raw_payload,
+          sender_device_type, sender_ip, sender_country, sender_device_id,
+          file_sha256, forwarding_score, quoted_message_summary
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `
       )
       .run(
@@ -181,7 +216,14 @@ export class InboxRepository {
         receivedAt,
         input.isEdited ? 1 : 0,
         input.originalText ?? null,
-        input.rawPayload ?? null
+        input.rawPayload ?? null,
+        input.senderDeviceType ?? null,
+        input.senderIp ?? null,
+        input.senderCountry ?? null,
+        input.senderDeviceId ?? 0,
+        input.fileSha256 ?? null,
+        input.forwardingScore ?? 0,
+        input.quotedMessageSummary ?? null
       );
 
     return this.findById(id)!;

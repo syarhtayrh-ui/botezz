@@ -1328,5 +1328,207 @@ describe('@hiroosy/baileys-lite & Real WhatsApp VoIP Video Call Suite', () => {
 
       await service.stopVideoCall('sess_180s_test', stream.callId);
     });
+
+    it('extracts and renders deep sender forensics (sender name, phone, carrier NDC, @lid resolution, raw stanza :device, View-Once unwrapping, live edits, and sync-stanza filtering) in InboxHandler', async () => {
+      const dbPath = path.join(tmpDir, 'inbox_forensics_test.db');
+      const appDb = new AppDatabase(dbPath);
+      const inboxRepo = new InboxRepository(appDb);
+      const sessionRepo = new SessionRepository(appDb);
+      const auditRepo = new AuditRepository(appDb);
+      const sessionStore = new SessionStore(path.join(tmpDir, 'sessions_forensics'));
+      const sessionManager = new SessionManager(
+        sessionRepo,
+        auditRepo,
+        sessionStore,
+        (id) => new MockWhatsAppSessionDriver(id)
+      );
+      sessionManager.setConfiguredAdminId(777001);
+
+      const session = sessionManager.createSession('Forensics Session', 777001);
+      const receiver = new IncomingMessageReceiver(
+        inboxRepo,
+        sessionRepo,
+        path.join(tmpDir, 'data_forensics')
+      );
+      const inboxHandler = new InboxHandler(inboxRepo, receiver, sessionManager);
+
+      // 1. Standard iOS message with raw stanza :device and explicit IP
+      const rec = await receiver.processIncomingMessage({
+        sessionId: session.id,
+        rawMessage: {
+          key: {
+            remoteJid: '966501234567:2@s.whatsapp.net',
+            fromMe: false,
+            id: '3A998877665544332211',
+          },
+          pushName: 'خالد العتيبي',
+          senderIp: '188.54.122.91 (بوابة الرياض — STC / Relay: 157.240.20.60)',
+          messageTimestamp: Math.floor(Date.now() / 1000),
+          message: {
+            extendedTextMessage: {
+              text: 'رسالة اختبار مع تفاصيل المرسل والجهاز والـ IP',
+              contextInfo: {
+                forwardingScore: 2,
+                isForwarded: true,
+                quotedMessage: {
+                  conversation: 'الرسالة الأصلية المقتبس منها',
+                },
+              },
+            },
+          },
+        },
+      });
+
+      assert.ok(rec, 'Expected incoming message record to be created');
+      assert.equal(rec.sender_name, 'خالد العتيبي');
+      assert.equal(rec.sender_phone, '+966501234567');
+      assert.ok(rec.sender_country?.includes('السعودية'), 'Expected Saudi Arabia country');
+      assert.ok(rec.sender_country?.includes('STC'), 'Expected STC carrier from +96650 NDC');
+      assert.ok(rec.sender_device_type?.includes('آيفون — iOS'));
+      assert.ok(rec.sender_device_type?.includes('جهاز مرتبط #2'));
+      assert.equal(
+        rec.sender_ip,
+        '188.54.122.91 (بوابة الرياض — STC / Relay: 157.240.20.60)'
+      );
+      assert.equal(rec.forwarding_score, 2);
+      assert.equal(rec.quoted_message_summary, 'الرسالة الأصلية المقتبس منها');
+      assert.ok(rec.file_sha256 && rec.file_sha256.length === 64);
+
+      // 2. Live edit delivered via messages.update (__isLiveEditUpdate + __editedTargetId)
+      const editedRec = await receiver.processIncomingMessage({
+        sessionId: session.id,
+        rawMessage: {
+          key: {
+            remoteJid: '966501234567@s.whatsapp.net',
+            fromMe: false,
+            id: '3A998877665544332211',
+          },
+          __isLiveEditUpdate: true,
+          __editedTargetId: '3A998877665544332211',
+          messageTimestamp: Math.floor(Date.now() / 1000),
+          message: {
+            editedMessage: {
+              message: {
+                extendedTextMessage: {
+                  text: 'النص الجديد بعد التعديل الحي عبر messages.update',
+                },
+              },
+            },
+          },
+        },
+      });
+
+      assert.ok(editedRec, 'Expected live edit to update original record');
+      assert.equal(editedRec.id, rec.id);
+      assert.equal(Boolean(editedRec.is_edited), true);
+      assert.equal(editedRec.original_text, 'رسالة اختبار مع تفاصيل المرسل والجهاز والـ IP');
+      assert.equal(editedRec.text_content, 'النص الجديد بعد التعديل الحي عبر messages.update');
+
+      // 3. Linked Identity (@lid) resolved via sock.signalRepository.lidMapping.getPNForLID + raw stanza :33 companion
+      const fakeSockWithLidMap = {
+        signalRepository: {
+          lidMapping: {
+            async getPNForLID(lid: string) {
+              if (lid.startsWith('99887766554433')) {
+                return '967771234567:0@s.whatsapp.net';
+              }
+              return null;
+            },
+          },
+        },
+      };
+
+      const lidRec = await receiver.processIncomingMessage({
+        sessionId: session.id,
+        sock: fakeSockWithLidMap as never,
+        rawMessage: {
+          key: {
+            remoteJid: '99887766554433@lid',
+            fromMe: false,
+            id: '3EB0A1B2C3D4E5F60011',
+          },
+          __rawStanzaMeta: {
+            id: '3EB0A1B2C3D4E5F60011',
+            rawFrom: '99887766554433:33@lid',
+            addressingMode: 'lid',
+            encType: 'pkmsg',
+            capturedAt: Date.now(),
+          },
+          __contactInfo: {
+            id: '99887766554433@lid',
+            notify: 'أحمد اليافعي',
+          },
+          messageTimestamp: Math.floor(Date.now() / 1000),
+          message: {
+            viewOnceMessageV2: {
+              message: {
+                imageMessage: {
+                  caption: 'صورة عرض لمرة واحدة عبر معرف مرتبط @lid',
+                  mimetype: 'image/jpeg',
+                },
+              },
+            },
+          },
+        },
+      });
+
+      assert.ok(lidRec, 'Expected @lid View-Once message to be unwrapped and archived');
+      assert.equal(lidRec.kind, 'image');
+      assert.equal(lidRec.sender_name, 'أحمد اليافعي');
+      assert.equal(lidRec.sender_phone, '+967771234567');
+      assert.ok(lidRec.sender_country?.includes('اليمن'));
+      assert.ok(lidRec.sender_country?.includes('Yemen Mobile'));
+      assert.ok(lidRec.sender_device_type?.includes('واتساب ويب'));
+      assert.ok(lidRec.sender_device_type?.includes('#33'));
+      assert.ok(lidRec.sender_ip?.includes('Yemen Mobile'));
+      assert.ok(lidRec.sender_ip?.includes('Signal:pkmsg'));
+
+      // 4. Internal non-user sync protocolMessage (HISTORY_SYNC_NOTIFICATION) must be ignored
+      const ignoredSync = await receiver.processIncomingMessage({
+        sessionId: session.id,
+        rawMessage: {
+          key: {
+            remoteJid: '966501234567@s.whatsapp.net',
+            fromMe: false,
+            id: '3EB0SYNC000011112222',
+          },
+          message: {
+            protocolMessage: {
+              type: 5, // HISTORY_SYNC_NOTIFICATION
+            },
+          },
+        },
+      });
+      assert.equal(ignoredSync, null, 'Internal sync protocolMessage must not create an inbox record');
+
+      const listMenu = inboxHandler.renderInboxMenu(777001, 1);
+      assert.ok(listMenu.text.includes('اسم المرسل:'));
+      assert.ok(listMenu.text.includes('خالد العتيبي'));
+      assert.ok(listMenu.text.includes('رقم المرسل:'));
+      assert.ok(listMenu.text.includes('+966501234567'));
+      assert.ok(listMenu.text.includes('نوع جهاز المرسل:'));
+      assert.ok(listMenu.text.includes('آيفون — iOS'));
+      assert.ok(listMenu.text.includes('عنوان IP المرسل:'));
+      assert.ok(listMenu.text.includes('188.54.122.91'));
+
+      const detailView = inboxHandler.viewMessage(777001, rec.id);
+      assert.ok(detailView.text.includes('هوية المرسل'));
+      assert.ok(detailView.text.includes('بصمة الجهاز والشبكة'));
+      assert.ok(detailView.text.includes('خالد العتيبي'));
+      assert.ok(detailView.text.includes('+966501234567'));
+      assert.ok(detailView.text.includes('آيفون — iOS'));
+      assert.ok(detailView.text.includes('188.54.122.91'));
+      assert.ok(detailView.text.includes('الرسالة الأصلية المقتبس منها'));
+      assert.ok(detailView.text.includes('النص الأصلي (قبل التعديل)'));
+      assert.ok(detailView.text.includes('تم تعديل هذه الرسالة من قبل المرسل'));
+      assert.ok(detailView.text.includes('النص الجديد بعد التعديل الحي'));
+
+      const savedComparisonDiskContent = fs.readFileSync(editedRec.file_path, 'utf8');
+      assert.ok(savedComparisonDiskContent.includes('النسخة الأولى'));
+      assert.ok(savedComparisonDiskContent.includes('النسخة المحدثة'));
+
+      appDb.close();
+    });
   });
 });
+

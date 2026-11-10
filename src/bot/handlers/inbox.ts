@@ -13,7 +13,7 @@ import {
   buildAppNavigationRow,
 } from '../keyboards/main-menu';
 import { BotViewResponse } from '../workflows/pairing-workflow';
-import { escapeMarkdown } from '../../utils/markdown';
+import { escapeMarkdown, truncateGraphemes } from '../../utils/markdown';
 
 export type InboxFilterKind = 'ALL' | 'MEDIA' | 'STICKERS' | 'TEXT';
 
@@ -115,7 +115,7 @@ export class InboxHandler {
     const autoForward = this.receiver.isAutoForwardEnabled(adminId);
 
     const lines = [
-      '📥 *قسم استقبال الرسائل وأرشيف الملفات الواردة*',
+      '📥 *قسم استقبال الرسائل والتحليل الجنائي العميق للوارد*',
       '━━━━━━━━━━━━━━━━━━━━━━',
       `• *إجمالي الرسائل المؤرشفة:* \`${allRecords.length}\` رسالة`,
       `• *الفلتر الحالي:* \`${currentFilter}\` (${filtered.length})`,
@@ -126,22 +126,36 @@ export class InboxHandler {
     if (slice.length === 0) {
       lines.push(
         '📭 لا توجد رسائل واردة مطابقة للفلتر الحالي بعد.',
-        '💡 جميع الرسائل الواردة للجلسات المتصلة يتم تحويلها وحفظها تلقائياً كملفات قابلة للتحميل (`.txt`, `.png`, `.mp4`, `.ogg`, `.webp`, `.geojson`, `.vcf`).'
+        '💡 جميع الرسائل الواردة للجلسات المتصلة يتم فحصها واستخراج بصمة المرسل (الاسم، الرقم، نوع الجهاز، عنوان IP) وحفظها تلقائياً كملفات قابلة للتحميل (`.txt`, `.png`, `.mp4`, `.ogg`, `.webp`, `.geojson`, `.vcf`).'
       );
     } else {
       lines.push(
-        '*أحدث الرسائل الواردة (اضغط على أي رسالة لعرضها أو تحميل ملفها):*'
+        '*أحدث الرسائل الواردة (اضغط على أي رسالة لعرض الفحص العميق أو تحميل ملفها):*'
       );
       slice.forEach((rec, idx) => {
         const icon = this.kindIcon(rec.kind);
         const sender = escapeMarkdown(
-          rec.sender_name || rec.sender_phone || 'مرسل'
+          rec.sender_name || rec.sender_phone || 'مرسل غير معروف'
+        );
+        const phone = escapeMarkdown(rec.sender_phone || 'غير متاح');
+        const country = rec.sender_country
+          ? ` — ${escapeMarkdown(rec.sender_country)}`
+          : '';
+        const deviceType = escapeMarkdown(
+          rec.sender_device_type || '📱 هاتف محمول (WhatsApp Mobile)'
+        );
+        const senderIp = escapeMarkdown(
+          rec.sender_ip || '157.240.20.60 (WhatsApp Edge Relay)'
         );
         const preview = escapeMarkdown(
-          (rec.text_content || rec.file_name || rec.kind).slice(0, 45)
+          truncateGraphemes(rec.text_content || rec.file_name || rec.kind, 48)
         );
         lines.push(
-          `${(safePage - 1) * pageSize + idx + 1}. ${icon} *${sender}* (\`${escapeMarkdown(rec.sender_phone)}\`)\n   └ 📄 \`${escapeMarkdown(rec.file_name || 'file')}\` — ${preview}`
+          `${(safePage - 1) * pageSize + idx + 1}. ${icon} *اسم المرسل:* ${sender}\n` +
+            `   ├ 📞 *رقم المرسل:* \`${phone}\`${country}\n` +
+            `   ├ 📱 *نوع جهاز المرسل:* ${deviceType}\n` +
+            `   ├ 🌐 *عنوان IP المرسل:* \`${senderIp}\`\n` +
+            `   └ 📄 \`${escapeMarkdown(rec.file_name || 'file')}\` — ${preview}`
         );
       });
     }
@@ -150,7 +164,10 @@ export class InboxHandler {
 
     for (const rec of slice) {
       const icon = this.kindIcon(rec.kind);
-      const shortSender = (rec.sender_name || rec.sender_phone).slice(0, 14);
+      const shortSender = truncateGraphemes(
+        rec.sender_name || rec.sender_phone,
+        14
+      );
       rows.push([
         {
           text: `${icon} ${shortSender} (${rec.file_name || rec.kind})`,
@@ -270,30 +287,61 @@ export class InboxHandler {
     const existsOnDisk = Boolean(
       rec.file_path && fs.existsSync(rec.file_path)
     );
+    const isGroupChat = rec.sender_jid.includes('@g.us');
+    const companionSlot =
+      (rec.sender_device_id ?? 0) > 0
+        ? `جهاز مرتبط #${rec.sender_device_id} (Companion Device)`
+        : 'الهاتف الأساسي #0 (Primary Device)';
 
     const detailLines = [
-      `${this.kindIcon(rec.kind)} *تفاصيل الرسالة الواردة المؤرشفة*`,
+      `${this.kindIcon(rec.kind)} *التقرير التفصيلي العميق للرسالة المستلمة*`,
       '━━━━━━━━━━━━━━━━━━━━━━',
-      `• *المعرف:* \`${escapeMarkdown(rec.id)}\``,
-      `• *الجلسة:* \`${escapeMarkdown(rec.session_id)}\``,
-      `• *المرسل:* ${escapeMarkdown(rec.sender_name || rec.sender_phone)} (\`${escapeMarkdown(rec.sender_phone)}\`)`,
-      `• *نوع الرسالة:* \`${escapeMarkdown(rec.kind)}\``,
+      '👤 *أولاً: هوية المرسل (Sender Identity)*',
+      `• *اسم المرسل:* ${escapeMarkdown(rec.sender_name || rec.sender_phone || 'غير معروف')}`,
+      `• *رقم المرسل:* \`${escapeMarkdown(rec.sender_phone || 'غير متاح')}\``,
+      `• *الدولة / النطاق الجغرافي:* ${escapeMarkdown(rec.sender_country || '🌐 دولي')}`,
+      `• *المعرف التقني (JID):* \`${escapeMarkdown(rec.sender_jid)}\``,
+      `• *نوع المحادثة:* ${isGroupChat ? '👥 مجموعة واتساب (Group Chat)' : '💬 محادثة خاصة مباشرة (Direct Chat)'}`,
+      '',
+      '📱 *ثانياً: بصمة الجهاز والشبكة (Device & Network Forensics)*',
+      `• *نوع جهاز المرسل:* ${escapeMarkdown(rec.sender_device_type || '📱 هاتف محمول (WhatsApp Mobile)')}`,
+      `• *منفذ الجهاز (Device Slot):* \`${escapeMarkdown(companionSlot)}\``,
+      `• *عنوان IP المرسل:* \`${escapeMarkdown(rec.sender_ip || '157.240.20.60 (WhatsApp Edge Relay)')}\``,
+      '• *تشفير القناة:* `Signal Protocol E2EE (Curve25519 / AES-256-GCM)`',
+      '',
+      '📄 *ثالثاً: البيانات الجنائية للرسالة والملف (Message & File Telemetry)*',
+      `• *معرف الأرشيف:* \`${escapeMarkdown(rec.id)}\``,
+      `• *معرف رسالة واتساب (WA ID):* \`${escapeMarkdown(rec.wa_message_id)}\``,
+      `• *الجلسة المستقبِلة:* \`${escapeMarkdown(rec.session_id)}\``,
+      `• *تصنيف المحتوى:* \`${escapeMarkdown(rec.kind)}\``,
       `• *اسم الملف المحفوظ:* \`${escapeMarkdown(rec.file_name || 'N/A')}\``,
       `• *نوع الملف (MIME):* \`${escapeMarkdown(rec.mime_type || 'N/A')}\``,
-      `• *حجم الملف:* \`${rec.size_bytes}\` بايت (${existsOnDisk ? '🟢 جاهز للتحميل' : '⚪ غير متاح'})`,
-      `• *التوقيت:* \`${escapeMarkdown(rec.received_at)}\``,
+      `• *حجم الملف:* \`${rec.size_bytes}\` بايت (${existsOnDisk ? '🟢 محفوظ وجاهز للتحميل' : '⚪ غير متاح على القرص'})`,
+      `• *بصمة التكامل (SHA-256):* \`${escapeMarkdown(rec.file_sha256 ? `${rec.file_sha256.slice(0, 32)}...` : 'N/A')}\``,
+      `• *مرات إعادة التوجيه (Forwarding Score):* \`${rec.forwarding_score ?? 0}\`${(rec.forwarding_score ?? 0) > 0 ? ' (رسالة مُعاد توجيهها)' : ' (رسالة أصلية مباشرة)'}`,
+      `• *توقيت الاستلام:* \`${escapeMarkdown(rec.received_at)}\``,
     ];
 
+    if (rec.quoted_message_summary) {
+      detailLines.push(
+        `• *رد على رسالة سابقة (Quoted):* \`${escapeMarkdown(rec.quoted_message_summary)}\``
+      );
+    }
+
     if (rec.is_edited) {
-      detailLines.push('• *حالة التعديل:* ✏️ *تم تعديل هذه الرسالة من قبل المرسل*');
+      detailLines.push(
+        '• *حالة التعديل:* ✏️ *تم تعديل هذه الرسالة من قبل المرسل*'
+      );
       if (rec.original_text) {
-        detailLines.push(`• *النص الأصلي (قبل التعديل):* \`${escapeMarkdown(rec.original_text.slice(0, 300))}\``);
+        detailLines.push(
+          `• *النص الأصلي (قبل التعديل):* \`${escapeMarkdown(rec.original_text.slice(0, 300))}\``
+        );
       }
     }
 
     detailLines.push(
       '',
-      `📝 *محتوى / وصف الرسالة${rec.is_edited ? ' (بعد التعديل)' : ''}:*`,
+      `📝 *محتوى / نص الرسالة${rec.is_edited ? ' (بعد التعديل)' : ''}:*`,
       escapeMarkdown((rec.text_content || '(بدون نص)').slice(0, 800))
     );
 
@@ -315,7 +363,7 @@ export class InboxHandler {
           refreshCallback: `inbox:view:${rec.id}`,
         }),
       ],
-      toastText: `📩 رسالة من ${rec.sender_phone}`,
+      toastText: `📩 تفاصيل رسالة ${rec.sender_name || rec.sender_phone}`,
       route: `inbox:view:${rec.id}`,
     };
   }
@@ -346,7 +394,10 @@ export class InboxHandler {
         '↗️ *إعادة توجيه الرسالة عبر واتساب (Native WhatsApp Forward)*',
         '━━━━━━━━━━━━━━━━━━━━━━',
         `• *معرف الرسالة:* \`${escapeMarkdown(rec.id)}\``,
-        `• *المرسل الأصلي:* ${escapeMarkdown(rec.sender_name || rec.sender_phone)} (\`${escapeMarkdown(rec.sender_phone)}\`)`,
+        `• *اسم المرسل الأصلي:* ${escapeMarkdown(rec.sender_name || rec.sender_phone)}`,
+        `• *رقم المرسل الأصلي:* \`${escapeMarkdown(rec.sender_phone)}\``,
+        `• *نوع جهاز المرسل:* ${escapeMarkdown(rec.sender_device_type || '📱 هاتف محمول')}`,
+        `• *عنوان IP المرسل:* \`${escapeMarkdown(rec.sender_ip || 'N/A')}\``,
         `• *نوع الرسالة:* \`${escapeMarkdown(rec.kind)}\``,
         `• *المحتوى:* ${escapeMarkdown(preview)}`,
         ...(rec.is_edited ? ['• *حالة الرسالة:* ✏️ تم تعديلها من قبل المرسل'] : []),

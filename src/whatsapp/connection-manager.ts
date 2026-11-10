@@ -7,6 +7,7 @@ import makeWASocket, {
   fetchLatestBaileysVersion,
   fetchLatestWaWebVersion,
   Browsers,
+  jidDecode,
   jidNormalizedUser,
   areJidsSameUser,
   proto,
@@ -15,6 +16,10 @@ import makeWASocket, {
   GroupMetadata,
   ParticipantAction,
   AnyMessageContent,
+  WAMessageKey,
+  WAPresence,
+  PresenceData,
+  WABusinessProfile,
   generateForwardMessageContent,
   generateWAMessageFromContent,
   toCompatibleWhatsAppSocket,
@@ -32,6 +37,8 @@ import {
   SupportedMediaKind,
   validateCustomPairingCode,
   generateRandomPairingCode,
+  normalizePhoneNumber,
+  validateRecipient,
 } from '../security/validation';
 import {
   WhatsAppConnectionError,
@@ -90,6 +97,70 @@ export interface SessionSocketDiagnostics {
   chatsCount: number;
   contactsCount: number;
   cachedMessagesCount: number;
+}
+
+export interface PresenceStateTransition {
+  state: WAPresence;
+  timestampMs: number;
+  participantJid: string;
+}
+
+export interface TrackedPresenceRecord {
+  chatJid: string;
+  resolvedLid?: string;
+  currentState: WAPresence;
+  lastSeenTimestampSec?: number;
+  lastUpdatedMs: number;
+  transitions: PresenceStateTransition[];
+  totalOnlineDurationMs: number;
+  onlineSessionStartedAtMs?: number;
+}
+
+export interface WhatsAppFullProfileReport {
+  queriedInput: string;
+  existsOnWhatsApp: boolean;
+  pnJid: string;
+  e164Phone: string;
+  lidJid?: string;
+  pushName?: string;
+  verifiedName?: string;
+  statusText?: string;
+  statusSetAt?: string;
+  profilePicture: {
+    hdUrl?: string;
+    previewUrl?: string;
+    status: 'AVAILABLE' | 'PRIVACY_HIDDEN' | 'NO_PICTURE' | 'ERROR';
+    statusReasonArabic: string;
+    imageBuffer?: Buffer;
+  };
+  presence: {
+    currentState: WAPresence | 'unknown';
+    lastSeenIso?: string;
+  };
+  devices: {
+    totalCount: number;
+    primaryDevice: number[];
+    companionDevices: number[];
+    deviceListFormatted: string[];
+  };
+  businessProfile?: {
+    isBusiness: boolean;
+    category?: string;
+    description?: string;
+    email?: string;
+    website?: string[];
+    address?: string;
+    latitude?: number;
+    longitude?: number;
+    timezone?: string;
+    businessHoursSummary?: string[];
+  };
+  sharedGroups: Array<{
+    groupJid: string;
+    subject: string;
+    role: 'superadmin' | 'admin' | 'member';
+  }>;
+  fetchedAtIso: string;
 }
 
 import {
@@ -383,8 +454,178 @@ export class SessionMemoryStore {
   public readonly messages = new Map<string, unknown[]>();
   public readonly normalizedMessages: NormalizedIncomingMessage[] = [];
   public readonly contacts = new Map<string, unknown>();
+  public readonly presences = new Map<string, TrackedPresenceRecord>();
+  public readonly lidToPnMap = new Map<string, string>();
+  public readonly pnToLidMap = new Map<string, string>();
+  private readonly presenceListeners = new Map<
+    string,
+    Set<(record: TrackedPresenceRecord) => void>
+  >();
   private readonly messageByKey = new Map<string, proto.IMessage>();
   private readonly normalizer = new MessageNormalizer();
+
+  public recordLidMapping(lidRaw?: string | null, pnRaw?: string | null): void {
+    if (!lidRaw || !pnRaw) return;
+    try {
+      const lid = jidNormalizedUser(lidRaw);
+      const pn = jidNormalizedUser(pnRaw);
+      if (!lid.endsWith('@lid') || !pn.endsWith('@s.whatsapp.net')) return;
+      this.lidToPnMap.set(lid, pn);
+      this.pnToLidMap.set(pn, lid);
+      const pnRecord = this.presences.get(pn);
+      if (pnRecord && !pnRecord.resolvedLid) {
+        pnRecord.resolvedLid = lid;
+      }
+      const lidRecord = this.presences.get(lid);
+      if (lidRecord && !pnRecord) {
+        this.presences.set(pn, {
+          ...lidRecord,
+          chatJid: pn,
+          resolvedLid: lid,
+          transitions: [...lidRecord.transitions],
+        });
+      }
+    } catch {
+      // Ignore invalid JID format
+    }
+  }
+
+  public getLidForPn(pnRaw: string): string | undefined {
+    try {
+      return this.pnToLidMap.get(jidNormalizedUser(pnRaw));
+    } catch {
+      return undefined;
+    }
+  }
+
+  public getPnForLid(lidRaw: string): string | undefined {
+    try {
+      return this.lidToPnMap.get(jidNormalizedUser(lidRaw));
+    } catch {
+      return undefined;
+    }
+  }
+
+  public onPresenceChange(
+    jid: string,
+    listener: (record: TrackedPresenceRecord) => void
+  ): () => void {
+    const norm = jidNormalizedUser(jid);
+    let set = this.presenceListeners.get(norm);
+    if (!set) {
+      set = new Set();
+      this.presenceListeners.set(norm, set);
+    }
+    set.add(listener);
+    return () => {
+      set?.delete(listener);
+      if (set && set.size === 0) {
+        this.presenceListeners.delete(norm);
+      }
+    };
+  }
+
+  public applyPresenceTransition(params: {
+    chatJid: string;
+    participantJid: string;
+    state: WAPresence;
+    lastSeen?: number;
+    timestampMs?: number;
+  }): TrackedPresenceRecord {
+    const now = params.timestampMs ?? Date.now();
+    const rawChat = jidNormalizedUser(params.chatJid);
+    const rawParticipant = jidNormalizedUser(params.participantJid || params.chatJid);
+
+    const mappedPn = rawChat.endsWith('@lid')
+      ? this.lidToPnMap.get(rawChat)
+      : rawParticipant.endsWith('@lid')
+        ? this.lidToPnMap.get(rawParticipant)
+        : undefined;
+    const mappedLid = rawChat.endsWith('@lid')
+      ? rawChat
+      : rawParticipant.endsWith('@lid')
+        ? rawParticipant
+        : this.pnToLidMap.get(rawChat);
+
+    const primaryChatJid = mappedPn || rawChat;
+    const existing = this.presences.get(primaryChatJid) ||
+      (mappedLid ? this.presences.get(mappedLid) : undefined) || {
+        chatJid: primaryChatJid,
+        resolvedLid: mappedLid,
+        currentState: 'unavailable' as WAPresence,
+        lastUpdatedMs: now,
+        transitions: [],
+        totalOnlineDurationMs: 0,
+      };
+
+    const isOnlineState =
+      params.state === 'available' ||
+      params.state === 'composing' ||
+      params.state === 'recording';
+
+    let totalOnlineDurationMs = existing.totalOnlineDurationMs;
+    let onlineSessionStartedAtMs = existing.onlineSessionStartedAtMs;
+
+    if (isOnlineState) {
+      if (onlineSessionStartedAtMs === undefined) {
+        onlineSessionStartedAtMs = now;
+      }
+    } else if (params.state === 'unavailable') {
+      if (onlineSessionStartedAtMs !== undefined) {
+        totalOnlineDurationMs += Math.max(0, now - onlineSessionStartedAtMs);
+        onlineSessionStartedAtMs = undefined;
+      }
+    }
+
+    const transitions = [...existing.transitions];
+    const lastTransition = transitions[transitions.length - 1];
+    if (!lastTransition || lastTransition.state !== params.state) {
+      transitions.push({
+        state: params.state,
+        timestampMs: now,
+        participantJid: rawParticipant,
+      });
+      if (transitions.length > 50) {
+        transitions.shift();
+      }
+    }
+
+    const updated: TrackedPresenceRecord = {
+      chatJid: primaryChatJid,
+      resolvedLid: mappedLid || existing.resolvedLid,
+      currentState: params.state,
+      lastSeenTimestampSec:
+        typeof params.lastSeen === 'number' && params.lastSeen > 0
+          ? params.lastSeen
+          : existing.lastSeenTimestampSec,
+      lastUpdatedMs: now,
+      transitions,
+      totalOnlineDurationMs,
+      onlineSessionStartedAtMs,
+    };
+
+    this.presences.set(primaryChatJid, updated);
+    if (updated.resolvedLid) {
+      this.presences.set(updated.resolvedLid, updated);
+    }
+
+    const notifyTargets = new Set<string>([primaryChatJid, rawChat, rawParticipant]);
+    if (updated.resolvedLid) notifyTargets.add(updated.resolvedLid);
+    for (const targetKey of notifyTargets) {
+      const listeners = this.presenceListeners.get(targetKey);
+      if (listeners) {
+        for (const cb of listeners) {
+          try {
+            cb(updated);
+          } catch {
+            // Ignore listener errors
+          }
+        }
+      }
+    }
+
+    return updated;
+  }
 
   private setBoundedMessageKey(lookupKey: string, message: proto.IMessage): void {
     if (this.messageByKey.has(lookupKey)) {
@@ -480,7 +721,13 @@ export class SessionMemoryStore {
       messages: newMessages,
     }: {
       messages: Array<{
-        key?: { remoteJid?: string | null; id?: string | null };
+        key?: {
+          remoteJid?: string | null;
+          id?: string | null;
+          remoteJidAlt?: string | null;
+          participant?: string | null;
+          participantAlt?: string | null;
+        };
         message?: proto.IMessage | null;
         pushName?: string | null;
         messageTimestamp?: number | { toNumber(): number };
@@ -497,6 +744,21 @@ export class SessionMemoryStore {
           }
         } catch {
           // Never allow malformed incoming messages to crash the store listener
+        }
+
+        if (msg?.key?.remoteJid && msg?.key?.remoteJidAlt) {
+          if (msg.key.remoteJid.endsWith('@lid')) {
+            this.recordLidMapping(msg.key.remoteJid, msg.key.remoteJidAlt);
+          } else if (msg.key.remoteJidAlt.endsWith('@lid')) {
+            this.recordLidMapping(msg.key.remoteJidAlt, msg.key.remoteJid);
+          }
+        }
+        if (msg?.key?.participant && msg?.key?.participantAlt) {
+          if (msg.key.participant.endsWith('@lid')) {
+            this.recordLidMapping(msg.key.participant, msg.key.participantAlt);
+          } else if (msg.key.participantAlt.endsWith('@lid')) {
+            this.recordLidMapping(msg.key.participantAlt, msg.key.participant);
+          }
         }
 
         const chatId = msg?.key?.remoteJid;
@@ -539,6 +801,19 @@ export class SessionMemoryStore {
       }
     };
 
+    const recordContactLidIfPresent = (cObj: Record<string, unknown>, fallbackId?: string) => {
+      const idStr = typeof cObj.id === 'string' ? cObj.id : fallbackId;
+      const lidStr = typeof cObj.lid === 'string' ? cObj.lid : undefined;
+      const pnStr = typeof cObj.phoneNumber === 'string' ? cObj.phoneNumber : undefined;
+      if (idStr && lidStr && idStr.endsWith('@s.whatsapp.net')) {
+        this.recordLidMapping(lidStr, idStr);
+      } else if (idStr && pnStr && idStr.endsWith('@lid')) {
+        this.recordLidMapping(idStr, pnStr);
+      } else if (lidStr && pnStr) {
+        this.recordLidMapping(lidStr, pnStr);
+      }
+    };
+
     const upsertContactsPayload = (
       newContacts?:
         | Record<string, unknown>
@@ -548,6 +823,7 @@ export class SessionMemoryStore {
       if (Array.isArray(newContacts)) {
         for (const contact of newContacts) {
           if (contact && typeof contact.id === 'string' && contact.id) {
+            recordContactLidIfPresent(contact, contact.id);
             const prev =
               (this.contacts.get(contact.id) as Record<string, unknown> | undefined) ||
               {};
@@ -560,6 +836,7 @@ export class SessionMemoryStore {
         if (contact && typeof contact === 'object' && 'id' in contact) {
           const cObj = contact as { id?: string; [key: string]: unknown };
           const key = typeof cObj.id === 'string' && cObj.id ? cObj.id : id;
+          recordContactLidIfPresent(cObj, key);
           const prev =
             (this.contacts.get(key) as Record<string, unknown> | undefined) || {};
           this.contacts.set(key, { ...prev, ...cObj });
@@ -613,6 +890,30 @@ export class SessionMemoryStore {
       }
     };
 
+    const onLidMappingUpdate = (mapping: { lid?: string; pn?: string }) => {
+      if (mapping?.lid && mapping?.pn) {
+        this.recordLidMapping(mapping.lid, mapping.pn);
+      }
+    };
+
+    const onPresenceUpdate = (update: {
+      id: string;
+      presences: { [participant: string]: PresenceData };
+    }) => {
+      if (!update?.id || !update?.presences || typeof update.presences !== 'object') {
+        return;
+      }
+      for (const [participant, pData] of Object.entries(update.presences)) {
+        const state = pData?.lastKnownPresence || 'unavailable';
+        this.applyPresenceTransition({
+          chatJid: update.id,
+          participantJid: participant || update.id,
+          state,
+          lastSeen: pData?.lastSeen,
+        });
+      }
+    };
+
     ev.on('messages.upsert', onMessagesUpsert);
     ev.on('chats.set', onChatsSet);
     ev.on('chats.upsert', onChatsUpsert);
@@ -620,6 +921,8 @@ export class SessionMemoryStore {
     ev.on('contacts.upsert', onContactsUpsert);
     ev.on('contacts.update', onContactsUpdate);
     ev.on('messaging-history.set', onMessagingHistorySet);
+    ev.on('lid-mapping.update', onLidMappingUpdate);
+    ev.on('presence.update', onPresenceUpdate);
 
     return () => {
       try {
@@ -630,6 +933,8 @@ export class SessionMemoryStore {
         ev.off('contacts.upsert', onContactsUpsert);
         ev.off('contacts.update', onContactsUpdate);
         ev.off('messaging-history.set', onMessagingHistorySet);
+        ev.off('lid-mapping.update', onLidMappingUpdate);
+        ev.off('presence.update', onPresenceUpdate);
       } catch {
         // Ignore cleanup errors
       }
@@ -720,9 +1025,58 @@ export interface WhatsAppSessionDriver {
   getChannelMetadata(inviteCode: string): Promise<WhatsAppChannelMetadata>;
   getSocketDiagnostics(): SessionSocketDiagnostics;
   sendPresenceUpdate(
-    state: 'available' | 'composing' | 'paused',
+    state: WAPresence,
     jid: string
   ): Promise<void>;
+  resolveLidForRecipient(targetInput: string): Promise<{
+    pnJid?: string;
+    lidJid: string;
+    source:
+      | 'DIRECT_LID'
+      | 'LID_MAPPING_STORE'
+      | 'ON_WHATSAPP_USYNC'
+      | 'GROUP_PARTICIPANT_CACHE';
+  }>;
+  sendAnonymousLidMessage(params: {
+    recipient: string;
+    text: string;
+    customPushName?: string;
+  }): Promise<{
+    messageId: string;
+    targetLid: string;
+    resolvedPn?: string;
+    resolutionSource: string;
+  }>;
+  trackRecipientPresence(params: {
+    recipient: string;
+    durationSeconds: number;
+    onUpdate?: (record: TrackedPresenceRecord) => void;
+    staleComposingTimeoutMs?: number;
+  }): Promise<TrackedPresenceRecord>;
+  startPresenceHeartbeatBroadcast(params: {
+    recipient: string;
+    mode: 'composing' | 'recording' | 'available';
+    durationSeconds: number;
+    pulseIntervalMs?: number;
+  }): Promise<{
+    pulsesSent: number;
+    targetJid: string;
+    durationMs: number;
+  }>;
+  fetchFullProfileInfo(recipient: string): Promise<WhatsAppFullProfileReport>;
+  sendShortEphemeralMessage(params: {
+    recipient: string;
+    text: string;
+    expirationSeconds: number;
+    triggerMode?: 'ON_SEND' | 'ON_READ';
+    setChatEphemeralIq?: boolean;
+  }): Promise<{
+    messageId: string;
+    targetJid: string;
+    expirationSeconds: number;
+    triggerMode: 'ON_SEND' | 'ON_READ';
+    scheduledRevokeAtIso: string;
+  }>;
   executeTestFunction(
     params: TestFunctionExecutionParams
   ): Promise<TestFunctionExecutionResult>;
@@ -1078,6 +1432,20 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
     resolve: () => void;
     reject: (err: Error) => void;
   }>();
+  public readonly ephemeralRevokeTimers = new Map<
+    string,
+    ReturnType<typeof setTimeout>
+  >();
+  public readonly pendingOnReadRevokes = new Map<
+    string,
+    {
+      targetJid: string;
+      key: WAMessageKey;
+      expirationSeconds: number;
+      fallbackTimer: ReturnType<typeof setTimeout>;
+    }
+  >();
+  private readonly activePresenceCleanups = new Set<() => void>();
   public messageSender?: MessageSender;
 
   constructor(
@@ -1089,6 +1457,40 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
       optionsOrSender instanceof MessageSender
         ? optionsOrSender
         : optionsOrSender?.messageSender;
+  }
+
+  /**
+   * Attaches a socket instance directly (used in deterministic protocol unit tests).
+   */
+  public attachSocketForTesting(sock: WASocket): () => void {
+    this.sock = sock;
+    this.wsOpen = true;
+    this.authenticatedOpen = true;
+    this.handshakeReady = true;
+    this.connectionState = 'CONNECTED';
+    const unbind = this.memoryStore.bind(sock.ev);
+    const onReceipt = (
+      updates: Array<{
+        key?: { id?: string | null; remoteJid?: string | null };
+        receipt?: {
+          readTimestamp?: unknown;
+          playedTimestamp?: unknown;
+          receiptTimestamp?: unknown;
+        };
+      }>
+    ) => {
+      this.handleReceiptUpdates(updates);
+    };
+    sock.ev.on('message-receipt.update', onReceipt as never);
+    this.evCleanup = () => {
+      unbind();
+      try {
+        sock.ev.off('message-receipt.update', onReceipt as never);
+      } catch {
+        // Ignore
+      }
+    };
+    return this.evCleanup;
   }
 
   /**
@@ -1492,20 +1894,143 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
       }
     };
 
+    const rawStanzaMetaByMsgId = new Map<
+      string,
+      {
+        rawFrom?: string;
+        rawParticipant?: string;
+        senderPn?: string;
+        senderLid?: string;
+        addressingMode?: string;
+        notify?: string;
+        encType?: string;
+        encVersion?: string;
+        retryCount?: number;
+        offline?: boolean;
+      }
+    >();
+
+    const rawMessageStanzaListener = (node: {
+      attrs?: Record<string, string | undefined>;
+      content?: unknown;
+    }) => {
+      try {
+        const attrs = node?.attrs || {};
+        const msgId = attrs.id;
+        if (!msgId) return;
+        let encType: string | undefined;
+        let encVersion: string | undefined;
+        let retryCount: number | undefined;
+        if (Array.isArray(node?.content)) {
+          for (const child of node.content as Array<{
+            tag?: string;
+            attrs?: Record<string, string | undefined>;
+          }>) {
+            if (child?.tag === 'enc' && child.attrs) {
+              encType = child.attrs.type || encType;
+              encVersion = child.attrs.v || encVersion;
+              if (child.attrs.count) {
+                retryCount = Number(child.attrs.count) || 0;
+              }
+            }
+          }
+        }
+        rawStanzaMetaByMsgId.set(msgId, {
+          rawFrom: attrs.from,
+          rawParticipant: attrs.participant,
+          senderPn:
+            attrs.sender_pn || attrs.participant_pn || attrs.peer_recipient_pn,
+          senderLid:
+            attrs.sender_lid ||
+            attrs.participant_lid ||
+            attrs.peer_recipient_lid,
+          addressingMode: attrs.addressing_mode,
+          notify: attrs.notify,
+          encType,
+          encVersion,
+          retryCount,
+          offline: Boolean(attrs.offline),
+        });
+        if (rawStanzaMetaByMsgId.size > 500) {
+          const oldest = rawStanzaMetaByMsgId.keys().next().value;
+          if (oldest) rawStanzaMetaByMsgId.delete(oldest);
+        }
+      } catch {
+        // Never allow stanza metadata inspection to disrupt socket pipeline
+      }
+    };
+
+    const wsEmitter = (
+      sock as unknown as {
+        ws?: {
+          on?: (event: string, cb: (node: unknown) => void) => void;
+          off?: (event: string, cb: (node: unknown) => void) => void;
+        };
+      }
+    ).ws;
+    if (typeof wsEmitter?.on === 'function') {
+      wsEmitter.on('CB:message', rawMessageStanzaListener as never);
+    }
+
     const messagesUpdateListener = (
       updates: Array<{
-        key?: { id?: string | null; remoteJid?: string | null };
-        update?: { status?: number };
+        key?: {
+          id?: string | null;
+          remoteJid?: string | null;
+          fromMe?: boolean | null;
+          participant?: string | null;
+          remoteJidAlt?: string | null;
+          participantAlt?: string | null;
+        };
+        update?: {
+          status?: number;
+          message?: Record<string, unknown> | null;
+          messageTimestamp?: number;
+        };
       }>
     ) => {
-      if (!this.messageSender || !Array.isArray(updates)) return;
+      if (!Array.isArray(updates)) return;
       for (const u of updates) {
-        if (u?.key?.id && typeof u?.update?.status === 'number') {
+        if (this.messageSender && u?.key?.id && typeof u?.update?.status === 'number') {
           this.messageSender.recordAckUpdate({
             sessionId: this.sessionId,
             messageId: u.key.id,
             statusNumber: u.update.status,
           });
+        }
+        // Forward live message edits (emitted by @hiroosy/baileys-lite on messages.update)
+        if (
+          callbacks.onIncomingMessage &&
+          u?.key?.id &&
+          u?.key?.remoteJid &&
+          u?.update?.message &&
+          typeof u.update.message === 'object'
+        ) {
+          try {
+            const targetId = String(u.key.id);
+            const rawMeta = rawStanzaMetaByMsgId.get(targetId);
+            callbacks.onIncomingMessage({
+              sessionId: this.sessionId,
+              rawMessage: {
+                key: {
+                  ...u.key,
+                  id: targetId,
+                },
+                message: u.update.message,
+                messageTimestamp:
+                  u.update.messageTimestamp || Math.floor(Date.now() / 1000),
+                __isLiveEditUpdate: true,
+                __editedTargetId: targetId,
+                ...(rawMeta ? { __rawStanzaMeta: rawMeta } : {}),
+              },
+              sock,
+            });
+          } catch (err) {
+            log.warn('Error forwarding live message edit from messages.update', {
+              sessionId: this.sessionId,
+              error: err instanceof Error ? err.message : String(err),
+            });
+          }
         }
       }
     };
@@ -1520,20 +2045,7 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
         };
       }>
     ) => {
-      if (!this.messageSender || !Array.isArray(updates)) return;
-      for (const r of updates) {
-        if (!r?.key?.id || !r?.receipt) continue;
-        const receiptType = r.receipt.readTimestamp
-          ? 'read'
-          : r.receipt.playedTimestamp
-            ? 'played'
-            : 'delivery';
-        this.messageSender.recordAckUpdate({
-          sessionId: this.sessionId,
-          messageId: r.key.id,
-          receiptType,
-        });
-      }
+      this.handleReceiptUpdates(updates);
     };
 
     const incomingMessagesUpsertListener = ({
@@ -1545,9 +2057,50 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
       if (!callbacks.onIncomingMessage || !Array.isArray(newMessages)) return;
       for (const msg of newMessages) {
         try {
+          const msgKey = (msg?.key || {}) as {
+            id?: string;
+            remoteJid?: string;
+            participant?: string;
+            remoteJidAlt?: string;
+            participantAlt?: string;
+          };
+          const msgId = String(msgKey.id || '');
+          const rawMeta = msgId ? rawStanzaMetaByMsgId.get(msgId) : undefined;
+          const lookupJids = [
+            msgKey.participant,
+            msgKey.participantAlt,
+            msgKey.remoteJid,
+            msgKey.remoteJidAlt,
+            rawMeta?.senderPn,
+            rawMeta?.rawParticipant,
+            rawMeta?.rawFrom,
+          ].filter((j): j is string => typeof j === 'string' && j.length > 0);
+
+          let contactInfo: Record<string, unknown> | undefined;
+          for (const candidateJid of lookupJids) {
+            const normJid = jidNormalizedUser(candidateJid);
+            const found =
+              (this.memoryStore.contacts.get(normJid) as
+                | Record<string, unknown>
+                | undefined) ||
+              (this.memoryStore.contacts.get(candidateJid) as
+                | Record<string, unknown>
+                | undefined);
+            if (found) {
+              contactInfo = found;
+              break;
+            }
+          }
+
+          const enrichedMsg: Record<string, unknown> = {
+            ...msg,
+            ...(rawMeta ? { __rawStanzaMeta: rawMeta } : {}),
+            ...(contactInfo ? { __contactInfo: contactInfo } : {}),
+          };
+
           callbacks.onIncomingMessage({
             sessionId: this.sessionId,
-            rawMessage: msg,
+            rawMessage: enrichedMsg,
             sock,
           });
         } catch (err) {
@@ -1568,6 +2121,9 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
     this.evCleanup = () => {
       unbindStore();
       try {
+        if (typeof wsEmitter?.off === 'function') {
+          wsEmitter.off('CB:message', rawMessageStanzaListener as never);
+        }
         sock.ev.off('creds.update', credsListener);
         sock.ev.off('connection.update', connectionListener);
         sock.ev.off('messages.update', messagesUpdateListener);
@@ -2046,7 +2602,7 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
    * Safe presence wrapper (adapted from Nebula `createSafeSock`).
    */
   public async sendPresenceUpdate(
-    state: 'available' | 'composing' | 'paused',
+    state: WAPresence,
     jid: string
   ): Promise<void> {
     const sock = this.ensureSocket();
@@ -2056,6 +2612,1137 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
     } catch {
       // Presence updates are best-effort
     }
+  }
+
+  private handleReceiptUpdates(
+    updates: Array<{
+      key?: { id?: string | null; remoteJid?: string | null };
+      receipt?: {
+        readTimestamp?: unknown;
+        playedTimestamp?: unknown;
+        receiptTimestamp?: unknown;
+      };
+    }>
+  ): void {
+    if (!Array.isArray(updates)) return;
+    for (const r of updates) {
+      if (!r?.key?.id || !r?.receipt) continue;
+      const msgId = String(r.key.id);
+      const receiptType = r.receipt.readTimestamp
+        ? 'read'
+        : r.receipt.playedTimestamp
+          ? 'played'
+          : 'delivery';
+      if (this.messageSender) {
+        this.messageSender.recordAckUpdate({
+          sessionId: this.sessionId,
+          messageId: msgId,
+          receiptType,
+        });
+      }
+      if (r.receipt.readTimestamp) {
+        const pendingOnRead = this.pendingOnReadRevokes.get(msgId);
+        if (pendingOnRead) {
+          clearTimeout(pendingOnRead.fallbackTimer);
+          this.pendingOnReadRevokes.delete(msgId);
+          this.scheduleEphemeralRevokeTimer(
+            msgId,
+            pendingOnRead.targetJid,
+            pendingOnRead.key,
+            pendingOnRead.expirationSeconds * 1000
+          );
+        }
+      }
+    }
+  }
+
+  private scheduleEphemeralRevokeTimer(
+    msgId: string,
+    targetJid: string,
+    messageKey: WAMessageKey,
+    delayMs: number
+  ): void {
+    const existing = this.ephemeralRevokeTimers.get(msgId);
+    if (existing) {
+      clearTimeout(existing);
+    }
+    const timer = setTimeout(async () => {
+      this.ephemeralRevokeTimers.delete(msgId);
+      try {
+        if (!this.sock || !this.wsOpen) return;
+        await this.sock.sendMessage(targetJid, {
+          delete: {
+            remoteJid: targetJid,
+            fromMe: true,
+            id: msgId,
+            ...(messageKey.participant
+              ? { participant: messageKey.participant }
+              : {}),
+          },
+        });
+      } catch (err) {
+        log.warn('Failed auto-revoking short ephemeral message', {
+          sessionId: this.sessionId,
+          msgId,
+          targetJid,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    }, Math.max(10, delayMs));
+    if (typeof timer.unref === 'function') {
+      timer.unref();
+    }
+    this.ephemeralRevokeTimers.set(msgId, timer);
+  }
+
+  private extractLidString(rawLid: unknown): string | undefined {
+    if (!rawLid) return undefined;
+    if (typeof rawLid === 'string') {
+      const trimmed = rawLid.trim();
+      if (!trimmed) return undefined;
+      return trimmed.includes('@')
+        ? jidNormalizedUser(trimmed)
+        : `${trimmed.replace(/\D/g, '')}@lid`;
+    }
+    if (typeof rawLid === 'object') {
+      const obj = rawLid as {
+        id?: string;
+        lid?: string;
+        _serialized?: string;
+        user?: string;
+      };
+      const candidate = obj.lid || obj.id || obj._serialized || obj.user;
+      if (typeof candidate === 'string' && candidate.trim()) {
+        return candidate.includes('@')
+          ? jidNormalizedUser(candidate)
+          : `${candidate.replace(/\D/g, '')}@lid`;
+      }
+    }
+    return undefined;
+  }
+
+  private async persistLidPnMappingOnSocket(
+    sock: WASocket,
+    lidJid: string,
+    pnJid: string
+  ): Promise<void> {
+    this.memoryStore.recordLidMapping(lidJid, pnJid);
+    try {
+      await sock.signalRepository?.lidMapping?.storeLIDPNMappings?.([
+        { lid: lidJid, pn: pnJid },
+      ]);
+    } catch {
+      // Best-effort
+    }
+    try {
+      const pnUser = jidDecode(pnJid)?.user || pnJid.split('@')[0];
+      const lidUser = jidDecode(lidJid)?.user || lidJid.split('@')[0];
+      if (pnUser && lidUser && sock.authState?.keys?.set) {
+        await sock.authState.keys.set({
+          'lid-mapping': {
+            [pnUser]: lidUser,
+            [`${lidUser}_reverse`]: pnUser,
+          },
+        } as never);
+      }
+    } catch {
+      // Best-effort
+    }
+  }
+
+  /**
+   * Resolves the Privacy-Preserving Linked Identity (`@lid`) for a target phone number or JID
+   * across 4 protocol layers:
+   * 1. Direct `@lid` input
+   * 2. Local `signalRepository.lidMapping` & `SessionMemoryStore`
+   * 3. Live `sock.onWhatsApp(pnJid)` USync `<lid>` stanza query
+   * 4. Participating `groupMetadataCache` participant entries
+   */
+  public async resolveLidForRecipient(targetInput: string): Promise<{
+    pnJid?: string;
+    lidJid: string;
+    source:
+      | 'DIRECT_LID'
+      | 'LID_MAPPING_STORE'
+      | 'ON_WHATSAPP_USYNC'
+      | 'GROUP_PARTICIPANT_CACHE';
+  }> {
+    const sock = this.ensureSocket();
+    const trimmed = String(targetInput || '').trim();
+    if (!trimmed) {
+      throw new ValidationError('الرجاء إدخال رقم الهاتف أو معرف @lid للمستلم.');
+    }
+
+    // 1. Direct @lid input
+    if (trimmed.endsWith('@lid')) {
+      const validated = validateRecipient(trimmed);
+      const lidJid = jidNormalizedUser(validated.jid);
+      let pnJid = this.memoryStore.getPnForLid(lidJid);
+      if (!pnJid && sock.signalRepository?.lidMapping?.getPNForLID) {
+        try {
+          const fromRepo = await sock.signalRepository.lidMapping.getPNForLID(lidJid);
+          if (fromRepo) {
+            pnJid = jidNormalizedUser(fromRepo);
+            this.memoryStore.recordLidMapping(lidJid, pnJid);
+          }
+        } catch {
+          // Ignore
+        }
+      }
+      return {
+        pnJid,
+        lidJid,
+        source: 'DIRECT_LID',
+      };
+    }
+
+    // Normalize as PN JID
+    const normalizedRecipient = validateRecipient(trimmed);
+    if (normalizedRecipient.isGroup) {
+      throw new ValidationError(
+        'استخراج معرف @lid المباشر مخصص لجهات الاتصال الفردية (رقم دولي أو @lid).'
+      );
+    }
+    const pnJid = jidNormalizedUser(normalizedRecipient.jid);
+
+    // 2. Check signalRepository.lidMapping & memoryStore
+    try {
+      const repoLid = await sock.signalRepository?.lidMapping?.getLIDForPN?.(pnJid);
+      const parsedRepoLid = this.extractLidString(repoLid);
+      if (parsedRepoLid && parsedRepoLid.endsWith('@lid')) {
+        await this.persistLidPnMappingOnSocket(sock, parsedRepoLid, pnJid);
+        return {
+          pnJid,
+          lidJid: parsedRepoLid,
+          source: 'LID_MAPPING_STORE',
+        };
+      }
+    } catch {
+      // Fall through
+    }
+
+    const storeLid = this.memoryStore.getLidForPn(pnJid);
+    if (storeLid && storeLid.endsWith('@lid')) {
+      return {
+        pnJid,
+        lidJid: storeLid,
+        source: 'LID_MAPPING_STORE',
+      };
+    }
+
+    // 3. Query USync via sock.onWhatsApp(pnJid)
+    if (typeof sock.onWhatsApp === 'function') {
+      try {
+        const results = await sock.onWhatsApp(pnJid);
+        const entry = Array.isArray(results) ? results[0] : undefined;
+        const resolvedServerPn = entry?.jid ? jidNormalizedUser(entry.jid) : pnJid;
+        const usyncLid = this.extractLidString(entry?.lid);
+        if (usyncLid && usyncLid.endsWith('@lid')) {
+          await this.persistLidPnMappingOnSocket(sock, usyncLid, resolvedServerPn);
+          return {
+            pnJid: resolvedServerPn,
+            lidJid: usyncLid,
+            source: 'ON_WHATSAPP_USYNC',
+          };
+        }
+      } catch {
+        // Fall through to group participant cache
+      }
+    }
+
+    // 4. Search groupMetadataCache participants
+    for (const meta of this.groupMetadataCache.values()) {
+      for (const p of meta.participants || []) {
+        const pId = p.id ? jidNormalizedUser(p.id) : '';
+        const pPn = (p as { phoneNumber?: string }).phoneNumber
+          ? jidNormalizedUser((p as { phoneNumber?: string }).phoneNumber!)
+          : '';
+        const pLid = this.extractLidString(
+          p.lid || (pId.endsWith('@lid') ? pId : undefined)
+        );
+        const matchesPn =
+          (pId && areJidsSameUser(pId, pnJid)) ||
+          (pPn && areJidsSameUser(pPn, pnJid));
+        if (matchesPn && pLid && pLid.endsWith('@lid')) {
+          await this.persistLidPnMappingOnSocket(sock, pLid, pnJid);
+          return {
+            pnJid,
+            lidJid: pLid,
+            source: 'GROUP_PARTICIPANT_CACHE',
+          };
+        }
+      }
+    }
+
+    throw new WhatsAppConnectionError(
+      `تعذر استخراج معرف الهوية المخفية (@lid) للمستلم (${pnJid}) عبر USync أو سجل المجموعات. تأكد من أن الرقم مسجل في واتساب أو أدخل معرف @lid مباشرة.`
+    );
+  }
+
+  /**
+   * Sends a protocol-level LID-addressed message (`addressing_mode="lid"`) via `@hiroosy/baileys-lite`,
+   * migrating/asserting the E2E Signal session onto the target `@lid` JID without leaking PN presence.
+   */
+  public async sendAnonymousLidMessage(params: {
+    recipient: string;
+    text: string;
+    customPushName?: string;
+  }): Promise<{
+    messageId: string;
+    targetLid: string;
+    resolvedPn?: string;
+    resolutionSource: string;
+  }> {
+    const sock = this.ensureSocket();
+    if (this.connectionState !== 'CONNECTED' || !this.wsOpen) {
+      throw new WhatsAppConnectionError(
+        'الجلسة غير متصلة حالياً لإرسال الرسائل عبر بروتوكول LID.'
+      );
+    }
+
+    const trimmedRecipient = String(params.recipient || '').trim();
+    if (trimmedRecipient.endsWith('@g.us')) {
+      const groupCheck = validateRecipient(trimmedRecipient);
+      const waMsg = generateWAMessageFromContent(
+        groupCheck.jid,
+        { extendedTextMessage: { text: params.text } },
+        { userJid: sock.user?.lid || sock.user?.id }
+      );
+      const msgId = waMsg.key.id || `lid_grp_${Date.now()}`;
+      if (waMsg.message) {
+        this.memoryStore.cacheSentMessage(groupCheck.jid, msgId, waMsg.message);
+      }
+      await sock.relayMessage(groupCheck.jid, waMsg.message!, {
+        messageId: msgId,
+        additionalAttributes: { addressing_mode: 'lid' },
+      });
+      await Promise.allSettled([this.credsSaveChain, this.flushAuthWrites()]);
+      return {
+        messageId: msgId,
+        targetLid: groupCheck.jid,
+        resolutionSource: 'GROUP_LID_RELAY',
+      };
+    }
+
+    const { pnJid, lidJid, source } = await this.resolveLidForRecipient(
+      trimmedRecipient
+    );
+
+    // Warm up USync devices & migrate/assert E2E Signal session onto the @lid identity
+    try {
+      if (typeof sock.getUSyncDevices === 'function') {
+        await sock.getUSyncDevices([pnJid || lidJid], false, false).catch(() => []);
+      }
+      if (pnJid && typeof sock.signalRepository?.migrateSession === 'function') {
+        await sock.signalRepository.migrateSession(pnJid, lidJid).catch(() => undefined);
+      }
+      if (typeof sock.assertSessions === 'function') {
+        await sock.assertSessions([lidJid], false).catch(() => false);
+      }
+    } catch {
+      // Best-effort session preparation before sendMessage
+    }
+
+    const previousName = sock.user?.name;
+    if (params.customPushName && sock.user) {
+      sock.user.name = params.customPushName;
+    }
+
+    let res: { key?: WAMessageKey; message?: proto.IMessage } | undefined;
+    try {
+      res = await sock.sendMessage(
+        lidJid,
+        { text: params.text },
+        { addressingMode: 'lid' }
+      );
+    } finally {
+      if (params.customPushName && sock.user) {
+        sock.user.name = previousName;
+      }
+    }
+
+    const msgId = res?.key?.id || `lid_msg_${Date.now()}`;
+    if (res?.message) {
+      this.memoryStore.cacheSentMessage(lidJid, msgId, res.message);
+    }
+    await Promise.allSettled([this.credsSaveChain, this.flushAuthWrites()]);
+
+    return {
+      messageId: msgId,
+      targetLid: lidJid,
+      resolvedPn: pnJid,
+      resolutionSource: source,
+    };
+  }
+
+  /**
+   * Subscribes to and tracks real-time recipient presence (`available`, `unavailable`, `composing`, `recording`, `paused`)
+   * across both `@s.whatsapp.net` and `@lid` JIDs, auto-expiring stale composing states after 12s of silence.
+   */
+  public async trackRecipientPresence(params: {
+    recipient: string;
+    durationSeconds: number;
+    onUpdate?: (record: TrackedPresenceRecord) => void;
+    staleComposingTimeoutMs?: number;
+  }): Promise<TrackedPresenceRecord> {
+    const sock = this.ensureSocket();
+    if (this.connectionState !== 'CONNECTED' || !this.wsOpen) {
+      throw new WhatsAppConnectionError(
+        'الجلسة غير متصلة حالياً لتتبع حالة التواجد (Presence).'
+      );
+    }
+
+    const durationSec = Math.min(
+      300,
+      Math.max(1, Math.floor(Number(params.durationSeconds) || 15))
+    );
+    const staleTimeoutMs = Math.max(
+      250,
+      params.staleComposingTimeoutMs ?? 12_000
+    );
+
+    const validated = validateRecipient(params.recipient);
+    const targetJid = jidNormalizedUser(validated.jid);
+    let pnJid = targetJid.endsWith('@s.whatsapp.net') ? targetJid : undefined;
+    let lidJid = targetJid.endsWith('@lid') ? targetJid : undefined;
+
+    try {
+      const resolved = await this.resolveLidForRecipient(params.recipient);
+      pnJid = resolved.pnJid || pnJid;
+      lidJid = resolved.lidJid || lidJid;
+    } catch {
+      // Proceed with targetJid if LID is not available
+    }
+
+    if (pnJid && lidJid) {
+      this.memoryStore.recordLidMapping(lidJid, pnJid);
+    }
+
+    const primaryKey = pnJid || lidJid || targetJid;
+
+    // 1. Activate our own presence so WhatsApp servers stream presence updates + lastSeen
+    await sock.sendPresenceUpdate('available').catch(() => undefined);
+
+    // 2. Subscribe to both PN and LID JIDs
+    const subscribeBoth = async () => {
+      if (pnJid) {
+        await sock.presenceSubscribe(pnJid).catch(() => undefined);
+      }
+      if (lidJid && lidJid !== pnJid) {
+        await sock.presenceSubscribe(lidJid).catch(() => undefined);
+      }
+      if (!pnJid && !lidJid) {
+        await sock.presenceSubscribe(primaryKey).catch(() => undefined);
+      }
+    };
+    await subscribeBoth();
+
+    const unsubListener = params.onUpdate
+      ? this.memoryStore.onPresenceChange(primaryKey, params.onUpdate)
+      : () => undefined;
+
+    // 3. Re-subscribe every 45s to keep WhatsApp's server-side subscription active
+    const resubscribeInterval = setInterval(() => {
+      void subscribeBoth();
+    }, 45_000);
+    if (typeof resubscribeInterval.unref === 'function') {
+      resubscribeInterval.unref();
+    }
+
+    // 4. Watchdog for stale composing/recording (>12s without paused/message)
+    const staleWatchdogInterval = setInterval(() => {
+      const rec =
+        this.memoryStore.presences.get(primaryKey) ||
+        (lidJid ? this.memoryStore.presences.get(lidJid) : undefined);
+      if (
+        rec &&
+        (rec.currentState === 'composing' || rec.currentState === 'recording') &&
+        Date.now() - rec.lastUpdatedMs >= staleTimeoutMs
+      ) {
+        this.memoryStore.applyPresenceTransition({
+          chatJid: primaryKey,
+          participantJid: rec.resolvedLid || primaryKey,
+          state: 'available',
+        });
+      }
+    }, Math.min(1_000, Math.max(50, Math.floor(staleTimeoutMs / 2))));
+    if (typeof staleWatchdogInterval.unref === 'function') {
+      staleWatchdogInterval.unref();
+    }
+
+    await new Promise<void>((resolve) => {
+      let settled = false;
+      const doneTimer = setTimeout(() => {
+        cleanup();
+      }, durationSec * 1000);
+      const cleanup = () => {
+        clearTimeout(doneTimer);
+        clearInterval(resubscribeInterval);
+        clearInterval(staleWatchdogInterval);
+        unsubListener();
+        this.activePresenceCleanups.delete(cleanup);
+        if (!settled) {
+          settled = true;
+          resolve();
+        }
+      };
+      this.activePresenceCleanups.add(cleanup);
+    });
+
+    const finalRecord =
+      this.memoryStore.presences.get(primaryKey) ||
+      (lidJid ? this.memoryStore.presences.get(lidJid) : undefined) || {
+        chatJid: primaryKey,
+        resolvedLid: lidJid,
+        currentState: 'unavailable' as WAPresence,
+        lastUpdatedMs: Date.now(),
+        transitions: [],
+        totalOnlineDurationMs: 0,
+      };
+
+    if (finalRecord.onlineSessionStartedAtMs !== undefined) {
+      const now = Date.now();
+      return {
+        ...finalRecord,
+        totalOnlineDurationMs:
+          finalRecord.totalOnlineDurationMs +
+          Math.max(0, now - finalRecord.onlineSessionStartedAtMs),
+      };
+    }
+
+    return finalRecord;
+  }
+
+  /**
+   * Broadcasts continuous presence heartbeat pulses (`composing`, `recording`, or `available`)
+   * every `pulseIntervalMs` (default `7500ms`) so the indicator never times out on the recipient's phone,
+   * concluding with a clean `paused` stanza.
+   */
+  public async startPresenceHeartbeatBroadcast(params: {
+    recipient: string;
+    mode: 'composing' | 'recording' | 'available';
+    durationSeconds: number;
+    pulseIntervalMs?: number;
+  }): Promise<{
+    pulsesSent: number;
+    targetJid: string;
+    durationMs: number;
+  }> {
+    const sock = this.ensureSocket();
+    if (this.connectionState !== 'CONNECTED' || !this.wsOpen) {
+      throw new WhatsAppConnectionError(
+        'الجلسة غير متصلة حالياً لبث نبضات التواجد.'
+      );
+    }
+
+    const durationSec = Math.min(
+      180,
+      Math.max(1, Math.floor(Number(params.durationSeconds) || 15))
+    );
+    const pulseIntervalMs = Math.max(50, params.pulseIntervalMs ?? 7_500);
+
+    const validated = validateRecipient(params.recipient);
+    const resolvedJid = validated.jid.endsWith('@s.whatsapp.net')
+      ? await this.resolveDirectRecipientJid(sock, validated.jid)
+      : jidNormalizedUser(validated.jid);
+
+    const startedAt = Date.now();
+    await sock.presenceSubscribe(resolvedJid).catch(() => undefined);
+
+    let pulsesSent = 0;
+    const sendPulse = async () => {
+      if (!this.sock || !this.wsOpen) return;
+      await sock.sendPresenceUpdate(params.mode, resolvedJid).catch(() => undefined);
+      pulsesSent++;
+    };
+
+    await sendPulse();
+
+    await new Promise<void>((resolve) => {
+      let settled = false;
+      const pulseTimer = setInterval(() => {
+        void sendPulse();
+      }, pulseIntervalMs);
+      if (typeof pulseTimer.unref === 'function') {
+        pulseTimer.unref();
+      }
+
+      const endTimer = setTimeout(() => {
+        cleanup();
+      }, durationSec * 1000);
+
+      const cleanup = () => {
+        clearInterval(pulseTimer);
+        clearTimeout(endTimer);
+        this.activePresenceCleanups.delete(cleanup);
+        if (!settled) {
+          settled = true;
+          resolve();
+        }
+      };
+      this.activePresenceCleanups.add(cleanup);
+    });
+
+    if (this.sock && this.wsOpen) {
+      await sock.sendPresenceUpdate('paused', resolvedJid).catch(() => undefined);
+    }
+
+    return {
+      pulsesSent,
+      targetJid: resolvedJid,
+      durationMs: Math.max(0, Date.now() - startedAt),
+    };
+  }
+
+  /**
+   * Deep OSINT Profile Inspector (`fetchFullProfileInfo`) combining 7 parallel protocol sources:
+   * 1. USync `onWhatsApp` + `lidMapping`
+   * 2. High-definition & preview `profilePictureUrl` with privacy/404 classification + buffer download
+   * 3. USync `fetchStatus` (About text + `setAt` timestamp with 1970 epoch filter)
+   * 4. `getBusinessProfile` (category, description, email, website, coordinates, business hours)
+   * 5. `getUSyncDevices` (primary & companion Web/Desktop devices)
+   * 6. `SessionMemoryStore` contacts (`pushName`/`verifiedName`) + live presence snapshot
+   * 7. Participating `groupMetadataCache` shared groups & roles
+   */
+  public async fetchFullProfileInfo(
+    recipient: string
+  ): Promise<WhatsAppFullProfileReport> {
+    const sock = this.ensureSocket();
+    if (this.connectionState !== 'CONNECTED' || !this.wsOpen) {
+      throw new WhatsAppConnectionError(
+        'الجلسة غير متصلة حالياً لفحص الملف الشخصي.'
+      );
+    }
+
+    const validated = validateRecipient(recipient);
+    if (validated.isGroup) {
+      throw new ValidationError(
+        'فحص الملف الشخصي العميق (/fullprofile) مخصص لحسابات المستخدمين الفردية (رقم دولي أو @lid).'
+      );
+    }
+
+    let pnJid = validated.isLid ? '' : jidNormalizedUser(validated.jid);
+    let lidJid = validated.isLid ? jidNormalizedUser(validated.jid) : undefined;
+
+    if (validated.isLid && lidJid) {
+      const mappedPn =
+        this.memoryStore.getPnForLid(lidJid) ||
+        (await sock.signalRepository?.lidMapping
+          ?.getPNForLID?.(lidJid)
+          .catch(() => undefined)) ||
+        undefined;
+      if (mappedPn) {
+        pnJid = jidNormalizedUser(mappedPn);
+      }
+    }
+
+    const targetQueryJid = pnJid || lidJid || validated.jid;
+
+    // Subscribe to presence early so the server pushes presence while other queries run
+    void sock.presenceSubscribe(targetQueryJid).catch(() => undefined);
+
+    const [
+      onWaSettled,
+      statusSettled,
+      bizSettled,
+      devicesSettled,
+    ] = await Promise.allSettled([
+      // (A) Identity & LID
+      (async () => {
+        let exists = true;
+        if (typeof sock.onWhatsApp === 'function' && pnJid) {
+          const res = await sock.onWhatsApp(pnJid);
+          if (Array.isArray(res) && res.length > 0) {
+            exists = Boolean(res[0]?.exists);
+            if (res[0]?.jid) {
+              pnJid = jidNormalizedUser(res[0].jid);
+            }
+            const extractedLid = this.extractLidString(res[0]?.lid);
+            if (extractedLid) {
+              lidJid = extractedLid;
+              await this.persistLidPnMappingOnSocket(sock, extractedLid, pnJid);
+            }
+          } else {
+            exists = false;
+          }
+        }
+        if (!lidJid && pnJid) {
+          const repoLid = await sock.signalRepository?.lidMapping
+            ?.getLIDForPN?.(pnJid)
+            .catch(() => undefined);
+          lidJid =
+            this.extractLidString(repoLid) || this.memoryStore.getLidForPn(pnJid);
+        }
+        return { exists };
+      })(),
+
+      // (C) About / Status (`fetchStatus`)
+      (async () => {
+        if (typeof sock.fetchStatus !== 'function') return undefined;
+        return await sock.fetchStatus(targetQueryJid);
+      })(),
+
+      // (D) Business Profile (`getBusinessProfile`)
+      (async () => {
+        if (typeof sock.getBusinessProfile !== 'function') return undefined;
+        return await sock.getBusinessProfile(targetQueryJid);
+      })(),
+
+      // (E) Linked Companion Devices (`getUSyncDevices`)
+      (async () => {
+        if (typeof sock.getUSyncDevices !== 'function') return [];
+        return await sock.getUSyncDevices([targetQueryJid], false, false);
+      })(),
+    ]);
+
+    const existsOnWhatsApp =
+      onWaSettled.status === 'fulfilled' ? onWaSettled.value.exists : true;
+
+    if (lidJid) {
+      void sock.presenceSubscribe(lidJid).catch(() => undefined);
+    }
+
+    // (B) Profile Picture with fallback & privacy/404 classification
+    const profilePicture: WhatsAppFullProfileReport['profilePicture'] = {
+      status: 'NO_PICTURE',
+      statusReasonArabic: 'لا توجد صورة شخصية متاحة',
+    };
+
+    if (typeof sock.profilePictureUrl === 'function') {
+      const classifyPicError = (err: unknown): {
+        status: 'PRIVACY_HIDDEN' | 'NO_PICTURE' | 'ERROR';
+        reason: string;
+      } => {
+        const msg = err instanceof Error ? err.message : String(err || '');
+        const statusCode = Number(
+          (err as { data?: number; output?: { statusCode?: number } })?.data ||
+            (err as { output?: { statusCode?: number } })?.output?.statusCode ||
+            0
+        );
+        if (
+          statusCode === 401 ||
+          statusCode === 403 ||
+          /not-authorized|401|403|forbidden/i.test(msg)
+        ) {
+          return {
+            status: 'PRIVACY_HIDDEN',
+            reason: 'محجوبة بإعدادات الخصوصية (جهات الاتصال فقط / لا أحد)',
+          };
+        }
+        if (statusCode === 404 || /item-not-found|404/i.test(msg)) {
+          return {
+            status: 'NO_PICTURE',
+            reason: 'لا توجد صورة شخصية (أو محذوفة)',
+          };
+        }
+        return {
+          status: 'ERROR',
+          reason: 'تعذر جلب الصورة الشخصية من الخادم',
+        };
+      };
+
+      let hdUrl: string | undefined;
+      let previewUrl: string | undefined;
+      let lastPicError: unknown;
+
+      try {
+        hdUrl = await sock.profilePictureUrl(targetQueryJid, 'image', 10_000);
+      } catch (err) {
+        lastPicError = err;
+        if (lidJid && lidJid !== targetQueryJid) {
+          try {
+            hdUrl = await sock.profilePictureUrl(lidJid, 'image', 10_000);
+          } catch (lidErr) {
+            lastPicError = lidErr;
+          }
+        }
+      }
+
+      try {
+        previewUrl = await sock.profilePictureUrl(
+          lidJid && !hdUrl ? lidJid : targetQueryJid,
+          'preview',
+          8_000
+        );
+      } catch (err) {
+        if (!lastPicError) lastPicError = err;
+      }
+
+      if (hdUrl || previewUrl) {
+        profilePicture.hdUrl = hdUrl;
+        profilePicture.previewUrl = previewUrl;
+        profilePicture.status = 'AVAILABLE';
+        profilePicture.statusReasonArabic = hdUrl
+          ? 'متاحة بدقة عالية (HD)'
+          : 'متاحة بدقة مصغرة (Preview)';
+
+        const downloadUrl = hdUrl || previewUrl;
+        if (downloadUrl) {
+          try {
+            const parsedUrl = new URL(downloadUrl);
+            if (
+              parsedUrl.protocol === 'https:' &&
+              (parsedUrl.hostname.endsWith('.whatsapp.net') ||
+                parsedUrl.hostname === 'whatsapp.net')
+            ) {
+              const res = await fetch(downloadUrl, {
+                signal: AbortSignal.timeout(10_000),
+              });
+              if (res.ok) {
+                const ab = await res.arrayBuffer();
+                profilePicture.imageBuffer = Buffer.from(ab);
+              }
+            }
+          } catch {
+            // Keep URL even if binary download fails
+          }
+        }
+      } else if (lastPicError) {
+        const classified = classifyPicError(lastPicError);
+        profilePicture.status = classified.status;
+        profilePicture.statusReasonArabic = classified.reason;
+      }
+    }
+
+    // Parse Status (About) from Array or Object
+    let statusText: string | undefined;
+    let statusSetAt: string | undefined;
+    if (statusSettled.status === 'fulfilled' && statusSettled.value) {
+      const rawStatus = statusSettled.value as unknown;
+      const firstEntry = Array.isArray(rawStatus) ? rawStatus[0] : rawStatus;
+      if (firstEntry && typeof firstEntry === 'object') {
+        const entryObj = firstEntry as Record<string, unknown>;
+        const nestedStatus = entryObj.status;
+        if (typeof nestedStatus === 'string') {
+          statusText = nestedStatus.trim() || undefined;
+          const rawDate = entryObj.setAt;
+          if (rawDate) {
+            const d = new Date(rawDate as string | number | Date);
+            if (!Number.isNaN(d.getTime()) && d.getTime() > 0) {
+              statusSetAt = d.toISOString();
+            }
+          }
+        } else if (nestedStatus && typeof nestedStatus === 'object') {
+          const inner = nestedStatus as Record<string, unknown>;
+          if (typeof inner.status === 'string') {
+            statusText = inner.status.trim() || undefined;
+          }
+          const rawDate = inner.setAt ?? entryObj.setAt;
+          if (rawDate) {
+            const d = new Date(rawDate as string | number | Date);
+            if (!Number.isNaN(d.getTime()) && d.getTime() > 0) {
+              statusSetAt = d.toISOString();
+            }
+          }
+        }
+      }
+    }
+
+    // Parse Business Profile
+    let businessProfile: WhatsAppFullProfileReport['businessProfile'];
+    if (
+      bizSettled.status === 'fulfilled' &&
+      bizSettled.value &&
+      typeof bizSettled.value === 'object'
+    ) {
+      const biz = bizSettled.value as WABusinessProfile;
+      const hoursCfg =
+        biz.business_hours?.config || biz.business_hours?.business_config || [];
+      const hoursSummary = Array.isArray(hoursCfg)
+        ? hoursCfg.map((h) => {
+            const day = h.day_of_week || 'day';
+            const mode = h.mode || 'open';
+            if (
+              typeof h.open_time === 'number' &&
+              typeof h.close_time === 'number'
+            ) {
+              const openH = String(Math.floor(h.open_time / 60)).padStart(2, '0');
+              const openM = String(h.open_time % 60).padStart(2, '0');
+              const closeH = String(Math.floor(h.close_time / 60)).padStart(2, '0');
+              const closeM = String(h.close_time % 60).padStart(2, '0');
+              return `${day}: ${openH}:${openM} - ${closeH}:${closeM} (${mode})`;
+            }
+            return `${day}: ${mode}`;
+          })
+        : undefined;
+
+      const hasBizFields = Boolean(
+        biz.wid ||
+          biz.description ||
+          biz.category ||
+          biz.email ||
+          (Array.isArray(biz.website) && biz.website.length > 0) ||
+          biz.address
+      );
+      if (hasBizFields) {
+        businessProfile = {
+          isBusiness: true,
+          category: biz.category,
+          description: biz.description,
+          email: biz.email,
+          website: Array.isArray(biz.website) ? biz.website : undefined,
+          address: biz.address,
+          latitude:
+            typeof biz.latitude === 'number' ? biz.latitude : undefined,
+          longitude:
+            typeof biz.longitude === 'number' ? biz.longitude : undefined,
+          timezone: biz.business_hours?.timezone,
+          businessHoursSummary:
+            hoursSummary && hoursSummary.length > 0 ? hoursSummary : undefined,
+        };
+      }
+    }
+
+    // Parse Linked Devices
+    const rawDevices =
+      devicesSettled.status === 'fulfilled' && Array.isArray(devicesSettled.value)
+        ? devicesSettled.value
+        : [];
+    const primaryDevice: number[] = [];
+    const companionDevices: number[] = [];
+    const seenDevs = new Set<number>();
+    for (const d of rawDevices) {
+      const devNum = typeof d?.device === 'number' ? d.device : 0;
+      if (seenDevs.has(devNum)) continue;
+      seenDevs.add(devNum);
+      if (devNum === 0) {
+        primaryDevice.push(0);
+      } else {
+        companionDevices.push(devNum);
+      }
+    }
+    const deviceListFormatted = [
+      ...primaryDevice.map((d) => `${d} (الهاتف الأساسي)`),
+      ...companionDevices.map((d) => `${d} (جهاز مرافق Web/Desktop #${d})`),
+    ];
+
+    // Contact names & Presence snapshot
+    const contactFromPn = pnJid
+      ? (this.memoryStore.contacts.get(pnJid) as
+          | Record<string, unknown>
+          | undefined)
+      : undefined;
+    const contactFromLid = lidJid
+      ? (this.memoryStore.contacts.get(lidJid) as
+          | Record<string, unknown>
+          | undefined)
+      : undefined;
+    const chatEntry =
+      (pnJid ? this.memoryStore.chats.get(pnJid) : undefined) ||
+      (lidJid ? this.memoryStore.chats.get(lidJid) : undefined);
+
+    const pushName =
+      (typeof contactFromPn?.notify === 'string' && contactFromPn.notify) ||
+      (typeof contactFromLid?.notify === 'string' && contactFromLid.notify) ||
+      (typeof contactFromPn?.name === 'string' && contactFromPn.name) ||
+      (typeof contactFromLid?.name === 'string' && contactFromLid.name) ||
+      chatEntry?.name ||
+      undefined;
+
+    const verifiedName =
+      (typeof contactFromPn?.verifiedName === 'string' &&
+        contactFromPn.verifiedName) ||
+      (typeof contactFromLid?.verifiedName === 'string' &&
+        contactFromLid.verifiedName) ||
+      undefined;
+
+    // Wait briefly (up to 400ms if not yet in store) for presence response
+    let presenceRec =
+      (pnJid ? this.memoryStore.presences.get(pnJid) : undefined) ||
+      (lidJid ? this.memoryStore.presences.get(lidJid) : undefined);
+    if (!presenceRec) {
+      await new Promise((r) => setTimeout(r, 150));
+      presenceRec =
+        (pnJid ? this.memoryStore.presences.get(pnJid) : undefined) ||
+        (lidJid ? this.memoryStore.presences.get(lidJid) : undefined);
+    }
+
+    // Shared Groups from groupMetadataCache
+    const sharedGroups: WhatsAppFullProfileReport['sharedGroups'] = [];
+    for (const meta of this.groupMetadataCache.values()) {
+      for (const p of meta.participants || []) {
+        const pId = p.id ? jidNormalizedUser(p.id) : '';
+        const pLid = p.lid ? jidNormalizedUser(p.lid) : '';
+        const matchesUser =
+          (pnJid && pId && areJidsSameUser(pId, pnJid)) ||
+          (lidJid &&
+            ((pLid && areJidsSameUser(pLid, lidJid)) ||
+              (pId && areJidsSameUser(pId, lidJid))));
+        if (matchesUser) {
+          const role: 'superadmin' | 'admin' | 'member' =
+            p.admin === 'superadmin'
+              ? 'superadmin'
+              : p.admin === 'admin'
+                ? 'admin'
+                : 'member';
+          sharedGroups.push({
+            groupJid: meta.id,
+            subject: meta.subject || meta.id,
+            role,
+          });
+          break;
+        }
+      }
+    }
+
+    const finalPnJid = pnJid || targetQueryJid;
+    const digitsOnly = (jidDecode(finalPnJid)?.user || finalPnJid.split('@')[0]).replace(
+      /\D/g,
+      ''
+    );
+    const e164Phone = digitsOnly ? `+${digitsOnly}` : finalPnJid;
+
+    return {
+      queriedInput: recipient,
+      existsOnWhatsApp,
+      pnJid: finalPnJid,
+      e164Phone,
+      lidJid,
+      pushName,
+      verifiedName,
+      statusText,
+      statusSetAt,
+      profilePicture,
+      presence: {
+        currentState: presenceRec?.currentState || 'unknown',
+        lastSeenIso:
+          presenceRec?.lastSeenTimestampSec &&
+          presenceRec.lastSeenTimestampSec > 0
+            ? new Date(presenceRec.lastSeenTimestampSec * 1000).toISOString()
+            : undefined,
+      },
+      devices: {
+        totalCount: primaryDevice.length + companionDevices.length,
+        primaryDevice,
+        companionDevices,
+        deviceListFormatted,
+      },
+      businessProfile,
+      sharedGroups,
+      fetchedAtIso: new Date().toISOString(),
+    };
+  }
+
+  /**
+   * Sends a short-timer self-destructing message (`1` to `60` seconds) using a 3-layer hybrid mechanism:
+   * 1. Optional `<iq xmlns="w:g2" type="set"><ephemeral expiration="N" trigger="1"/></iq>` stanza
+   * 2. Protobuf `contextInfo.expiration = expirationSeconds` via `{ ephemeralExpiration: expirationSeconds }`
+   * 3. Deterministic auto-revoke timer (`REVOKE` protocolMessage) triggered `ON_SEND` or `ON_READ`.
+   */
+  public async sendShortEphemeralMessage(params: {
+    recipient: string;
+    text: string;
+    expirationSeconds: number;
+    triggerMode?: 'ON_SEND' | 'ON_READ';
+    setChatEphemeralIq?: boolean;
+  }): Promise<{
+    messageId: string;
+    targetJid: string;
+    expirationSeconds: number;
+    triggerMode: 'ON_SEND' | 'ON_READ';
+    scheduledRevokeAtIso: string;
+  }> {
+    const sock = this.ensureSocket();
+    if (this.connectionState !== 'CONNECTED' || !this.wsOpen) {
+      throw new WhatsAppConnectionError(
+        'الجلسة غير متصلة حالياً لإرسال رسائل التدمير الذاتي.'
+      );
+    }
+
+    const expSec = Math.floor(Number(params.expirationSeconds));
+    if (!Number.isFinite(expSec) || expSec < 1 || expSec > 60) {
+      throw new ValidationError(
+        'مدة التدمير الذاتي القصير يجب أن تكون بين 1 و60 ثانية.'
+      );
+    }
+
+    const triggerMode: 'ON_SEND' | 'ON_READ' =
+      params.triggerMode === 'ON_READ' ? 'ON_READ' : 'ON_SEND';
+
+    const validated = validateRecipient(params.recipient);
+    const resolvedJid = validated.jid.endsWith('@s.whatsapp.net')
+      ? await this.resolveDirectRecipientJid(sock, validated.jid)
+      : jidNormalizedUser(validated.jid);
+
+    // Layer 1: Optional <iq xmlns="w:g2" type="set"><ephemeral expiration="..."/></iq>
+    if (params.setChatEphemeralIq !== false && typeof sock.query === 'function') {
+      await sock
+        .query({
+          tag: 'iq',
+          attrs: {
+            to: resolvedJid,
+            type: 'set',
+            xmlns: 'w:g2',
+          },
+          content: [
+            {
+              tag: 'ephemeral',
+              attrs: {
+                expiration: String(expSec),
+                trigger: '1',
+              },
+            },
+          ],
+        })
+        .catch(() => undefined);
+    }
+
+    // Layer 2: Send message with ephemeralExpiration in contextInfo
+    const res = await sock.sendMessage(
+      resolvedJid,
+      { text: params.text },
+      { ephemeralExpiration: expSec }
+    );
+
+    const msgId = res?.key?.id || `eph_${Date.now()}`;
+    const msgKey: WAMessageKey = res?.key || {
+      remoteJid: resolvedJid,
+      fromMe: true,
+      id: msgId,
+    };
+
+    if (res?.message) {
+      this.memoryStore.cacheSentMessage(resolvedJid, msgId, res.message);
+    }
+
+    // Layer 3: Guaranteed Protocol Auto-Revoke Timer
+    const nowMs = Date.now();
+    let scheduledRevokeAtMs = nowMs + expSec * 1000;
+
+    if (triggerMode === 'ON_READ') {
+      const fallbackDelaySec = Math.max(expSec * 3, 180);
+      scheduledRevokeAtMs = nowMs + fallbackDelaySec * 1000;
+      const fallbackTimer = setTimeout(() => {
+        this.pendingOnReadRevokes.delete(msgId);
+        this.scheduleEphemeralRevokeTimer(msgId, resolvedJid, msgKey, 10);
+      }, fallbackDelaySec * 1000);
+      if (typeof fallbackTimer.unref === 'function') {
+        fallbackTimer.unref();
+      }
+      this.pendingOnReadRevokes.set(msgId, {
+        targetJid: resolvedJid,
+        key: msgKey,
+        expirationSeconds: expSec,
+        fallbackTimer,
+      });
+    } else {
+      this.scheduleEphemeralRevokeTimer(
+        msgId,
+        resolvedJid,
+        msgKey,
+        expSec * 1000
+      );
+    }
+
+    await Promise.allSettled([this.credsSaveChain, this.flushAuthWrites()]);
+
+    return {
+      messageId: msgId,
+      targetJid: resolvedJid,
+      expirationSeconds: expSec,
+      triggerMode,
+      scheduledRevokeAtIso: new Date(scheduledRevokeAtMs).toISOString(),
+    };
   }
 
   public async sendNode(node: BinaryNode): Promise<void> {
@@ -2208,6 +3895,22 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
     this.handshakeReady = false;
     this.connectionState = 'CLOSED';
     this.verifiedRecipientJids.clear();
+    for (const timer of this.ephemeralRevokeTimers.values()) {
+      clearTimeout(timer);
+    }
+    this.ephemeralRevokeTimers.clear();
+    for (const pending of this.pendingOnReadRevokes.values()) {
+      clearTimeout(pending.fallbackTimer);
+    }
+    this.pendingOnReadRevokes.clear();
+    for (const cleanup of Array.from(this.activePresenceCleanups)) {
+      try {
+        cleanup();
+      } catch {
+        // Ignore
+      }
+    }
+    this.activePresenceCleanups.clear();
     this.rejectHandshakeWaiters(
       new WhatsAppConnectionError('تم إغلاق مقبس واتساب.')
     );
@@ -2675,12 +4378,279 @@ export class MockWhatsAppSessionDriver implements WhatsAppSessionDriver {
   }
 
   public async sendPresenceUpdate(
-    _state: 'available' | 'composing' | 'paused',
+    _state: WAPresence,
     _jid: string
   ): Promise<void> {
     if (!this.connected || !this.registered) {
       throw new WhatsAppConnectionError('الجلسة غير متصلة حالياً.');
     }
+  }
+
+  public readonly sentAnonymousLidMessages: Array<{
+    recipient: string;
+    targetLid: string;
+    resolvedPn?: string;
+    text: string;
+    messageId: string;
+  }> = [];
+
+  public readonly sentShortEphemeralMessages: Array<{
+    targetJid: string;
+    text: string;
+    expirationSeconds: number;
+    triggerMode: 'ON_SEND' | 'ON_READ';
+    messageId: string;
+    revoked: boolean;
+  }> = [];
+
+  private readonly mockEphemeralTimers = new Map<
+    string,
+    ReturnType<typeof setTimeout>
+  >();
+
+  public async resolveLidForRecipient(targetInput: string): Promise<{
+    pnJid?: string;
+    lidJid: string;
+    source:
+      | 'DIRECT_LID'
+      | 'LID_MAPPING_STORE'
+      | 'ON_WHATSAPP_USYNC'
+      | 'GROUP_PARTICIPANT_CACHE';
+  }> {
+    if (!this.connected || !this.registered) {
+      throw new WhatsAppConnectionError('الجلسة غير متصلة حالياً.');
+    }
+    const trimmed = String(targetInput || '').trim();
+    if (trimmed.endsWith('@lid')) {
+      const validated = validateRecipient(trimmed);
+      return {
+        lidJid: validated.jid,
+        source: 'DIRECT_LID',
+      };
+    }
+    const validated = validateRecipient(trimmed);
+    const digits = validated.jid.split('@')[0].replace(/\D/g, '');
+    const lidDigits = `1000${digits.slice(-10).padStart(10, '0')}`;
+    return {
+      pnJid: validated.jid,
+      lidJid: `${lidDigits}@lid`,
+      source: 'ON_WHATSAPP_USYNC',
+    };
+  }
+
+  public async sendAnonymousLidMessage(params: {
+    recipient: string;
+    text: string;
+    customPushName?: string;
+  }): Promise<{
+    messageId: string;
+    targetLid: string;
+    resolvedPn?: string;
+    resolutionSource: string;
+  }> {
+    if (!this.connected || !this.registered) {
+      throw new WhatsAppConnectionError('الجلسة غير متصلة حالياً.');
+    }
+    const resolved = await this.resolveLidForRecipient(params.recipient);
+    const messageId = `sim_lid_${this.sessionId}_${Date.now()}`;
+    this.sentAnonymousLidMessages.push({
+      recipient: params.recipient,
+      targetLid: resolved.lidJid,
+      resolvedPn: resolved.pnJid,
+      text: params.text,
+      messageId,
+    });
+    this.sentMessagesCount++;
+    return {
+      messageId,
+      targetLid: resolved.lidJid,
+      resolvedPn: resolved.pnJid,
+      resolutionSource: resolved.source,
+    };
+  }
+
+  public async trackRecipientPresence(params: {
+    recipient: string;
+    durationSeconds: number;
+    onUpdate?: (record: TrackedPresenceRecord) => void;
+    staleComposingTimeoutMs?: number;
+  }): Promise<TrackedPresenceRecord> {
+    if (!this.connected || !this.registered) {
+      throw new WhatsAppConnectionError('الجلسة غير متصلة حالياً.');
+    }
+    const resolved = await this.resolveLidForRecipient(params.recipient);
+    const chatJid = resolved.pnJid || resolved.lidJid;
+    const now = Date.now();
+    const record: TrackedPresenceRecord = {
+      chatJid,
+      resolvedLid: resolved.lidJid,
+      currentState: 'available',
+      lastSeenTimestampSec: Math.floor(now / 1000),
+      lastUpdatedMs: now,
+      transitions: [
+        {
+          state: 'available',
+          timestampMs: now - 1500,
+          participantJid: chatJid,
+        },
+        {
+          state: 'composing',
+          timestampMs: now - 800,
+          participantJid: resolved.lidJid,
+        },
+        {
+          state: 'available',
+          timestampMs: now,
+          participantJid: chatJid,
+        },
+      ],
+      totalOnlineDurationMs: Math.min(params.durationSeconds * 1000, 3500),
+    };
+    params.onUpdate?.(record);
+    return record;
+  }
+
+  public async startPresenceHeartbeatBroadcast(params: {
+    recipient: string;
+    mode: 'composing' | 'recording' | 'available';
+    durationSeconds: number;
+    pulseIntervalMs?: number;
+  }): Promise<{
+    pulsesSent: number;
+    targetJid: string;
+    durationMs: number;
+  }> {
+    if (!this.connected || !this.registered) {
+      throw new WhatsAppConnectionError('الجلسة غير متصلة حالياً.');
+    }
+    const validated = validateRecipient(params.recipient);
+    const durationSec = Math.min(
+      180,
+      Math.max(1, Math.floor(Number(params.durationSeconds) || 15))
+    );
+    const intervalMs = Math.max(50, params.pulseIntervalMs ?? 7_500);
+    const pulsesSent = Math.max(1, Math.ceil((durationSec * 1000) / intervalMs));
+    return {
+      pulsesSent,
+      targetJid: validated.jid,
+      durationMs: durationSec * 1000,
+    };
+  }
+
+  public async fetchFullProfileInfo(
+    recipient: string
+  ): Promise<WhatsAppFullProfileReport> {
+    if (!this.connected || !this.registered) {
+      throw new WhatsAppConnectionError('الجلسة غير متصلة حالياً.');
+    }
+    const resolved = await this.resolveLidForRecipient(recipient);
+    const pnJid = resolved.pnJid || resolved.lidJid;
+    const digits = pnJid.split('@')[0].replace(/\D/g, '');
+    const e164Phone = digits ? `+${digits}` : pnJid;
+
+    return {
+      queriedInput: recipient,
+      existsOnWhatsApp: true,
+      pnJid,
+      e164Phone,
+      lidJid: resolved.lidJid,
+      pushName: `مستخدم واتساب (${digits.slice(-4) || 'LID'})`,
+      verifiedName: 'حساب موثق تجريبي',
+      statusText: 'متاح عبر بروتوكول WhatsApp Multi-Device',
+      statusSetAt: new Date(Date.now() - 86_400_000).toISOString(),
+      profilePicture: {
+        hdUrl: `https://pps.whatsapp.net/v/t61.24694-24/mock_hd_${digits || 'user'}.jpg`,
+        previewUrl: `https://pps.whatsapp.net/v/t61.24694-24/mock_prev_${digits || 'user'}.jpg`,
+        status: 'AVAILABLE',
+        statusReasonArabic: 'متاحة بدقة عالية (HD - محاكاة)',
+      },
+      presence: {
+        currentState: 'available',
+        lastSeenIso: new Date().toISOString(),
+      },
+      devices: {
+        totalCount: 2,
+        primaryDevice: [0],
+        companionDevices: [33],
+        deviceListFormatted: [
+          '0 (الهاتف الأساسي)',
+          '33 (جهاز مرافق Web/Desktop #33)',
+        ],
+      },
+      businessProfile: {
+        isBusiness: true,
+        category: 'تقنية المعلومات والاتصالات',
+        description: 'حساب أعمال رسمي عبر واتساب للأعمال',
+        email: 'contact@example.com',
+        website: ['https://example.com'],
+        address: 'الرياض، المملكة العربية السعودية',
+        timezone: 'Asia/Riyadh',
+        businessHoursSummary: ['sun: 09:00 - 17:00 (specific_hours)'],
+      },
+      sharedGroups: [
+        {
+          groupJid: '120363041001@g.us',
+          subject: 'مجموعة العمليات والتنسيق الإداري',
+          role: 'admin',
+        },
+      ],
+      fetchedAtIso: new Date().toISOString(),
+    };
+  }
+
+  public async sendShortEphemeralMessage(params: {
+    recipient: string;
+    text: string;
+    expirationSeconds: number;
+    triggerMode?: 'ON_SEND' | 'ON_READ';
+    setChatEphemeralIq?: boolean;
+  }): Promise<{
+    messageId: string;
+    targetJid: string;
+    expirationSeconds: number;
+    triggerMode: 'ON_SEND' | 'ON_READ';
+    scheduledRevokeAtIso: string;
+  }> {
+    if (!this.connected || !this.registered) {
+      throw new WhatsAppConnectionError('الجلسة غير متصلة حالياً.');
+    }
+    const expSec = Math.floor(Number(params.expirationSeconds));
+    if (!Number.isFinite(expSec) || expSec < 1 || expSec > 60) {
+      throw new ValidationError(
+        'مدة التدمير الذاتي القصير يجب أن تكون بين 1 و60 ثانية.'
+      );
+    }
+    const validated = validateRecipient(params.recipient);
+    const triggerMode: 'ON_SEND' | 'ON_READ' =
+      params.triggerMode === 'ON_READ' ? 'ON_READ' : 'ON_SEND';
+    const messageId = `sim_eph_${this.sessionId}_${Date.now()}`;
+    const entry = {
+      targetJid: validated.jid,
+      text: params.text,
+      expirationSeconds: expSec,
+      triggerMode,
+      messageId,
+      revoked: false,
+    };
+    this.sentShortEphemeralMessages.push(entry);
+    this.sentMessagesCount++;
+
+    const timer = setTimeout(() => {
+      entry.revoked = true;
+      this.mockEphemeralTimers.delete(messageId);
+    }, expSec * 1000);
+    if (typeof timer.unref === 'function') {
+      timer.unref();
+    }
+    this.mockEphemeralTimers.set(messageId, timer);
+
+    return {
+      messageId,
+      targetJid: validated.jid,
+      expirationSeconds: expSec,
+      triggerMode,
+      scheduledRevokeAtIso: new Date(Date.now() + expSec * 1000).toISOString(),
+    };
   }
 
   public readonly sentNodes: BinaryNode[] = [];
@@ -2869,6 +4839,10 @@ export class MockWhatsAppSessionDriver implements WhatsAppSessionDriver {
     this.handshakeComplete = false;
     this.connected = false;
     this.connectionState = 'CLOSED';
+    for (const timer of this.mockEphemeralTimers.values()) {
+      clearTimeout(timer);
+    }
+    this.mockEphemeralTimers.clear();
   }
 
   public async logout(): Promise<void> {

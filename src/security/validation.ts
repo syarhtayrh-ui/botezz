@@ -2,6 +2,7 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import {
   jidEncode,
+  jidDecode,
   jidNormalizedUser,
   isJidGroup,
 } from '../whatsapp/baileys-compat';
@@ -116,10 +117,11 @@ export interface NormalizedRecipient {
   jid: string;
   displayTarget: string;
   isGroup: boolean;
+  isLid?: boolean;
 }
 
 /**
- * Validates and normalizes a WhatsApp recipient identifier (either phone number or JID)
+ * Validates and normalizes a WhatsApp recipient identifier (either phone number, @g.us, or @lid JID)
  * using @hiroosy/baileys-lite JID utilities.
  */
 export function validateRecipient(rawInput: string): NormalizedRecipient {
@@ -128,6 +130,20 @@ export function validateRecipient(rawInput: string): NormalizedRecipient {
   }
 
   const trimmed = rawInput.trim();
+  if (trimmed.endsWith('@lid')) {
+    const decoded = jidDecode(trimmed);
+    const lidDigits = decoded?.user || trimmed.slice(0, -4).split(':')[0];
+    if (!/^\d{5,25}$/.test(lidDigits)) {
+      throw new ValidationError('صيغة معرف الهوية المخفية (@lid) غير صالحة.');
+    }
+    return {
+      jid: `${lidDigits}@lid`,
+      displayTarget: `${lidDigits}@lid`,
+      isGroup: false,
+      isLid: true,
+    };
+  }
+
   if (isJidGroup(trimmed) || trimmed.endsWith('@g.us')) {
     const groupPrefix = trimmed.slice(0, -5);
     if (!/^[0-9\-]{8,35}$/.test(groupPrefix)) {

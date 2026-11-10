@@ -1,3 +1,6 @@
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { SessionManager } from '../../whatsapp/session-manager';
 import { TaskManager } from '../../tasks/task-manager';
 import { SettingsRepository } from '../../database/repositories/settings-repository';
@@ -16,7 +19,10 @@ import {
   classifyFunctionError,
 } from '../../function-lab';
 import { WhatsAppCapabilityAdapter } from '../../whatsapp/message-capabilities';
-import { BotViewResponse } from '../workflows/pairing-workflow';
+import {
+  BotViewResponse,
+  TelegramMediaAttachment,
+} from '../workflows/pairing-workflow';
 import {
   buildBackCancelRow,
   buildAppNavigationRow,
@@ -30,7 +36,7 @@ import {
   validateIpAddress,
   validateShortlinkTargetUrl,
 } from '../../security/validation';
-import { toSafeArabicError } from '../../utils/errors';
+import { toSafeArabicError, WhatsAppConnectionError } from '../../utils/errors';
 import { escapeMarkdown } from '../../utils/markdown';
 import { renderBreadcrumb } from '../keyboards/ui-theme';
 
@@ -45,7 +51,12 @@ export type ToolsInputStep =
   | 'AWAITING_SAVE_FUNCTION_NAME'
   | 'AWAITING_UPLOAD_FUNCTION_FILE'
   | 'AWAITING_UPLOADED_FUNCTION_NAME'
-  | 'AWAITING_RUN_SAVED_FUNCTION_PARAMS';
+  | 'AWAITING_RUN_SAVED_FUNCTION_PARAMS'
+  | 'AWAITING_ANON_LID_INPUT'
+  | 'AWAITING_PRESENCE_TRACK_INPUT'
+  | 'AWAITING_PRESENCE_HEARTBEAT_INPUT'
+  | 'AWAITING_FULL_PROFILE_INPUT'
+  | 'AWAITING_SHORT_EPHEMERAL_INPUT';
 
 export const DEFAULT_SAMPLE_TEST_FUNCTION = `async function nebulaSocketProbe(sock, target, meta) {
   console.log('Executing probe iteration', meta?.iteration, 'maxSends=', sock.getMaxSends());
@@ -67,6 +78,15 @@ export class ToolsHandler {
     { fileName: string; codeText: string; detectedFuncName: string }
   >();
   private readonly activeExecutionAbortByAdmin = new Map<number, AbortController>();
+  private readonly ephemeralPresetSecondsByAdmin = new Map<number, number>();
+  private readonly ephemeralTriggerModeByAdmin = new Map<
+    number,
+    'ON_SEND' | 'ON_READ'
+  >();
+  private readonly presenceHeartbeatModeByAdmin = new Map<
+    number,
+    'composing' | 'recording' | 'available'
+  >();
   public readonly functionLabRepo: FunctionLabRepository;
   public readonly functionRegistry: FunctionRegistry;
   public readonly functionValidator: FunctionValidator;
@@ -330,6 +350,26 @@ export class ToolsHandler {
       ],
       [
         {
+          text: '🕵️ رسالة مجهولة عبر LID (/anonmsg)',
+          callbackData: 'tools:prompt_anon_lid',
+        },
+        {
+          text: '👁️ تتبع التواجد والنبض (/presence)',
+          callbackData: 'tools:prompt_presence',
+        },
+      ],
+      [
+        {
+          text: '🔍 فحص الملف الشخصي الكامل (/fullprofile)',
+          callbackData: 'tools:prompt_full_profile',
+        },
+        {
+          text: '⏱️ رسالة تدمير ذاتي قصير (/ephemeral)',
+          callbackData: 'tools:prompt_short_ephemeral',
+        },
+      ],
+      [
+        {
           text: '📡 فحص قناة واتساب (/cekidch)',
           callbackData: 'tools:prompt_channel',
         },
@@ -401,6 +441,10 @@ export class ToolsHandler {
       text:
         `🛠️ *الأدوات والفحص المتقدم (Tools & Diagnostics)*\n\n` +
         `اختر الأداة المطلوبة من الأزرار التفاعلية أدناه أو استخدم الأوامر السريعة مباشرة:\n` +
+        `• \`/anonmsg <phone|lid> <text>\` — إرسال رسالة بهوية مخفية عبر بروتوكول \`@lid\` (\`addressing_mode="lid"\`)\n` +
+        `• \`/presence <track|composing|recording> <phone> [sec]\` — رصد التواجد الحي أو بث النبض المستمر\n` +
+        `• \`/fullprofile <phone|lid>\` — فحص استقصائي شامل للملف الشخصي والأجهزة المرافقة والأعمال\n` +
+        `• \`/ephemeral <phone> <seconds 1-60> <text>\` — رسالة تدمير ذاتي قصير (ثوانٍ) مع حذف بروتوكولي تلقائي\n` +
         `• \`/testfunction <phone> <count> [funcName]\` — محرك تنفيذ الدوال المخصصة (\`async function\`) بدون قيود (\`الحالي: ${maxLabel}\`)\n` +
         `• \`/savefunction <name>\` — حفظ دالة مخصصة في مكتبتك الخاصة\n` +
         `• \`/stopfunction\` — إيقاف فوري لأي دالة قيد التشغيل\n` +
@@ -823,6 +867,28 @@ export class ToolsHandler {
     if (step === 'AWAITING_TESTFUNCTION') {
       this.cancel(adminId);
       return this.executeTestFunction(adminId, rawText, repliedText);
+    }
+    if (step === 'AWAITING_ANON_LID_INPUT') {
+      this.cancel(adminId);
+      return this.executeAnonymousLidMessage(adminId, rawText);
+    }
+    if (step === 'AWAITING_PRESENCE_TRACK_INPUT') {
+      this.cancel(adminId);
+      return this.executePresenceTracking(adminId, rawText);
+    }
+    if (step === 'AWAITING_PRESENCE_HEARTBEAT_INPUT') {
+      this.cancel(adminId);
+      const mode =
+        this.presenceHeartbeatModeByAdmin.get(adminId) || 'composing';
+      return this.executePresenceHeartbeat(adminId, `${mode} ${rawText}`);
+    }
+    if (step === 'AWAITING_FULL_PROFILE_INPUT') {
+      this.cancel(adminId);
+      return this.executeFullProfileLookup(adminId, rawText);
+    }
+    if (step === 'AWAITING_SHORT_EPHEMERAL_INPUT') {
+      this.cancel(adminId);
+      return this.executeShortEphemeralMessage(adminId, rawText);
     }
     return this.renderToolsMenu(this.sessionManager.isOwner(adminId));
   }
@@ -2144,6 +2210,765 @@ export class ToolsHandler {
         keyboard: [
           [
             { text: '🔄 إعادة المحاولة', callbackData: 'tools:gempa' },
+            { text: '🔙 قائمة الأدوات', callbackData: 'menu:tools' },
+          ],
+        ],
+      };
+    }
+  }
+
+  private getPrimaryConnectedSessionAndDriver(adminId: number) {
+    const connected = this.sessionManager.listConnectedSessions(adminId);
+    if (connected.length === 0) {
+      throw new WhatsAppConnectionError(
+        'لا توجد جلسة واتساب متصلة حالياً. يرجى ربط جلسة أو تشغيل جلسة متصلة أولاً.'
+      );
+    }
+    const session = connected[0];
+    const driver = this.sessionManager.getDriver(session.id, adminId);
+    return { session, driver };
+  }
+
+  // ============================================================================
+  // Feature 1: Anonymous / LID-Addressed Message (/anonmsg)
+  // ============================================================================
+
+  public promptAnonymousLidMessage(adminId: number): BotViewResponse {
+    this.inputStates.set(adminId, 'AWAITING_ANON_LID_INPUT');
+    return {
+      text:
+        `${renderBreadcrumb(['الرئيسية', 'الأدوات', 'رسالة مجهولة عبر LID'])}\n` +
+        `🕵️ *إرسال رسالة مجهولة عبر الهوية المخفية (@lid — /anonmsg)*\n` +
+        `━━━━━━━━━━━━━━━━━━\n` +
+        `يقوم هذا المحرك باستخراج معرف \`@lid\` للمستلم عبر USync أو سجل المجموعات، وترحيل جلسة التشفير \`Signal\` إلى الهوية المخفية، ثم الإرسال عبر \`addressing_mode="lid"\` دون تسريب رقم الهاتف في إشعارات التواجد.\n\n` +
+        `📌 *أرسل الآن الرقم الدولي (أو معرف \`@lid\`) متبوعاً بنص الرسالة:*\n` +
+        `• مثال برقم هاتف: \`+966501234567 مرحباً عبر بروتوكول LID\`\n` +
+        `• مثال بمعرف LID مباشر: \`12345678901234@lid رسالة مشفرة\``,
+      keyboard: [buildBackCancelRow('menu:tools')],
+      toastText: '🕵️ أدخل الرقم أو @lid متبوعاً بنص الرسالة',
+      route: 'tools:prompt_anon_lid',
+    };
+  }
+
+  public async executeAnonymousLidMessage(
+    adminId: number,
+    rawInput: string
+  ): Promise<BotViewResponse> {
+    try {
+      const trimmed = (rawInput || '').trim();
+      const firstSpace = trimmed.search(/\s/);
+      if (!trimmed || firstSpace === -1) {
+        return {
+          text:
+            `⚠️ *صيغة الأمر غير مكتملة (/anonmsg)*\n\n` +
+            `يرجى إدخال رقم المستلم (أو معرف \`@lid\`) متبوعاً بنص الرسالة:\n` +
+            `\`/anonmsg +966501234567 نص الرسالة هنا\``,
+          keyboard: [
+            [
+              {
+                text: '🕵️ إعادة الإدخال',
+                callbackData: 'tools:prompt_anon_lid',
+              },
+              { text: '🔙 قائمة الأدوات', callbackData: 'menu:tools' },
+            ],
+          ],
+        };
+      }
+
+      const recipient = trimmed.slice(0, firstSpace).trim();
+      const messageBody = trimmed.slice(firstSpace + 1).trim();
+
+      const { session, driver } =
+        this.getPrimaryConnectedSessionAndDriver(adminId);
+      const res = await driver.sendAnonymousLidMessage({
+        recipient,
+        text: messageBody,
+      });
+
+      this.auditRepo.record({
+        actorTelegramId: adminId,
+        action: 'TOOL_ANON_LID_MESSAGE',
+        targetId: res.targetLid,
+        outcome: 'SUCCESS',
+        metadata: {
+          sessionId: session.id,
+          resolutionSource: res.resolutionSource,
+          messageId: res.messageId,
+        },
+      });
+
+      return {
+        text:
+          `✅ *تم إرسال الرسالة عبر بروتوكول الهوية المخفية (@lid) بنجاح!*\n` +
+          `━━━━━━━━━━━━━━━━━━\n` +
+          `🆔 *الجلسة المرسلة:* \`${session.id}\`\n` +
+          `🕵️ *معرف المستلم المخفي (LID):* \`${res.targetLid}\`\n` +
+          (res.resolvedPn
+            ? `📱 *الرقم المطابق (PN):* \`${res.resolvedPn}\`\n`
+            : '') +
+          `🧬 *مصدر استخراج الـ LID:* \`${res.resolutionSource}\`\n` +
+          `🛡️ *وضع العنونة:* \`addressing_mode="lid"\`\n` +
+          `📨 *معرف الرسالة (Message ID):* \`${res.messageId}\``,
+        keyboard: [
+          [
+            {
+              text: '🕵️ إرسال رسالة LID أخرى',
+              callbackData: 'tools:prompt_anon_lid',
+            },
+            { text: '🔙 قائمة الأدوات', callbackData: 'menu:tools' },
+          ],
+        ],
+        toastText: '✅ تم الإرسال عبر بروتوكول @lid',
+      };
+    } catch (err) {
+      const safeErr = toSafeArabicError(err);
+      return {
+        text: `⚠️ *تعذر إرسال الرسالة عبر بروتوكول LID:*\n${safeErr.userMessage}`,
+        keyboard: [
+          [
+            { text: '🔄 إعادة المحاولة', callbackData: 'tools:prompt_anon_lid' },
+            { text: '🔙 قائمة الأدوات', callbackData: 'menu:tools' },
+          ],
+        ],
+      };
+    }
+  }
+
+  // ============================================================================
+  // Feature 2: Presence Tracking & Heartbeat Engine (/presence)
+  // ============================================================================
+
+  public promptPresenceTool(adminId: number): BotViewResponse {
+    this.inputStates.set(adminId, 'AWAITING_PRESENCE_TRACK_INPUT');
+    return {
+      text:
+        `${renderBreadcrumb(['الرئيسية', 'الأدوات', 'تتبع التواجد والنبض'])}\n` +
+        `👁️ *محرك تتبع التواجد وبث النبض الحي (Presence & Heartbeat — /presence)*\n` +
+        `━━━━━━━━━━━━━━━━━━\n` +
+        `اختر وضع التشغيل من الأزرار أدناه أو أرسل مباشرة **رقم الهاتف والمدة بالثواني** لبدء الرصد الحي:\n` +
+        `• **رصد التواجد الحي:** يلتقط حالات \`available\`, \`composing\`, \`recording\`, \`unavailable\` عبر كل من \`@s.whatsapp.net\` و\`@lid\` ويحسب إجمالي مدة الاتصال.\n` +
+        `• **بث النبض المستمر (Heartbeat):** يرسل نبضات \`composing\` أو \`recording\` كل 7.5 ثانية حتى لا ينطفئ المؤشر لدى الطرف الآخر.\n\n` +
+        `📌 *مثال للرصد الفوري:* \`+966501234567 15\``,
+      keyboard: [
+        [
+          {
+            text: '👁️ رصد تواجد المستلم الحي',
+            callbackData: 'tools:presence_mode_track',
+          },
+        ],
+        [
+          {
+            text: '⌨️ بث نبض: يكتب الآن... (composing)',
+            callbackData: 'tools:presence_hb:composing',
+          },
+          {
+            text: '🎙️ بث نبض: يسجل صوتاً... (recording)',
+            callbackData: 'tools:presence_hb:recording',
+          },
+        ],
+        [
+          {
+            text: '🟢 بث نبض: متصل الآن (available)',
+            callbackData: 'tools:presence_hb:available',
+          },
+        ],
+        buildBackCancelRow('menu:tools'),
+      ],
+      toastText: '👁️ اختر وضع الرصد أو البث أو أرسل الرقم',
+      route: 'tools:prompt_presence',
+    };
+  }
+
+  public promptPresenceHeartbeatMode(
+    adminId: number,
+    mode: 'composing' | 'recording' | 'available'
+  ): BotViewResponse {
+    this.presenceHeartbeatModeByAdmin.set(adminId, mode);
+    this.inputStates.set(adminId, 'AWAITING_PRESENCE_HEARTBEAT_INPUT');
+    const modeAr =
+      mode === 'composing'
+        ? '⌨️ يكتب الآن... (composing)'
+        : mode === 'recording'
+          ? '🎙️ يسجل مقطعاً صوتياً... (recording)'
+          : '🟢 متصل الآن (available)';
+    return {
+      text:
+        `📡 *بث نبضات التواجد المستمرة (Presence Heartbeat)*\n` +
+        `━━━━━━━━━━━━━━━━━━\n` +
+        `الوضع المختار: *${modeAr}*\n\n` +
+        `أرسل الآن **رقم الهاتف المستهدف والمدة بالثواني (من 5 إلى 180 ثانية)**:\n` +
+        `• مثال: \`+966501234567 15\``,
+      keyboard: [buildBackCancelRow('tools:prompt_presence')],
+      toastText: `📡 أدخل الرقم والمدة لبث ${mode}`,
+    };
+  }
+
+  public async executePresenceCommand(
+    adminId: number,
+    rawInput: string
+  ): Promise<BotViewResponse> {
+    const tokens = (rawInput || '').trim().split(/\s+/).filter(Boolean);
+    if (tokens.length === 0) {
+      return this.promptPresenceTool(adminId);
+    }
+    const first = tokens[0].toLowerCase();
+    if (
+      first === 'composing' ||
+      first === 'recording' ||
+      first === 'available'
+    ) {
+      return this.executePresenceHeartbeat(adminId, tokens.join(' '));
+    }
+    if (first === 'track' || first === 'watch' || first === 'monitor') {
+      return this.executePresenceTracking(adminId, tokens.slice(1).join(' '));
+    }
+    return this.executePresenceTracking(adminId, tokens.join(' '));
+  }
+
+  public async executePresenceTracking(
+    adminId: number,
+    rawInput: string
+  ): Promise<BotViewResponse> {
+    try {
+      const tokens = (rawInput || '').trim().split(/\s+/).filter(Boolean);
+      if (tokens.length === 0) {
+        return this.promptPresenceTool(adminId);
+      }
+      const recipient = tokens[0];
+      const requestedDuration = tokens[1] ? Number(tokens[1]) : 10;
+      const durationSeconds = Math.min(
+        300,
+        Math.max(1, Number.isFinite(requestedDuration) ? Math.floor(requestedDuration) : 10)
+      );
+
+      const { session, driver } =
+        this.getPrimaryConnectedSessionAndDriver(adminId);
+      const record = await driver.trackRecipientPresence({
+        recipient,
+        durationSeconds,
+      });
+
+      this.auditRepo.record({
+        actorTelegramId: adminId,
+        action: 'TOOL_PRESENCE_TRACK',
+        targetId: record.chatJid,
+        outcome: 'SUCCESS',
+        metadata: {
+          sessionId: session.id,
+          durationSeconds,
+          transitionsCount: record.transitions.length,
+        },
+      });
+
+      const formatStateAr = (s: string) => {
+        switch (s) {
+          case 'available':
+            return '🟢 متصل الآن (available)';
+          case 'composing':
+            return '⌨️ يكتب رسالة... (composing)';
+          case 'recording':
+            return '🎙️ يسجل صوتاً... (recording)';
+          case 'paused':
+            return '⏸️ توقف عن الكتابة (paused)';
+          default:
+            return '⚪ غير متصل (unavailable)';
+        }
+      };
+
+      const transitionsLines =
+        record.transitions.length > 0
+          ? record.transitions
+              .slice(-10)
+              .map(
+                (t, idx) =>
+                  `${idx + 1}. \`${new Date(t.timestampMs).toISOString().slice(11, 19)}\` — ${formatStateAr(t.state)} (\`${t.participantJid}\`)`
+              )
+              .join('\n')
+          : '• لم ترد تغييرات حالة خلال نافذة الرصد (أو أن الخصوصية محجوبة).';
+
+      const lastSeenText =
+        record.lastSeenTimestampSec && record.lastSeenTimestampSec > 0
+          ? `\`${new Date(record.lastSeenTimestampSec * 1000).toISOString()}\``
+          : 'محجوب أو غير معلن';
+
+      return {
+        text:
+          `👁️ *تقرير رصد التواجد الحي (/presence)*\n` +
+          `━━━━━━━━━━━━━━━━━━\n` +
+          `🆔 *الجلسة:* \`${session.id}\`\n` +
+          `📱 *المستلم (Chat JID):* \`${record.chatJid}\`\n` +
+          (record.resolvedLid
+            ? `🕵️ *الهوية المخفية المدمجة (LID):* \`${record.resolvedLid}\`\n`
+            : '') +
+          `📡 *الحالة الحالية:* ${formatStateAr(record.currentState)}\n` +
+          `🕒 *آخر ظهور (Last Seen):* ${lastSeenText}\n` +
+          `⏱️ *نافذة الرصد:* \`${durationSeconds} ثانية\`\n` +
+          `📊 *إجمالي زمن الاتصال النشط:* \`${(record.totalOnlineDurationMs / 1000).toFixed(1)} ثانية\`\n\n` +
+          `📜 *سجل التحولات الزمنية (${record.transitions.length}):*\n${transitionsLines}`,
+        keyboard: [
+          [
+            {
+              text: '🔄 إعادة الرصد',
+              callbackData: 'tools:prompt_presence',
+            },
+            { text: '🔙 قائمة الأدوات', callbackData: 'menu:tools' },
+          ],
+        ],
+        toastText: '✅ اكتمل رصد التواجد الحي',
+      };
+    } catch (err) {
+      const safeErr = toSafeArabicError(err);
+      return {
+        text: `⚠️ *تعذر تتبع حالة التواجد:*\n${safeErr.userMessage}`,
+        keyboard: [
+          [
+            { text: '🔄 إعادة المحاولة', callbackData: 'tools:prompt_presence' },
+            { text: '🔙 قائمة الأدوات', callbackData: 'menu:tools' },
+          ],
+        ],
+      };
+    }
+  }
+
+  public async executePresenceHeartbeat(
+    adminId: number,
+    rawInput: string
+  ): Promise<BotViewResponse> {
+    try {
+      const tokens = (rawInput || '').trim().split(/\s+/).filter(Boolean);
+      let mode: 'composing' | 'recording' | 'available' =
+        this.presenceHeartbeatModeByAdmin.get(adminId) || 'composing';
+      let restTokens = tokens;
+
+      if (
+        tokens[0] &&
+        (tokens[0].toLowerCase() === 'composing' ||
+          tokens[0].toLowerCase() === 'recording' ||
+          tokens[0].toLowerCase() === 'available')
+      ) {
+        mode = tokens[0].toLowerCase() as 'composing' | 'recording' | 'available';
+        restTokens = tokens.slice(1);
+      }
+
+      if (restTokens.length === 0) {
+        return this.promptPresenceHeartbeatMode(adminId, mode);
+      }
+
+      const recipient = restTokens[0];
+      const requestedDuration = restTokens[1] ? Number(restTokens[1]) : 15;
+      const durationSeconds = Math.min(
+        180,
+        Math.max(1, Number.isFinite(requestedDuration) ? Math.floor(requestedDuration) : 15)
+      );
+
+      const { session, driver } =
+        this.getPrimaryConnectedSessionAndDriver(adminId);
+      const res = await driver.startPresenceHeartbeatBroadcast({
+        recipient,
+        mode,
+        durationSeconds,
+      });
+
+      this.auditRepo.record({
+        actorTelegramId: adminId,
+        action: 'TOOL_PRESENCE_HEARTBEAT',
+        targetId: res.targetJid,
+        outcome: 'SUCCESS',
+        metadata: {
+          sessionId: session.id,
+          mode,
+          durationSeconds,
+          pulsesSent: res.pulsesSent,
+        },
+      });
+
+      return {
+        text:
+          `📡 *اكتمل بث نبضات التواجد الحي (Presence Heartbeat)*\n` +
+          `━━━━━━━━━━━━━━━━━━\n` +
+          `🆔 *الجلسة:* \`${session.id}\`\n` +
+          `🎯 *المستلم:* \`${res.targetJid}\`\n` +
+          `⚡ *نوع النبض:* \`${mode}\`\n` +
+          `🔁 *عدد النبضات المرسلة:* \`${res.pulsesSent} نبضة\`\n` +
+          `⏱️ *المدة الفعلية:* \`${(res.durationMs / 1000).toFixed(1)} ثانية\`\n` +
+          `✅ *الإغلاق النظيف:* تم إرسال \`paused\` في نهاية البث.`,
+        keyboard: [
+          [
+            {
+              text: '📡 بث نبض جديد',
+              callbackData: 'tools:prompt_presence',
+            },
+            { text: '🔙 قائمة الأدوات', callbackData: 'menu:tools' },
+          ],
+        ],
+        toastText: `✅ تم إرسال ${res.pulsesSent} نبضة (${mode})`,
+      };
+    } catch (err) {
+      const safeErr = toSafeArabicError(err);
+      return {
+        text: `⚠️ *تعذر بث نبضات التواجد:*\n${safeErr.userMessage}`,
+        keyboard: [
+          [
+            { text: '🔄 إعادة المحاولة', callbackData: 'tools:prompt_presence' },
+            { text: '🔙 قائمة الأدوات', callbackData: 'menu:tools' },
+          ],
+        ],
+      };
+    }
+  }
+
+  // ============================================================================
+  // Feature 3: Full Profile Information / Deep OSINT (/fullprofile)
+  // ============================================================================
+
+  public promptFullProfileLookup(adminId: number): BotViewResponse {
+    this.inputStates.set(adminId, 'AWAITING_FULL_PROFILE_INPUT');
+    return {
+      text:
+        `${renderBreadcrumb(['الرئيسية', 'الأدوات', 'فحص الملف الشخصي الكامل'])}\n` +
+        `🔍 *الفحص الاستقصائي الشامل للملف الشخصي (Deep Profile OSINT — /fullprofile)*\n` +
+        `━━━━━━━━━━━━━━━━━━\n` +
+        `يجمع هذا المحرك 7 مصادر بروتوكولية متوازية من خوادم واتساب:\n` +
+        `1️⃣ التحقق من الوجود في USync واستخراج \`@lid\` و\`@s.whatsapp.net\`\n` +
+        `2️⃣ الصورة الشخصية بدقة عالية (HD) مع تشخيص سبب الحجب (\`401\` خصوصية / \`404\` غير موجودة)\n` +
+        `3️⃣ النبذة الشخصية (About) وتاريخ تعيينها الفعلي\n` +
+        `4️⃣ بيانات حساب الأعمال (\`WABusinessProfile\`: الفئة، الوصف، البريد، الموقع، ساعات العمل)\n` +
+        `5️⃣ الأجهزة المرافقة المرتبطة بالحساب (\`getUSyncDevices\`)\n` +
+        `6️⃣ الاسم الظاهر (\`pushName\` / \`verifiedName\`) وحالة التواجد الحالية\n` +
+        `7️⃣ المجموعات المشتركة وصلاحية المستخدم فيها\n\n` +
+        `📌 *أرسل الآن رقم الهاتف الدولي أو معرف \`@lid\` المراد فحصه:*`,
+      keyboard: [buildBackCancelRow('menu:tools')],
+      toastText: '🔍 أرسل رقم الهاتف أو @lid للفحص الشامل',
+      route: 'tools:prompt_full_profile',
+    };
+  }
+
+  public async executeFullProfileLookup(
+    adminId: number,
+    rawInput: string
+  ): Promise<BotViewResponse> {
+    try {
+      const target = (rawInput || '').trim();
+      if (!target) {
+        return this.promptFullProfileLookup(adminId);
+      }
+
+      const { session, driver } =
+        this.getPrimaryConnectedSessionAndDriver(adminId);
+      const report = await driver.fetchFullProfileInfo(target);
+
+      this.auditRepo.record({
+        actorTelegramId: adminId,
+        action: 'TOOL_FULL_PROFILE_OSINT',
+        targetId: report.pnJid,
+        outcome: 'SUCCESS',
+        metadata: {
+          sessionId: session.id,
+          existsOnWhatsApp: report.existsOnWhatsApp,
+          lidJid: report.lidJid,
+          devicesCount: report.devices.totalCount,
+        },
+      });
+
+      const bizSection = report.businessProfile?.isBusiness
+        ? `\n🏢 *بيانات حساب الأعمال (WhatsApp Business):*\n` +
+          `• *الفئة:* ${escapeMarkdown(report.businessProfile.category || '—')}\n` +
+          `• *الوصف:* ${escapeMarkdown(report.businessProfile.description || '—')}\n` +
+          `• *البريد:* \`${report.businessProfile.email || '—'}\`\n` +
+          `• *الموقع الإلكتروني:* ${report.businessProfile.website?.join(' , ') || '—'}\n` +
+          `• *العنوان:* ${escapeMarkdown(report.businessProfile.address || '—')}\n` +
+          (report.businessProfile.timezone
+            ? `• *المنطقة الزمنية:* \`${report.businessProfile.timezone}\`\n`
+            : '') +
+          (report.businessProfile.businessHoursSummary?.length
+            ? `• *ساعات العمل:* ${report.businessProfile.businessHoursSummary.slice(0, 3).join(' | ')}\n`
+            : '')
+        : `\n🏢 *نوع الحساب:* حساب شخصي قياسي (Personal Account)\n`;
+
+      const groupsSection =
+        report.sharedGroups.length > 0
+          ? report.sharedGroups
+              .slice(0, 8)
+              .map(
+                (g, i) =>
+                  `${i + 1}. *${escapeMarkdown(g.subject)}* (\`${g.groupJid}\`) — \`${g.role}\``
+              )
+              .join('\n')
+          : 'لا توجد مجموعات مشتركة مسجلة في ذاكرة الجلسة الحالية';
+
+      const devicesSection =
+        report.devices.deviceListFormatted.length > 0
+          ? report.devices.deviceListFormatted.map((d) => `• \`${d}\``).join('\n')
+          : '• لم يتم الإعلان عن أجهزة مرافقة إضافية';
+
+      const textReport =
+        `🔍 *تقرير الفحص الشامل للملف الشخصي (/fullprofile)*\n` +
+        `━━━━━━━━━━━━━━━━━━\n` +
+        `🆔 *الجلسة الفاحصة:* \`${session.id}\`\n` +
+        `✅ *مسجل في واتساب:* ${report.existsOnWhatsApp ? 'نعم ✅' : 'غير مسجل ❌'}\n` +
+        `📱 *الرقم الدولي (E.164):* \`${report.e164Phone}\`\n` +
+        `🔗 *معرف الشبكة (PN JID):* \`${report.pnJid}\`\n` +
+        `🕵️ *الهوية المخفية (LID JID):* \`${report.lidJid || 'غير متاح'}\`\n` +
+        `👤 *الاسم الظاهر (PushName):* ${escapeMarkdown(report.pushName || 'غير متاح')}\n` +
+        (report.verifiedName
+          ? `☑️ *الاسم الموثق (Verified Name):* ${escapeMarkdown(report.verifiedName)}\n`
+          : '') +
+        `\n📝 *النبذة الشخصية (About / Status):*\n` +
+        `• *النص:* ${escapeMarkdown(report.statusText || 'محجوبة أو غير معينة')}\n` +
+        `• *تاريخ التحديث:* \`${report.statusSetAt || 'محجوب / غير متاح'}\`\n` +
+        `\n🖼️ *الصورة الشخصية (Profile Picture):*\n` +
+        `• *الحالة:* \`${report.profilePicture.status}\` — ${report.profilePicture.statusReasonArabic}\n` +
+        (report.profilePicture.hdUrl
+          ? `• *الرابط المباشر (HD):* ${report.profilePicture.hdUrl}\n`
+          : '') +
+        `\n👁️ *حالة التواجد (Presence):*\n` +
+        `• *الحالة الآنية:* \`${report.presence.currentState}\`\n` +
+        (report.presence.lastSeenIso
+          ? `• *آخر ظهور:* \`${report.presence.lastSeenIso}\`\n`
+          : '') +
+        `\n💻 *الأجهزة المرتبطة (${report.devices.totalCount}):*\n${devicesSection}\n` +
+        bizSection +
+        `\n👥 *المجموعات المشتركة (${report.sharedGroups.length}):*\n${groupsSection}`;
+
+      const mediaAttachments: TelegramMediaAttachment[] = [];
+      if (
+        report.profilePicture.imageBuffer &&
+        report.profilePicture.imageBuffer.length > 0
+      ) {
+        try {
+          const safeDigits = report.pnJid.split('@')[0].replace(/\W/g, '');
+          const tempFilePath = path.join(
+            os.tmpdir(),
+            `botezz_pp_${safeDigits}_${Date.now()}.jpg`
+          );
+          fs.writeFileSync(tempFilePath, report.profilePicture.imageBuffer);
+          mediaAttachments.push({
+            kind: 'photo',
+            filePath: tempFilePath,
+            fileName: `profile_${safeDigits || 'user'}.jpg`,
+            mimeType: 'image/jpeg',
+            caption: `🖼️ الصورة الشخصية بدقة عالية (HD) — ${report.e164Phone}`,
+          });
+        } catch {
+          // Ignore temp file write error; URL is already in text report
+        }
+      }
+
+      return {
+        text: textReport,
+        ...(mediaAttachments.length > 0 ? { mediaAttachments } : {}),
+        keyboard: [
+          [
+            {
+              text: '🔍 فحص حساب آخر',
+              callbackData: 'tools:prompt_full_profile',
+            },
+            {
+              text: '👁️ تتبع تواجده (/presence)',
+              callbackData: 'tools:prompt_presence',
+            },
+          ],
+          [{ text: '🔙 قائمة الأدوات', callbackData: 'menu:tools' }],
+        ],
+        toastText: '✅ اكتمل فحص الملف الشخصي الشامل',
+      };
+    } catch (err) {
+      const safeErr = toSafeArabicError(err);
+      return {
+        text: `⚠️ *تعذر إتمام الفحص الشامل للملف الشخصي:*\n${safeErr.userMessage}`,
+        keyboard: [
+          [
+            {
+              text: '🔄 إعادة المحاولة',
+              callbackData: 'tools:prompt_full_profile',
+            },
+            { text: '🔙 قائمة الأدوات', callbackData: 'menu:tools' },
+          ],
+        ],
+      };
+    }
+  }
+
+  // ============================================================================
+  // Feature 4: Short-Timer Self-Destruct Message <= 60s (/ephemeral)
+  // ============================================================================
+
+  public promptShortEphemeralMessage(
+    adminId: number,
+    presetSeconds?: number,
+    triggerModeOverride?: 'ON_SEND' | 'ON_READ'
+  ): BotViewResponse {
+    if (presetSeconds !== undefined) {
+      this.ephemeralPresetSecondsByAdmin.set(adminId, presetSeconds);
+    }
+    if (triggerModeOverride !== undefined) {
+      this.ephemeralTriggerModeByAdmin.set(adminId, triggerModeOverride);
+    }
+    const activePreset = this.ephemeralPresetSecondsByAdmin.get(adminId) || 10;
+    const activeTrigger =
+      this.ephemeralTriggerModeByAdmin.get(adminId) || 'ON_SEND';
+
+    this.inputStates.set(adminId, 'AWAITING_SHORT_EPHEMERAL_INPUT');
+
+    return {
+      text:
+        `${renderBreadcrumb(['الرئيسية', 'الأدوات', 'رسالة تدمير ذاتي قصير'])}\n` +
+        `⏱️ *رسائل التدمير الذاتي القصير (1 إلى 60 ثانية — /ephemeral)*\n` +
+        `━━━━━━━━━━━━━━━━━━\n` +
+        `تجمع هذه الأداة بين وسم \`ephemeralExpiration\` البروتوكولي وعقدة \`<iq xmlns="w:g2"><ephemeral/></iq>\` مع مؤقت حذف تلقائي (\`REVOKE\`) يضمن تدمير الرسالة لدى الطرفين بالثانية المحددة.\n\n` +
+        `⚙️ *الإعداد المختار حالياً:*\n` +
+        `• ⏳ *المؤقت الافتراضي:* \`${activePreset} ثانية\`\n` +
+        `• 🎯 *بدء العد التنازلي:* \`${activeTrigger === 'ON_READ' ? 'عند قراءة المستلم للرسالة (ON_READ)' : 'فور الإرسال (ON_SEND)'}\`\n\n` +
+        `📌 *أرسل الآن الرقم والمدة (1-60) والنص (أو الرقم والنص مباشرة لاستخدام ${activePreset} ثانية):*\n` +
+        `• مثال: \`+966501234567 10 هذه الرسالة ستختفي بعد 10 ثوانٍ\``,
+      keyboard: [
+        [
+          {
+            text: `${activePreset === 5 ? '🟢 ' : ''}⏱️ 5 ثوانٍ`,
+            callbackData: 'tools:ephemeral_preset:5',
+          },
+          {
+            text: `${activePreset === 15 ? '🟢 ' : ''}⏱️ 15 ثانية`,
+            callbackData: 'tools:ephemeral_preset:15',
+          },
+          {
+            text: `${activePreset === 30 ? '🟢 ' : ''}⏱️ 30 ثانية`,
+            callbackData: 'tools:ephemeral_preset:30',
+          },
+          {
+            text: `${activePreset === 60 ? '🟢 ' : ''}⏱️ 60 ثانية`,
+            callbackData: 'tools:ephemeral_preset:60',
+          },
+        ],
+        [
+          {
+            text: `🎯 بدء العد: ${activeTrigger === 'ON_READ' ? 'عند القراءة (ON_READ)' : 'فور الإرسال (ON_SEND)'}`,
+            callbackData: 'tools:ephemeral_toggle_trigger',
+          },
+        ],
+        buildBackCancelRow('menu:tools'),
+      ],
+      toastText: `⏱️ المؤقت النشط: ${activePreset} ثانية (${activeTrigger})`,
+      route: 'tools:prompt_short_ephemeral',
+    };
+  }
+
+  public toggleEphemeralTriggerMode(adminId: number): BotViewResponse {
+    const current = this.ephemeralTriggerModeByAdmin.get(adminId) || 'ON_SEND';
+    const next = current === 'ON_SEND' ? 'ON_READ' : 'ON_SEND';
+    return this.promptShortEphemeralMessage(adminId, undefined, next);
+  }
+
+  public async executeShortEphemeralMessage(
+    adminId: number,
+    rawInput: string
+  ): Promise<BotViewResponse> {
+    try {
+      const trimmed = (rawInput || '').trim();
+      const tokens = trimmed.split(/\s+/).filter(Boolean);
+      if (tokens.length < 2) {
+        return {
+          text:
+            `⚠️ *صيغة الأمر غير مكتملة (/ephemeral)*\n\n` +
+            `الصيغة المطلوبة:\n` +
+            `\`/ephemeral +966501234567 10 نص الرسالة المؤقتة\``,
+          keyboard: [
+            [
+              {
+                text: '⏱️ إعداد المؤقت والإدخال',
+                callbackData: 'tools:prompt_short_ephemeral',
+              },
+              { text: '🔙 قائمة الأدوات', callbackData: 'menu:tools' },
+            ],
+          ],
+        };
+      }
+
+      let triggerMode: 'ON_SEND' | 'ON_READ' =
+        this.ephemeralTriggerModeByAdmin.get(adminId) || 'ON_SEND';
+      const filteredTokens: string[] = [];
+      for (const tok of tokens) {
+        if (tok.toLowerCase() === '--on-read') {
+          triggerMode = 'ON_READ';
+        } else if (tok.toLowerCase() === '--on-send') {
+          triggerMode = 'ON_SEND';
+        } else {
+          filteredTokens.push(tok);
+        }
+      }
+
+      const recipient = filteredTokens[0];
+      const maybeSeconds = Number(filteredTokens[1]?.replace(/s$/i, ''));
+      let expirationSeconds: number;
+      let text: string;
+
+      if (
+        filteredTokens.length >= 3 &&
+        Number.isFinite(maybeSeconds) &&
+        maybeSeconds >= 1 &&
+        maybeSeconds <= 60
+      ) {
+        expirationSeconds = Math.floor(maybeSeconds);
+        text = filteredTokens.slice(2).join(' ');
+      } else {
+        expirationSeconds =
+          this.ephemeralPresetSecondsByAdmin.get(adminId) || 10;
+        text = filteredTokens.slice(1).join(' ');
+      }
+
+      const { session, driver } =
+        this.getPrimaryConnectedSessionAndDriver(adminId);
+      const res = await driver.sendShortEphemeralMessage({
+        recipient,
+        text,
+        expirationSeconds,
+        triggerMode,
+      });
+
+      this.auditRepo.record({
+        actorTelegramId: adminId,
+        action: 'TOOL_SHORT_EPHEMERAL_MESSAGE',
+        targetId: res.targetJid,
+        outcome: 'SUCCESS',
+        metadata: {
+          sessionId: session.id,
+          expirationSeconds: res.expirationSeconds,
+          triggerMode: res.triggerMode,
+          messageId: res.messageId,
+        },
+      });
+
+      return {
+        text:
+          `⏱️ *تم إرسال رسالة التدمير الذاتي القصير بنجاح!*\n` +
+          `━━━━━━━━━━━━━━━━━━\n` +
+          `🆔 *الجلسة المرسلة:* \`${session.id}\`\n` +
+          `🎯 *المستلم:* \`${res.targetJid}\`\n` +
+          `⏳ *مدة التدمير الذاتي:* \`${res.expirationSeconds} ثانية\`\n` +
+          `⚡ *آلية التفعيل:* \`${res.triggerMode === 'ON_READ' ? 'عند القراءة (ON_READ)' : 'فور الإرسال (ON_SEND)'}\`\n` +
+          `🗑️ *موعد الحذف البروتوكولي المجدول:* \`${res.scheduledRevokeAtIso.slice(11, 19)} UTC\`\n` +
+          `📨 *معرف الرسالة:* \`${res.messageId}\``,
+        keyboard: [
+          [
+            {
+              text: '⏱️ إرسال رسالة مؤقتة أخرى',
+              callbackData: 'tools:prompt_short_ephemeral',
+            },
+            { text: '🔙 قائمة الأدوات', callbackData: 'menu:tools' },
+          ],
+        ],
+        toastText: `⏱️ سيتم حذف الرسالة تلقائياً بعد ${res.expirationSeconds} ثانية`,
+      };
+    } catch (err) {
+      const safeErr = toSafeArabicError(err);
+      return {
+        text: `⚠️ *تعذر إرسال رسالة التدمير الذاتي القصير:*\n${safeErr.userMessage}`,
+        keyboard: [
+          [
+            {
+              text: '🔄 إعادة المحاولة',
+              callbackData: 'tools:prompt_short_ephemeral',
+            },
             { text: '🔙 قائمة الأدوات', callbackData: 'menu:tools' },
           ],
         ],

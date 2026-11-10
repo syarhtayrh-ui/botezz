@@ -1185,6 +1185,56 @@ export class TelegramBotController {
     if (callbackData === 'tools:gempa') {
       return this.toolsHandler.executeEarthquakeCheck();
     }
+    if (callbackData === 'tools:prompt_anon_lid') {
+      this.cancelAllWorkflowsForAdmin(actorUserId);
+      this.activeConversationMode.set(actorUserId, 'TOOLS');
+      return this.toolsHandler.promptAnonymousLidMessage(actorUserId);
+    }
+    if (
+      callbackData === 'tools:prompt_presence' ||
+      callbackData === 'tools:presence_mode_track'
+    ) {
+      this.cancelAllWorkflowsForAdmin(actorUserId);
+      this.activeConversationMode.set(actorUserId, 'TOOLS');
+      return this.toolsHandler.promptPresenceTool(actorUserId);
+    }
+    if (callbackData.startsWith('tools:presence_hb:')) {
+      const modeRaw = callbackData
+        .slice('tools:presence_hb:'.length)
+        .toLowerCase();
+      const mode: 'composing' | 'recording' | 'available' =
+        modeRaw === 'recording'
+          ? 'recording'
+          : modeRaw === 'available'
+            ? 'available'
+            : 'composing';
+      this.cancelAllWorkflowsForAdmin(actorUserId);
+      this.activeConversationMode.set(actorUserId, 'TOOLS');
+      return this.toolsHandler.promptPresenceHeartbeatMode(actorUserId, mode);
+    }
+    if (callbackData === 'tools:prompt_full_profile') {
+      this.cancelAllWorkflowsForAdmin(actorUserId);
+      this.activeConversationMode.set(actorUserId, 'TOOLS');
+      return this.toolsHandler.promptFullProfileLookup(actorUserId);
+    }
+    if (callbackData === 'tools:prompt_short_ephemeral') {
+      this.cancelAllWorkflowsForAdmin(actorUserId);
+      this.activeConversationMode.set(actorUserId, 'TOOLS');
+      return this.toolsHandler.promptShortEphemeralMessage(actorUserId);
+    }
+    if (callbackData.startsWith('tools:ephemeral_preset:')) {
+      const sec = Number(callbackData.slice('tools:ephemeral_preset:'.length));
+      this.cancelAllWorkflowsForAdmin(actorUserId);
+      this.activeConversationMode.set(actorUserId, 'TOOLS');
+      return this.toolsHandler.promptShortEphemeralMessage(
+        actorUserId,
+        Number.isFinite(sec) && sec >= 1 && sec <= 60 ? sec : 10
+      );
+    }
+    if (callbackData === 'tools:ephemeral_toggle_trigger') {
+      this.activeConversationMode.set(actorUserId, 'TOOLS');
+      return this.toolsHandler.toggleEphemeralTriggerMode(actorUserId);
+    }
 
     return this.startHandler.renderMainMenu({
       isAdmin: isOwner,
@@ -1510,6 +1560,49 @@ export class TelegramBotController {
           return this.toolsHandler.promptShortlink(actorUserId);
         }
         return this.toolsHandler.executeShortlink(actorUserId, args.join(' '));
+      }
+
+      if (command === '/anonmsg' || command === '/lidmsg') {
+        const rawArgs = trimmed.replace(/^\/\S+\s*/, '');
+        if (!rawArgs) {
+          this.cancelAllWorkflowsForAdmin(actorUserId);
+          this.activeConversationMode.set(actorUserId, 'TOOLS');
+          return this.toolsHandler.promptAnonymousLidMessage(actorUserId);
+        }
+        return this.toolsHandler.executeAnonymousLidMessage(actorUserId, rawArgs);
+      }
+
+      if (command === '/presence') {
+        const rawArgs = trimmed.replace(/^\/\S+\s*/, '');
+        if (!rawArgs) {
+          this.cancelAllWorkflowsForAdmin(actorUserId);
+          this.activeConversationMode.set(actorUserId, 'TOOLS');
+          return this.toolsHandler.promptPresenceTool(actorUserId);
+        }
+        return this.toolsHandler.executePresenceCommand(actorUserId, rawArgs);
+      }
+
+      if (command === '/fullprofile' || command === '/whois') {
+        const rawArgs = trimmed.replace(/^\/\S+\s*/, '');
+        if (!rawArgs) {
+          this.cancelAllWorkflowsForAdmin(actorUserId);
+          this.activeConversationMode.set(actorUserId, 'TOOLS');
+          return this.toolsHandler.promptFullProfileLookup(actorUserId);
+        }
+        return this.toolsHandler.executeFullProfileLookup(actorUserId, rawArgs);
+      }
+
+      if (command === '/ephemeral' || command === '/selfdestruct') {
+        const rawArgs = trimmed.replace(/^\/\S+\s*/, '');
+        if (!rawArgs) {
+          this.cancelAllWorkflowsForAdmin(actorUserId);
+          this.activeConversationMode.set(actorUserId, 'TOOLS');
+          return this.toolsHandler.promptShortEphemeralMessage(actorUserId);
+        }
+        return this.toolsHandler.executeShortEphemeralMessage(
+          actorUserId,
+          rawArgs
+        );
       }
 
       if (command === '/testfunction') {

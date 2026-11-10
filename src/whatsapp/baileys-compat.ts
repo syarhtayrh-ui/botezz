@@ -60,8 +60,51 @@ import {
   type WAMessageUpdate,
   type MessageUserReceiptUpdate,
   type BinaryNode,
+  type WAPresence,
+  type PresenceData,
+  type WABusinessHoursConfig,
+  type WABusinessProfile,
 } from '@hiroosy/baileys-lite';
 import Voip from '@hiroosy/baileys-lite/voip';
+
+export const getDevice: (
+  id: string
+) => 'ios' | 'web' | 'android' | 'desktop' | 'unknown' =
+  (
+    BaileysNamespace as unknown as {
+      getDevice?: (id: string) => 'ios' | 'web' | 'android' | 'desktop' | 'unknown';
+    }
+  ).getDevice ||
+  ((id = '') =>
+    /^3A.{18}$/.test(id)
+      ? 'ios'
+      : /^3E.{20}$/.test(id)
+        ? 'web'
+        : /^(.{21}|.{32})$/.test(id)
+          ? 'android'
+          : /^(3F|.{18}$)/.test(id)
+            ? 'desktop'
+            : 'unknown');
+
+export const extractAddressingContext: (
+  stanza: BinaryNode
+) => {
+  addressingMode: string;
+  altSender?: string;
+  altRecipient?: string;
+} =
+  (
+    BaileysNamespace as unknown as {
+      extractAddressingContext?: (stanza: BinaryNode) => {
+        addressingMode: string;
+        altSender?: string;
+        altRecipient?: string;
+      };
+    }
+  ).extractAddressingContext ||
+  ((stanza: BinaryNode) => ({
+    addressingMode: stanza?.attrs?.addressing_mode || 'pn',
+  }));
 
 export async function getUSyncDevices(
   sock: Partial<WASocket> | CompatibleWhatsAppSocket,
@@ -431,6 +474,10 @@ export {
   type WAMessageUpdate,
   type MessageUserReceiptUpdate,
   type BinaryNode,
+  type WAPresence,
+  type PresenceData,
+  type WABusinessHoursConfig,
+  type WABusinessProfile,
 };
 
 export default makeWASocket;

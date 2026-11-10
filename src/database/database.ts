@@ -179,6 +179,41 @@ export class AppDatabase {
         'ALTER TABLE incoming_messages ADD COLUMN raw_payload TEXT'
       );
     }
+    if (!inColNames.has('sender_device_type')) {
+      this.sqlite.exec(
+        'ALTER TABLE incoming_messages ADD COLUMN sender_device_type TEXT'
+      );
+    }
+    if (!inColNames.has('sender_ip')) {
+      this.sqlite.exec(
+        'ALTER TABLE incoming_messages ADD COLUMN sender_ip TEXT'
+      );
+    }
+    if (!inColNames.has('sender_country')) {
+      this.sqlite.exec(
+        'ALTER TABLE incoming_messages ADD COLUMN sender_country TEXT'
+      );
+    }
+    if (!inColNames.has('sender_device_id')) {
+      this.sqlite.exec(
+        'ALTER TABLE incoming_messages ADD COLUMN sender_device_id INTEGER NOT NULL DEFAULT 0'
+      );
+    }
+    if (!inColNames.has('file_sha256')) {
+      this.sqlite.exec(
+        'ALTER TABLE incoming_messages ADD COLUMN file_sha256 TEXT'
+      );
+    }
+    if (!inColNames.has('forwarding_score')) {
+      this.sqlite.exec(
+        'ALTER TABLE incoming_messages ADD COLUMN forwarding_score INTEGER NOT NULL DEFAULT 0'
+      );
+    }
+    if (!inColNames.has('quoted_message_summary')) {
+      this.sqlite.exec(
+        'ALTER TABLE incoming_messages ADD COLUMN quoted_message_summary TEXT'
+      );
+    }
 
     const statCols = this.sqlite
       .prepare('PRAGMA table_info(captured_statuses)')
