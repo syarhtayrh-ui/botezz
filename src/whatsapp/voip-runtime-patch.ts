@@ -32,6 +32,7 @@ export interface InstrumentedVideoEngine {
   accessUnitsSent: number;
   videoPath: string | null;
   waitingForKeyFrame: boolean;
+  waitForKeyFrame?: boolean;
   sourceKind: 'file' | 'blank' | null;
   videoLoop?: boolean;
   _deliberateStop?: boolean;
@@ -40,7 +41,8 @@ export interface InstrumentedVideoEngine {
   lastGeneratedFfmpegArgs?: string[];
   onVideoCompleted?: () => void;
   onEncoderFatalError?: (err: Error) => void;
-  start?: () => void;
+  onAccessUnit?: (au: Uint8Array) => void;
+  start?: (...args: unknown[]) => unknown;
   spawnFfmpeg?: () => ChildProcess | null;
   onData?: (chunk: Uint8Array | Buffer) => void;
   handleChunk?: (chunk: Uint8Array | Buffer, flush?: boolean) => void;
@@ -521,11 +523,12 @@ export function instrumentVideoEngineInstance(
     this: InstrumentedVideoEngine,
     au: Uint8Array
   ) {
-    if (this.waitingForKeyFrame) {
+    if (this.waitingForKeyFrame || this.waitForKeyFrame) {
       if (!auHasIdrNalu(au)) {
         return;
       }
       this.waitingForKeyFrame = false;
+      this.waitForKeyFrame = false;
     }
     this.accessUnitsSent = (this.accessUnitsSent ?? 0) + 1;
     const frameDurMs = this.frameDurationMs || 1000 / (this.frameRate || 15);
@@ -541,6 +544,8 @@ export function instrumentVideoEngineInstance(
           message: err instanceof Error ? err.message : String(err),
         });
       }
+    } else if (typeof this.onAccessUnit === 'function') {
+      this.onAccessUnit(au);
     } else if (origEmitAccessUnit && origEmitAccessUnit !== patchedEmitAccessUnit) {
       origEmitAccessUnit.call(this, au);
     }
@@ -754,6 +759,7 @@ export function instrumentVideoEngineInstance(
     this._pendingHeaderNalus = [];
     this.accessUnitsSent = 0;
     this.waitingForKeyFrame = true;
+    this.waitForKeyFrame = true;
     this.running = true;
     this._deliberateStop = false;
 
@@ -841,8 +847,27 @@ export function instrumentVideoEngineInstance(
     return proc;
   };
 
-  videoEngine.start = function patchedVideoStart(this: InstrumentedVideoEngine) {
-    this.spawnFfmpeg?.();
+  const origStart =
+    typeof videoEngine.start === 'function' ? videoEngine.start : undefined;
+  videoEngine.start = function patchedVideoStart(
+    this: InstrumentedVideoEngine,
+    ...args: unknown[]
+  ) {
+    this._deliberateStop = false;
+    this.running = true;
+    this.waitForKeyFrame = true;
+    this.waitingForKeyFrame = true;
+    if (typeof args[0] === 'function') {
+      this.onAccessUnit = args[0] as (au: Uint8Array) => void;
+    }
+    if (
+      typeof origStart === 'function' &&
+      origStart !== patchedVideoStart &&
+      this.videoLoop !== false
+    ) {
+      return origStart.apply(this, args);
+    }
+    return this.spawnFfmpeg?.();
   };
 
   const origStop = videoEngine.stop;
@@ -947,45 +972,135 @@ export function instrumentMediaSessionInstance(
   }
 
   const sessionWithAccept = session as InstrumentedMediaSession & {
-    handleCallAccept?: (node: unknown) => Promise<void>;
+    handleCallAccept?: (...args: unknown[]) => Promise<void>;
     srtpSession?: {
+      sendCtx?: {
+        sessionKey?: Uint8Array;
+        sessionSalt?: Uint8Array;
+        authKey?: Uint8Array;
+        authTagLen?: number;
+      };
       recvCtx?: {
         sessionKey?: Uint8Array;
         sessionSalt?: Uint8Array;
         authKey?: Uint8Array;
+        authTagLen?: number;
       };
+      protect?: (packet: unknown) => Uint8Array;
+      unprotect?: (data: Uint8Array) => unknown;
     } | null;
   };
   if (typeof sessionWithAccept.handleCallAccept === 'function') {
     const origHandleCallAccept = sessionWithAccept.handleCallAccept;
     sessionWithAccept.handleCallAccept = async function patchedHandleCallAccept(
       this: typeof sessionWithAccept,
-      node: unknown
+      ...args: unknown[]
     ) {
-      const res = await origHandleCallAccept.call(this, node);
+      const res = await origHandleCallAccept.apply(this, args);
+      const primarySend = this.srtpSession?.sendCtx;
       const primaryRecv = this.srtpSession?.recvCtx;
-      const videoRecv = (
-        this.videoSrtpSession as
-          | {
-              recvCtx?: {
-                sessionKey?: Uint8Array;
-                sessionSalt?: Uint8Array;
-                authKey?: Uint8Array;
-              };
+
+      // If `this.videoSrtpSession` was not created yet (because `srtpFromPeerKey` skipped `initSrtpKeys()`),
+      // create a dedicated video SRTP session cloned from `this.srtpSession` with independent ROC/seq counters.
+      if (
+        !this.videoSrtpSession &&
+        this.srtpSession &&
+        primarySend &&
+        primaryRecv
+      ) {
+        const srtpCtor = (
+          this.srtpSession as unknown as {
+            constructor?: new (...cArgs: unknown[]) => unknown;
+          }
+        ).constructor;
+        const ctxCtor = (
+          primarySend as unknown as {
+            constructor?: new (...cArgs: unknown[]) => unknown;
+          }
+        ).constructor;
+        if (
+          typeof srtpCtor === 'function' &&
+          srtpCtor !== Object &&
+          typeof ctxCtor === 'function'
+        ) {
+          try {
+            const dummyKeying = {
+              masterKey: new Uint8Array(16),
+              masterSalt: new Uint8Array(14),
+            };
+            const clonedSession = new srtpCtor(
+              dummyKeying,
+              dummyKeying,
+              primarySend.authTagLen ?? 4,
+              primaryRecv.authTagLen ?? 4
+            ) as {
+              sendCtx?: Record<string, unknown>;
+              recvCtx?: Record<string, unknown>;
+              protect?: (pkt: unknown) => Uint8Array;
+            };
+            if (clonedSession.sendCtx && clonedSession.recvCtx) {
+              clonedSession.sendCtx.sessionKey = primarySend.sessionKey;
+              clonedSession.sendCtx.sessionSalt = primarySend.sessionSalt;
+              clonedSession.sendCtx.authKey = primarySend.authKey;
+              clonedSession.recvCtx.sessionKey = primaryRecv.sessionKey;
+              clonedSession.recvCtx.sessionSalt = primaryRecv.sessionSalt;
+              clonedSession.recvCtx.authKey = primaryRecv.authKey;
+              this.videoSrtpSession = clonedSession as NonNullable<
+                typeof this.videoSrtpSession
+              >;
             }
-          | null
-          | undefined
-      )?.recvCtx;
+          } catch {
+            // Fall through to object fallback below
+          }
+        }
+        if (!this.videoSrtpSession) {
+          this.videoSrtpSession = {
+            sendCtx: { ...primarySend },
+            recvCtx: { ...primaryRecv },
+            protect:
+              typeof this.srtpSession.protect === 'function'
+                ? this.srtpSession.protect.bind(this.srtpSession)
+                : (pkt: unknown) => pkt as Uint8Array,
+          } as unknown as NonNullable<typeof this.videoSrtpSession>;
+        }
+      }
+
+      const videoSessionObj = this.videoSrtpSession as
+        | {
+            sendCtx?: {
+              sessionKey?: Uint8Array;
+              sessionSalt?: Uint8Array;
+              authKey?: Uint8Array;
+            };
+            recvCtx?: {
+              sessionKey?: Uint8Array;
+              sessionSalt?: Uint8Array;
+              authKey?: Uint8Array;
+            };
+          }
+        | null
+        | undefined;
+      if (
+        primarySend &&
+        videoSessionObj?.sendCtx &&
+        primarySend.sessionKey instanceof Uint8Array &&
+        primarySend.sessionSalt instanceof Uint8Array &&
+        primarySend.authKey instanceof Uint8Array
+      ) {
+        videoSessionObj.sendCtx.sessionKey = primarySend.sessionKey;
+        videoSessionObj.sendCtx.sessionSalt = primarySend.sessionSalt;
+        videoSessionObj.sendCtx.authKey = primarySend.authKey;
+      }
       if (
         primaryRecv &&
-        videoRecv &&
+        videoSessionObj?.recvCtx &&
         primaryRecv.sessionKey instanceof Uint8Array &&
         primaryRecv.sessionSalt instanceof Uint8Array &&
         primaryRecv.authKey instanceof Uint8Array
       ) {
-        videoRecv.sessionKey = primaryRecv.sessionKey;
-        videoRecv.sessionSalt = primaryRecv.sessionSalt;
-        videoRecv.authKey = primaryRecv.authKey;
+        videoSessionObj.recvCtx.sessionKey = primaryRecv.sessionKey;
+        videoSessionObj.recvCtx.sessionSalt = primaryRecv.sessionSalt;
+        videoSessionObj.recvCtx.authKey = primaryRecv.authKey;
       }
       return res;
     };

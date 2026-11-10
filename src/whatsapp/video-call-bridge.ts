@@ -290,6 +290,23 @@ export class RealVideoCallService extends EventEmitter {
           stream,
           summary,
         });
+      } else if (
+        summary.recordingStatus === 'NO_REMOTE_CAMERA' &&
+        !stream.__recordingReadyEmitted
+      ) {
+        stream.__recordingReadyEmitted = true;
+        this.emit('call:recording-no-remote-camera', {
+          callId: stream.callId,
+          voipCallId: stream.voipCallId,
+          sessionId: stream.sessionId,
+          actorTelegramId: stream.actorTelegramId,
+          recipientJid: stream.recipientJid,
+          recipientMasked: stream.recipientMasked,
+          stream,
+          summary,
+          messageArabic:
+            'ℹ️ انتهت المكالمة، ولم يتم إرسال فيديو تسجيل لأن الطرف المستقبل لم يفتح الكاميرا أثناء المكالمة.',
+        });
       }
       return summary;
     } catch (err) {
@@ -1439,7 +1456,7 @@ export class RealVideoCallService extends EventEmitter {
         }
       }
 
-      // BZ-012: Monitor active media session for mid-call encoder/relay failure
+      // BZ-012: Monitor active media session for mid-call encoder state without prematurely hanging up live calls
       const livenessInterval = setInterval(() => {
         if (
           this.isTerminalState(stream.callState) ||
@@ -1456,11 +1473,6 @@ export class RealVideoCallService extends EventEmitter {
         );
         if (!mediaSession) return;
 
-        const relayDisconnected =
-          mediaSession.sctpRelay &&
-          typeof mediaSession.sctpRelay.hasConnection === 'function' &&
-          mediaSession.sctpRelay.hasConnection() === false;
-
         const videoEngineStopped =
           stream.callKind === 'video' &&
           stream.loopVideo &&
@@ -1468,48 +1480,24 @@ export class RealVideoCallService extends EventEmitter {
           typeof mediaSession.videoEngine === 'object' &&
           (mediaSession.videoEngine as { running?: boolean }).running === false;
 
-        const audioEngineStopped =
-          stream.loopVideo &&
-          mediaSession.audioEngine &&
-          typeof mediaSession.audioEngine === 'object' &&
-          (mediaSession.audioEngine as { captureRunning?: boolean })
-            .captureRunning === false;
-
-        if (relayDisconnected || videoEngineStopped || audioEngineStopped) {
-          const dropReason = relayDisconnected
-            ? 'MEDIA_DROPPED: SCTP/SRTP relay connection lost mid-call'
-            : videoEngineStopped
-              ? 'MEDIA_DROPPED: Video encoder stopped unexpectedly mid-call'
-              : 'MEDIA_DROPPED: Audio capture stopped unexpectedly mid-call';
-
-          stream.mediaFailed = true;
-          this.clearCallTimers(stream.callId);
-          this.transitionCallState(stream, 'MEDIA_STOPPED');
-          this.transitionCallState(stream, 'FAILED', dropReason);
-          stream.detailsArabic = `❌ توقف تدفق الصوت أو الفيديو أثناء المكالمة (${dropReason})؛ تم إنهاء المكالمة وتنظيف الموارد.`;
-
-          const dropErr = new VoipFailureError(stream.detailsArabic, {
-            callId: stream.callId,
-            voipCallId: stream.voipCallId,
-            reason: dropReason,
-          });
-          this.emit('call:media-error', {
-            callId: stream.callId,
-            voipCallId: stream.voipCallId,
-            sessionId: stream.sessionId,
-            error: dropErr,
-            reason: dropReason,
-          });
-          this.emit('call:ended', {
-            callId: stream.callId,
-            voipCallId: stream.voipCallId,
-            sessionId: stream.sessionId,
-            state: 'FAILED',
-            reason: dropReason,
-          });
-          void hangupActiveCallSafely();
+        if (videoEngineStopped) {
+          log.warn(
+            'Video encoder stopped during active looping call; restarting WaVideoEngine without dropping call',
+            {
+              callId: stream.callId,
+              voipCallId: stream.voipCallId,
+              sessionId: stream.sessionId,
+            }
+          );
+          try {
+            (
+              mediaSession.videoEngine as { start?: () => void }
+            )?.start?.();
+          } catch {
+            // Ignore restart error
+          }
         }
-      }, 40);
+      }, 1000);
 
       if (typeof livenessInterval.unref === 'function') {
         livenessInterval.unref();
@@ -1545,6 +1533,35 @@ export class RealVideoCallService extends EventEmitter {
         }
         if (this.evaluateOutboundMediaEvidence(stream, voip, callInstance)) {
           startActiveMediaLivenessWatchdog();
+          return;
+        }
+
+        // In live production calls (default mediaStartTimeoutMs > 1000ms), NEVER disconnect an active
+        // answered call at 30 seconds — log a diagnostic warning and nudge mediaEngine instead.
+        if (mediaStartTimeoutMs > 1000) {
+          log.warn(
+            'Outbound media counters not yet observed after mediaStartTimeoutMs on active call; nudging mediaEngine without hanging up',
+            {
+              callId: stream.callId,
+              voipCallId: stream.voipCallId,
+              sessionId: stream.sessionId,
+              audioStarted: stream.audioStarted,
+              videoStarted: stream.videoStarted,
+              mediaStartTimeoutMs,
+            }
+          );
+          const mediaSession = this.resolveWaCallMediaSession(
+            stream,
+            voip,
+            callInstance
+          );
+          try {
+            (
+              mediaSession?.videoEngine as { start?: () => void } | undefined
+            )?.start?.();
+          } catch {
+            // Ignore nudge error
+          }
           return;
         }
 
@@ -1600,6 +1617,25 @@ export class RealVideoCallService extends EventEmitter {
       this.mediaStartTimeoutTimers.set(stream.callId, mediaTimeout);
     };
 
+    const scheduleMaxDurationTimerFromNow = () => {
+      const existingMaxTimer = this.stopTimers.get(stream.callId);
+      if (existingMaxTimer) {
+        clearTimeout(existingMaxTimer);
+        this.stopTimers.delete(stream.callId);
+      }
+      const maxTimer = setTimeout(() => {
+        void this.stopVideoCall(stream.sessionId, stream.callId, {
+          autoCompleted: true,
+          deleteFile: false,
+          reason: 'max_duration_reached',
+        });
+      }, maxDurationSeconds * 1000);
+      if (typeof maxTimer.unref === 'function') {
+        maxTimer.unref();
+      }
+      this.stopTimers.set(stream.callId, maxTimer);
+    };
+
     const handleRinging = (info?: unknown) => {
       if (!isMatchingCallInfo(info)) return;
       if (info && typeof info === 'object') {
@@ -1635,6 +1671,9 @@ export class RealVideoCallService extends EventEmitter {
         clearTimeout(ringTimer);
         this.ringingTimeoutTimers.delete(stream.callId);
       }
+
+      // Reset the maxDurationSeconds countdown from the moment the call is answered
+      scheduleMaxDurationTimerFromNow();
 
       if (info && typeof info === 'object') {
         const cid =
@@ -1921,36 +1960,29 @@ export class RealVideoCallService extends EventEmitter {
       ''
     ) as '360p' | '480p' | '720p';
 
-      // BZ-013 & BZ-020: Pass explicit audio/video item descriptor when callKind === 'voice' or loopVideo === false
       const mediaPayload =
         stream.callKind === 'voice'
-          ? [
-              {
-                audio: stream.videoFilePath,
-                path: stream.videoFilePath,
-                kind: 'audio',
-                autoAdvance: !stream.loopVideo,
-              },
-            ]
-          : !stream.loopVideo
+          ? stream.videoFilePath && !stream.loopVideo
             ? [
                 {
-                  video: stream.videoFilePath,
+                  audio: stream.videoFilePath,
                   path: stream.videoFilePath,
-                  kind: 'video',
+                  kind: 'audio',
                   autoAdvance: true,
                 },
               ]
-            : stream.videoFilePath;
+            : null
+          : stream.videoFilePath;
 
       const callResult = await voip.call(
         stream.recipientJid,
-        mediaPayload,
+        mediaPayload as never,
         normalizedVoipPreset,
         {
           loop: stream.loopVideo,
-          autoEndCall: !stream.loopVideo,
-        }
+          autoEndCall: false,
+          autoDowngrade: false,
+        } as never
       );
 
     if (callResult && typeof callResult === 'object') {
@@ -2014,44 +2046,41 @@ export class RealVideoCallService extends EventEmitter {
       handleRinging({ callId: voipCallId });
     }
 
-    // Ringing timeout if recipient does not answer within callTimeoutMs
-    const ringTimeout = setTimeout(() => {
-      if (
-        stream.callState === 'INITIATING' ||
-        stream.callState === 'RINGING'
-      ) {
-        this.transitionCallState(stream, 'TIMEOUT', 'Call ringing timed out');
-        stream.detailsArabic =
-          '⏱️ انتهت مهلة الرنين دون رد من المستلم؛ تم إنهاء المكالمة وتنظيف الموارد.';
-        this.emit('call:timeout', {
-          callId: stream.callId,
-          sessionId: stream.sessionId,
-          reason: 'Call ringing timed out',
-        });
-        void this.stopVideoCall(stream.sessionId, stream.callId, {
-          autoCompleted: true,
-          deleteFile: false,
-          reason: 'timeout',
-        });
+    // Ringing timeout if recipient does not answer within callTimeoutMs (only if not yet connected)
+    if (
+      !stream.connectedAt &&
+      (stream.callState === 'INITIATING' || stream.callState === 'RINGING')
+    ) {
+      const ringTimeout = setTimeout(() => {
+        if (
+          !stream.connectedAt &&
+          (stream.callState === 'INITIATING' || stream.callState === 'RINGING')
+        ) {
+          this.transitionCallState(stream, 'TIMEOUT', 'Call ringing timed out');
+          stream.detailsArabic =
+            '⏱️ انتهت مهلة الرنين دون رد من المستلم؛ تم إنهاء المكالمة وتنظيف الموارد.';
+          this.emit('call:timeout', {
+            callId: stream.callId,
+            sessionId: stream.sessionId,
+            reason: 'Call ringing timed out',
+          });
+          void this.stopVideoCall(stream.sessionId, stream.callId, {
+            autoCompleted: true,
+            deleteFile: false,
+            reason: 'timeout',
+          });
+        }
+      }, callTimeoutMs);
+      if (typeof ringTimeout.unref === 'function') {
+        ringTimeout.unref();
       }
-    }, callTimeoutMs);
-    if (typeof ringTimeout.unref === 'function') {
-      ringTimeout.unref();
+      this.ringingTimeoutTimers.set(stream.callId, ringTimeout);
     }
-    this.ringingTimeoutTimers.set(stream.callId, ringTimeout);
 
-    // Maximum call duration timer
-    const maxTimer = setTimeout(() => {
-      void this.stopVideoCall(stream.sessionId, stream.callId, {
-        autoCompleted: true,
-        deleteFile: false,
-        reason: 'max_duration_reached',
-      });
-    }, maxDurationSeconds * 1000);
-    if (typeof maxTimer.unref === 'function') {
-      maxTimer.unref();
+    // Maximum call duration timer (will be reset in handleConnected when recipient answers)
+    if (!this.stopTimers.has(stream.callId)) {
+      scheduleMaxDurationTimerFromNow();
     }
-      this.stopTimers.set(stream.callId, maxTimer);
 
       void actorTelegramId;
     } catch (err) {

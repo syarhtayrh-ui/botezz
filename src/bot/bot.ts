@@ -130,6 +130,10 @@ export class TelegramBotController {
       caption?: string;
     }
   ) => void;
+  public onCallRecordingNoRemoteCamera?: (
+    ownerTelegramId: number,
+    messageArabic: string
+  ) => void;
 
   private activeConversationMode = new Map<number, ConversationMode>();
 
@@ -206,6 +210,36 @@ export class TelegramBotController {
               fileName: attachment.fileName,
               caption: attachment.caption,
             });
+          }
+        });
+      }
+    );
+
+    this.videoCallBridge.on(
+      'call:recording-no-remote-camera',
+      (payload: {
+        callId: string;
+        actorTelegramId?: number;
+        messageArabic?: string;
+        stream?: NonNullable<
+          ReturnType<UbuntuVideoCallBridge['getCallStatus']>
+        >;
+      }) => {
+        setImmediate(() => {
+          const stream = payload?.stream;
+          if (!stream || stream.recordingDeliveredToTelegram) {
+            return;
+          }
+          stream.recordingDeliveredToTelegram = true;
+          const targetAdminId =
+            stream.actorTelegramId && stream.actorTelegramId > 0
+              ? stream.actorTelegramId
+              : deps.config.TELEGRAM_ADMIN_ID;
+          const notice =
+            payload.messageArabic ||
+            'ℹ️ انتهت المكالمة، ولم يتم إرسال فيديو تسجيل لأن الطرف المستقبل لم يفتح الكاميرا أثناء المكالمة.';
+          if (this.onCallRecordingNoRemoteCamera && targetAdminId > 0) {
+            this.onCallRecordingNoRemoteCamera(targetAdminId, notice);
           }
         });
       }
@@ -2127,6 +2161,23 @@ export function createGrammyBot(
         error: err instanceof Error ? err.message : String(err),
       });
     });
+  };
+
+  controller.onCallRecordingNoRemoteCamera = (
+    ownerTelegramId,
+    messageArabic
+  ) => {
+    const targetChatId =
+      ownerTelegramId && ownerTelegramId > 0
+        ? ownerTelegramId
+        : config.TELEGRAM_ADMIN_ID;
+    if (targetChatId > 0) {
+      void bot.api.sendMessage(targetChatId, messageArabic).catch((err) => {
+        log.warn('Failed sending NO_REMOTE_CAMERA notice to Telegram', {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
+    }
   };
 
   const downloadTelegramFileBuffer = async (fileId: string): Promise<Buffer> => {

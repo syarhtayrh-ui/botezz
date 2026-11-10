@@ -478,4 +478,138 @@ describe('Two-Way VoIP Video Call Recording (VoipCallRecorder)', () => {
       // Ignore cleanup error
     }
   });
+
+  it('decrypts both 4-byte (HMAC-SHA1-32) and 10-byte (HMAC-SHA1-80) SRTP packets with independent srtpBySsrc states (audio seq=800, video seq=10)', () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'botezz-vcall-srtp-'));
+    try {
+      const recorder = new VoipCallRecorder({
+        callId: 'vcall_srtp_tag_test',
+        sessionId: 'sess_srtp_1',
+        recipientJid: '966501234567@s.whatsapp.net',
+        outboundVideoPath: path.join(tmpDir, 'unused_outbound.mp4'),
+        recordingsDir: tmpDir,
+        isMockMode: false,
+      });
+
+      const peerKeys4: SrtpKeyMaterial = {
+        sessionKey: crypto.randomBytes(16),
+        sessionSalt: crypto.randomBytes(14),
+        authKey: crypto.randomBytes(20),
+        authTagLen: 4,
+      };
+
+      const fakeSession: Record<string, unknown> = {
+        localVideoSsrc: 1001,
+        peerAudioSsrc: 0xaaaa1111,
+        peerVideoSsrc: 0xbbbb2222,
+        srtpSession: { recvCtx: peerKeys4 },
+        videoSrtpSession: { recvCtx: peerKeys4 },
+      };
+
+      recorder.attachToMediaSession(fakeSession);
+
+      // Simulate high audio sequence number (800) on audio SSRC first
+      const audioRtp = buildRawRtpPacket({
+        payloadType: 120,
+        seq: 800,
+        timestamp: 48000,
+        ssrc: 0xaaaa1111,
+        payload: new Uint8Array([0x01, 0x02, 0x03, 0x04]),
+      });
+      const srtpAudio = protectRtpForTest(audioRtp, peerKeys4);
+      const decAudio = new PerSsrcSrtpDecryptor().unprotectRtpPacket(
+        srtpAudio,
+        peerKeys4
+      );
+      assert.ok(decAudio);
+
+      // Now feed video packets with low sequence numbers (10, 11) and 10-byte auth tag (HMAC-SHA1-80)
+      // even though peerKeys4 has authTagLen = 4 configured by default
+      const peerKeys10: SrtpKeyMaterial = {
+        ...peerKeys4,
+        authTagLen: 10,
+      };
+      const spsVideo10 = protectRtpForTest(
+        buildRawRtpPacket({
+          payloadType: 96,
+          seq: 10,
+          timestamp: 9000,
+          ssrc: 0xbbbb2222,
+          payload: new Uint8Array([0x67, 0x42, 0xc0, 0x1f, 0xda, 0x02, 0x80, 0x2d]),
+        }),
+        peerKeys10
+      );
+      const idrVideo4 = protectRtpForTest(
+        buildRawRtpPacket({
+          payloadType: 96,
+          seq: 11,
+          timestamp: 9000,
+          ssrc: 0xbbbb2222,
+          marker: true,
+          payload: new Uint8Array([0x65, 0x88, 0x84, 0x21, 0xa0]),
+        }),
+        peerKeys4
+      );
+
+      const res10 = recorder.handleInboundVideoPacket(spsVideo10, fakeSession);
+      const res4 = recorder.handleInboundVideoPacket(idrVideo4, fakeSession);
+
+      assert.ok(res10);
+      assert.deepEqual(res10.nalTypes, [7]);
+      assert.ok(res4);
+      assert.deepEqual(res4.nalTypes, [5]);
+      assert.equal(recorder.srtpBySsrc.get(0xbbbb2222)?.lastSeq, 11);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('never copies or re-encodes outboundVideoPath when recipient camera is closed (returns NO_REMOTE_CAMERA)', async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'botezz-no-cam-'));
+    try {
+      const outboundVideoPath = path.join(tmpDir, 'local_uploaded_video.mp4');
+      fs.writeFileSync(
+        outboundVideoPath,
+        Buffer.from('LOCAL_UPLOADED_VIDEO_SENTINEL_BYTES_DO_NOT_COPY')
+      );
+
+      const recorder = new VoipCallRecorder({
+        callId: 'vcall_no_remote_cam',
+        sessionId: 'sess_no_cam',
+        recipientJid: '966501234567@s.whatsapp.net',
+        outboundVideoPath,
+        recordingsDir: tmpDir,
+        isMockMode: false,
+      });
+
+      // Only inbound audio, zero inbound video frames
+      recorder.recordInboundAudioPcm(new Int16Array(320).fill(512), Date.now());
+
+      const summary = await recorder.finalizeRecording();
+      assert.equal(summary.recordingStatus, 'NO_REMOTE_CAMERA');
+      assert.equal(summary.remoteCameraCaptured, false);
+      assert.equal(summary.recordedVideoPath, undefined);
+      assert.equal(summary.inboundVideoFramesRecorded, 0);
+      assert.ok(
+        summary.failureReason?.includes(
+          'لم يتم إرسال فيديو تسجيل لأن الطرف المستقبل لم يفتح الكاميرا'
+        )
+      );
+
+      // Verify executeFinalizeRecording source code contains zero references to this.outboundVideoPath
+      const recorderSource = fs.readFileSync(
+        path.resolve(process.cwd(), 'src/whatsapp/voip-call-recorder.ts'),
+        'utf8'
+      );
+      const finalizeSection =
+        recorderSource.split('private async executeFinalizeRecording')[1] || '';
+      assert.equal(
+        finalizeSection.includes('this.outboundVideoPath'),
+        false,
+        'executeFinalizeRecording must never reference this.outboundVideoPath'
+      );
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
 });

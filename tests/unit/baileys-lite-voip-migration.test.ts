@@ -31,6 +31,10 @@ import {
 } from '../../src/whatsapp/voip-media-pipeline';
 import { RealVideoCallService } from '../../src/whatsapp/video-call-bridge';
 import {
+  instrumentVideoEngineInstance,
+  instrumentMediaSessionInstance,
+} from '../../src/whatsapp/voip-runtime-patch';
+import {
   MockWhatsAppSessionDriver,
   HiroosyBaileysSessionDriver,
   BaileysSessionDriver,
@@ -1208,6 +1212,121 @@ describe('@hiroosy/baileys-lite & Real WhatsApp VoIP Video Call Suite', () => {
       assert.equal(dlStatusByA.mediaAttachments?.length, 1);
 
       db.close();
+    });
+
+    it('preserves and calls WaVideoEngine.prototype.start in instrumentVideoEngineInstance and forwards (node, peerJid) in patchedHandleCallAccept', async () => {
+      let origStartInvocations = 0;
+      const fakeVideoEngine: Record<string, unknown> = {
+        _deliberateStop: true,
+        running: false,
+        waitForKeyFrame: false,
+        waitingForKeyFrame: false,
+        videoLoop: true,
+        start() {
+          origStartInvocations++;
+        },
+        stop() {
+          this._deliberateStop = true;
+          this.running = false;
+        },
+      };
+
+      instrumentVideoEngineInstance(
+        fakeVideoEngine as unknown as Parameters<
+          typeof instrumentVideoEngineInstance
+        >[0]
+      );
+      (fakeVideoEngine.start as () => void)();
+
+      assert.equal(
+        origStartInvocations,
+        1,
+        'instrumentVideoEngineInstance must call origStart so ffmpeg H.264 outbound streaming starts'
+      );
+      assert.equal(fakeVideoEngine._deliberateStop, false);
+      assert.equal(fakeVideoEngine.running, true);
+      assert.equal(fakeVideoEngine.waitForKeyFrame, true);
+      assert.equal(fakeVideoEngine.waitingForKeyFrame, true);
+
+      // Verify patchedHandleCallAccept forwards both (node, peerJid) and synchronizes videoSrtpSession
+      let capturedArgs: unknown[] = [];
+      const peerKeyBytes = new Uint8Array(16).fill(0x42);
+      const peerSaltBytes = new Uint8Array(14).fill(0x24);
+      const peerAuthBytes = new Uint8Array(20).fill(0x99);
+      const fakeMediaSession: Record<string, unknown> = {
+        videoEnabled: true,
+        localVideoSsrc: 1111,
+        videoRtpStream: { ssrc: 1111 },
+        videoEngine: fakeVideoEngine,
+        srtpSession: {
+          sendCtx: {
+            sessionKey: new Uint8Array(16).fill(0x11),
+            sessionSalt: new Uint8Array(14).fill(0x22),
+            authKey: new Uint8Array(20).fill(0x33),
+          },
+          recvCtx: {
+            sessionKey: peerKeyBytes,
+            sessionSalt: peerSaltBytes,
+            authKey: peerAuthBytes,
+          },
+        },
+        videoSrtpSession: null,
+        async handleCallAccept(...args: unknown[]) {
+          capturedArgs = args;
+          return true;
+        },
+      };
+
+      instrumentMediaSessionInstance(fakeMediaSession);
+      const acceptNode = { tag: 'accept', attrs: { 'call-id': 'call_123' }, content: [] };
+      const peerDeviceJid = '966501234567:0@s.whatsapp.net';
+      await (
+        fakeMediaSession.handleCallAccept as (
+          node: unknown,
+          peerJid: string
+        ) => Promise<unknown>
+      )(acceptNode, peerDeviceJid);
+
+      assert.equal(capturedArgs.length, 2);
+      assert.equal(capturedArgs[0], acceptNode);
+      assert.equal(
+        capturedArgs[1],
+        peerDeviceJid,
+        'patchedHandleCallAccept must forward peerJid (2nd argument) so ensureDeviceJid does not throw'
+      );
+      assert.ok(
+        fakeMediaSession.videoSrtpSession,
+        'patchedHandleCallAccept must initialize/sync videoSrtpSession when srtpSession is created from peerCallKey'
+      );
+    });
+
+    it('keeps a connected call with maxDurationSeconds=180 alive past 30s without ringingTimeout or mediaStartTimeout disconnecting it', async () => {
+      const service = new RealVideoCallService();
+      const mockDriver = await createConnectedMockDriver('sess_180s_test');
+
+      const stream = await service.startVideoCall({
+        sessionId: 'sess_180s_test',
+        driver: mockDriver,
+        recipientJid: '966501234567@s.whatsapp.net',
+        videoFilePath: validLandscapeMp4,
+        allowedRootDirs: [tmpDir],
+        maxDurationSeconds: 180,
+        callTimeoutMs: 50,
+        mediaStartTimeoutMs: 1200,
+        simulateLifecycle: 'auto',
+      });
+
+      assert.equal(stream.callState, 'MEDIA_STARTED');
+      assert.equal(stream.maxDurationSeconds, 180);
+
+      // Wait longer than callTimeoutMs (50ms) and verify call was NOT terminated by ringingTimeout
+      await new Promise((r) => setTimeout(r, 90));
+      const activeAfterRingingWindow = service.getCallStatus(stream.callId);
+      assert.ok(activeAfterRingingWindow);
+      assert.equal(activeAfterRingingWindow.callState, 'MEDIA_STARTED');
+      assert.equal(activeAfterRingingWindow.status, 'MEDIA_STARTED');
+
+      await service.stopVideoCall('sess_180s_test', stream.callId);
     });
   });
 });

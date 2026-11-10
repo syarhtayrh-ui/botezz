@@ -664,14 +664,16 @@ export class VideoCallWorkflow {
 
     const recordingStatusLabel =
       stream.recordingStatus === 'RECORDING'
-        ? '🔴 قيد التسجيل ثنائي الاتجاه (`RECORDING`)'
+        ? '🔴 قيد التسجيل (`RECORDING`)'
         : stream.recordingStatus === 'FINALIZING'
           ? '⏳ جاري دمج وحفظ ملف التسجيل (`FINALIZING`)'
           : stream.recordingStatus === 'READY'
             ? `✅ جاهز (\`${stream.recordedVideoFileName || 'recording.mp4'}\`)`
-            : stream.recordingStatus === 'DISABLED'
-              ? '⚪ معطل (`DISABLED`)'
-              : '⚠️ تعذر الحفظ (`FAILED`)';
+            : stream.recordingStatus === 'NO_REMOTE_CAMERA'
+              ? 'ℹ️ انتهت المكالمة، ولم يتم إرسال فيديو تسجيل لأن الطرف المستقبل لم يفتح الكاميرا أثناء المكالمة.'
+              : stream.recordingStatus === 'DISABLED'
+                ? '⚪ معطل (`DISABLED`)'
+                : '⚠️ تعذر الحفظ (`FAILED`)';
 
     const keyboardRows: InlineKeyboardRows = [
       [
@@ -778,13 +780,13 @@ export class VideoCallWorkflow {
         fileName,
         mimeType: 'video/mp4',
         caption: [
-          '🎬 *تسجيل المكالمة المرئية ثنائي الاتجاه (Two-Way VoIP Call Recording)*',
+          '🎬 *تسجيل كاميرا وصوت المستلم (VoIP Call Recording)*',
           '━━━━━━━━━━━━━━━━━━━━━━',
           `• *معرف المكالمة:* \`${stream.callId}\``,
           `• *المستلم:* \`${stream.recipientMasked}\``,
           `• *مدة التسجيل:* \`${stream.recordedDurationSeconds ?? 1} ثانية\``,
           `• *حجم الملف:* \`${sizeStr}\``,
-          `• *كاميرا المستلم:* ${stream.remoteCameraCaptured ? `🟢 تم التقاطها (${stream.inboundVideoFramesRecorded} إطار)` : '⚪ غير مفعلة / صوت فقط + فيديو البوت'}`,
+          `• *كاميرا المستلم:* ${stream.remoteCameraCaptured ? `🟢 تم التقاطها (${stream.inboundVideoFramesRecorded} إطار)` : '⚪ غير مفعلة'}`,
           `• *حزم صوت المستلم:* \`${stream.inboundAudioPacketsReceived} حزمة\``,
         ].join('\n'),
       };
@@ -802,6 +804,13 @@ export class VideoCallWorkflow {
     const stream = callId
       ? this.videoCallBridge.getCallStatus(callId)
       : this.videoCallBridge.listCompletedStreams()[0];
+
+    if (stream?.recordingStatus === 'NO_REMOTE_CAMERA') {
+      return {
+        text: 'ℹ️ انتهت المكالمة، ولم يتم إرسال فيديو تسجيل لأن الطرف المستقبل لم يفتح الكاميرا أثناء المكالمة.',
+        keyboard: [buildBackCancelRow('menu:video_call')],
+      };
+    }
 
     if (!stream || stream.recordingStatus !== 'READY' || !stream.recordedVideoPath) {
       return {
@@ -962,6 +971,11 @@ export class VideoCallWorkflow {
         ...(stopped?.recordingEnabled
           ? [
               `• *حالة تسجيل المكالمة:* \`${stopped.recordingStatus}\``,
+              ...(stopped.recordingStatus === 'NO_REMOTE_CAMERA'
+                ? [
+                    'ℹ️ انتهت المكالمة، ولم يتم إرسال فيديو تسجيل لأن الطرف المستقبل لم يفتح الكاميرا أثناء المكالمة.',
+                  ]
+                : []),
               ...(stopped.recordedVideoFileName
                 ? [`• *ملف تسجيل المكالمة:* \`${stopped.recordedVideoFileName}\``]
                 : []),
