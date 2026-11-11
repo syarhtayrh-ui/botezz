@@ -13,6 +13,7 @@ import {
   CheckCircle2,
   XCircle,
   AlertTriangle,
+  Activity,
 } from 'lucide-react';
 
 export interface InlineButtonSpec {
@@ -92,6 +93,60 @@ export interface AuditLogRecord {
   created_at: string;
 }
 
+export interface NetworkTrafficEntryDto {
+  requestId: string;
+  shortId: string;
+  channel: 'HTTP' | 'WA_STANZA' | 'LOCAL_API' | 'VOIP_RTP';
+  direction: 'OUTBOUND' | 'INBOUND';
+  sessionId?: string;
+  methodOrTag: string;
+  targetOrUrl: string;
+  summary: string;
+  statusCode: number | string;
+  outcome: 'SUCCESS' | 'ERROR' | 'SLOW_LATENCY';
+  startedAtIso: string;
+  durationMs: number;
+  txBytes: number;
+  rxBytes: number;
+  requestHeaders?: Record<string, unknown>;
+  responseHeaders?: Record<string, unknown>;
+  stanzaAttrs?: Record<string, string | undefined>;
+  requestBodyPreview?: string;
+  responseBodyPreview?: string;
+  errorDetail?: string;
+}
+
+export interface NetworkTelemetryDto {
+  metrics: {
+    captureEnabled: boolean;
+    totalEntries: number;
+    maxEntries: number;
+    totalTxBytes: number;
+    totalRxBytes: number;
+    currentTxKbps: number;
+    currentRxKbps: number;
+    countsByChannel: {
+      HTTP: number;
+      WA_STANZA: number;
+      LOCAL_API: number;
+      VOIP_RTP: number;
+    };
+    errorCount: number;
+    slowCount: number;
+    avgRttMs: number;
+    maxRttMs: number;
+    activeListeningPorts: Array<{
+      protocol: 'TCP' | 'UDP';
+      localAddress: string;
+      localPort: number;
+      state: string;
+    }>;
+    establishedTcpCount: number;
+    openUdpSocketsCount: number;
+  };
+  recentEntries: NetworkTrafficEntryDto[];
+}
+
 export interface HarnessStateResponse {
   ok: boolean;
   authRequired?: boolean;
@@ -108,6 +163,7 @@ export interface HarnessStateResponse {
   sessions: SessionRecord[];
   tasks: TaskWithResults[];
   auditLogs: AuditLogRecord[];
+  networkTelemetry?: NetworkTelemetryDto;
   health: {
     status: string;
     connectedSessions: number;
@@ -126,8 +182,15 @@ export default function ControlCenterDashboard({
   const [data, setData] = useState<HarnessStateResponse>(initialData);
   const [busyAction, setBusyAction] = useState<boolean>(false);
   const [activeTab, setActiveTab] = useState<
-    'simulator' | 'sessions_tasks' | 'security_audit' | 'aws_deployment'
+    | 'simulator'
+    | 'network_traffic'
+    | 'sessions_tasks'
+    | 'security_audit'
+    | 'aws_deployment'
   >('simulator');
+  const [netChannelFilter, setNetChannelFilter] = useState<string>('ALL');
+  const [selectedNetEntry, setSelectedNetEntry] =
+    useState<NetworkTrafficEntryDto | null>(null);
 
   const [inputText, setInputText] = useState<string>('');
   const [simulatedUserId, setSimulatedUserId] = useState<number>(
@@ -225,7 +288,11 @@ export default function ControlCenterDashboard({
         if (res.status === 401 || json.authRequired) {
           setData((prev) => ({ ...prev, ok: false, authRequired: true }));
         } else if (json.auditLogs) {
-          setData((prev) => ({ ...prev, auditLogs: json.auditLogs }));
+          setData((prev) => ({
+            ...prev,
+            auditLogs: json.auditLogs,
+            networkTelemetry: json.networkTelemetry ?? prev.networkTelemetry,
+          }));
         }
       } else {
         setIsStale(false);
@@ -237,6 +304,7 @@ export default function ControlCenterDashboard({
           sessions: json.sessions,
           tasks: json.tasks,
           auditLogs: json.auditLogs,
+          networkTelemetry: json.networkTelemetry ?? prev.networkTelemetry,
           health: json.health,
         }));
       }
@@ -291,6 +359,17 @@ export default function ControlCenterDashboard({
             }`}
           >
             محاكي بوت تيليجرام
+          </button>
+          <button
+            type="button"
+            onClick={() => setActiveTab('network_traffic')}
+            className={`py-1 transition-colors whitespace-nowrap shrink-0 border-b-2 tabular-nums ${
+              activeTab === 'network_traffic'
+                ? 'border-sky-400 text-white'
+                : 'border-transparent text-slate-400 hover:text-slate-100'
+            }`}
+          >
+            مرصد حركة الشبكة ({data.networkTelemetry?.metrics.totalEntries ?? 0})
           </button>
           <button
             type="button"
@@ -350,6 +429,17 @@ export default function ControlCenterDashboard({
           }`}
         >
           محاكي تيليجرام
+        </button>
+        <button
+          type="button"
+          onClick={() => setActiveTab('network_traffic')}
+          className={`px-3 py-1.5 text-xs font-medium rounded-md whitespace-nowrap shrink-0 ${
+            activeTab === 'network_traffic'
+              ? 'bg-sky-500 text-slate-950'
+              : 'text-slate-300'
+          }`}
+        >
+          مرصد الشبكة
         </button>
         <button
           type="button"
@@ -799,6 +889,293 @@ export default function ControlCenterDashboard({
                   </div>
                 )}
               </div>
+
+              {/* Live Network Traffic Summary Card */}
+              <div className="p-5 rounded-lg border border-slate-800 bg-slate-900 space-y-3">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <Activity className="w-4 h-4 text-sky-400" />
+                    <h2 className="text-sm font-bold text-white">
+                      مرصد حركة مرور الشبكة الحي (Telemetry)
+                    </h2>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setActiveTab('network_traffic')}
+                    className="text-xs text-sky-300 hover:text-sky-200 font-semibold"
+                  >
+                    عرض المرصد الكامل ←
+                  </button>
+                </div>
+                <div className="grid grid-cols-3 gap-2 text-xs tabular-nums">
+                  <div className="p-2.5 rounded border border-slate-800 bg-slate-950/60">
+                    <div className="text-slate-400">صادر (TX)</div>
+                    <div className="font-bold text-emerald-300" dir="ltr">
+                      {(
+                        (data.networkTelemetry?.metrics.totalTxBytes ?? 0) /
+                        1024
+                      ).toFixed(1)}{' '}
+                      KB
+                    </div>
+                  </div>
+                  <div className="p-2.5 rounded border border-slate-800 bg-slate-950/60">
+                    <div className="text-slate-400">وارد (RX)</div>
+                    <div className="font-bold text-sky-300" dir="ltr">
+                      {(
+                        (data.networkTelemetry?.metrics.totalRxBytes ?? 0) /
+                        1024
+                      ).toFixed(1)}{' '}
+                      KB
+                    </div>
+                  </div>
+                  <div className="p-2.5 rounded border border-slate-800 bg-slate-950/60">
+                    <div className="text-slate-400">متوسط RTT</div>
+                    <div className="font-bold text-white" dir="ltr">
+                      {data.networkTelemetry?.metrics.avgRttMs ?? 0} ms
+                    </div>
+                  </div>
+                </div>
+                <div className="divide-y divide-slate-800/80 text-xs tabular-nums">
+                  {(data.networkTelemetry?.recentEntries ?? [])
+                    .slice(0, 3)
+                    .map((entry) => (
+                      <div
+                        key={entry.requestId}
+                        className="py-2 flex items-center justify-between gap-2"
+                      >
+                        <span className="truncate text-slate-200" dir="ltr">
+                          {entry.direction === 'OUTBOUND' ? '⬆️' : '⬇️'}{' '}
+                          [{entry.channel}] {entry.summary}
+                        </span>
+                        <span className="text-sky-300 shrink-0" dir="ltr">
+                          {entry.durationMs}ms
+                        </span>
+                      </div>
+                    ))}
+                </div>
+              </div>
+            </section>
+          </div>
+        )}
+
+        {/* TAB 1.5: Full Network Traffic & Protocol Telemetry Inspector */}
+        {activeTab === 'network_traffic' && (
+          <div className="space-y-6">
+            <section
+              aria-label="لوحة قياس حركة مرور الشبكة"
+              className="p-6 rounded-lg border border-slate-800 bg-slate-900 space-y-5"
+            >
+              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4">
+                <div>
+                  <h2 className="text-base font-bold text-white">
+                    مرصد حركة مرور الشبكة والبروتوكول الحي (Full Network & Stanza Telemetry)
+                  </h2>
+                  <p className="text-xs text-slate-400">
+                    يرصد طلبات HTTP/HTTPS، عقد واتساب الثنائية (BinaryNode IQ/Message)، طلبات الخادم المحلي، وتدفقات مكالمات VoIP مع تنقيح تلقائي للتوكنات والمفاتيح.
+                  </p>
+                </div>
+                <div className="flex items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={() =>
+                      void dispatchInteraction('callback', 'menu:network')
+                    }
+                    className="px-3 py-1.5 text-xs font-semibold rounded bg-sky-400 text-slate-950 hover:bg-sky-300 transition-colors whitespace-nowrap"
+                  >
+                    فتح في محاكي تيليجرام (/nettraffic)
+                  </button>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-2 md:grid-cols-4 gap-4 text-xs tabular-nums">
+                <div className="p-4 rounded border border-slate-800 bg-slate-950/60 space-y-1">
+                  <div className="text-slate-400">إجمالي الصادر (TX)</div>
+                  <div className="text-base font-bold text-emerald-300" dir="ltr">
+                    {(
+                      (data.networkTelemetry?.metrics.totalTxBytes ?? 0) / 1024
+                    ).toFixed(2)}{' '}
+                    KB ({data.networkTelemetry?.metrics.currentTxKbps ?? 0} KB/s)
+                  </div>
+                </div>
+                <div className="p-4 rounded border border-slate-800 bg-slate-950/60 space-y-1">
+                  <div className="text-slate-400">إجمالي الوارد (RX)</div>
+                  <div className="text-base font-bold text-sky-300" dir="ltr">
+                    {(
+                      (data.networkTelemetry?.metrics.totalRxBytes ?? 0) / 1024
+                    ).toFixed(2)}{' '}
+                    KB ({data.networkTelemetry?.metrics.currentRxKbps ?? 0} KB/s)
+                  </div>
+                </div>
+                <div className="p-4 rounded border border-slate-800 bg-slate-950/60 space-y-1">
+                  <div className="text-slate-400">زمن الاستجابة (Avg / Max RTT)</div>
+                  <div className="text-base font-bold text-white" dir="ltr">
+                    {data.networkTelemetry?.metrics.avgRttMs ?? 0} ms /{' '}
+                    {data.networkTelemetry?.metrics.maxRttMs ?? 0} ms
+                  </div>
+                </div>
+                <div className="p-4 rounded border border-slate-800 bg-slate-950/60 space-y-1">
+                  <div className="text-slate-400">المنافذ والمقابس النشطة</div>
+                  <div className="text-xs font-semibold text-slate-200" dir="ltr">
+                    {(
+                      data.networkTelemetry?.metrics.activeListeningPorts ?? []
+                    )
+                      .slice(0, 3)
+                      .map((p) => `${p.protocol}:${p.localPort}`)
+                      .join(', ') || 'TCP:3000'}
+                  </div>
+                </div>
+              </div>
+
+              <div className="flex flex-wrap items-center gap-2 text-xs">
+                {[
+                  { id: 'ALL', label: '🌐 الكل' },
+                  { id: 'WA_STANZA', label: '📡 عقد واتساب (WA_STANZA)' },
+                  { id: 'HTTP', label: '🔗 طلبات HTTP' },
+                  { id: 'LOCAL_API', label: '🏠 الخادم المحلي (LOCAL_API)' },
+                  { id: 'VOIP_RTP', label: '📹 مكالمات VoIP' },
+                  { id: 'ERRORS', label: '❌ الأخطاء والبطء' },
+                ].map((f) => (
+                  <button
+                    key={f.id}
+                    type="button"
+                    onClick={() => setNetChannelFilter(f.id)}
+                    className={`px-3 py-1.5 rounded border font-medium transition-colors ${
+                      netChannelFilter === f.id
+                        ? 'bg-sky-500/20 border-sky-400 text-sky-200'
+                        : 'bg-slate-950 border-slate-800 text-slate-400 hover:text-white'
+                    }`}
+                  >
+                    {f.label}
+                  </button>
+                ))}
+              </div>
+
+              <div className="overflow-x-auto">
+                <table className="w-full text-right text-xs border-collapse tabular-nums">
+                  <thead>
+                    <tr className="border-b border-slate-800 text-slate-400">
+                      <th className="py-2.5 px-3 font-semibold">المعرف</th>
+                      <th className="py-2.5 px-3 font-semibold">الاتجاه</th>
+                      <th className="py-2.5 px-3 font-semibold">القناة</th>
+                      <th className="py-2.5 px-3 font-semibold">الملخص</th>
+                      <th className="py-2.5 px-3 font-semibold">الحالة</th>
+                      <th className="py-2.5 px-3 font-semibold">الزمن</th>
+                      <th className="py-2.5 px-3 font-semibold">الحجم</th>
+                      <th className="py-2.5 px-3 font-semibold">فحص</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-800/70">
+                    {(data.networkTelemetry?.recentEntries ?? [])
+                      .filter((entry) => {
+                        if (netChannelFilter === 'ALL') return true;
+                        if (netChannelFilter === 'ERRORS') {
+                          return (
+                            entry.outcome === 'ERROR' ||
+                            entry.outcome === 'SLOW_LATENCY'
+                          );
+                        }
+                        return entry.channel === netChannelFilter;
+                      })
+                      .map((entry) => (
+                        <tr
+                          key={entry.requestId}
+                          className="hover:bg-slate-800/40"
+                        >
+                          <td className="py-2.5 px-3 text-sky-300" dir="ltr">
+                            #{entry.shortId}
+                          </td>
+                          <td className="py-2.5 px-3" dir="ltr">
+                            {entry.direction === 'OUTBOUND'
+                              ? '⬆️ OUT'
+                              : '⬇️ IN'}
+                          </td>
+                          <td className="py-2.5 px-3 text-slate-300" dir="ltr">
+                            {entry.channel} ({entry.methodOrTag})
+                          </td>
+                          <td
+                            className="py-2.5 px-3 text-slate-100 max-w-md truncate"
+                            dir="ltr"
+                          >
+                            {entry.summary}
+                          </td>
+                          <td className="py-2.5 px-3" dir="ltr">
+                            <span
+                              className={
+                                entry.outcome === 'ERROR'
+                                  ? 'text-red-400 font-semibold'
+                                  : entry.outcome === 'SLOW_LATENCY'
+                                    ? 'text-amber-300 font-semibold'
+                                    : 'text-emerald-300'
+                              }
+                            >
+                              {entry.statusCode}
+                            </span>
+                          </td>
+                          <td className="py-2.5 px-3 text-slate-300" dir="ltr">
+                            {entry.durationMs} ms
+                          </td>
+                          <td className="py-2.5 px-3 text-slate-400" dir="ltr">
+                            ⬆️{entry.txBytes}B / ⬇️{entry.rxBytes}B
+                          </td>
+                          <td className="py-2.5 px-3">
+                            <button
+                              type="button"
+                              onClick={() => setSelectedNetEntry(entry)}
+                              className="px-2.5 py-1 rounded border border-slate-700 hover:bg-slate-800 text-sky-300"
+                            >
+                              🔍 تفاصيل
+                            </button>
+                          </td>
+                        </tr>
+                      ))}
+                  </tbody>
+                </table>
+              </div>
+
+              {selectedNetEntry && (
+                <div className="p-4 rounded-lg border border-sky-500/40 bg-slate-950 space-y-3 text-xs">
+                  <div className="flex items-center justify-between">
+                    <h3 className="font-bold text-sky-300" dir="ltr">
+                      🔍 Request Inspection #{selectedNetEntry.shortId} ({selectedNetEntry.requestId})
+                    </h3>
+                    <button
+                      type="button"
+                      onClick={() => setSelectedNetEntry(null)}
+                      className="px-2.5 py-1 rounded bg-slate-800 text-slate-200 hover:bg-slate-700"
+                    >
+                      إغلاق التفاصيل
+                    </button>
+                  </div>
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
+                    {selectedNetEntry.requestBodyPreview && (
+                      <div>
+                        <div className="text-slate-400 mb-1">
+                          ⬆️ Outbound Payload / Stanza:
+                        </div>
+                        <pre
+                          dir="ltr"
+                          className="p-3 rounded border border-slate-800 bg-slate-900 text-slate-200 overflow-x-auto max-h-60"
+                        >
+                          {selectedNetEntry.requestBodyPreview}
+                        </pre>
+                      </div>
+                    )}
+                    {selectedNetEntry.responseBodyPreview && (
+                      <div>
+                        <div className="text-slate-400 mb-1">
+                          ⬇️ Inbound Payload / Stanza:
+                        </div>
+                        <pre
+                          dir="ltr"
+                          className="p-3 rounded border border-slate-800 bg-slate-900 text-slate-200 overflow-x-auto max-h-60"
+                        >
+                          {selectedNetEntry.responseBodyPreview}
+                        </pre>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
             </section>
           </div>
         )}

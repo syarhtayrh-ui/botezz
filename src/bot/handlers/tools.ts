@@ -2241,9 +2241,10 @@ export class ToolsHandler {
         `${renderBreadcrumb(['الرئيسية', 'الأدوات', 'رسالة مجهولة عبر LID'])}\n` +
         `🕵️ *إرسال رسالة مجهولة عبر الهوية المخفية (@lid — /anonmsg)*\n` +
         `━━━━━━━━━━━━━━━━━━\n` +
-        `يقوم هذا المحرك باستخراج معرف \`@lid\` للمستلم عبر USync أو سجل المجموعات، وترحيل جلسة التشفير \`Signal\` إلى الهوية المخفية، ثم الإرسال عبر \`addressing_mode="lid"\` دون تسريب رقم الهاتف في إشعارات التواجد.\n\n` +
-        `📌 *أرسل الآن الرقم الدولي (أو معرف \`@lid\`) متبوعاً بنص الرسالة:*\n` +
+        `يقوم هذا المحرك باستخراج معرف \`@lid\` للمستلم عبر USync أو سجل المجموعات، وترحيل جلسة التشفير \`Signal\` إلى الهوية المخفية، ثم الإرسال عبر \`addressing_mode="lid"\` مع تجريد \`pushName\` دون تسريب رقم الهاتف.\n\n` +
+        `📌 *أرسل الآن الرقم الدولي (أو معرف \`@lid\`) متبوعاً بنص الرسالة (مع أو بدون فاصل \`|\`):*\n` +
         `• مثال برقم هاتف: \`+966501234567 مرحباً عبر بروتوكول LID\`\n` +
+        `• مثال بفاصل صريح: \`+966 50 123 4567 | مرحباً عبر بروتوكول LID\`\n` +
         `• مثال بمعرف LID مباشر: \`12345678901234@lid رسالة مشفرة\``,
       keyboard: [buildBackCancelRow('menu:tools')],
       toastText: '🕵️ أدخل الرقم أو @lid متبوعاً بنص الرسالة',
@@ -2251,19 +2252,101 @@ export class ToolsHandler {
     };
   }
 
+  /**
+   * Parses `/anonmsg` raw input supporting:
+   * 1. Pipe-separated input: `+966 50 123 4567 | نص الرسالة`
+   * 2. JID-prefixed input: `12345678901234@lid نص الرسالة`
+   * 3. Formatted phone numbers with spaces/hyphens: `+966 50 123 4567 نص الرسالة`
+   * 4. Compact phone numbers: `+966501234567 نص الرسالة`
+   */
+  private parseRecipientAndBodyInput(rawInput: string): {
+    recipient: string;
+    messageBody: string;
+  } | null {
+    const trimmed = (rawInput || '').trim();
+    if (!trimmed) return null;
+
+    // 1. Explicit pipe separator `|`
+    const pipeIdx = trimmed.indexOf('|');
+    if (pipeIdx !== -1) {
+      const rawTarget = trimmed.slice(0, pipeIdx).trim();
+      const messageBody = trimmed.slice(pipeIdx + 1).trim();
+      if (!rawTarget || !messageBody) return null;
+      const recipient = rawTarget.includes('@')
+        ? rawTarget.replace(/\s+/g, '')
+        : rawTarget.replace(/[\s\-()]+/g, '');
+      return { recipient, messageBody };
+    }
+
+    // 2. Leading JID token (`...@lid`, `...@s.whatsapp.net`, `...@g.us`)
+    const jidMatch = trimmed.match(/^(\S+@(?:lid|s\.whatsapp\.net|g\.us))\s+([\s\S]+)$/i);
+    if (jidMatch) {
+      return {
+        recipient: jidMatch[1].trim(),
+        messageBody: jidMatch[2].trim(),
+      };
+    }
+
+    // 3. Leading international phone number (possibly containing spaces/hyphens/parentheses)
+    const tokens = trimmed.split(/\s+/);
+    if (tokens.length >= 2) {
+      const accumulatedDigits: string[] = [];
+      let consumedTokens = 0;
+      for (let i = 0; i < tokens.length - 1; i++) {
+        const tok = tokens[i]!;
+        if (/^\+?[\d\-()]+$/.test(tok)) {
+          const digitsInTok = tok.replace(/\D/g, '');
+          const currentDigits = accumulatedDigits.join('').replace(/\D/g, '');
+          if (currentDigits.length + digitsInTok.length <= 15) {
+            accumulatedDigits.push(tok);
+            consumedTokens = i + 1;
+            if (currentDigits.length + digitsInTok.length >= 10) {
+              // Check if next token looks like a short 2-4 digit phone group or text
+              const nextTok = tokens[i + 1] || '';
+              if (!/^\d{2,4}$/.test(nextTok)) {
+                break;
+              }
+            }
+            continue;
+          }
+        }
+        break;
+      }
+
+      if (consumedTokens > 0) {
+        const joinedPhone = accumulatedDigits.join('').replace(/[\s\-()]+/g, '');
+        const restBody = tokens.slice(consumedTokens).join(' ').trim();
+        if (joinedPhone && restBody) {
+          return {
+            recipient: joinedPhone,
+            messageBody: restBody,
+          };
+        }
+      }
+    }
+
+    // 4. Fallback: first whitespace split
+    const firstSpace = trimmed.search(/\s/);
+    if (firstSpace === -1) return null;
+    const recipient = trimmed.slice(0, firstSpace).trim();
+    const messageBody = trimmed.slice(firstSpace + 1).trim();
+    if (!recipient || !messageBody) return null;
+    return { recipient, messageBody };
+  }
+
   public async executeAnonymousLidMessage(
     adminId: number,
     rawInput: string
   ): Promise<BotViewResponse> {
     try {
-      const trimmed = (rawInput || '').trim();
-      const firstSpace = trimmed.search(/\s/);
-      if (!trimmed || firstSpace === -1) {
+      const parsed = this.parseRecipientAndBodyInput(rawInput);
+      if (!parsed) {
         return {
           text:
             `⚠️ *صيغة الأمر غير مكتملة (/anonmsg)*\n\n` +
             `يرجى إدخال رقم المستلم (أو معرف \`@lid\`) متبوعاً بنص الرسالة:\n` +
-            `\`/anonmsg +966501234567 نص الرسالة هنا\``,
+            `• \`/anonmsg +966501234567 نص الرسالة هنا\`\n` +
+            `• أو بفاصل: \`+966 50 123 4567 | نص الرسالة هنا\``,
           keyboard: [
             [
               {
@@ -2276,8 +2359,7 @@ export class ToolsHandler {
         };
       }
 
-      const recipient = trimmed.slice(0, firstSpace).trim();
-      const messageBody = trimmed.slice(firstSpace + 1).trim();
+      const { recipient, messageBody } = parsed;
 
       const { session, driver } =
         this.getPrimaryConnectedSessionAndDriver(adminId);
@@ -2295,8 +2377,11 @@ export class ToolsHandler {
           sessionId: session.id,
           resolutionSource: res.resolutionSource,
           messageId: res.messageId,
+          usedLid: res.usedLid ?? true,
         },
       });
+
+      const usedLid = res.usedLid ?? res.targetLid.endsWith('@lid');
 
       return {
         text:
@@ -2308,7 +2393,7 @@ export class ToolsHandler {
             ? `📱 *الرقم المطابق (PN):* \`${res.resolvedPn}\`\n`
             : '') +
           `🧬 *مصدر استخراج الـ LID:* \`${res.resolutionSource}\`\n` +
-          `🛡️ *وضع العنونة:* \`addressing_mode="lid"\`\n` +
+          `🛡️ *وضع العنونة:* \`${usedLid ? 'addressing_mode="lid"' : 'pn_fallback (pushName="")'}\`\n` +
           `📨 *معرف الرسالة (Message ID):* \`${res.messageId}\``,
         keyboard: [
           [
@@ -2347,7 +2432,7 @@ export class ToolsHandler {
         `👁️ *محرك تتبع التواجد وبث النبض الحي (Presence & Heartbeat — /presence)*\n` +
         `━━━━━━━━━━━━━━━━━━\n` +
         `اختر وضع التشغيل من الأزرار أدناه أو أرسل مباشرة **رقم الهاتف والمدة بالثواني** لبدء الرصد الحي:\n` +
-        `• **رصد التواجد الحي:** يلتقط حالات \`available\`, \`composing\`, \`recording\`, \`unavailable\` عبر كل من \`@s.whatsapp.net\` و\`@lid\` ويحسب إجمالي مدة الاتصال.\n` +
+        `• **رصد التواجد الحي:** يلتقط حالات \`available\`, \`composing\`, \`recording\`, \`paused\`, \`unavailable\` عبر كل من \`@s.whatsapp.net\` و\`@lid\` ويحسب إجمالي مدة الاتصال.\n` +
         `• **بث النبض المستمر (Heartbeat):** يرسل نبضات \`composing\` أو \`recording\` كل 7.5 ثانية حتى لا ينطفئ المؤشر لدى الطرف الآخر.\n\n` +
         `📌 *مثال للرصد الفوري:* \`+966501234567 15\``,
       keyboard: [
@@ -2378,6 +2463,64 @@ export class ToolsHandler {
       toastText: '👁️ اختر وضع الرصد أو البث أو أرسل الرقم',
       route: 'tools:prompt_presence',
     };
+  }
+
+  public stopPresenceTrackingForAdmin(adminId: number): BotViewResponse {
+    try {
+      const connected = this.sessionManager.listConnectedSessions(adminId);
+      let stopped = 0;
+      for (const sess of connected) {
+        const driver = this.sessionManager.getDriver(sess.id, adminId);
+        stopped += driver.stopTrackingRecipientPresence?.() ?? 0;
+      }
+      return {
+        text:
+          `⏹️ *تم إيقاف جلسات رصد التواجد الحي بنجاح*\n` +
+          `• عدد مهام الرصد المتوقفة: \`${stopped}\``,
+        keyboard: [
+          [
+            { text: '👁️ بدء رصد جديد', callbackData: 'tools:prompt_presence' },
+            { text: '🔙 قائمة الأدوات', callbackData: 'menu:tools' },
+          ],
+        ],
+        toastText: '⏹️ تم إيقاف رصد التواجد',
+      };
+    } catch (err) {
+      const safeErr = toSafeArabicError(err);
+      return {
+        text: `⚠️ *تعذر إيقاف الرصد:*\n${safeErr.userMessage}`,
+        keyboard: [[{ text: '🔙 قائمة الأدوات', callbackData: 'menu:tools' }]],
+      };
+    }
+  }
+
+  public stopPresenceHeartbeatForAdmin(adminId: number): BotViewResponse {
+    try {
+      const connected = this.sessionManager.listConnectedSessions(adminId);
+      let stopped = 0;
+      for (const sess of connected) {
+        const driver = this.sessionManager.getDriver(sess.id, adminId);
+        stopped += driver.stopPresenceHeartbeat?.() ?? 0;
+      }
+      return {
+        text:
+          `⏹️ *تم إيقاف بث نبضات التواجد (Heartbeat) بنجاح*\n` +
+          `• عدد مهام البث المتوقفة: \`${stopped}\``,
+        keyboard: [
+          [
+            { text: '📡 بث نبض جديد', callbackData: 'tools:prompt_presence' },
+            { text: '🔙 قائمة الأدوات', callbackData: 'menu:tools' },
+          ],
+        ],
+        toastText: '⏹️ تم إيقاف بث النبضات',
+      };
+    } catch (err) {
+      const safeErr = toSafeArabicError(err);
+      return {
+        text: `⚠️ *تعذر إيقاف البث:*\n${safeErr.userMessage}`,
+        keyboard: [[{ text: '🔙 قائمة الأدوات', callbackData: 'menu:tools' }]],
+      };
+    }
   }
 
   public promptPresenceHeartbeatMode(
@@ -2414,6 +2557,9 @@ export class ToolsHandler {
       return this.promptPresenceTool(adminId);
     }
     const first = tokens[0].toLowerCase();
+    if (first === 'stop') {
+      return this.stopPresenceTrackingForAdmin(adminId);
+    }
     if (
       first === 'composing' ||
       first === 'recording' ||
@@ -2467,7 +2613,7 @@ export class ToolsHandler {
           case 'recording':
             return '🎙️ يسجل صوتاً... (recording)';
           case 'paused':
-            return '⏸️ توقف عن الكتابة (paused)';
+            return '⏸️ متصل - توقف عن الكتابة (paused)';
           default:
             return '⚪ غير متصل (unavailable)';
         }
@@ -2520,15 +2666,31 @@ export class ToolsHandler {
             `⏱️ *نافذة الرصد:* \`${durationSeconds} ثانية\`\n` +
             `📊 *إجمالي زمن الاتصال النشط:* \`${(rec.totalOnlineDurationMs / 1000).toFixed(1)} ثانية\`\n\n` +
             `📜 *سجل التحولات الزمنية (${rec.transitions.length}):*\n${transitionsLines}`,
-          keyboard: [
-            [
-              {
-                text: '🔄 إعادة الرصد',
-                callbackData: 'tools:prompt_presence',
-              },
-              { text: '🔙 قائمة الأدوات', callbackData: 'menu:tools' },
-            ],
-          ],
+          keyboard: isFinal
+            ? [
+                [
+                  {
+                    text: '🔄 إعادة الرصد',
+                    callbackData: 'tools:prompt_presence',
+                  },
+                  { text: '🔙 قائمة الأدوات', callbackData: 'menu:tools' },
+                ],
+              ]
+            : [
+                [
+                  {
+                    text: '⏹️ إيقاف الرصد الحي والاكتفاء بالتقرير',
+                    callbackData: 'tools:presence_stop',
+                  },
+                ],
+                [
+                  {
+                    text: '🔄 إعادة الرصد',
+                    callbackData: 'tools:prompt_presence',
+                  },
+                  { text: '🔙 قائمة الأدوات', callbackData: 'menu:tools' },
+                ],
+              ],
           ...(isFinal ? { toastText: '✅ اكتمل رصد التواجد الحي' } : {}),
         };
       };
@@ -2914,14 +3076,14 @@ export class ToolsHandler {
     return {
       text:
         `${renderBreadcrumb(['الرئيسية', 'الأدوات', 'رسالة تدمير ذاتي قصير'])}\n` +
-        `⏱️ *رسائل التدمير الذاتي القصير (1 إلى 60 ثانية — /ephemeral)*\n` +
+        `⏱️ *رسائل التدمير الذاتي القصير الصامت (1 إلى 60 ثانية — /ephemeral)*\n` +
         `━━━━━━━━━━━━━━━━━━\n` +
-        `تجمع هذه الأداة بين وسم \`ephemeralExpiration\` البروتوكولي وعقدة \`<iq xmlns="w:g2"><ephemeral/></iq>\` مع مؤقت حذف تلقائي (\`REVOKE\`) يضمن تدمير الرسالة لدى الطرفين بالثانية المحددة.\n\n` +
+        `تعتمد هذه الأداة على حقن \`ephemeralExpiration\` و\`contextInfo.expiration\` و\`disappearingMode\` الأصلي في البروتوكول بحيث تختفي الرسالة تلقائياً وبصمت من شاشة المستلم بعد انتهاء المؤقت **دون ترك أثر "🚫 تم حذف هذه الرسالة"**.\n\n` +
         `⚙️ *الإعداد المختار حالياً:*\n` +
         `• ⏳ *المؤقت الافتراضي:* \`${activePreset} ثانية\`\n` +
-        `• 🎯 *بدء العد التنازلي:* \`${activeTrigger === 'ON_READ' ? 'عند قراءة المستلم للرسالة (ON_READ)' : 'فور الإرسال (ON_SEND)'}\`\n\n` +
+        `• 🎯 *بدء العد التنازلي:* \`${activeTrigger === 'ON_READ' ? 'عند قراءة المستلم للرسالة (ON_READ)' : 'اختفاء صامت تلقائي (ON_SEND)'}\`\n\n` +
         `📌 *أرسل الآن الرقم والمدة (1-60) والنص (أو الرقم والنص مباشرة لاستخدام ${activePreset} ثانية):*\n` +
-        `• مثال: \`+966501234567 10 هذه الرسالة ستختفي بعد 10 ثوانٍ\``,
+        `• مثال: \`+966501234567 10 هذه الرسالة ستختفي بصمت بعد 10 ثوانٍ\``,
       keyboard: [
         [
           {
@@ -2943,7 +3105,7 @@ export class ToolsHandler {
         ],
         [
           {
-            text: `🎯 بدء العد: ${activeTrigger === 'ON_READ' ? 'عند القراءة (ON_READ)' : 'فور الإرسال (ON_SEND)'}`,
+            text: `🎯 بدء العد: ${activeTrigger === 'ON_READ' ? 'عند القراءة (ON_READ)' : 'اختفاء صامت (ON_SEND)'}`,
             callbackData: 'tools:ephemeral_toggle_trigger',
           },
         ],
@@ -2987,34 +3149,43 @@ export class ToolsHandler {
 
       let triggerMode: 'ON_SEND' | 'ON_READ' =
         this.ephemeralTriggerModeByAdmin.get(adminId) || 'ON_SEND';
+      let useRevokeDelete: boolean | undefined;
       const filteredTokens: string[] = [];
       for (const tok of tokens) {
-        if (tok.toLowerCase() === '--on-read') {
+        const lower = tok.toLowerCase();
+        if (lower === '--on-read') {
           triggerMode = 'ON_READ';
-        } else if (tok.toLowerCase() === '--on-send') {
+        } else if (lower === '--on-send') {
           triggerMode = 'ON_SEND';
+        } else if (lower === '--revoke') {
+          useRevokeDelete = true;
         } else {
           filteredTokens.push(tok);
         }
       }
 
-      const recipient = filteredTokens[0];
-      const maybeSeconds = Number(filteredTokens[1]?.replace(/s$/i, ''));
+      const parsed = this.parseRecipientAndBodyInput(filteredTokens.join(' '));
+      const recipient = parsed ? parsed.recipient : filteredTokens[0];
+      const remainderTokens = parsed
+        ? parsed.messageBody.split(/\s+/).filter(Boolean)
+        : filteredTokens.slice(1);
+
+      const maybeSeconds = Number(remainderTokens[0]?.replace(/s$/i, ''));
       let expirationSeconds: number;
       let text: string;
 
       if (
-        filteredTokens.length >= 3 &&
+        remainderTokens.length >= 2 &&
         Number.isFinite(maybeSeconds) &&
         maybeSeconds >= 1 &&
         maybeSeconds <= 60
       ) {
         expirationSeconds = Math.floor(maybeSeconds);
-        text = filteredTokens.slice(2).join(' ');
+        text = remainderTokens.slice(1).join(' ');
       } else {
         expirationSeconds =
           this.ephemeralPresetSecondsByAdmin.get(adminId) || 10;
-        text = filteredTokens.slice(1).join(' ');
+        text = remainderTokens.join(' ');
       }
 
       const { session, driver } =
@@ -3024,6 +3195,7 @@ export class ToolsHandler {
         text,
         expirationSeconds,
         triggerMode,
+        useRevokeDelete,
       });
 
       this.auditRepo.record({
@@ -3046,8 +3218,8 @@ export class ToolsHandler {
           `🆔 *الجلسة المرسلة:* \`${session.id}\`\n` +
           `🎯 *المستلم:* \`${res.targetJid}\`\n` +
           `⏳ *مدة التدمير الذاتي:* \`${res.expirationSeconds} ثانية\`\n` +
-          `⚡ *آلية التفعيل:* \`${res.triggerMode === 'ON_READ' ? 'عند القراءة (ON_READ)' : 'فور الإرسال (ON_SEND)'}\`\n` +
-          `🗑️ *موعد الحذف البروتوكولي المجدول:* \`${res.scheduledRevokeAtIso.slice(11, 19)} UTC\`\n` +
+          `⚡ *آلية التفعيل:* \`${res.triggerMode === 'ON_READ' ? 'عند القراءة (ON_READ)' : 'اختفاء صامت بدون أثر حذف (Native Ephemeral)'}\`\n` +
+          `🗑️ *موعد الاختفاء المجدول:* \`${res.scheduledRevokeAtIso.slice(11, 19)} UTC\`\n` +
           `📨 *معرف الرسالة:* \`${res.messageId}\``,
         keyboard: [
           [
@@ -3058,7 +3230,7 @@ export class ToolsHandler {
             { text: '🔙 قائمة الأدوات', callbackData: 'menu:tools' },
           ],
         ],
-        toastText: `⏱️ سيتم حذف الرسالة تلقائياً بعد ${res.expirationSeconds} ثانية`,
+        toastText: `⏱️ ستختفي الرسالة تلقائياً بعد ${res.expirationSeconds} ثانية`,
       };
     } catch (err) {
       const safeErr = toSafeArabicError(err);

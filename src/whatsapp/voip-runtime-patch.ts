@@ -1,4 +1,5 @@
 import { spawn, type ChildProcess } from 'node:child_process';
+import { hkdfSync } from 'node:crypto';
 import fs from 'node:fs';
 import { createRequire } from 'node:module';
 import path from 'node:path';
@@ -29,6 +30,9 @@ export interface InstrumentedVideoEngine {
   running: boolean;
   pending: Uint8Array;
   _pendingHeaderNalus?: Uint8Array[];
+  _cachedSpsNalu?: Uint8Array | null;
+  _cachedPpsNalu?: Uint8Array | null;
+  _cachedIdrNalu?: Uint8Array | null;
   accessUnitsSent: number;
   videoPath: string | null;
   waitingForKeyFrame: boolean;
@@ -68,7 +72,16 @@ export interface InstrumentedMediaSession extends WaCallMediaSessionLike {
   };
   localCallKey?: Uint8Array;
   peerCallKey?: Uint8Array;
+  selfLid?: string;
+  selfSsrcJid?: string;
+  selfSsrc?: number;
+  videoSsrc?: number;
+  ensureDeviceJid?: (jid: string) => string;
   _pendingNonVclNalus?: Uint8Array[];
+  _cachedSpsNalu?: Uint8Array | null;
+  _cachedPpsNalu?: Uint8Array | null;
+  _cachedIdrNalu?: Uint8Array | null;
+  injectCachedSpsPpsKeyframe?: () => boolean;
   videoTimestamp?: number;
   acceptedAudioPackets?: number;
   acceptedAudioOctets?: number;
@@ -89,6 +102,8 @@ export interface InstrumentedMediaSession extends WaCallMediaSessionLike {
     hasConnection?: () => boolean;
     broadcast?: (packet: Buffer | Uint8Array | ArrayBuffer) => boolean;
     getVideoFlushCount?: () => number;
+    setVideoSsrc?: (ssrc: number) => void;
+    setStreamSsrcs?: (ssrcs: number[]) => void;
     __botezzBroadcastWrapped?: boolean;
     [key: string]: unknown;
   } | null;
@@ -126,6 +141,9 @@ export interface InstrumentedMediaSession extends WaCallMediaSessionLike {
       sessionSalt?: Uint8Array;
       authKey?: Uint8Array;
       authTagLen?: number;
+      roc?: number;
+      lastSeq?: number;
+      initialized?: boolean;
     };
     recvCtx?: {
       sessionKey?: Uint8Array;
@@ -141,6 +159,7 @@ export interface InstrumentedMediaSession extends WaCallMediaSessionLike {
   videoKeyframeRequired?: boolean;
   info?: {
     callId?: string;
+    callCreator?: string;
     callKey?: Uint8Array;
     encryptionKey?: Uint8Array;
     isEnded?: boolean;
@@ -153,6 +172,7 @@ export interface InstrumentedMediaSession extends WaCallMediaSessionLike {
   };
   cleanup?: () => void;
   startMediaFlow?: () => void;
+  handleCallAck?: (node: unknown) => Promise<void>;
   sendCapturedAudio?: (opusFrame: Buffer | Uint8Array) => void;
   sendCapturedVideoAU?: (
     auOrNalus: Uint8Array | Buffer | Array<Buffer | Uint8Array>,
@@ -178,21 +198,41 @@ export interface InstrumentedAudioEngine {
 let patchPromise: Promise<void> | null = null;
 let patchApplied = false;
 
-function resolveBaileysLitePackageDir(): string | null {
+export function resolveBaileysLitePackageDir(): string | null {
   try {
     const req = createRequire(import.meta.url);
     const pkgJsonPath = req.resolve('@hiroosy/baileys-lite/package.json');
     return path.dirname(pkgJsonPath);
   } catch {
-    const candidate = path.resolve(
-      process.cwd(),
-      'node_modules/@hiroosy/baileys-lite'
-    );
-    if (fs.existsSync(path.join(candidate, 'package.json'))) {
-      return candidate;
+    const candidates = [
+      path.resolve(process.cwd(), 'node_modules/@hiroosy/baileys-lite'),
+      path.resolve(process.cwd(), '../node_modules/@hiroosy/baileys-lite'),
+      path.resolve(process.cwd(), '../../node_modules/@hiroosy/baileys-lite'),
+    ];
+    for (const candidate of candidates) {
+      if (fs.existsSync(path.join(candidate, 'package.json'))) {
+        return candidate;
+      }
     }
     return null;
   }
+}
+
+/**
+ * Computes the deterministic WhatsApp VoIP SSRC (`generateSecureSsrc`) for a given
+ * `callId`, device JID (`selfJid`), and stream counter (`0` = audio, `2` = video).
+ */
+export function computeWhatsAppSecureSsrc(
+  callId: string,
+  selfJid: string,
+  counter = 0
+): number {
+  const key = Buffer.from(callId, 'utf8');
+  const salt = Buffer.alloc(4);
+  salt.writeUInt32LE(counter >>> 0, 0);
+  const info = Buffer.from(selfJid, 'utf8');
+  const derived = Buffer.from(hkdfSync('sha256', key, salt, info, 4));
+  return derived.readUInt32LE(0);
 }
 
 function annexBStartCodeLen(data: Uint8Array, offset: number): number {
@@ -285,6 +325,70 @@ export function packageH264SingleOrFuA(nalu: Uint8Array): Uint8Array[] {
     offset = end;
   }
   return out;
+}
+
+/**
+ * Builds a raw 12-byte RTP header + H.264 payload packet.
+ */
+export function buildRtpPacket(
+  payload: Uint8Array | Buffer,
+  timestamp: number,
+  sequenceNumber: number,
+  ssrc: number,
+  marker: boolean,
+  payloadType = 96
+): Buffer {
+  const header = Buffer.alloc(12);
+  header[0] = 0x80; // V=2, P=0, X=0, CC=0
+  header[1] = (marker ? 0x80 : 0x00) | (payloadType & 0x7f);
+  header.writeUInt16BE(sequenceNumber & 0xffff, 2);
+  header.writeUInt32BE(timestamp >>> 0, 4);
+  header.writeUInt32BE(ssrc >>> 0, 8);
+  const payloadBuf = Buffer.isBuffer(payload)
+    ? payload
+    : Buffer.from(payload.buffer, payload.byteOffset, payload.byteLength);
+  return Buffer.concat([header, payloadBuf]);
+}
+
+/**
+ * RFC 6184 compliant H.264 NALU -> RTP packet builder.
+ * Enforces `Marker Bit = false (0)` on all non-VCL parameter/supplemental NALUs (`SPS=7`, `PPS=8`, `SEI=6`, `AUD=9`)
+ * and `Marker Bit = true (1)` strictly on the final packet/fragment of a VCL frame slice (`IDR=5` or `Non-IDR=1`).
+ */
+export function buildH264RtpPackets(
+  naluBuffer: Uint8Array | Buffer,
+  timestamp: number,
+  sequenceNumberGenerator: () => number,
+  ssrc: number,
+  isLastNaluInAccessUnit = true
+): Buffer[] {
+  if (!naluBuffer || naluBuffer.length === 0) return [];
+  const view = new Uint8Array(
+    naluBuffer.buffer,
+    naluBuffer.byteOffset,
+    naluBuffer.byteLength
+  );
+  const split = splitAnnexBNalus(view);
+  const payload = split.length === 1 ? split[0] : view;
+  if (!payload || payload.length === 0) return [];
+
+  const nalHeader = payload[0];
+  const nalType = nalHeader & 0x1f;
+  const isVclFrameSlice = nalType === 1 || nalType === 5;
+  const chunks = packageH264SingleOrFuA(payload);
+
+  return chunks.map((chunk, idx) => {
+    const isLastFragment = idx === chunks.length - 1;
+    const isFinalPacketOfFrame =
+      isVclFrameSlice && isLastNaluInAccessUnit && isLastFragment;
+    return buildRtpPacket(
+      chunk,
+      timestamp,
+      sequenceNumberGenerator(),
+      ssrc,
+      isFinalPacketOfFrame
+    );
+  });
 }
 
 export function auHasIdrNalu(au: Uint8Array): boolean {
@@ -549,6 +653,20 @@ export function instrumentVideoEngineInstance(
     this: InstrumentedVideoEngine,
     au: Uint8Array
   ) {
+    // Cache SPS (7), PPS (8), and IDR (5) whenever emitted by ffmpeg
+    const emittedNalus = splitAnnexBNalus(au);
+    for (const n of emittedNalus.length > 0 ? emittedNalus : [au]) {
+      if (!n || n.length === 0) continue;
+      const nt = n[0] & 0x1f;
+      if (nt === 7) {
+        this._cachedSpsNalu = n.slice();
+      } else if (nt === 8) {
+        this._cachedPpsNalu = n.slice();
+      } else if (nt === 5) {
+        this._cachedIdrNalu = n.slice();
+      }
+    }
+
     if (this.waitingForKeyFrame || this.waitForKeyFrame) {
       if (!auHasIdrNalu(au)) {
         return;
@@ -730,6 +848,7 @@ export function instrumentVideoEngineInstance(
       `min-keyint=${gop}`,
       'scenecut=0',
       'bframes=0',
+      'cabac=0',
       'aud=1',
       'annexb=1',
       'sliced-threads=0',
@@ -758,7 +877,7 @@ export function instrumentVideoEngineInstance(
       '-level',
       level,
       '-preset',
-      'veryfast',
+      'ultrafast',
       '-tune',
       'zerolatency',
       '-pix_fmt',
@@ -950,19 +1069,79 @@ export function instrumentVideoEngineInstance(
     this._deliberateStop = true;
     this.running = false;
     this._pendingHeaderNalus = [];
-    if (typeof origStop === 'function') {
-      return origStop.call(this, opts);
-    }
-    if (this.proc) {
+    const activeProc = this.proc;
+    if (activeProc) {
       try {
-        this.proc.kill('SIGKILL');
+        activeProc.stdout?.removeAllListeners('data');
+        activeProc.stderr?.removeAllListeners('data');
+        activeProc.kill('SIGTERM');
+        const forceKillTimer = setTimeout(() => {
+          try {
+            if (!activeProc.killed && activeProc.exitCode === null) {
+              activeProc.kill('SIGKILL');
+            }
+          } catch {
+            // Ignore SIGKILL error
+          }
+        }, 1200);
+        forceKillTimer.unref?.();
       } catch {
         // Ignore kill error
       }
-      this.proc = null;
     }
+    if (typeof origStop === 'function') {
+      return origStop.call(this, opts);
+    }
+    this.proc = null;
     this.pending = new Uint8Array(0);
   };
+}
+
+/**
+ * Synchronizes `session.videoSsrc` and `session.videoRtpStream.ssrc` with `session.selfSsrcJid`
+ * (`generateSecureSsrc(callId, ourDeviceJid, 2)`), fixing the `@hiroosy/baileys-lite` bug where
+ * `handleCallAck` updates `selfSsrc` (`streamIndex=0`) to the `:33@lid` companion device JID
+ * but leaves `videoSsrc` (`streamIndex=2`) on the bare `:0@lid` JID.
+ */
+function syncSessionVideoSsrcWithDeviceJid(
+  session: InstrumentedMediaSession
+): void {
+  const callId = session.info?.callId || session.callId;
+  const activeDeviceJid = session.selfSsrcJid || session.selfLid;
+  if (!callId || !activeDeviceJid) {
+    return;
+  }
+  const normalizedDeviceJid =
+    typeof session.ensureDeviceJid === 'function'
+      ? session.ensureDeviceJid(activeDeviceJid)
+      : activeDeviceJid.includes(':')
+        ? activeDeviceJid
+        : activeDeviceJid.replace('@', ':0@');
+
+  // Only recompute if `selfSsrcJid` is explicitly set (or if `videoSsrc` is missing)
+  if (!session.selfSsrcJid && session.videoSsrc !== undefined) {
+    return;
+  }
+
+  const expectedVideoSsrc = computeWhatsAppSecureSsrc(
+    callId,
+    normalizedDeviceJid,
+    2
+  );
+  session.videoSsrc = expectedVideoSsrc;
+  if (session.videoRtpStream && typeof session.videoRtpStream === 'object') {
+    session.videoRtpStream.ssrc = expectedVideoSsrc;
+  }
+  if (
+    session.sctpRelay &&
+    typeof session.sctpRelay.setVideoSsrc === 'function'
+  ) {
+    try {
+      session.sctpRelay.setVideoSsrc(expectedVideoSsrc);
+    } catch {
+      // Ignore relay SSRC setter failure
+    }
+  }
 }
 
 export function instrumentMediaSessionInstance(
@@ -988,6 +1167,34 @@ export function instrumentMediaSessionInstance(
     return session;
   }
   session.__botezzInstrumented = true;
+
+  session.injectCachedSpsPpsKeyframe = function injectCachedSpsPpsKeyframe(
+    this: InstrumentedMediaSession
+  ): boolean {
+    const sps =
+      this._cachedSpsNalu ?? this.videoEngine?._cachedSpsNalu ?? null;
+    const pps =
+      this._cachedPpsNalu ?? this.videoEngine?._cachedPpsNalu ?? null;
+    const idr =
+      this._cachedIdrNalu ?? this.videoEngine?._cachedIdrNalu ?? null;
+    if (!sps || !pps || !idr) {
+      return false;
+    }
+    this.sendCapturedVideoAU?.([sps, pps, idr], true);
+    return true;
+  };
+
+  if (typeof session.handleCallAck === 'function') {
+    const origHandleCallAck = session.handleCallAck;
+    session.handleCallAck = async function patchedHandleCallAck(
+      this: InstrumentedMediaSession,
+      node: unknown
+    ) {
+      const res = await origHandleCallAck.call(this, node);
+      syncSessionVideoSsrcWithDeviceJid(this);
+      return res;
+    };
+  }
 
   if (typeof session.cleanup === 'function') {
     const origCleanup = session.cleanup;
@@ -1029,6 +1236,7 @@ export function instrumentMediaSessionInstance(
         return;
       }
       wrapSctpRelayOnSession(this);
+      syncSessionVideoSsrcWithDeviceJid(this);
       if (this.audioEngine && typeof this.audioEngine === 'object') {
         instrumentAudioEngineInstance(
           this.audioEngine as unknown as InstrumentedAudioEngine
@@ -1039,7 +1247,9 @@ export function instrumentMediaSessionInstance(
           this.videoEngine as unknown as InstrumentedVideoEngine
         );
       }
-      return origStartMediaFlow.apply(this);
+      const res = origStartMediaFlow.apply(this);
+      syncSessionVideoSsrcWithDeviceJid(this);
+      return res;
     };
   }
 
@@ -1108,6 +1318,9 @@ export function instrumentMediaSessionInstance(
 
       const res = await origHandleCallAccept.apply(this, args);
 
+      // Ensure `videoSsrc` and `videoRtpStream.ssrc` match the resolved companion device JID (`selfSsrcJid`)
+      syncSessionVideoSsrcWithDeviceJid(this);
+
       // Extract peerCallKey (from accept node or session property) and store it strictly on `this.__peerCallKey`
       // for `VoipCallRecorder` inbound decryption (`unprotect`). NEVER put `peerCallKey` into `videoSrtpSession.sendCtx`!
       const acceptArgObj =
@@ -1158,10 +1371,11 @@ export function instrumentMediaSessionInstance(
         };
       }
 
-      // If `this.videoSrtpSession` was not created yet (because `srtpFromPeerKey` skipped `initSrtpKeys()`),
-      // create a dedicated video SRTP session using `localOutboundSend` for `sendCtx` and `primaryRecv` for `recvCtx`.
+      // Always ensure `this.videoSrtpSession` is a DEDICATED SrtpSession instance separate from `this.srtpSession`
+      // so audio and video sequence numbers never collide in `SrtpContext.updateRoc(seq)`.
       if (
-        !this.videoSrtpSession &&
+        (!this.videoSrtpSession ||
+          (this.videoSrtpSession as unknown) === (this.srtpSession as unknown)) &&
         this.srtpSession &&
         localOutboundSend
       ) {
@@ -1212,7 +1426,10 @@ export function instrumentMediaSessionInstance(
             // Fall through to object fallback below
           }
         }
-        if (!this.videoSrtpSession) {
+        if (
+          !this.videoSrtpSession ||
+          (this.videoSrtpSession as unknown) === (this.srtpSession as unknown)
+        ) {
           this.videoSrtpSession = {
             sendCtx: { ...localOutboundSend },
             recvCtx: primaryRecv ? { ...primaryRecv } : { ...localOutboundSend },
@@ -1332,6 +1549,7 @@ export function instrumentMediaSessionInstance(
     durationOrIsKeyframe?: number | boolean
   ) {
     wrapSctpRelayOnSession(this);
+    syncSessionVideoSsrcWithDeviceJid(this);
 
     // 1. Legacy mock test path when `auOrNalus` is an Array and no `videoRtpStream` is attached,
     //    AND the caller did not configure RFC 6184 packet capture (`sentVideoRtpPackets`).
@@ -1438,6 +1656,24 @@ export function instrumentMediaSessionInstance(
       return;
     }
 
+    // Update cached SPS (7), PPS (8), and IDR (5) on the session
+    for (const n of filteredNalus) {
+      const t = n[0] & 0x1f;
+      if (t === 7) {
+        this._cachedSpsNalu = n.slice();
+      } else if (t === 8) {
+        this._cachedPpsNalu = n.slice();
+      } else if (t === 5) {
+        this._cachedIdrNalu = n.slice();
+      }
+    }
+    if (!this._cachedSpsNalu && this.videoEngine?._cachedSpsNalu) {
+      this._cachedSpsNalu = this.videoEngine._cachedSpsNalu.slice();
+    }
+    if (!this._cachedPpsNalu && this.videoEngine?._cachedPpsNalu) {
+      this._cachedPpsNalu = this.videoEngine._cachedPpsNalu.slice();
+    }
+
     const hasVcl = filteredNalus.some((n) => {
       const t = n[0] & 0x1f;
       return t >= 1 && t <= 5;
@@ -1452,11 +1688,27 @@ export function instrumentMediaSessionInstance(
       return;
     }
 
-    const frameNalus = this._pendingNonVclNalus?.length
+    let frameNalus = this._pendingNonVclNalus?.length
       ? [...this._pendingNonVclNalus.splice(0), ...filteredNalus]
-      : filteredNalus;
+      : [...filteredNalus];
 
     const isIdr = frameNalus.some((n) => (n[0] & 0x1f) === 5);
+
+    // Guarantee In-Band SPS (7) + PPS (8) before every IDR (5) NALU under the exact same 90kHz timestamp
+    if (isIdr) {
+      const hasSpsInFrame = frameNalus.some((n) => (n[0] & 0x1f) === 7);
+      const hasPpsInFrame = frameNalus.some((n) => (n[0] & 0x1f) === 8);
+      const prependHeaders: Uint8Array[] = [];
+      if (!hasSpsInFrame && this._cachedSpsNalu) {
+        prependHeaders.push(this._cachedSpsNalu);
+      }
+      if (!hasPpsInFrame && this._cachedPpsNalu) {
+        prependHeaders.push(this._cachedPpsNalu);
+      }
+      if (prependHeaders.length > 0) {
+        frameNalus = [...prependHeaders, ...frameNalus];
+      }
+    }
 
     const flushesBefore =
       typeof this.sctpRelay?.getVideoFlushCount === 'function'
@@ -1503,7 +1755,7 @@ export function instrumentMediaSessionInstance(
         // Drop SEI (6) from wire RTP or keep M=0 if needed; dropping SEI saves SCTP bandwidth
         continue;
       }
-      const isVclNalu = naluType >= 1 && naluType <= 5;
+      const isVclNalu = naluType === 1 || naluType === 5;
       const chunks = packageH264SingleOrFuA(nalu);
       for (const chunk of chunks) {
         framePackets.push({
@@ -1539,9 +1791,13 @@ export function instrumentMediaSessionInstance(
       let accepted = true;
       let seqNum = i;
 
-      if (this.videoRtpStream && this.videoSrtpSession) {
+      if (
+        this.videoRtpStream &&
+        typeof this.videoRtpStream.nextPacket === 'function' &&
+        this.videoSrtpSession
+      ) {
         this.videoRtpStream.timestamp = frameTimestamp;
-        const header = this.videoRtpStream.nextPacket!(
+        const header = this.videoRtpStream.nextPacket(
           isMarker,
           mediaFrameInfo
         );
@@ -1569,6 +1825,53 @@ export function instrumentMediaSessionInstance(
         );
         if (typeof this.sctpRelay?.broadcast === 'function') {
           accepted = Boolean(this.sctpRelay.broadcast(srtpBytes));
+        } else if (
+          typeof (this as { sendMediaPayload?: (b: Uint8Array) => void })
+            .sendMediaPayload === 'function'
+        ) {
+          (
+            this as unknown as { sendMediaPayload: (b: Uint8Array) => void }
+          ).sendMediaPayload(srtpBytes);
+        }
+      } else if (
+        this.videoRtpStream &&
+        typeof (this.videoRtpStream as { nextSeq?: () => number }).nextSeq ===
+          'function'
+      ) {
+        seqNum = (
+          this.videoRtpStream as unknown as { nextSeq: () => number }
+        ).nextSeq();
+        const ssrcVal =
+          this.videoRtpStream.ssrc ?? this.videoSsrc ?? 0x11223344;
+        const rawRtpBuf = buildRtpPacket(
+          pkt.payload,
+          frameTimestamp,
+          seqNum,
+          ssrcVal,
+          isMarker
+        );
+        const activeSrtp = (this.videoSrtpSession ?? this.srtpSession) as
+          | { protect?: (pkt: unknown) => Uint8Array }
+          | null
+          | undefined;
+        const protectedBuf =
+          typeof activeSrtp?.protect === 'function'
+            ? activeSrtp.protect(rawRtpBuf)
+            : rawRtpBuf;
+        const srtpBytes = new Uint8Array(
+          protectedBuf.buffer,
+          protectedBuf.byteOffset,
+          protectedBuf.byteLength
+        );
+        if (typeof this.sctpRelay?.broadcast === 'function') {
+          accepted = Boolean(this.sctpRelay.broadcast(srtpBytes));
+        } else if (
+          typeof (this as { sendMediaPayload?: (b: Uint8Array) => void })
+            .sendMediaPayload === 'function'
+        ) {
+          (
+            this as unknown as { sendMediaPayload: (b: Uint8Array) => void }
+          ).sendMediaPayload(srtpBytes);
         }
       } else if (typeof this.sctpRelay?.broadcast === 'function') {
         accepted = Boolean(this.sctpRelay.broadcast(pkt.payload));

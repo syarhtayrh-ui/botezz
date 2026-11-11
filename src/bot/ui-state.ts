@@ -131,7 +131,11 @@ export function isNavigableRoute(callbackData: string): boolean {
     callbackData.startsWith('inbox:filter:') ||
     callbackData.startsWith('stories:dl:') ||
     callbackData.startsWith('stories:dlc:') ||
-    callbackData.startsWith('stories:filter:')
+    callbackData.startsWith('stories:filter:') ||
+    callbackData === 'menu:network' ||
+    callbackData.startsWith('net:list:') ||
+    callbackData.startsWith('net:view:') ||
+    callbackData === 'net:ping'
   );
 }
 

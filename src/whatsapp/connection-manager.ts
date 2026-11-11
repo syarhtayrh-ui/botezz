@@ -37,6 +37,10 @@ export interface BinaryNode {
 }
 import { createAtomicMultiFileAuthState } from './atomic-auth-state';
 import {
+  getNetworkTrafficMonitor,
+  InspectableBinaryNode,
+} from '../network/network-traffic-monitor';
+import {
   SupportedMediaKind,
   validateCustomPairingCode,
   generateRandomPairingCode,
@@ -570,7 +574,15 @@ export class SessionMemoryStore {
     const isOnlineState =
       params.state === 'available' ||
       params.state === 'composing' ||
-      params.state === 'recording';
+      params.state === 'recording' ||
+      params.state === 'paused';
+
+    const wasPreviouslyOnline =
+      existing.onlineSessionStartedAtMs !== undefined ||
+      existing.currentState === 'available' ||
+      existing.currentState === 'composing' ||
+      existing.currentState === 'recording' ||
+      existing.currentState === 'paused';
 
     let totalOnlineDurationMs = existing.totalOnlineDurationMs;
     let onlineSessionStartedAtMs = existing.onlineSessionStartedAtMs;
@@ -599,14 +611,18 @@ export class SessionMemoryStore {
       }
     }
 
+    const computedLastSeenSec =
+      typeof params.lastSeen === 'number' && params.lastSeen > 0
+        ? params.lastSeen
+        : params.state === 'unavailable' && wasPreviouslyOnline
+          ? Math.floor(now / 1000)
+          : existing.lastSeenTimestampSec;
+
     const updated: TrackedPresenceRecord = {
       chatJid: primaryChatJid,
       resolvedLid: mappedLid || existing.resolvedLid,
       currentState: params.state,
-      lastSeenTimestampSec:
-        typeof params.lastSeen === 'number' && params.lastSeen > 0
-          ? params.lastSeen
-          : existing.lastSeenTimestampSec,
+      lastSeenTimestampSec: computedLastSeenSec,
       lastUpdatedMs: now,
       transitions,
       totalOnlineDurationMs,
@@ -1055,6 +1071,7 @@ export interface WhatsAppSessionDriver {
     targetLid: string;
     resolvedPn?: string;
     resolutionSource: string;
+    usedLid?: boolean;
   }>;
   trackRecipientPresence(params: {
     recipient: string;
@@ -1062,6 +1079,7 @@ export interface WhatsAppSessionDriver {
     onUpdate?: (record: TrackedPresenceRecord) => void;
     staleComposingTimeoutMs?: number;
   }): Promise<TrackedPresenceRecord>;
+  stopTrackingRecipientPresence?(recipient?: string): number;
   startPresenceHeartbeatBroadcast(params: {
     recipient: string;
     mode: 'composing' | 'recording' | 'available';
@@ -1072,6 +1090,7 @@ export interface WhatsAppSessionDriver {
     targetJid: string;
     durationMs: number;
   }>;
+  stopPresenceHeartbeat?(recipient?: string): number;
   fetchFullProfileInfo(recipient: string): Promise<WhatsAppFullProfileReport>;
   sendShortEphemeralMessage(params: {
     recipient: string;
@@ -1079,6 +1098,8 @@ export interface WhatsAppSessionDriver {
     expirationSeconds: number;
     triggerMode?: 'ON_SEND' | 'ON_READ';
     setChatEphemeralIq?: boolean;
+    useRevokeDelete?: boolean;
+    viewOnce?: boolean;
   }): Promise<{
     messageId: string;
     targetJid: string;
@@ -1455,6 +1476,8 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
     }
   >();
   private readonly activePresenceCleanups = new Set<() => void>();
+  private readonly activePresenceTrackersByKey = new Map<string, Set<() => void>>();
+  private readonly activePresenceHeartbeatsByKey = new Map<string, Set<() => void>>();
   public messageSender?: MessageSender;
 
   constructor(
@@ -1500,8 +1523,10 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
     };
     sock.ev.on('message-receipt.update', onReceipt as never);
     sock.ev.on('messages.update', onMessagesUpdate as never);
+    const unbindTelemetry = this.instrumentSocketForTelemetry(sock);
     this.evCleanup = () => {
       unbind();
+      unbindTelemetry();
       try {
         sock.ev.off('message-receipt.update', onReceipt as never);
         sock.ev.off('messages.update', onMessagesUpdate as never);
@@ -1510,6 +1535,228 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
       }
     };
     return this.evCleanup;
+  }
+
+  private instrumentSocketForTelemetry(sock: WASocket): () => void {
+    const anySock = sock as unknown as Record<string, unknown> & {
+      __botezzTelemetryInstrumented?: boolean;
+      ws?: {
+        on?: (event: string, cb: (node: unknown) => void) => void;
+        off?: (event: string, cb: (node: unknown) => void) => void;
+      };
+    };
+    if (anySock.__botezzTelemetryInstrumented) {
+      return () => undefined;
+    }
+    anySock.__botezzTelemetryInstrumented = true;
+    const monitor = getNetworkTrafficMonitor();
+
+    if (typeof sock.query === 'function') {
+      const origQuery = sock.query.bind(sock);
+      sock.query = async (node: BinaryNode, timeoutMs?: number) => {
+        const start = Date.now();
+        try {
+          const res = await origQuery(node, timeoutMs);
+          monitor.recordWhatsAppStanza({
+            sessionId: this.sessionId,
+            direction: 'OUTBOUND',
+            node: node as unknown as InspectableBinaryNode,
+            responseNode:
+              res && typeof res === 'object' && 'tag' in (res as object)
+                ? (res as InspectableBinaryNode)
+                : undefined,
+            durationMs: Date.now() - start,
+          });
+          return res;
+        } catch (err) {
+          monitor.recordWhatsAppStanza({
+            sessionId: this.sessionId,
+            direction: 'OUTBOUND',
+            node: node as unknown as InspectableBinaryNode,
+            durationMs: Date.now() - start,
+            statusCode: 'ERR',
+            errorDetail: err instanceof Error ? err.message : String(err),
+          });
+          throw err;
+        }
+      };
+    }
+
+    if (typeof sock.sendNode === 'function') {
+      const origSendNode = sock.sendNode.bind(sock);
+      sock.sendNode = async (node: BinaryNode) => {
+        const start = Date.now();
+        try {
+          await origSendNode(node);
+          monitor.recordWhatsAppStanza({
+            sessionId: this.sessionId,
+            direction: 'OUTBOUND',
+            node: node as unknown as InspectableBinaryNode,
+            durationMs: Date.now() - start,
+          });
+        } catch (err) {
+          monitor.recordWhatsAppStanza({
+            sessionId: this.sessionId,
+            direction: 'OUTBOUND',
+            node: node as unknown as InspectableBinaryNode,
+            durationMs: Date.now() - start,
+            statusCode: 'ERR',
+            errorDetail: err instanceof Error ? err.message : String(err),
+          });
+          throw err;
+        }
+      };
+    }
+
+    if (typeof sock.sendMessage === 'function') {
+      const origSendMessage = sock.sendMessage.bind(sock);
+      sock.sendMessage = async (jid, content, options) => {
+        const start = Date.now();
+        const contentKeys =
+          content && typeof content === 'object' ? Object.keys(content) : ['text'];
+        const syntheticNode: InspectableBinaryNode = {
+          tag: 'message',
+          attrs: {
+            to: jid,
+            type: contentKeys[0] || 'text',
+          },
+          content: [
+            {
+              tag: contentKeys[0] || 'body',
+              attrs: {},
+              content:
+                typeof (content as { text?: string })?.text === 'string'
+                  ? (content as { text: string }).text.slice(0, 200)
+                  : `[${contentKeys.join(', ')}]`,
+            },
+          ],
+        };
+        try {
+          const res = await origSendMessage(jid, content, options);
+          if (res?.key?.id && syntheticNode.attrs) {
+            syntheticNode.attrs.id = res.key.id;
+          }
+          monitor.recordWhatsAppStanza({
+            sessionId: this.sessionId,
+            direction: 'OUTBOUND',
+            node: syntheticNode,
+            durationMs: Date.now() - start,
+            statusCode: 'SENT',
+          });
+          return res;
+        } catch (err) {
+          monitor.recordWhatsAppStanza({
+            sessionId: this.sessionId,
+            direction: 'OUTBOUND',
+            node: syntheticNode,
+            durationMs: Date.now() - start,
+            statusCode: 'ERR',
+            errorDetail: err instanceof Error ? err.message : String(err),
+          });
+          throw err;
+        }
+      };
+    }
+
+    if (typeof sock.relayMessage === 'function') {
+      const origRelayMessage = sock.relayMessage.bind(sock);
+      sock.relayMessage = async (jid, message, options) => {
+        const start = Date.now();
+        const msgKeys =
+          message && typeof message === 'object' ? Object.keys(message) : ['proto'];
+        const syntheticNode: InspectableBinaryNode = {
+          tag: 'message',
+          attrs: {
+            to: jid,
+            id:
+              typeof options?.messageId === 'string'
+                ? options.messageId
+                : undefined,
+            addressing_mode:
+              typeof options?.addressingMode === 'string'
+                ? options.addressingMode
+                : typeof (options?.additionalAttributes as Record<string, unknown> | undefined)
+                      ?.addressing_mode === 'string'
+                  ? String(
+                      (options?.additionalAttributes as Record<string, unknown>)
+                        .addressing_mode
+                    )
+                  : undefined,
+          },
+          content: [
+            {
+              tag: 'enc',
+              attrs: { type: 'msg', proto: msgKeys[0] || 'message' },
+              content: '[Signal Encrypted Message]',
+            },
+          ],
+        };
+        try {
+          const res = await origRelayMessage(jid, message, options);
+          monitor.recordWhatsAppStanza({
+            sessionId: this.sessionId,
+            direction: 'OUTBOUND',
+            node: syntheticNode,
+            durationMs: Date.now() - start,
+            statusCode: 'RELAYED',
+          });
+          return res;
+        } catch (err) {
+          monitor.recordWhatsAppStanza({
+            sessionId: this.sessionId,
+            direction: 'OUTBOUND',
+            node: syntheticNode,
+            durationMs: Date.now() - start,
+            statusCode: 'ERR',
+            errorDetail: err instanceof Error ? err.message : String(err),
+          });
+          throw err;
+        }
+      };
+    }
+
+    const wsCallbacks: Array<{ event: string; fn: (node: unknown) => void }> = [];
+    const ws = anySock.ws;
+    if (typeof ws?.on === 'function') {
+      const inboundEvents = [
+        'CB:iq',
+        'CB:message',
+        'CB:call',
+        'CB:presence',
+        'CB:receipt',
+        'CB:notification',
+        'CB:ack',
+      ];
+      for (const evt of inboundEvents) {
+        const fn = (rawNode: unknown) => {
+          try {
+            if (rawNode && typeof rawNode === 'object' && 'tag' in (rawNode as object)) {
+              monitor.recordWhatsAppStanza({
+                sessionId: this.sessionId,
+                direction: 'INBOUND',
+                node: rawNode as InspectableBinaryNode,
+              });
+            }
+          } catch {
+            // Never disrupt socket pipeline
+          }
+        };
+        ws.on(evt, fn);
+        wsCallbacks.push({ event: evt, fn });
+      }
+    }
+
+    return () => {
+      if (typeof ws?.off === 'function') {
+        for (const item of wsCallbacks) {
+          try {
+            ws.off(item.event, item.fn);
+          } catch {
+            // Ignore
+          }
+        }
+      }
+    };
   }
 
   /**
@@ -1990,6 +2237,7 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
     if (typeof wsEmitter?.on === 'function') {
       wsEmitter.on('CB:message', rawMessageStanzaListener as never);
     }
+    const unbindSocketTelemetry = this.instrumentSocketForTelemetry(sock);
 
     const messagesUpdateListener = (
       updates: Array<{
@@ -2142,6 +2390,7 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
 
     this.evCleanup = () => {
       unbindStore();
+      unbindSocketTelemetry();
       try {
         if (typeof wsEmitter?.off === 'function') {
           wsEmitter.off('CB:message', rawMessageStanzaListener as never);
@@ -2852,32 +3101,48 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
       | 'GROUP_PARTICIPANT_CACHE';
   }> {
     const sock = this.ensureSocket();
-    const trimmed = String(targetInput || '').trim();
+    let trimmed = String(targetInput || '').trim();
     if (!trimmed) {
       throw new ValidationError('الرجاء إدخال رقم الهاتف أو معرف @lid للمستلم.');
     }
 
-    // 1. Direct @lid input
+    // Strip formatting spaces/hyphens/parentheses if user entered a formatted phone number
+    if (!trimmed.includes('@')) {
+      trimmed = trimmed.replace(/[\s\-()]+/g, '');
+    }
+
+    // 1. Direct @lid input (guarding against phone numbers that had @lid mistakenly appended, e.g. +966501234567@lid)
     if (trimmed.endsWith('@lid')) {
-      const validated = validateRecipient(trimmed);
-      const lidJid = jidNormalizedUser(validated.jid);
-      let pnJid = this.memoryStore.getPnForLid(lidJid);
-      if (!pnJid && sock.signalRepository?.lidMapping?.getPNForLID) {
-        try {
-          const fromRepo = await sock.signalRepository.lidMapping.getPNForLID(lidJid);
-          if (fromRepo) {
-            pnJid = jidNormalizedUser(fromRepo);
-            this.memoryStore.recordLidMapping(lidJid, pnJid);
+      const userPart = trimmed.slice(0, -4).trim();
+      const digitsOnly = userPart.replace(/\D/g, '');
+      const looksLikePhoneWithFakeLid =
+        userPart.startsWith('+') ||
+        /^(?:9665\d{8}|9715\d{8}|965[569]\d{7}|974[3567]\d{7}|9733\d{7}|968[79]\d{7}|201\d{9}|9627\d{8}|9647\d{9}|9677\d{8})$/.test(
+          digitsOnly
+        );
+      if (looksLikePhoneWithFakeLid) {
+        trimmed = `+${digitsOnly}`;
+      } else {
+        const validated = validateRecipient(trimmed);
+        const lidJid = jidNormalizedUser(validated.jid);
+        let pnJid = this.memoryStore.getPnForLid(lidJid);
+        if (!pnJid && sock.signalRepository?.lidMapping?.getPNForLID) {
+          try {
+            const fromRepo = await sock.signalRepository.lidMapping.getPNForLID(lidJid);
+            if (fromRepo) {
+              pnJid = jidNormalizedUser(fromRepo);
+              this.memoryStore.recordLidMapping(lidJid, pnJid);
+            }
+          } catch {
+            // Ignore
           }
-        } catch {
-          // Ignore
         }
+        return {
+          pnJid,
+          lidJid,
+          source: 'DIRECT_LID',
+        };
       }
-      return {
-        pnJid,
-        lidJid,
-        source: 'DIRECT_LID',
-      };
     }
 
     // Normalize as PN JID
@@ -3066,6 +3331,8 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
    * Sends a protocol-level LID-addressed message (`addressing_mode="lid"`) via `@hiroosy/baileys-lite`,
    * migrating/asserting the E2E Signal session onto the target `@lid` JID and relaying with `userJid = selfLid`
    * so the message stanza is strictly addressed from `@lid` to `@lid` without leaking PN identity.
+   * If the WhatsApp server does not expose a `@lid` for a valid phone number, safely falls back to delivering
+   * to `pnJid` (`@s.whatsapp.net`) with stripped `pushName` instead of failing or fabricating `<phone>@lid`.
    */
   public async sendAnonymousLidMessage(params: {
     recipient: string;
@@ -3076,6 +3343,7 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
     targetLid: string;
     resolvedPn?: string;
     resolutionSource: string;
+    usedLid?: boolean;
   }> {
     const sock = this.ensureSocket();
     if (this.connectionState !== 'CONNECTED' || !this.wsOpen) {
@@ -3098,7 +3366,11 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
         ? jidNormalizedUser(sock.user.id)
         : undefined;
 
-    const trimmedRecipient = String(params.recipient || '').trim();
+    const rawRecipient = String(params.recipient || '').trim();
+    const trimmedRecipient = rawRecipient.includes('@')
+      ? rawRecipient
+      : rawRecipient.replace(/[\s\-()]+/g, '');
+
     if (trimmedRecipient.endsWith('@g.us')) {
       const groupCheck = validateRecipient(trimmedRecipient);
       const waMsg = generateWAMessageFromContent(
@@ -3120,70 +3392,121 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
         messageId: msgId,
         targetLid: groupCheck.jid,
         resolutionSource: 'GROUP_LID_RELAY',
+        usedLid: true,
       };
     }
 
-    const { pnJid, lidJid, source } = await this.resolveLidForRecipient(
-      trimmedRecipient
-    );
+    let pnJid: string | undefined;
+    let lidJid: string | undefined;
+    let source = 'ON_WHATSAPP_USYNC';
+    let usedLid = true;
 
-    // Warm up USync devices & migrate/assert E2E Signal session onto the @lid identity
+    try {
+      const resolved = await this.resolveLidForRecipient(trimmedRecipient);
+      pnJid = resolved.pnJid;
+      lidJid = resolved.lidJid;
+      source = resolved.source;
+    } catch (err) {
+      // If the user passed a valid phone number / @s.whatsapp.net JID and the server did not expose a @lid,
+      // check if we can safely fall back to PN delivery with stripped pushName rather than failing outright
+      // when sock.sendMessage or relayMessage is available.
+      const normalizedCheck = validateRecipient(
+        trimmedRecipient.endsWith('@lid')
+          ? `+${trimmedRecipient.slice(0, -4).replace(/\D/g, '')}`
+          : trimmedRecipient
+      );
+      if (normalizedCheck.jid.endsWith('@s.whatsapp.net') && typeof sock.onWhatsApp === 'function') {
+        const waCheck = await sock.onWhatsApp(normalizedCheck.jid).catch(() => []);
+        const waEntry = Array.isArray(waCheck) ? waCheck[0] : undefined;
+        if (waEntry && waEntry.exists === false) {
+          throw err;
+        }
+      }
+      if (normalizedCheck.jid.endsWith('@s.whatsapp.net')) {
+        pnJid = jidNormalizedUser(normalizedCheck.jid);
+        lidJid = pnJid;
+        source = 'PN_FALLBACK';
+        usedLid = false;
+      } else {
+        throw err;
+      }
+    }
+
+    const deliveryJid = lidJid!;
+
+    // Warm up USync devices & migrate/assert E2E Signal session onto the target identity
     try {
       if (typeof sock.getUSyncDevices === 'function') {
-        const jidsToFetch = [pnJid, lidJid].filter((j): j is string => Boolean(j));
+        const jidsToFetch = Array.from(
+          new Set([pnJid, deliveryJid].filter((j): j is string => Boolean(j)))
+        );
         await sock.getUSyncDevices(jidsToFetch, false, false).catch(() => []);
-        await sock.getUSyncDevices([lidJid], true, false).catch(() => []);
+        if (usedLid) {
+          await sock.getUSyncDevices([deliveryJid], true, false).catch(() => []);
+        }
       }
-      if (pnJid && typeof sock.signalRepository?.migrateSession === 'function') {
+      if (
+        usedLid &&
+        pnJid &&
+        typeof sock.signalRepository?.migrateSession === 'function'
+      ) {
         await sock.signalRepository
-          .migrateSession(pnJid, lidJid)
+          .migrateSession(pnJid, deliveryJid)
           .catch(() => undefined);
       }
       if (typeof sock.assertSessions === 'function') {
-        await sock.assertSessions([lidJid], false).catch(() => false);
+        await sock.assertSessions([deliveryJid], false).catch(() => false);
       }
     } catch {
       // Best-effort session preparation before relayMessage
     }
 
     const previousName = sock.user?.name;
-    if (params.customPushName && sock.user) {
-      sock.user.name = params.customPushName;
+    if (sock.user) {
+      sock.user.name = params.customPushName ?? '';
     }
 
     let msgId = `lid_msg_${Date.now()}`;
     try {
       const waMsg = generateWAMessageFromContent(
-        lidJid,
+        deliveryJid,
         { extendedTextMessage: { text: validText } },
-        { userJid: senderJid }
+        { userJid: usedLid ? senderJid : sock.user?.id ? jidNormalizedUser(sock.user.id) : senderJid }
       );
       msgId = waMsg.key?.id || msgId;
       if (waMsg.message) {
-        this.memoryStore.cacheSentMessage(lidJid, msgId, waMsg.message);
+        this.memoryStore.cacheSentMessage(deliveryJid, msgId, waMsg.message);
       }
 
       if (typeof sock.relayMessage === 'function') {
-        await sock.relayMessage(lidJid, waMsg.message!, {
-          messageId: msgId,
-          addressingMode: 'lid',
-          additionalAttributes: { addressing_mode: 'lid' },
-        });
+        await sock.relayMessage(
+          deliveryJid,
+          waMsg.message!,
+          usedLid
+            ? {
+                messageId: msgId,
+                addressingMode: 'lid',
+                additionalAttributes: { addressing_mode: 'lid' },
+              }
+            : {
+                messageId: msgId,
+              }
+        );
       } else {
         const res = await sock.sendMessage(
-          lidJid,
+          deliveryJid,
           { text: validText },
-          { addressingMode: 'lid' }
+          usedLid ? { addressingMode: 'lid' } : undefined
         );
         if (res?.key?.id) {
           msgId = res.key.id;
         }
         if (res?.message) {
-          this.memoryStore.cacheSentMessage(lidJid, msgId, res.message);
+          this.memoryStore.cacheSentMessage(deliveryJid, msgId, res.message);
         }
       }
     } finally {
-      if (params.customPushName && sock.user) {
+      if (sock.user) {
         sock.user.name = previousName;
       }
     }
@@ -3192,9 +3515,10 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
 
     return {
       messageId: msgId,
-      targetLid: lidJid,
+      targetLid: deliveryJid,
       resolvedPn: pnJid,
       resolutionSource: source,
+      usedLid,
     };
   }
 
@@ -3224,12 +3548,15 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
       params.staleComposingTimeoutMs ?? 12_000
     );
 
-    const validated = validateRecipient(params.recipient);
+    const cleanRecipient = String(params.recipient || '').includes('@')
+      ? String(params.recipient || '').trim()
+      : String(params.recipient || '').replace(/[\s\-()]+/g, '');
+    const validated = validateRecipient(cleanRecipient);
     const targetJid = jidNormalizedUser(validated.jid);
     let pnJid = targetJid.endsWith('@s.whatsapp.net') ? targetJid : undefined;
     let lidJid = targetJid.endsWith('@lid') ? targetJid : undefined;
 
-    const resolved = await this.resolveLidForRecipient(params.recipient).catch(
+    const resolved = await this.resolveLidForRecipient(cleanRecipient).catch(
       () => null
     );
     if (resolved) {
@@ -3256,6 +3583,7 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
 
     // 3. Subscribe to both PN and LID JIDs
     const subscribeBoth = async () => {
+      await sock.sendPresenceUpdate('available').catch(() => undefined);
       if (pnJid) {
         await sock.presenceSubscribe(pnJid).catch(() => undefined);
       }
@@ -3308,12 +3636,25 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
         clearInterval(staleWatchdogInterval);
         unsubListener();
         this.activePresenceCleanups.delete(cleanup);
+        const keySet = this.activePresenceTrackersByKey.get(primaryKey);
+        if (keySet) {
+          keySet.delete(cleanup);
+          if (keySet.size === 0) {
+            this.activePresenceTrackersByKey.delete(primaryKey);
+          }
+        }
         if (!settled) {
           settled = true;
           resolve();
         }
       };
       this.activePresenceCleanups.add(cleanup);
+      let keySet = this.activePresenceTrackersByKey.get(primaryKey);
+      if (!keySet) {
+        keySet = new Set();
+        this.activePresenceTrackersByKey.set(primaryKey, keySet);
+      }
+      keySet.add(cleanup);
     });
 
     const finalRecord =
@@ -3338,6 +3679,42 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
     }
 
     return finalRecord;
+  }
+
+  /**
+   * Stops active recipient presence tracking loop(s) immediately without sending `unavailable`.
+   */
+  public stopTrackingRecipientPresence(recipient?: string): number {
+    let stoppedCount = 0;
+    if (!recipient) {
+      for (const set of this.activePresenceTrackersByKey.values()) {
+        for (const fn of Array.from(set)) {
+          fn();
+          stoppedCount++;
+        }
+      }
+      this.activePresenceTrackersByKey.clear();
+      return stoppedCount;
+    }
+
+    const clean = recipient.includes('@')
+      ? recipient.trim()
+      : recipient.replace(/[\s\-()]+/g, '');
+    let normalizedKey = clean;
+    try {
+      normalizedKey = jidNormalizedUser(validateRecipient(clean).jid);
+    } catch {
+      // keep raw
+    }
+    const matchingSet = this.activePresenceTrackersByKey.get(normalizedKey);
+    if (matchingSet) {
+      for (const fn of Array.from(matchingSet)) {
+        fn();
+        stoppedCount++;
+      }
+      this.activePresenceTrackersByKey.delete(normalizedKey);
+    }
+    return stoppedCount;
   }
 
   /**
@@ -3368,7 +3745,10 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
     );
     const pulseIntervalMs = Math.max(50, params.pulseIntervalMs ?? 7_500);
 
-    const validated = validateRecipient(params.recipient);
+    const cleanRecipient = String(params.recipient || '').includes('@')
+      ? String(params.recipient || '').trim()
+      : String(params.recipient || '').replace(/[\s\-()]+/g, '');
+    const validated = validateRecipient(cleanRecipient);
     const resolvedJid = validated.jid.endsWith('@s.whatsapp.net')
       ? await this.resolveDirectRecipientJid(sock, validated.jid)
       : jidNormalizedUser(validated.jid);
@@ -3402,12 +3782,25 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
         clearInterval(pulseTimer);
         clearTimeout(endTimer);
         this.activePresenceCleanups.delete(cleanup);
+        const hbSet = this.activePresenceHeartbeatsByKey.get(resolvedJid);
+        if (hbSet) {
+          hbSet.delete(cleanup);
+          if (hbSet.size === 0) {
+            this.activePresenceHeartbeatsByKey.delete(resolvedJid);
+          }
+        }
         if (!settled) {
           settled = true;
           resolve();
         }
       };
       this.activePresenceCleanups.add(cleanup);
+      let hbSet = this.activePresenceHeartbeatsByKey.get(resolvedJid);
+      if (!hbSet) {
+        hbSet = new Set();
+        this.activePresenceHeartbeatsByKey.set(resolvedJid, hbSet);
+      }
+      hbSet.add(cleanup);
     });
 
     if (this.sock && this.wsOpen) {
@@ -3419,6 +3812,42 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
       targetJid: resolvedJid,
       durationMs: Math.max(0, Date.now() - startedAt),
     };
+  }
+
+  /**
+   * Stops active presence heartbeat broadcast(s) immediately.
+   */
+  public stopPresenceHeartbeat(recipient?: string): number {
+    let stoppedCount = 0;
+    if (!recipient) {
+      for (const set of this.activePresenceHeartbeatsByKey.values()) {
+        for (const fn of Array.from(set)) {
+          fn();
+          stoppedCount++;
+        }
+      }
+      this.activePresenceHeartbeatsByKey.clear();
+      return stoppedCount;
+    }
+
+    const clean = recipient.includes('@')
+      ? recipient.trim()
+      : recipient.replace(/[\s\-()]+/g, '');
+    let normalizedKey = clean;
+    try {
+      normalizedKey = jidNormalizedUser(validateRecipient(clean).jid);
+    } catch {
+      // keep raw
+    }
+    const matchingSet = this.activePresenceHeartbeatsByKey.get(normalizedKey);
+    if (matchingSet) {
+      for (const fn of Array.from(matchingSet)) {
+        fn();
+        stoppedCount++;
+      }
+      this.activePresenceHeartbeatsByKey.delete(normalizedKey);
+    }
+    return stoppedCount;
   }
 
   /**
@@ -4029,6 +4458,8 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
     expirationSeconds: number;
     triggerMode?: 'ON_SEND' | 'ON_READ';
     setChatEphemeralIq?: boolean;
+    useRevokeDelete?: boolean;
+    viewOnce?: boolean;
   }): Promise<{
     messageId: string;
     targetJid: string;
@@ -4055,7 +4486,10 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
 
     // Keep PN JID (`@s.whatsapp.net`) when user provides a phone number so both sendMessage and delete
     // use the exact same JID; only use `@lid` if the caller explicitly passed `@lid`.
-    const validated = validateRecipient(params.recipient);
+    const cleanRecipient = String(params.recipient || '').includes('@')
+      ? String(params.recipient || '').trim()
+      : String(params.recipient || '').replace(/[\s\-()]+/g, '');
+    const validated = validateRecipient(cleanRecipient);
     const resolvedJid = validated.jid.endsWith('@s.whatsapp.net')
       ? await this.resolveDirectRecipientJid(sock, validated.jid)
       : jidNormalizedUser(validated.jid);
@@ -4087,10 +4521,22 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
         .catch(() => undefined);
     }
 
-    // Layer 2: Send message with ephemeralExpiration in contextInfo
+    // Layer 2: Send message with native Protobuf contextInfo.expiration + disappearingMode + ephemeralExpiration
+    // so the recipient's WhatsApp client natively expires the message silently without a "This message was deleted" tombstone.
+    const nowSec = Math.floor(Date.now() / 1000);
     const res = await sock.sendMessage(
       resolvedJid,
-      { text: params.text },
+      {
+        text: params.text,
+        ...(params.viewOnce ? { viewOnce: true } : {}),
+        contextInfo: {
+          expiration: expSec,
+          ephemeralSettingTimestamp: nowSec,
+          disappearingMode: {
+            initiator: 0,
+          },
+        },
+      } as AnyMessageContent,
       { ephemeralExpiration: expSec }
     );
 
@@ -4106,38 +4552,47 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
       this.memoryStore.cacheSentMessage(resolvedJid, msgId, res.message);
     }
 
-    // Layer 3: Guaranteed Protocol Auto-Revoke Timer
+    // Layer 3: Protocol Auto-Revoke Timer
+    // Only send `{ delete: exactSentKey }` (which produces "🚫 تم حذف هذه الرسالة" on recipient phones)
+    // when explicitly requested via `useRevokeDelete: true`, `setChatEphemeralIq: true`, or `triggerMode === 'ON_READ'`.
+    const shouldScheduleRevokeDelete = Boolean(
+      params.useRevokeDelete ??
+        (params.setChatEphemeralIq === true || triggerMode === 'ON_READ')
+    );
+
     const nowMs = Date.now();
     let scheduledRevokeAtMs = nowMs + expSec * 1000;
 
-    if (triggerMode === 'ON_READ') {
-      const fallbackDelaySec = Math.max(expSec * 3, 180);
-      scheduledRevokeAtMs = nowMs + fallbackDelaySec * 1000;
-      const fallbackTimer = setTimeout(() => {
-        this.pendingOnReadRevokes.delete(msgId);
+    if (shouldScheduleRevokeDelete) {
+      if (triggerMode === 'ON_READ') {
+        const fallbackDelaySec = Math.max(expSec * 3, 180);
+        scheduledRevokeAtMs = nowMs + fallbackDelaySec * 1000;
+        const fallbackTimer = setTimeout(() => {
+          this.pendingOnReadRevokes.delete(msgId);
+          this.scheduleEphemeralRevokeTimer(
+            msgId,
+            resolvedJid,
+            exactSentKey,
+            10
+          );
+        }, fallbackDelaySec * 1000);
+        if (typeof fallbackTimer.unref === 'function') {
+          fallbackTimer.unref();
+        }
+        this.pendingOnReadRevokes.set(msgId, {
+          targetJid: resolvedJid,
+          key: exactSentKey,
+          expirationSeconds: expSec,
+          fallbackTimer,
+        });
+      } else {
         this.scheduleEphemeralRevokeTimer(
           msgId,
           resolvedJid,
           exactSentKey,
-          10
+          expSec * 1000
         );
-      }, fallbackDelaySec * 1000);
-      if (typeof fallbackTimer.unref === 'function') {
-        fallbackTimer.unref();
       }
-      this.pendingOnReadRevokes.set(msgId, {
-        targetJid: resolvedJid,
-        key: exactSentKey,
-        expirationSeconds: expSec,
-        fallbackTimer,
-      });
-    } else {
-      this.scheduleEphemeralRevokeTimer(
-        msgId,
-        resolvedJid,
-        exactSentKey,
-        expSec * 1000
-      );
     }
 
     await Promise.allSettled([this.credsSaveChain, this.flushAuthWrites()]);
@@ -4638,12 +5093,24 @@ export class MockWhatsAppSessionDriver implements WhatsAppSessionDriver {
       throw new WhatsAppConnectionError('فشل إرسال الرسالة من هذه الجلسة (رفض من الخادم).');
     }
     this.sentMessagesCount++;
+    const messageId = `sim_msg_${this.sessionId}_${Date.now()}`;
+    getNetworkTrafficMonitor().recordWhatsAppStanza({
+      sessionId: this.sessionId,
+      direction: 'OUTBOUND',
+      node: {
+        tag: 'message',
+        attrs: { id: messageId, to: recipientJid, type: 'text' },
+        content: [{ tag: 'body', attrs: {}, content: text.slice(0, 180) }],
+      },
+      durationMs: Math.max(1, this.simulatedDelayMs),
+      statusCode: 'SENT',
+    });
     log.debug('Simulated text message sent', {
       sessionId: this.sessionId,
       recipientJid,
       length: text.length,
     });
-    return { messageId: `sim_msg_${this.sessionId}_${Date.now()}` };
+    return { messageId };
   }
 
   public async sendMediaMessage(params: {
@@ -5004,12 +5471,22 @@ export class MockWhatsAppSessionDriver implements WhatsAppSessionDriver {
     };
   }
 
+  public stopTrackingRecipientPresence(_recipient?: string): number {
+    return 1;
+  }
+
+  public stopPresenceHeartbeat(_recipient?: string): number {
+    return 1;
+  }
+
   public async sendShortEphemeralMessage(params: {
     recipient: string;
     text: string;
     expirationSeconds: number;
     triggerMode?: 'ON_SEND' | 'ON_READ';
     setChatEphemeralIq?: boolean;
+    useRevokeDelete?: boolean;
+    viewOnce?: boolean;
   }): Promise<{
     messageId: string;
     targetJid: string;
@@ -5076,6 +5553,13 @@ export class MockWhatsAppSessionDriver implements WhatsAppSessionDriver {
     }
     this.sentNodes.push(node);
     this.sentMessagesCount++;
+    getNetworkTrafficMonitor().recordWhatsAppStanza({
+      sessionId: this.sessionId,
+      direction: 'OUTBOUND',
+      node: node as unknown as InspectableBinaryNode,
+      durationMs: Math.max(1, this.simulatedDelayMs),
+      statusCode: 'SENT',
+    });
   }
 
   public async query(node: BinaryNode, _timeoutMs?: number): Promise<unknown> {
@@ -5083,7 +5567,20 @@ export class MockWhatsAppSessionDriver implements WhatsAppSessionDriver {
       throw new WhatsAppConnectionError('الجلسة غير متصلة حالياً.');
     }
     this.sentNodes.push(node);
-    return { tag: 'iq', attrs: { type: 'result' }, content: [] };
+    const responseNode: InspectableBinaryNode = {
+      tag: 'iq',
+      attrs: { type: 'result', id: node.attrs?.id },
+      content: [],
+    };
+    getNetworkTrafficMonitor().recordWhatsAppStanza({
+      sessionId: this.sessionId,
+      direction: 'OUTBOUND',
+      node: node as unknown as InspectableBinaryNode,
+      responseNode,
+      durationMs: Math.max(1, this.simulatedDelayMs),
+      statusCode: 'RESULT',
+    });
+    return responseNode;
   }
 
   public async recordSimulatedVoipCallOffer(

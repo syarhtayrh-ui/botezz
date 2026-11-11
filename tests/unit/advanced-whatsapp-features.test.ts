@@ -27,6 +27,11 @@ import { TaskRunner } from '../../src/tasks/task-runner';
 import { TaskManager } from '../../src/tasks/task-manager';
 import { TelegramBotController } from '../../src/bot/bot';
 import { AppConfig } from '../../src/config/env';
+import {
+  buildH264RtpPackets,
+  computeWhatsAppSecureSsrc,
+  instrumentMediaSessionInstance,
+} from '../../src/whatsapp/voip-runtime-patch';
 
 function createFakeBaileysSocket(overrides?: Partial<Record<string, any>>): {
   sock: WASocket;
@@ -662,7 +667,259 @@ test('5. TelegramBotController & ToolsHandler end-to-end commands (/anonmsg, /pr
   assert.equal(mockDrv.sentShortEphemeralMessages.length, 1);
   assert.equal(mockDrv.sentShortEphemeralMessages[0].expirationSeconds, 5);
 
+  // 5. /anonmsg with pipe separator and formatted phone number with spaces
+  const anonPipeView = await controller.handleTextMessage(
+    adminId,
+    '/anonmsg +966 50 999 8888 | رسالة مفصولة بعلامة الأنبوب'
+  );
+  assert.ok(anonPipeView.text.includes('تم إرسال الرسالة عبر بروتوكول الهوية المخفية'));
+  assert.equal(mockDrv.sentAnonymousLidMessages.length, 2);
+  assert.equal(mockDrv.sentAnonymousLidMessages[1].recipient, '+966509998888');
+  assert.equal(
+    mockDrv.sentAnonymousLidMessages[1].text,
+    'رسالة مفصولة بعلامة الأنبوب'
+  );
+
+  // 6. Stop presence callback
+  const stopPresView = await controller.handleCallbackQuery(
+    adminId,
+    'tools:presence_stop'
+  );
+  assert.ok(stopPresView.text.includes('تم إيقاف جلسات رصد التواجد الحي بنجاح'));
+
   await sessionManager.shutdownAll();
   db.close();
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
+
+test('6. Root-Cause Remediation Suite: RFC 6184 H.264 RTP Marker Bit, In-Band SPS/PPS Injection, videoSsrc Sync, Silent Ephemeral, and Safe LID Fallback', async () => {
+  // -------------------------------------------------------------------------
+  // A. RFC 6184 H.264 RTP Marker Bit & Fragmentation Verification
+  // -------------------------------------------------------------------------
+  let seq = 100;
+  const nextSeq = () => {
+    seq = (seq + 1) & 0xffff;
+    return seq;
+  };
+  const ssrc = 0x12345678;
+  const ts = 90_000;
+
+  // SPS (NALU Type 7 = 0x67): Single NALU MUST have Marker Bit = 0 (byte[1] = 0x60)
+  const spsNalu = Buffer.from([0x67, 0x42, 0xc0, 0x1f, 0xda, 0x02, 0x80, 0x2d]);
+  const spsPkts = buildH264RtpPackets(spsNalu, ts, nextSeq, ssrc, false);
+  assert.equal(spsPkts.length, 1);
+  assert.equal(spsPkts[0][1] & 0x80, 0, 'SPS packet MUST have Marker bit = 0');
+  assert.equal(spsPkts[0][1] & 0x7f, 96, 'Payload type MUST be 96');
+
+  // PPS (NALU Type 8 = 0x68): Single NALU MUST have Marker Bit = 0
+  const ppsNalu = Buffer.from([0x68, 0xce, 0x3c, 0x80]);
+  const ppsPkts = buildH264RtpPackets(ppsNalu, ts, nextSeq, ssrc, false);
+  assert.equal(ppsPkts.length, 1);
+  assert.equal(ppsPkts[0][1] & 0x80, 0, 'PPS packet MUST have Marker bit = 0');
+
+  // Small IDR (NALU Type 5 = 0x65): Single NALU MUST have Marker Bit = 1 (byte[1] = 0xe0)
+  const smallIdrNalu = Buffer.concat([
+    Buffer.from([0x65]),
+    Buffer.alloc(200, 0xaa),
+  ]);
+  const smallIdrPkts = buildH264RtpPackets(smallIdrNalu, ts, nextSeq, ssrc, true);
+  assert.equal(smallIdrPkts.length, 1);
+  assert.equal(
+    smallIdrPkts[0][1] & 0x80,
+    0x80,
+    'Final VCL IDR packet MUST have Marker bit = 1'
+  );
+
+  // Fragmented IDR (FU-A, Type 28): Only the last fragment (E=1) gets Marker Bit = 1
+  const largeIdrNalu = Buffer.concat([
+    Buffer.from([0x65]),
+    Buffer.alloc(2200, 0xbb),
+  ]);
+  const fuaPkts = buildH264RtpPackets(largeIdrNalu, ts, nextSeq, ssrc, true);
+  assert.ok(fuaPkts.length >= 3);
+  for (let i = 0; i < fuaPkts.length - 1; i++) {
+    assert.equal(
+      fuaPkts[i][1] & 0x80,
+      0,
+      `Intermediate FU-A fragment ${i} MUST have Marker bit = 0`
+    );
+  }
+  assert.equal(
+    fuaPkts[fuaPkts.length - 1][1] & 0x80,
+    0x80,
+    'Final FU-A fragment MUST have Marker bit = 1'
+  );
+
+  // -------------------------------------------------------------------------
+  // B. InstrumentedMediaSession: Unified 90kHz Timestamp, Auto SPS/PPS Prepending & videoSsrc Sync
+  // -------------------------------------------------------------------------
+  const sentUdpPayloads: Buffer[] = [];
+  const fakeMediaSession: any = {
+    info: {
+      callId: 'ABCDEF1234567890',
+      peerJid: '212751487918725:0@lid',
+      isVideo: true,
+      callKey: Buffer.alloc(32, 0x11),
+    },
+    sock: {
+      user: {
+        id: '966501112222:33@s.whatsapp.net',
+        lid: '1009988776655:33@lid',
+      },
+    },
+    selfSsrcJid: '1009988776655:0@lid',
+    videoSsrc: computeWhatsAppSecureSsrc(
+      'ABCDEF1234567890',
+      '1009988776655:0@lid',
+      2
+    ),
+    videoRtpStream: {
+      ssrc: 111,
+      seq: 1,
+      timestamp: 0,
+      nextSeq() {
+        this.seq = (this.seq + 1) & 0xffff;
+        return this.seq;
+      },
+    },
+    srtpSession: {
+      protect(pkt: Buffer) {
+        return pkt;
+      },
+    },
+    sendMediaPayload(pkt: Buffer) {
+      sentUdpPayloads.push(Buffer.from(pkt));
+    },
+    handleCallAck() {
+      // Simulate WaCallMediaSession.handleCallAck updating selfSsrcJid to companion device :33@lid
+      this.selfSsrcJid = '1009988776655:33@lid';
+    },
+  };
+
+  instrumentMediaSessionInstance(fakeMediaSession);
+
+  // Trigger handleCallAck -> should automatically synchronize videoSsrc to streamIndex=2 of '1009988776655:33@lid'
+  await fakeMediaSession.handleCallAck({ attrs: {} });
+  const expectedVideoSsrc = computeWhatsAppSecureSsrc(
+    'ABCDEF1234567890',
+    '1009988776655:33@lid',
+    2
+  );
+  assert.equal(fakeMediaSession.videoSsrc, expectedVideoSsrc);
+  assert.equal(fakeMediaSession.videoRtpStream.ssrc, expectedVideoSsrc);
+
+  // Send SPS + PPS + IDR in first Access Unit
+  fakeMediaSession.sendVideoAccessUnit([spsNalu, ppsNalu, smallIdrNalu]);
+  assert.equal(sentUdpPayloads.length, 3);
+  const tsSps1 = sentUdpPayloads[0].readUInt32BE(4);
+  const tsPps1 = sentUdpPayloads[1].readUInt32BE(4);
+  const tsIdr1 = sentUdpPayloads[2].readUInt32BE(4);
+  assert.equal(tsSps1, tsPps1, 'SPS and PPS must share identical RTP timestamp');
+  assert.equal(tsPps1, tsIdr1, 'PPS and IDR must share identical RTP timestamp');
+  assert.equal(sentUdpPayloads[0][1] & 0x80, 0, 'SPS Marker = 0');
+  assert.equal(sentUdpPayloads[1][1] & 0x80, 0, 'PPS Marker = 0');
+  assert.equal(sentUdpPayloads[2][1] & 0x80, 0x80, 'IDR Marker = 1');
+
+  // Send a standalone IDR without SPS/PPS -> should automatically prepend cached SPS + PPS with same next timestamp!
+  sentUdpPayloads.length = 0;
+  fakeMediaSession.sendVideoAccessUnit([smallIdrNalu]);
+  assert.equal(
+    sentUdpPayloads.length,
+    3,
+    'Cached SPS and PPS must be auto-prepended before standalone IDR'
+  );
+  const tsSps2 = sentUdpPayloads[0].readUInt32BE(4);
+  const tsIdr2 = sentUdpPayloads[2].readUInt32BE(4);
+  assert.equal(tsSps2, tsIdr2);
+  assert.equal(
+    (tsIdr2 - tsIdr1) >>> 0,
+    6000,
+    'Timestamp must advance by exactly 6000 ticks (15fps @ 90kHz) per VCL frame'
+  );
+
+  // -------------------------------------------------------------------------
+  // C. Silent Self-Destructing Ephemeral Default Mode (No Delete Tombstone)
+  // -------------------------------------------------------------------------
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'botezz-remed-'));
+  const driver = new HiroosyBaileysSessionDriver('sess_remed_1', tmpDir);
+  const fake = createFakeBaileysSocket();
+  driver.attachSocketForTesting(fake.sock);
+
+  const silentEph = await driver.sendShortEphemeralMessage({
+    recipient: '+966 50 123 4567',
+    text: 'رسالة تختفي بصمت بدون تم حذف هذه الرسالة',
+    expirationSeconds: 1,
+    triggerMode: 'ON_SEND',
+  });
+  assert.equal(silentEph.targetJid, '966501234567@s.whatsapp.net');
+  assert.equal(fake.sentMessages.length, 1);
+  assert.equal(fake.sentMessages[0].options?.ephemeralExpiration, 1);
+  assert.equal(
+    (fake.sentMessages[0].content.contextInfo as any)?.expiration,
+    1
+  );
+  await new Promise((r) => setTimeout(r, 1150));
+  assert.equal(
+    fake.sentMessages.length,
+    1,
+    'Default ON_SEND ephemeral must NOT send a revoke delete tombstone'
+  );
+
+  // -------------------------------------------------------------------------
+  // D. Safe Anonymous LID Fallback When Server Exposes No @lid
+  // -------------------------------------------------------------------------
+  const fakeNoLid = createFakeBaileysSocket({
+    onWhatsApp: async (jid: string) => [
+      { jid: jid.replace(/^\+/, ''), exists: true },
+    ],
+    query: async () => ({ tag: 'iq', attrs: { type: 'result' }, content: [] }),
+  });
+  const driverNoLid = new HiroosyBaileysSessionDriver('sess_nolid_1', tmpDir);
+  driverNoLid.attachSocketForTesting(fakeNoLid.sock);
+
+  const fallbackRes = await driverNoLid.sendAnonymousLidMessage({
+    recipient: '+966 50 123 4567',
+    text: 'رسالة مع بديل آمن عند غياب LID',
+  });
+  assert.equal(fallbackRes.targetLid, '966501234567@s.whatsapp.net');
+  assert.equal(fallbackRes.resolutionSource, 'PN_FALLBACK');
+  assert.equal(fallbackRes.usedLid, false);
+
+  // -------------------------------------------------------------------------
+  // E. SessionMemoryStore Presence Transitions: paused & disconnect lastSeen
+  // -------------------------------------------------------------------------
+  const store = new SessionMemoryStore();
+  store.applyPresenceTransition({
+    chatJid: '966501234567@s.whatsapp.net',
+    participantJid: '966501234567@s.whatsapp.net',
+    state: 'composing',
+  });
+  store.applyPresenceTransition({
+    chatJid: '966501234567@s.whatsapp.net',
+    participantJid: '966501234567@s.whatsapp.net',
+    state: 'paused',
+  });
+  const recAfterPaused = store.presences.get('966501234567@s.whatsapp.net')!;
+  assert.ok(
+    recAfterPaused.onlineSessionStartedAtMs !== undefined,
+    'paused state must keep onlineSessionStartedAtMs active'
+  );
+
+  store.applyPresenceTransition({
+    chatJid: '966501234567@s.whatsapp.net',
+    participantJid: '966501234567@s.whatsapp.net',
+    state: 'unavailable',
+  });
+  const recAfterOffline = store.presences.get('966501234567@s.whatsapp.net')!;
+  assert.equal(recAfterOffline.onlineSessionStartedAtMs, undefined);
+  assert.ok(
+    typeof recAfterOffline.lastSeenTimestampSec === 'number' &&
+      recAfterOffline.lastSeenTimestampSec > 0,
+    'Transition from online to unavailable must record lastSeenTimestampSec'
+  );
+
+  await driver.disconnect();
+  await driverNoLid.disconnect();
+  fs.rmSync(tmpDir, { recursive: true, force: true });
+});
+

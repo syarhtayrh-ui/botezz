@@ -43,6 +43,8 @@ import { IncomingMessageReceiver } from '../whatsapp/incoming-message-receiver';
 import { StatusDownloaderService } from '../whatsapp/status-downloader';
 import { InboxHandler, InboxFilterKind } from './handlers/inbox';
 import { StoriesHandler, StoriesFilterKind } from './handlers/stories';
+import { NetworkTrafficHandler } from './handlers/network';
+import { NetworkTrafficFilter } from '../network/network-traffic-monitor';
 import { toSafeArabicError } from '../utils/errors';
 import { createLogger } from '../logging/logger';
 
@@ -121,6 +123,7 @@ export class TelegramBotController {
   public readonly statusDownloader: StatusDownloaderService;
   public readonly inboxHandler: InboxHandler;
   public readonly storiesHandler: StoriesHandler;
+  public readonly networkHandler: NetworkTrafficHandler;
   public onCallRecordingReady?: (
     ownerTelegramId: number,
     attachment: {
@@ -309,6 +312,10 @@ export class TelegramBotController {
       deps.sessionManager,
       deps.taskManager,
       deps.settingsRepo,
+      deps.auditRepo
+    );
+    this.networkHandler = new NetworkTrafficHandler(
+      deps.sessionManager,
       deps.auditRepo
     );
   }
@@ -1198,6 +1205,12 @@ export class TelegramBotController {
       this.activeConversationMode.set(actorUserId, 'TOOLS');
       return this.toolsHandler.promptPresenceTool(actorUserId);
     }
+    if (callbackData === 'tools:presence_stop') {
+      return this.toolsHandler.stopPresenceTrackingForAdmin(actorUserId);
+    }
+    if (callbackData === 'tools:heartbeat_stop') {
+      return this.toolsHandler.stopPresenceHeartbeatForAdmin(actorUserId);
+    }
     if (callbackData.startsWith('tools:presence_hb:')) {
       const modeRaw = callbackData
         .slice('tools:presence_hb:'.length)
@@ -1234,6 +1247,42 @@ export class TelegramBotController {
     if (callbackData === 'tools:ephemeral_toggle_trigger') {
       this.activeConversationMode.set(actorUserId, 'TOOLS');
       return this.toolsHandler.toggleEphemeralTriggerMode(actorUserId);
+    }
+
+    // 13: Network Traffic & Protocol Telemetry Inspector (Owner-Only)
+    if (callbackData === 'menu:network') {
+      this.cancelAllWorkflowsForAdmin(actorUserId);
+      return this.networkHandler.renderDashboard(actorUserId, 'ALL', 1);
+    }
+    if (callbackData.startsWith('net:list:')) {
+      const parts = callbackData.split(':');
+      const rawFilter = (parts[2] || 'ALL').toUpperCase();
+      const page = Number(parts[3] || '1') || 1;
+      const validFilter: NetworkTrafficFilter =
+        rawFilter === 'HTTP' ||
+        rawFilter === 'WA_STANZA' ||
+        rawFilter === 'LOCAL_API' ||
+        rawFilter === 'VOIP_RTP' ||
+        rawFilter === 'ERRORS'
+          ? (rawFilter as NetworkTrafficFilter)
+          : 'ALL';
+      return this.networkHandler.renderDashboard(actorUserId, validFilter, page);
+    }
+    if (callbackData.startsWith('net:view:')) {
+      const shortId = callbackData.slice('net:view:'.length);
+      return this.networkHandler.renderEntryDetail(actorUserId, shortId);
+    }
+    if (callbackData === 'net:ping') {
+      return this.networkHandler.executeLivePing(actorUserId);
+    }
+    if (callbackData === 'net:export') {
+      return this.networkHandler.exportTrafficReport(actorUserId);
+    }
+    if (callbackData === 'net:toggle') {
+      return this.networkHandler.toggleCapture(actorUserId);
+    }
+    if (callbackData === 'net:clear') {
+      return this.networkHandler.clearBuffer(actorUserId);
     }
 
     return this.startHandler.renderMainMenu({
@@ -1620,6 +1669,21 @@ export class TelegramBotController {
           actorUserId,
           rawArgs
         );
+      }
+
+      if (command === '/nettraffic') {
+        this.cancelAllWorkflowsForAdmin(actorUserId);
+        this.uiState.recordRouteTransition(actorUserId, 'menu:network');
+        return this.networkHandler.handleCommandNetTraffic(actorUserId, args[0]);
+      }
+
+      if (command === '/netinspect') {
+        this.cancelAllWorkflowsForAdmin(actorUserId);
+        const targetId = args[0] || '';
+        if (!targetId) {
+          return this.networkHandler.renderDashboard(actorUserId, 'ALL', 1);
+        }
+        return this.networkHandler.renderEntryDetail(actorUserId, targetId);
       }
 
       if (command === '/testfunction') {

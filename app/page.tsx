@@ -120,6 +120,14 @@ async function loadInitialData(): Promise<HarnessStateResponse> {
       sessions,
       tasks,
       auditLogs,
+      networkTelemetry: {
+        metrics: harness.networkMonitor.getMetrics(),
+        recentEntries: harness.networkMonitor.queryEntries({
+          filter: 'ALL',
+          page: 1,
+          pageSize: 25,
+        }).items,
+      },
       health: {
         status: 'HEALTHY',
         connectedSessions: sessions.filter(

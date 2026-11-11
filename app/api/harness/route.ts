@@ -12,6 +12,15 @@ import {
   verifyWebRequestAuth,
 } from '../../../src/security/web-auth';
 import { toSafeArabicError } from '../../../src/utils/errors';
+import { getNetworkTrafficMonitor } from '../../../src/network/network-traffic-monitor';
+
+function extractClientIp(req: NextRequest): string {
+  const xff = req?.headers?.get?.('x-forwarded-for');
+  if (xff) {
+    return xff.split(',')[0].trim();
+  }
+  return req?.headers?.get?.('x-real-ip') || '127.0.0.1';
+}
 
 export async function GET(req: NextRequest) {
   const auth = verifyWebRequestAuth({
@@ -32,6 +41,7 @@ export async function GET(req: NextRequest) {
   }
 
   try {
+    const startedAt = Date.now();
     const harness = await getRuntimeHarness();
     // In live production mode, read SQLite session records directly so the web dashboard
     // never overwrites live socket statuses owned by the standalone bot process.
@@ -44,6 +54,29 @@ export async function GET(req: NextRequest) {
     const settings = harness.settingsRepo.listAll();
     const runnerStats = harness.taskManager.getRunnerStats();
     const botView = harness.getFreshBotView();
+
+    getNetworkTrafficMonitor().recordLocalApiRequest({
+      method: 'GET',
+      route: '/api/harness',
+      actionSummary: 'Fetch Dashboard State',
+      clientIp: extractClientIp(req),
+      statusCode: 200,
+      durationMs: Math.max(1, Date.now() - startedAt),
+      responsePayload: {
+        sessionsCount: sessions.length,
+        tasksCount: tasks.length,
+        route: botView.route || 'menu:main',
+      },
+    });
+
+    const networkTelemetry = {
+      metrics: harness.networkMonitor.getMetrics(),
+      recentEntries: harness.networkMonitor.queryEntries({
+        filter: 'ALL',
+        page: 1,
+        pageSize: 25,
+      }).items,
+    };
 
     return NextResponse.json({
       ok: true,
@@ -62,6 +95,7 @@ export async function GET(req: NextRequest) {
       tasks,
       auditLogs,
       settings,
+      networkTelemetry,
       health: {
         status: 'HEALTHY',
         connectedSessions: sessions.filter(
@@ -186,6 +220,7 @@ export async function POST(req: NextRequest) {
       ? harness.config.TELEGRAM_ADMIN_ID
       : Number(body.actorUserId) || harness.config.TELEGRAM_ADMIN_ID;
 
+    const postStartedAt = Date.now();
     let view;
     if (body.type === 'callback') {
       view = await harness.controller.handleCallbackQuery(
@@ -210,12 +245,40 @@ export async function POST(req: NextRequest) {
     const auditLogs = harness.auditRepo.listRecent(20).map(toClientSafeAuditDto);
     const runnerStats = harness.taskManager.getRunnerStats();
 
+    getNetworkTrafficMonitor().recordLocalApiRequest({
+      method: 'POST',
+      route: '/api/harness',
+      actionSummary: `${body.type || 'text'}: ${payload.slice(0, 48)}`,
+      clientIp: extractClientIp(req),
+      statusCode: 200,
+      durationMs: Math.max(1, Date.now() - postStartedAt),
+      requestPayload: {
+        type: body.type,
+        actorUserId,
+        payload: payload.slice(0, 120),
+      },
+      responsePayload: {
+        route: view.route,
+        toastText: view.toastText,
+      },
+    });
+
+    const networkTelemetry = {
+      metrics: harness.networkMonitor.getMetrics(),
+      recentEntries: harness.networkMonitor.queryEntries({
+        filter: 'ALL',
+        page: 1,
+        pageSize: 25,
+      }).items,
+    };
+
     return NextResponse.json({
       ok: true,
       botView: harness.getFreshBotView(),
       sessions,
       tasks,
       auditLogs,
+      networkTelemetry,
       health: {
         status: 'HEALTHY',
         connectedSessions: sessions.filter(
@@ -229,15 +292,36 @@ export async function POST(req: NextRequest) {
     });
   } catch (err) {
     const safeErr = toSafeArabicError(err);
+    getNetworkTrafficMonitor().recordLocalApiRequest({
+      method: 'POST',
+      route: '/api/harness',
+      actionSummary: `ERROR: ${String(body?.payload ?? '').slice(0, 40)}`,
+      clientIp: extractClientIp(req),
+      statusCode: safeErr.category === 'AUTHORIZATION_ERROR' ? 403 : 400,
+      durationMs: 1,
+      requestPayload: body,
+      errorDetail: safeErr.userMessage,
+    });
     const auditLogs = harness
       ? harness.auditRepo.listRecent(20).map(toClientSafeAuditDto)
       : [];
+    const networkTelemetry = harness
+      ? {
+          metrics: harness.networkMonitor.getMetrics(),
+          recentEntries: harness.networkMonitor.queryEntries({
+            filter: 'ALL',
+            page: 1,
+            pageSize: 25,
+          }).items,
+        }
+      : undefined;
     return NextResponse.json(
       {
         ok: false,
         error: safeErr.userMessage,
         category: safeErr.category,
         auditLogs,
+        networkTelemetry,
       },
       { status: safeErr.category === 'AUTHORIZATION_ERROR' ? 403 : 400 }
     );

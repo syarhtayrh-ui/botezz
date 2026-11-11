@@ -546,11 +546,23 @@ export async function generatePlayableVoipMp4File(
       '-profile:v',
       'baseline',
       '-level',
-      '3.0',
+      '3.1',
       '-pix_fmt',
       'yuv420p',
       '-preset',
-      'ultrafast'
+      'ultrafast',
+      '-tune',
+      'zerolatency',
+      '-g',
+      '15',
+      '-keyint_min',
+      '15',
+      '-sc_threshold',
+      '0',
+      '-bf',
+      '0',
+      '-x264-params',
+      'repeat-headers=1:annexb=1:bframes=0:cabac=0'
     );
   } else {
     args.push('-c:v', vcodec, '-pix_fmt', 'yuv420p');

@@ -6,6 +6,7 @@ import { promisify } from 'node:util';
 import type { WaCallMediaSessionLike } from '@hiroosy/baileys-lite/voip';
 import { createMinimalMp4Buffer } from '../function-lab/media-sticker-toolkit';
 import { createLogger } from '../logging/logger';
+import { getNetworkTrafficMonitor } from '../network/network-traffic-monitor';
 
 const execFileAsync = promisify(execFile);
 const log = createLogger('voip-call-recorder');
@@ -1704,6 +1705,27 @@ export class VoipCallRecorder {
       this.cleanupTempFiles();
     }
 
-    return this.getSummary();
+    const summary = this.getSummary();
+    try {
+      getNetworkTrafficMonitor().recordVoipStreamTelemetry({
+        sessionId: this.sessionId,
+        callId: this.callId,
+        recipientJid: this.recipientJid,
+        durationMs: Math.max(100, Date.now() - this.startedAtMs),
+        txPackets: Math.max(1, this.pliRequestsSent + 10),
+        rxPackets:
+          this.h264State.inboundVideoPacketsReceived +
+          this.inboundAudioPacketsReceived,
+        txBytes: Math.max(0, this.pliRequestsSent * 12),
+        rxBytes:
+          this.remoteVideoBytesWritten + this.inboundAudioBytesRecorded,
+        packetLossCount: this.h264State.sequenceGapsDetected,
+        isFinal: true,
+      });
+    } catch {
+      // Non-blocking telemetry
+    }
+
+    return summary;
   }
 }

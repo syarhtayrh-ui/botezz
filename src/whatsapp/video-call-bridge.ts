@@ -1707,8 +1707,17 @@ export class RealVideoCallService extends EventEmitter {
         sessionId: stream.sessionId,
       });
 
-      // Ensure mediaSession is instrumented as soon as call connects
-      this.resolveWaCallMediaSession(stream, voip, callInstance);
+      // Ensure mediaSession is instrumented as soon as call connects and trigger an immediate SPS+PPS+IDR burst if cached
+      const connectedMediaSession = this.resolveWaCallMediaSession(
+        stream,
+        voip,
+        callInstance
+      ) as (WaCallMediaSessionLike & { injectCachedSpsPpsKeyframe?: () => boolean }) | undefined;
+      try {
+        connectedMediaSession?.injectCachedSpsPpsKeyframe?.();
+      } catch {
+        // Ignore keyframe burst error before relay ready
+      }
 
       // Transition to MEDIA_NEGOTIATING and wait for real outbound RTP/SRTP audio+video evidence
       this.transitionCallState(stream, 'MEDIA_NEGOTIATING');

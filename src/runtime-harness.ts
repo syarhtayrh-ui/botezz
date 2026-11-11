@@ -17,6 +17,10 @@ import { TaskRunner } from './tasks/task-runner';
 import { TaskManager } from './tasks/task-manager';
 import { TelegramBotController } from './bot/bot';
 import { BotViewResponse } from './bot/workflows/pairing-workflow';
+import {
+  getNetworkTrafficMonitor,
+  NetworkTrafficMonitor,
+} from './network/network-traffic-monitor';
 
 export interface HarnessSingleton {
   config: AppConfig;
@@ -30,6 +34,7 @@ export interface HarnessSingleton {
   auditRepo: AuditRepository;
   settingsRepo: SettingsRepository;
   controller: TelegramBotController;
+  networkMonitor: NetworkTrafficMonitor;
   lastBotView: BotViewResponse;
   getFreshBotView: () => BotViewResponse;
 }
@@ -204,6 +209,65 @@ async function createRuntimeHarness(): Promise<HarnessSingleton> {
     preferEdit: false,
   });
 
+  const networkMonitor = getNetworkTrafficMonitor();
+  if (!isLiveConfigured && networkMonitor.getMetrics().totalEntries === 0) {
+    networkMonitor.recordWhatsAppStanza({
+      sessionId: 'sess_bootstrap',
+      direction: 'OUTBOUND',
+      node: {
+        tag: 'iq',
+        attrs: {
+          id: 'boot_usync_1',
+          to: 's.whatsapp.net',
+          type: 'get',
+          xmlns: 'usync',
+        },
+        content: [
+          {
+            tag: 'usync',
+            attrs: { mode: 'query', context: 'interactive' },
+            content: [
+              {
+                tag: 'query',
+                attrs: {},
+                content: [
+                  { tag: 'contact', attrs: {} },
+                  { tag: 'lid', attrs: {} },
+                  { tag: 'devices', attrs: { version: '2' } },
+                ],
+              },
+            ],
+          },
+        ],
+      },
+      responseNode: {
+        tag: 'iq',
+        attrs: { id: 'boot_usync_1', from: 's.whatsapp.net', type: 'result' },
+        content: [
+          {
+            tag: 'usync',
+            attrs: {},
+            content: [
+              {
+                tag: 'list',
+                attrs: {},
+                content: [
+                  {
+                    tag: 'user',
+                    attrs: { jid: '966501234567@s.whatsapp.net' },
+                    content: [{ tag: 'lid', attrs: { val: '192837465@lid' } }],
+                  },
+                ],
+              },
+            ],
+          },
+        ],
+      },
+      durationMs: 42,
+      statusCode: 'RESULT',
+    });
+  }
+
   const instance: HarnessSingleton = {
     config: effectiveConfig,
     isLiveConfigured,
@@ -216,6 +280,7 @@ async function createRuntimeHarness(): Promise<HarnessSingleton> {
     auditRepo,
     settingsRepo,
     controller,
+    networkMonitor,
     lastBotView: initialView,
     getFreshBotView() {
       const liveCallView = controller.videoCallWorkflow.renderLiveCallStatusView(

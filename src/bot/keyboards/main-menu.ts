@@ -77,6 +77,9 @@ export function buildMainMenuKeyboard(
 
   if (isAdmin) {
     rows.push([
+      { text: '🌐 حركة مرور الشبكة والطلبات', callbackData: 'menu:network' },
+    ]);
+    rows.push([
       { text: '⭐ الاشتراكات (Premium)', callbackData: 'menu:subscriptions:page:1' },
       { text: '🛡️ تحكم المشرف (Admin)', callbackData: 'menu:admin' },
     ]);

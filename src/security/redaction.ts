@@ -99,3 +99,33 @@ export function redactObject<T>(value: T, seen = new WeakSet<object>()): T {
   }
   return output as T;
 }
+
+export { redactObject as redactSensitiveData };
+
+/**
+ * Sanitizes URLs by redacting Telegram Bot tokens (`/bot<TOKEN>/`),
+ * query-string secrets (`token=`, `secret=`, `key=`, `password=`, `auth=`),
+ * and raw credentials in userinfo.
+ */
+export function sanitizeUrl(rawUrl: string): string {
+  if (!rawUrl) return rawUrl;
+  let cleaned = rawUrl
+    .replace(/\/bot[0-9]{6,15}:[A-Za-z0-9_-]{20,64}/gi, '/bot[REDACTED_TOKEN]')
+    .replace(TELEGRAM_BOT_TOKEN_REGEX, '[REDACTED_TELEGRAM_TOKEN]')
+    .replace(
+      /([?&](?:token|secret|password|api_key|apikey|access_token|auth|key)=)[^&#\s]+/gi,
+      '$1[REDACTED]'
+    );
+  try {
+    const parsed = new URL(cleaned);
+    if (parsed.username || parsed.password) {
+      parsed.username = '[REDACTED]';
+      parsed.password = '[REDACTED]';
+      cleaned = parsed.toString();
+    }
+  } catch {
+    // Relative path or non-standard URI; regex sanitization already applied
+  }
+  return cleaned;
+}
+
