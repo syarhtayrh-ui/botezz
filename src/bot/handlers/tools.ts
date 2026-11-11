@@ -823,7 +823,8 @@ export class ToolsHandler {
   public async handleGuidedInput(
     adminId: number,
     rawText: string,
-    repliedText?: string
+    repliedText?: string,
+    onProgressUpdate?: (view: BotViewResponse) => Promise<void>
   ): Promise<BotViewResponse> {
     const step = this.getStep(adminId);
     if (step === 'AWAITING_CHANNEL_LINK') {
@@ -874,7 +875,7 @@ export class ToolsHandler {
     }
     if (step === 'AWAITING_PRESENCE_TRACK_INPUT') {
       this.cancel(adminId);
-      return this.executePresenceTracking(adminId, rawText);
+      return this.executePresenceTracking(adminId, rawText, onProgressUpdate);
     }
     if (step === 'AWAITING_PRESENCE_HEARTBEAT_INPUT') {
       this.cancel(adminId);
@@ -2405,7 +2406,8 @@ export class ToolsHandler {
 
   public async executePresenceCommand(
     adminId: number,
-    rawInput: string
+    rawInput: string,
+    onProgressUpdate?: (view: BotViewResponse) => Promise<void>
   ): Promise<BotViewResponse> {
     const tokens = (rawInput || '').trim().split(/\s+/).filter(Boolean);
     if (tokens.length === 0) {
@@ -2420,14 +2422,23 @@ export class ToolsHandler {
       return this.executePresenceHeartbeat(adminId, tokens.join(' '));
     }
     if (first === 'track' || first === 'watch' || first === 'monitor') {
-      return this.executePresenceTracking(adminId, tokens.slice(1).join(' '));
+      return this.executePresenceTracking(
+        adminId,
+        tokens.slice(1).join(' '),
+        onProgressUpdate
+      );
     }
-    return this.executePresenceTracking(adminId, tokens.join(' '));
+    return this.executePresenceTracking(
+      adminId,
+      tokens.join(' '),
+      onProgressUpdate
+    );
   }
 
   public async executePresenceTracking(
     adminId: number,
-    rawInput: string
+    rawInput: string,
+    onProgressUpdate?: (view: BotViewResponse) => Promise<void>
   ): Promise<BotViewResponse> {
     try {
       const tokens = (rawInput || '').trim().split(/\s+/).filter(Boolean);
@@ -2438,27 +2449,14 @@ export class ToolsHandler {
       const requestedDuration = tokens[1] ? Number(tokens[1]) : 10;
       const durationSeconds = Math.min(
         300,
-        Math.max(1, Number.isFinite(requestedDuration) ? Math.floor(requestedDuration) : 10)
+        Math.max(
+          1,
+          Number.isFinite(requestedDuration) ? Math.floor(requestedDuration) : 10
+        )
       );
 
       const { session, driver } =
         this.getPrimaryConnectedSessionAndDriver(adminId);
-      const record = await driver.trackRecipientPresence({
-        recipient,
-        durationSeconds,
-      });
-
-      this.auditRepo.record({
-        actorTelegramId: adminId,
-        action: 'TOOL_PRESENCE_TRACK',
-        targetId: record.chatJid,
-        outcome: 'SUCCESS',
-        metadata: {
-          sessionId: session.id,
-          durationSeconds,
-          transitionsCount: record.transitions.length,
-        },
-      });
 
       const formatStateAr = (s: string) => {
         switch (s) {
@@ -2475,47 +2473,120 @@ export class ToolsHandler {
         }
       };
 
-      const transitionsLines =
-        record.transitions.length > 0
-          ? record.transitions
-              .slice(-10)
-              .map(
-                (t, idx) =>
-                  `${idx + 1}. \`${new Date(t.timestampMs).toISOString().slice(11, 19)}\` — ${formatStateAr(t.state)} (\`${t.participantJid}\`)`
-              )
-              .join('\n')
-          : '• لم ترد تغييرات حالة خلال نافذة الرصد (أو أن الخصوصية محجوبة).';
+      const renderLivePresenceView = (
+        rec: {
+          chatJid: string;
+          resolvedLid?: string;
+          currentState: string;
+          lastSeenTimestampSec?: number;
+          totalOnlineDurationMs: number;
+          transitions: Array<{
+            state: string;
+            timestampMs: number;
+            participantJid: string;
+          }>;
+        },
+        isFinal: boolean
+      ): BotViewResponse => {
+        const transitionsLines =
+          rec.transitions.length > 0
+            ? rec.transitions
+                .slice(-10)
+                .map(
+                  (t, idx) =>
+                    `${idx + 1}. \`${new Date(t.timestampMs).toISOString().slice(11, 19)}\` — ${formatStateAr(t.state)} (\`${t.participantJid}\`)`
+                )
+                .join('\n')
+            : isFinal
+              ? '• لم ترد تغييرات حالة خلال نافذة الرصد (أو أن الخصوصية محجوبة).'
+              : '• جاري الاستماع الحي لحزم التواجد من خوادم واتساب...';
 
-      const lastSeenText =
-        record.lastSeenTimestampSec && record.lastSeenTimestampSec > 0
-          ? `\`${new Date(record.lastSeenTimestampSec * 1000).toISOString()}\``
-          : 'محجوب أو غير معلن';
+        const lastSeenText =
+          rec.lastSeenTimestampSec && rec.lastSeenTimestampSec > 0
+            ? `\`${new Date(rec.lastSeenTimestampSec * 1000).toISOString()}\``
+            : 'محجوب أو غير معلن';
 
-      return {
-        text:
-          `👁️ *تقرير رصد التواجد الحي (/presence)*\n` +
-          `━━━━━━━━━━━━━━━━━━\n` +
-          `🆔 *الجلسة:* \`${session.id}\`\n` +
-          `📱 *المستلم (Chat JID):* \`${record.chatJid}\`\n` +
-          (record.resolvedLid
-            ? `🕵️ *الهوية المخفية المدمجة (LID):* \`${record.resolvedLid}\`\n`
-            : '') +
-          `📡 *الحالة الحالية:* ${formatStateAr(record.currentState)}\n` +
-          `🕒 *آخر ظهور (Last Seen):* ${lastSeenText}\n` +
-          `⏱️ *نافذة الرصد:* \`${durationSeconds} ثانية\`\n` +
-          `📊 *إجمالي زمن الاتصال النشط:* \`${(record.totalOnlineDurationMs / 1000).toFixed(1)} ثانية\`\n\n` +
-          `📜 *سجل التحولات الزمنية (${record.transitions.length}):*\n${transitionsLines}`,
-        keyboard: [
-          [
-            {
-              text: '🔄 إعادة الرصد',
-              callbackData: 'tools:prompt_presence',
-            },
-            { text: '🔙 قائمة الأدوات', callbackData: 'menu:tools' },
+        return {
+          text:
+            `${isFinal ? '👁️ *تقرير رصد التواجد الحي (/presence)*' : '📡 *جاري الرصد الحي لتواجد الهدف (/presence)...*'}\n` +
+            `━━━━━━━━━━━━━━━━━━\n` +
+            `🆔 *الجلسة:* \`${session.id}\`\n` +
+            `📱 *المستلم (Chat JID):* \`${rec.chatJid}\`\n` +
+            (rec.resolvedLid
+              ? `🕵️ *الهوية المخفية المدمجة (LID):* \`${rec.resolvedLid}\`\n`
+              : '') +
+            `📡 *الحالة الحالية:* ${formatStateAr(rec.currentState)}\n` +
+            `🕒 *آخر ظهور (Last Seen):* ${lastSeenText}\n` +
+            `⏱️ *نافذة الرصد:* \`${durationSeconds} ثانية\`\n` +
+            `📊 *إجمالي زمن الاتصال النشط:* \`${(rec.totalOnlineDurationMs / 1000).toFixed(1)} ثانية\`\n\n` +
+            `📜 *سجل التحولات الزمنية (${rec.transitions.length}):*\n${transitionsLines}`,
+          keyboard: [
+            [
+              {
+                text: '🔄 إعادة الرصد',
+                callbackData: 'tools:prompt_presence',
+              },
+              { text: '🔙 قائمة الأدوات', callbackData: 'menu:tools' },
+            ],
           ],
-        ],
-        toastText: '✅ اكتمل رصد التواجد الحي',
+          ...(isFinal ? { toastText: '✅ اكتمل رصد التواجد الحي' } : {}),
+        };
       };
+
+      let lastProgressSentAt = 0;
+      let lastProgressText = '';
+
+      if (onProgressUpdate) {
+        const initialView = renderLivePresenceView(
+          {
+            chatJid: recipient,
+            currentState: 'unavailable',
+            totalOnlineDurationMs: 0,
+            transitions: [],
+          },
+          false
+        );
+        lastProgressText = initialView.text;
+        lastProgressSentAt = Date.now();
+        await onProgressUpdate(initialView).catch(() => undefined);
+      }
+
+      const record = await driver.trackRecipientPresence({
+        recipient,
+        durationSeconds,
+        onUpdate: onProgressUpdate
+          ? (liveRec) => {
+              const now = Date.now();
+              if (
+                now - lastProgressSentAt < 1500 &&
+                liveRec.transitions.length > 1
+              ) {
+                return;
+              }
+              const liveView = renderLivePresenceView(liveRec, false);
+              if (liveView.text === lastProgressText) {
+                return;
+              }
+              lastProgressText = liveView.text;
+              lastProgressSentAt = now;
+              void onProgressUpdate(liveView).catch(() => undefined);
+            }
+          : undefined,
+      });
+
+      this.auditRepo.record({
+        actorTelegramId: adminId,
+        action: 'TOOL_PRESENCE_TRACK',
+        targetId: record.chatJid,
+        outcome: 'SUCCESS',
+        metadata: {
+          sessionId: session.id,
+          durationSeconds,
+          transitionsCount: record.transitions.length,
+        },
+      });
+
+      return renderLivePresenceView(record, true);
     } catch (err) {
       const safeErr = toSafeArabicError(err);
       return {
@@ -2701,6 +2772,14 @@ export class ToolsHandler {
           ? report.devices.deviceListFormatted.map((d) => `• \`${d}\``).join('\n')
           : '• لم يتم الإعلان عن أجهزة مرافقة إضافية';
 
+      const disappearingSection = report.disappearingMode
+        ? `\n⏳ *وضع الرسائل ذاتية الاختفاء الافتراضي (Disappearing Mode):*\n` +
+          `• *المدة:* \`${report.disappearingMode.durationSeconds} ثانية\`\n` +
+          (report.disappearingMode.setAtIso
+            ? `• *تاريخ التفعيل:* \`${report.disappearingMode.setAtIso}\`\n`
+            : '')
+        : '';
+
       const textReport =
         `🔍 *تقرير الفحص الشامل للملف الشخصي (/fullprofile)*\n` +
         `━━━━━━━━━━━━━━━━━━\n` +
@@ -2718,9 +2797,13 @@ export class ToolsHandler {
         `• *تاريخ التحديث:* \`${report.statusSetAt || 'محجوب / غير متاح'}\`\n` +
         `\n🖼️ *الصورة الشخصية (Profile Picture):*\n` +
         `• *الحالة:* \`${report.profilePicture.status}\` — ${report.profilePicture.statusReasonArabic}\n` +
+        (report.profilePicture.pictureId
+          ? `• *معرف الصورة (Picture ID):* \`${report.profilePicture.pictureId}\`\n`
+          : '') +
         (report.profilePicture.hdUrl
           ? `• *الرابط المباشر (HD):* ${report.profilePicture.hdUrl}\n`
           : '') +
+        disappearingSection +
         `\n👁️ *حالة التواجد (Presence):*\n` +
         `• *الحالة الآنية:* \`${report.presence.currentState}\`\n` +
         (report.presence.lastSeenIso
@@ -2730,33 +2813,43 @@ export class ToolsHandler {
         bizSection +
         `\n👥 *المجموعات المشتركة (${report.sharedGroups.length}):*\n${groupsSection}`;
 
+      const safeDigits = report.pnJid.split('@')[0].replace(/\W/g, '');
+      const photoFileName = `profile_${safeDigits || 'user'}.jpg`;
       const mediaAttachments: TelegramMediaAttachment[] = [];
       if (
         report.profilePicture.imageBuffer &&
         report.profilePicture.imageBuffer.length > 0
       ) {
+        let tempFilePath = '';
         try {
-          const safeDigits = report.pnJid.split('@')[0].replace(/\W/g, '');
-          const tempFilePath = path.join(
+          tempFilePath = path.join(
             os.tmpdir(),
             `botezz_pp_${safeDigits}_${Date.now()}.jpg`
           );
           fs.writeFileSync(tempFilePath, report.profilePicture.imageBuffer);
-          mediaAttachments.push({
-            kind: 'photo',
-            filePath: tempFilePath,
-            fileName: `profile_${safeDigits || 'user'}.jpg`,
-            mimeType: 'image/jpeg',
-            caption: `🖼️ الصورة الشخصية بدقة عالية (HD) — ${report.e164Phone}`,
-          });
         } catch {
-          // Ignore temp file write error; URL is already in text report
+          tempFilePath = '';
         }
+        mediaAttachments.push({
+          kind: 'photo',
+          filePath: tempFilePath,
+          fileName: photoFileName,
+          mimeType: 'image/jpeg',
+          buffer: report.profilePicture.imageBuffer,
+          caption: `🖼️ الصورة الشخصية بدقة عالية (HD) — ${report.e164Phone}`,
+        });
       }
 
       return {
         text: textReport,
-        ...(mediaAttachments.length > 0 ? { mediaAttachments } : {}),
+        ...(report.profilePicture.imageBuffer &&
+        report.profilePicture.imageBuffer.length > 0
+          ? {
+              photoBuffer: report.profilePicture.imageBuffer,
+              photoFileName,
+              mediaAttachments,
+            }
+          : {}),
         keyboard: [
           [
             {

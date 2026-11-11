@@ -254,10 +254,19 @@ test('1. validateRecipient & LID Resolution + sendAnonymousLidMessage across all
 
   assert.equal(fake.sentMessages.length, 1);
   assert.equal(fake.sentMessages[0].jid, '99887766554433@lid');
-  assert.deepEqual(fake.sentMessages[0].content, {
-    text: 'رسالة سرية عبر بروتوكول LID',
-  });
+  assert.equal(
+    (
+      fake.sentMessages[0].content as {
+        extendedTextMessage?: { text?: string };
+      }
+    )?.extendedTextMessage?.text,
+    'رسالة سرية عبر بروتوكول LID'
+  );
   assert.equal(fake.sentMessages[0].options?.addressingMode, 'lid');
+  assert.deepEqual(
+    fake.sentMessages[0].options?.additionalAttributes,
+    { addressing_mode: 'lid' }
+  );
   assert.ok(
     driver.memoryStore.getMessage({
       remoteJid: '99887766554433@lid',
@@ -396,18 +405,19 @@ test('3. Full Profile Inspector (fetchFullProfileInfo): aggregates 7 sources and
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
 
-test('4. Short-Timer Self-Destruct Message (sendShortEphemeralMessage): sends IQ + ephemeralExpiration and auto-revokes on timer or ON_READ receipt', async () => {
+test('4. Short-Timer Self-Destruct Message (sendShortEphemeralMessage): sends ephemeralExpiration and auto-revokes on timer or ON_READ (via message-receipt.update & messages.update)', async () => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'botezz-adv-eph-'));
   const driver = new HiroosyBaileysSessionDriver('sess_eph_1', tmpDir);
   const fake = createFakeBaileysSocket();
   driver.attachSocketForTesting(fake.sock);
 
-  // Case A: ON_SEND auto-revoke after 1 second
+  // Case A: ON_SEND auto-revoke after 1 second (with explicit setChatEphemeralIq: true)
   const ephSend = await driver.sendShortEphemeralMessage({
     recipient: '+966501234567',
     text: 'رسالة تختفي بعد ثانية واحدة',
     expirationSeconds: 1,
     triggerMode: 'ON_SEND',
+    setChatEphemeralIq: true,
   });
 
   assert.equal(ephSend.expirationSeconds, 1);
@@ -415,6 +425,7 @@ test('4. Short-Timer Self-Destruct Message (sendShortEphemeralMessage): sends IQ
   assert.equal(fake.queriedNodes.length, 1);
   assert.equal(fake.queriedNodes[0].attrs.xmlns, 'w:g2');
   assert.equal(fake.sentMessages.length, 1);
+  assert.equal(fake.sentMessages[0].jid, '966501234567@s.whatsapp.net');
   assert.equal(fake.sentMessages[0].options?.ephemeralExpiration, 1);
 
   // Wait 1.15s for the auto-revoke timer to fire
@@ -430,7 +441,7 @@ test('4. Short-Timer Self-Destruct Message (sendShortEphemeralMessage): sends IQ
     },
   });
 
-  // Case B: ON_READ mode waits for read receipt before starting countdown
+  // Case B: ON_READ mode waits for read receipt (or messages.update status=4) before starting countdown
   fake.sentMessages.length = 0;
   const ephRead = await driver.sendShortEphemeralMessage({
     recipient: '+966501234567',
@@ -440,15 +451,15 @@ test('4. Short-Timer Self-Destruct Message (sendShortEphemeralMessage): sends IQ
   });
   assert.equal(driver.pendingOnReadRevokes.has(ephRead.messageId), true);
 
-  // Emit read receipt
-  fake.ev.emit('message-receipt.update', [
+  // Emit messages.update with status=4 (READ) to verify handleMessagesUpdateForReadRevoke
+  fake.ev.emit('messages.update', [
     {
       key: {
         id: ephRead.messageId,
         remoteJid: '966501234567@s.whatsapp.net',
       },
-      receipt: {
-        readTimestamp: Math.floor(Date.now() / 1000),
+      update: {
+        status: 4,
       },
     },
   ]);

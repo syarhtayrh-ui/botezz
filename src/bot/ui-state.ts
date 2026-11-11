@@ -554,14 +554,23 @@ export function createGrammyTransport(
       });
     },
     sendMediaAttachment: async (attachment) => {
-      if (!fs.existsSync(attachment.filePath)) {
+      let inputFile: InputFile;
+      if (attachment.buffer && attachment.buffer.length > 0) {
+        inputFile = new InputFile(
+          attachment.buffer,
+          attachment.fileName || 'profile_hd.jpg'
+        );
+      } else if (attachment.filePath && fs.existsSync(attachment.filePath)) {
+        inputFile = new InputFile(attachment.filePath, attachment.fileName);
+      } else {
         return;
       }
-      const inputFile = new InputFile(attachment.filePath, attachment.fileName);
       const anyCtx = ctx as Record<string, unknown>;
-      const captionOpts = attachment.caption
-        ? { caption: attachment.caption }
-        : {};
+      const safeCaption =
+        attachment.caption && attachment.caption.length > 1024
+          ? `${attachment.caption.slice(0, 1020)}...`
+          : attachment.caption;
+      const captionOpts = safeCaption ? { caption: safeCaption } : {};
       if (
         attachment.kind === 'photo' &&
         typeof anyCtx.replyWithPhoto === 'function'

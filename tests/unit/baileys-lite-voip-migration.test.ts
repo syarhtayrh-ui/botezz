@@ -1296,7 +1296,25 @@ describe('@hiroosy/baileys-lite & Real WhatsApp VoIP Video Call Suite', () => {
       );
       assert.ok(
         fakeMediaSession.videoSrtpSession,
-        'patchedHandleCallAccept must initialize/sync videoSrtpSession when srtpSession is created from peerCallKey'
+        'patchedHandleCallAccept must initialize/sync videoSrtpSession'
+      );
+      const vidSrtp = fakeMediaSession.videoSrtpSession as {
+        sendCtx: { sessionKey: Uint8Array; sessionSalt: Uint8Array; authKey: Uint8Array };
+        recvCtx: { sessionKey: Uint8Array; sessionSalt: Uint8Array; authKey: Uint8Array };
+      };
+      assert.deepEqual(
+        vidSrtp.sendCtx.sessionKey,
+        new Uint8Array(16).fill(0x11),
+        'videoSrtpSession.sendCtx MUST use local outbound callKey and NEVER be overwritten with peerCallKey'
+      );
+      assert.deepEqual(
+        vidSrtp.recvCtx.sessionKey,
+        peerKeyBytes,
+        'videoSrtpSession.recvCtx must hold peer recv keys for inbound decryption'
+      );
+      assert.ok(
+        fakeMediaSession.__peerRecvCtx,
+        'patchedHandleCallAccept must store __peerRecvCtx for VoipCallRecorder'
       );
     });
 

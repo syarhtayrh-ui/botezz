@@ -19,6 +19,7 @@ export interface TelegramMediaAttachment {
   mimeType: string;
   kind: 'document' | 'photo' | 'video' | 'audio' | 'sticker';
   caption?: string;
+  buffer?: Buffer;
 }
 
 export interface BotViewResponse {
@@ -30,6 +31,10 @@ export interface BotViewResponse {
   showAlert?: boolean;
   /** Route identifier for navigation history */
   route?: string;
+  /** Optional in-memory HD photo buffer (e.g. /fullprofile HD profile picture) */
+  photoBuffer?: Buffer;
+  /** Optional file name for photoBuffer */
+  photoFileName?: string;
   /** Optional real file/media attachments to send to Telegram */
   mediaAttachments?: TelegramMediaAttachment[];
   /** Stateful single-message UI delivery metadata */

@@ -529,6 +529,17 @@ describe('Two-Way VoIP Video Call Recording (VoipCallRecorder)', () => {
         ...peerKeys4,
         authTagLen: 10,
       };
+      const pFrameBeforeIdr = protectRtpForTest(
+        buildRawRtpPacket({
+          payloadType: 96,
+          seq: 9,
+          timestamp: 8000,
+          ssrc: 0xbbbb2222,
+          marker: true,
+          payload: new Uint8Array([0x41, 0x9a, 0x24, 0x6c]),
+        }),
+        peerKeys10
+      );
       const spsVideo10 = protectRtpForTest(
         buildRawRtpPacket({
           payloadType: 96,
@@ -539,10 +550,20 @@ describe('Two-Way VoIP Video Call Recording (VoipCallRecorder)', () => {
         }),
         peerKeys10
       );
-      const idrVideo4 = protectRtpForTest(
+      const ppsVideo10 = protectRtpForTest(
         buildRawRtpPacket({
           payloadType: 96,
           seq: 11,
+          timestamp: 9000,
+          ssrc: 0xbbbb2222,
+          payload: new Uint8Array([0x68, 0xce, 0x3c, 0x80]),
+        }),
+        peerKeys10
+      );
+      const idrVideo4 = protectRtpForTest(
+        buildRawRtpPacket({
+          payloadType: 96,
+          seq: 12,
           timestamp: 9000,
           ssrc: 0xbbbb2222,
           marker: true,
@@ -551,14 +572,42 @@ describe('Two-Way VoIP Video Call Recording (VoipCallRecorder)', () => {
         peerKeys4
       );
 
+      // P-frame before first IDR must be parsed but NOT written to remote_video.h264
+      const resPBefore = recorder.handleInboundVideoPacket(
+        pFrameBeforeIdr,
+        fakeSession
+      );
+      assert.ok(resPBefore);
+      assert.deepEqual(resPBefore.nalTypes, [1]);
+      assert.equal(
+        fs.existsSync(recorder.remoteVideoTempPath)
+          ? fs.statSync(recorder.remoteVideoTempPath).size
+          : 0,
+        0,
+        'P-frames before first IDR must never be written to remote_video.h264'
+      );
+
       const res10 = recorder.handleInboundVideoPacket(spsVideo10, fakeSession);
+      const resPps = recorder.handleInboundVideoPacket(ppsVideo10, fakeSession);
       const res4 = recorder.handleInboundVideoPacket(idrVideo4, fakeSession);
 
       assert.ok(res10);
       assert.deepEqual(res10.nalTypes, [7]);
+      assert.ok(resPps);
+      assert.deepEqual(resPps.nalTypes, [8]);
       assert.ok(res4);
       assert.deepEqual(res4.nalTypes, [5]);
-      assert.equal(recorder.srtpBySsrc.get(0xbbbb2222)?.lastSeq, 11);
+      assert.ok(recorder.cachedSps);
+      assert.ok(recorder.cachedPps);
+      assert.equal(recorder.srtpBySsrc.get(0xbbbb2222)?.lastSeq, 12);
+
+      // Verify remote_video.h264 starts with 0x00000001 + SPS (0x67) + 0x00000001 + PPS (0x68) + 0x00000001 + IDR (0x65)
+      const h264Bytes = fs.readFileSync(recorder.remoteVideoTempPath);
+      assert.equal(h264Bytes[0], 0x00);
+      assert.equal(h264Bytes[1], 0x00);
+      assert.equal(h264Bytes[2], 0x00);
+      assert.equal(h264Bytes[3], 0x01);
+      assert.equal(h264Bytes[4], 0x67);
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }

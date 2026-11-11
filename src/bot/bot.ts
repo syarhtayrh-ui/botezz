@@ -1403,11 +1403,23 @@ export class TelegramBotController {
       return this.handleStartCommand(actorUserId, options);
     }
 
+    const onProgressUpdate = async (progressView: BotViewResponse) => {
+      const currentSess = this.uiState.getOrCreateSession(actorUserId);
+      await this.uiState.deliverView({
+        userId: actorUserId,
+        view: progressView,
+        pendingWorkflow: this.getConversationMode(actorUserId),
+        preferEdit: currentSess.activeMessageId !== undefined,
+        transport: options?.transport,
+      });
+    };
+
     const view = await this.routeTextMessageInternal(
       actorUserId,
       text,
       repliedText,
-      options?.chatId
+      options?.chatId,
+      onProgressUpdate
     );
     const sess = this.uiState.getOrCreateSession(actorUserId);
     const preferEdit = sess.activeMessageId !== undefined;
@@ -1425,7 +1437,8 @@ export class TelegramBotController {
     actorUserId: number,
     text: string,
     repliedText?: string,
-    chatId?: number
+    chatId?: number,
+    onProgressUpdate?: (view: BotViewResponse) => Promise<void>
   ): Promise<BotViewResponse> {
     const trimmed = text.trim();
     const parts = trimmed.split(/\s+/);
@@ -1579,7 +1592,11 @@ export class TelegramBotController {
           this.activeConversationMode.set(actorUserId, 'TOOLS');
           return this.toolsHandler.promptPresenceTool(actorUserId);
         }
-        return this.toolsHandler.executePresenceCommand(actorUserId, rawArgs);
+        return this.toolsHandler.executePresenceCommand(
+          actorUserId,
+          rawArgs,
+          onProgressUpdate
+        );
       }
 
       if (command === '/fullprofile' || command === '/whois') {
@@ -2108,7 +2125,8 @@ export class TelegramBotController {
       const response = await this.toolsHandler.handleGuidedInput(
         actorUserId,
         trimmed,
-        repliedText
+        repliedText,
+        onProgressUpdate
       );
       const nextStep = this.toolsHandler.getStep(actorUserId);
       this.activeConversationMode.set(

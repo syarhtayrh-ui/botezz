@@ -332,9 +332,26 @@ export class PerSsrcSrtpDecryptor {
     srtpData: Uint8Array,
     keys: SrtpKeyMaterial
   ): Uint8Array | null {
-    const preferredTagLen = keys.authTagLen ?? 4;
-    const candidateTagLengths =
-      preferredTagLen === 10 ? [10, 4] : preferredTagLen === 4 ? [4, 10] : [preferredTagLen, 4, 10];
+    if (!srtpData || srtpData.length < 16) {
+      return null;
+    }
+    const pt = srtpData[1] & 0x7f;
+    const isVideoPacket = pt >= 96 && pt !== 111 && pt !== 120;
+    const preferredTagLen = keys.authTagLen;
+
+    // WhatsApp mobile clients frequently authenticate inbound video SRTP packets (PT >= 96)
+    // with 10-byte HMAC-SHA1-80 tags even when audio uses 4-byte HMAC-SHA1-32 tags.
+    // Always test 10-byte tag first for video packets (unless explicitly overridden), then 4-byte fallback.
+    const candidateTagLengths = isVideoPacket
+      ? preferredTagLen && preferredTagLen !== 10 && preferredTagLen !== 4
+        ? [10, 4, preferredTagLen]
+        : [10, 4]
+      : preferredTagLen === 10
+        ? [10, 4]
+        : preferredTagLen === 4 || !preferredTagLen
+          ? [4, 10]
+          : [preferredTagLen, 4, 10];
+
     for (const tagLen of candidateTagLengths) {
       const dec = this.tryUnprotectWithTagLength(srtpData, keys, tagLen);
       if (dec) {
@@ -377,6 +394,14 @@ export class PerSsrcSrtpDecryptor {
     }
 
     return null;
+  }
+
+  public unprotectSrtpPacket(
+    packet: Uint8Array,
+    primaryKeys?: SrtpKeyMaterial | null,
+    fallbackKeys?: SrtpKeyMaterial | null
+  ): Uint8Array | null {
+    return this.unprotectRtpPacket(packet, primaryKeys, fallbackKeys);
   }
 }
 
@@ -649,12 +674,20 @@ export function depacketizeH264RtpPacket(
 
 /**
  * Extracts `SrtpKeyMaterial` from a `@hiroosy/baileys-lite` `SrtpSession` receive context
- * (`recvCtx`), direct key object, or `masterKey`/`masterSalt` pair.
+ * (`recvCtx`), direct key object, `masterKey`/`masterSalt` pair, or raw 30-byte `peerCallKey`.
  */
 function extractRecvKeyMaterial(
   srtpSessionLike: unknown
 ): SrtpKeyMaterial | null {
-  if (!srtpSessionLike || typeof srtpSessionLike !== 'object') return null;
+  if (!srtpSessionLike) return null;
+  if (srtpSessionLike instanceof Uint8Array && srtpSessionLike.length >= 30) {
+    return deriveSrtpSessionKeysFromMaster(
+      srtpSessionLike.subarray(0, 16),
+      srtpSessionLike.subarray(16, 30),
+      4
+    );
+  }
+  if (typeof srtpSessionLike !== 'object') return null;
   const candidate = srtpSessionLike as {
     recvCtx?: {
       sessionKey?: Uint8Array;
@@ -711,10 +744,11 @@ export function syncPeerRecvKeysOnMediaSession(
 ): void {
   if (!session || typeof session !== 'object') return;
   const s = session as {
+    __peerRecvCtx?: Record<string, unknown>;
     srtpSession?: { recvCtx?: Record<string, unknown> } | null;
     videoSrtpSession?: { recvCtx?: Record<string, unknown> } | null;
   };
-  const primaryRecv = s.srtpSession?.recvCtx;
+  const primaryRecv = s.__peerRecvCtx ?? s.srtpSession?.recvCtx;
   const videoRecv = s.videoSrtpSession?.recvCtx;
   if (
     primaryRecv &&
@@ -804,6 +838,9 @@ export class VoipCallRecorder {
   public readonly remoteVideoTempPath: string;
   public readonly remoteAudioTempPath: string;
 
+  public cachedSps: Uint8Array | null = null;
+  public cachedPps: Uint8Array | null = null;
+
   private readonly srtpDecryptor = new PerSsrcSrtpDecryptor();
   private readonly h264State = createInitialH264DepacketizerState();
   private readonly isMockMode: boolean;
@@ -816,6 +853,7 @@ export class VoipCallRecorder {
   private inboundAudioPacketsReceived = 0;
   private inboundAudioBytesRecorded = 0;
   private remoteVideoBytesWritten = 0;
+  private hasWrittenFirstIdr = false;
   private pliRequestsSent = 0;
   private pliInterval: NodeJS.Timeout | null = null;
   private attachedSession: Record<string, unknown> | null = null;
@@ -866,6 +904,18 @@ export class VoipCallRecorder {
     return this.srtpDecryptor.getMap();
   }
 
+  public unprotectSrtpPacket(
+    packet: Uint8Array,
+    primaryKeys?: SrtpKeyMaterial | null,
+    fallbackKeys?: SrtpKeyMaterial | null
+  ): Uint8Array | null {
+    return this.srtpDecryptor.unprotectSrtpPacket(
+      packet,
+      primaryKeys,
+      fallbackKeys
+    );
+  }
+
   public getStatus(): CallRecordingStatus {
     return this.status;
   }
@@ -886,7 +936,8 @@ export class VoipCallRecorder {
         this.remoteCameraCaptured ||
         (this.h264State.inboundVideoFramesRecorded > 0 &&
           Boolean(
-            this.h264State.cachedRemoteSps && this.h264State.cachedRemotePps
+            (this.cachedSps || this.h264State.cachedRemoteSps) &&
+              (this.cachedPps || this.h264State.cachedRemotePps)
           )),
       pliRequestsSent: this.pliRequestsSent,
       failureReason: this.failureReason,
@@ -1200,7 +1251,10 @@ export class VoipCallRecorder {
 
   /**
    * Decrypts (if SRTP-protected) and depacketizes an inbound H.264 RTP video packet,
-   * writing Annex-B NALUs (`00 00 00 01`) to `remote_video.h264`.
+   * writing Annex-B NALUs (`00 00 00 01`) to `remote_video.h264` only after gating on `SPS + PPS + IDR`:
+   * - Caches `cachedSps` (`7`) and `cachedPps` (`8`) in memory immediately.
+   * - Drops any `P-frame` (`1`) arriving before the first `IDR` (`5`) keyframe.
+   * - Precedes every `IDR` (`5`) frame written to `remote_video.h264` with `0x00000001 + cachedSps` and `0x00000001 + cachedPps`.
    */
   public handleInboundVideoPacket(
     packet: Uint8Array,
@@ -1228,12 +1282,15 @@ export class VoipCallRecorder {
 
     const effectiveSession = session ?? this.attachedSession;
     const primaryKeys =
+      extractRecvKeyMaterial(effectiveSession?.__peerRecvCtx) ??
       extractRecvKeyMaterial(effectiveSession?.srtpSession) ??
       extractRecvKeyMaterial(effectiveSession?.srtpRecv) ??
-      extractRecvKeyMaterial(effectiveSession?.rxSrtp);
-    const fallbackKeys = extractRecvKeyMaterial(
-      effectiveSession?.videoSrtpSession
-    );
+      extractRecvKeyMaterial(effectiveSession?.rxSrtp) ??
+      extractRecvKeyMaterial(effectiveSession?.__peerCallKey) ??
+      extractRecvKeyMaterial(effectiveSession?.peerCallKey);
+    const fallbackKeys =
+      extractRecvKeyMaterial(effectiveSession?.videoSrtpSession) ??
+      extractRecvKeyMaterial(effectiveSession?.__peerCallKey);
 
     const plainRtp = this.srtpDecryptor.unprotectRtpPacket(
       packet,
@@ -1254,9 +1311,46 @@ export class VoipCallRecorder {
 
     const depacketized = depacketizeH264RtpPacket(plainRtp, this.h264State);
 
+    if (this.h264State.cachedRemoteSps) {
+      this.cachedSps = this.h264State.cachedRemoteSps;
+    }
+    if (this.h264State.cachedRemotePps) {
+      this.cachedPps = this.h264State.cachedRemotePps;
+    }
+
     if (this.videoFd !== null && depacketized.annexBNalus.length > 0) {
       for (const naluWithStartCode of depacketized.annexBNalus) {
+        if (naluWithStartCode.length <= 4) continue;
+        const nalType = naluWithStartCode[4] & 0x1f;
+
+        if (nalType === 7) {
+          this.cachedSps = naluWithStartCode.subarray(4).slice();
+          continue;
+        }
+        if (nalType === 8) {
+          this.cachedPps = naluWithStartCode.subarray(4).slice();
+          continue;
+        }
+
+        // Strict SPS/PPS/IDR gate: never write P-frames (NALU 1) before the first IDR (NALU 5)
+        if (nalType === 1 && !this.hasWrittenFirstIdr) {
+          continue;
+        }
+
         try {
+          if (nalType === 5) {
+            if (this.cachedSps) {
+              const spsAnnexB = buildAnnexBNalu(this.cachedSps);
+              fs.writeSync(this.videoFd, spsAnnexB);
+              this.remoteVideoBytesWritten += spsAnnexB.length;
+            }
+            if (this.cachedPps) {
+              const ppsAnnexB = buildAnnexBNalu(this.cachedPps);
+              fs.writeSync(this.videoFd, ppsAnnexB);
+              this.remoteVideoBytesWritten += ppsAnnexB.length;
+            }
+            this.hasWrittenFirstIdr = true;
+          }
           fs.writeSync(this.videoFd, naluWithStartCode);
           this.remoteVideoBytesWritten += naluWithStartCode.length;
         } catch {

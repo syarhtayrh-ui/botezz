@@ -42,6 +42,7 @@ export interface InstrumentedVideoEngine {
   onVideoCompleted?: () => void;
   onEncoderFatalError?: (err: Error) => void;
   onAccessUnit?: (au: Uint8Array) => void;
+  __botezzSavedOnAccessUnit?: (au: Uint8Array) => void;
   start?: (...args: unknown[]) => unknown;
   spawnFfmpeg?: () => ChildProcess | null;
   onData?: (chunk: Uint8Array | Buffer) => void;
@@ -57,6 +58,15 @@ export interface InstrumentedMediaSession extends WaCallMediaSessionLike {
   __relayBroadcastAttempted?: boolean;
   __relayBroadcastAcceptedCount?: number;
   __mediaStartDelayTimers?: Set<ReturnType<typeof setTimeout>>;
+  __peerCallKey?: Uint8Array;
+  __peerRecvCtx?: {
+    sessionKey?: Uint8Array;
+    sessionSalt?: Uint8Array;
+    authKey?: Uint8Array;
+    authTagLen?: number;
+  };
+  localCallKey?: Uint8Array;
+  peerCallKey?: Uint8Array;
   _pendingNonVclNalus?: Uint8Array[];
   videoTimestamp?: number;
   acceptedAudioPackets?: number;
@@ -110,6 +120,18 @@ export interface InstrumentedMediaSession extends WaCallMediaSessionLike {
     };
   } | null;
   videoSrtpSession?: {
+    sendCtx?: {
+      sessionKey?: Uint8Array;
+      sessionSalt?: Uint8Array;
+      authKey?: Uint8Array;
+      authTagLen?: number;
+    };
+    recvCtx?: {
+      sessionKey?: Uint8Array;
+      sessionSalt?: Uint8Array;
+      authKey?: Uint8Array;
+      authTagLen?: number;
+    };
     protect: (packet: unknown) => Uint8Array;
   } | null;
   videoEngine?: InstrumentedVideoEngine | null;
@@ -118,6 +140,8 @@ export interface InstrumentedMediaSession extends WaCallMediaSessionLike {
   videoKeyframeRequired?: boolean;
   info?: {
     callId?: string;
+    callKey?: Uint8Array;
+    encryptionKey?: Uint8Array;
     isEnded?: boolean;
     stateData?: {
       state?: string;
@@ -498,9 +522,10 @@ export function instrumentAudioEngineInstance(
 
 /**
  * Instruments `WaVideoEngine` (`P0-A`, `BZ-012`, `BZ-020`):
- * 1. Configures WhatsApp real-time H.264 encoder parameters (`fps=15`, `gop=15`, `280k`/`420k`, `zerolatency`, `sliced-threads=0`, `aud=1`, `repeat-headers=1`).
+ * 1. Configures WhatsApp real-time H.264 encoder parameters (`fps=15`, `gop=15`, `sc_threshold=0`, `280k`/`420k`, `zerolatency`, `sliced-threads=0`, `aud=1`, `repeat-headers=1`).
  * 2. Groups non-VCL NALUs (`AUD=9`, `SEI=6`, `SPS=7`, `PPS=8`) with their VCL slice (`IDR=5` or `Slice=1`) into a single Access Unit per frame.
- * 3. Respects `videoLoop` (`loopVideo`) so non-looping calls finish cleanly after one pass.
+ * 3. Preserves `onAccessUnit` across no-arg restarts and prevents the mid-stream `waitForKeyFrame` trap.
+ * 4. Respects `videoLoop` (`loopVideo`) so non-looping calls finish cleanly after one pass.
  */
 export function instrumentVideoEngineInstance(
   videoEngine: InstrumentedVideoEngine | null | undefined
@@ -532,6 +557,13 @@ export function instrumentVideoEngineInstance(
     }
     this.accessUnitsSent = (this.accessUnitsSent ?? 0) + 1;
     const frameDurMs = this.frameDurationMs || 1000 / (this.frameRate || 15);
+    const activeCallback =
+      typeof this.onAccessUnit === 'function'
+        ? this.onAccessUnit
+        : typeof this.__botezzSavedOnAccessUnit === 'function'
+          ? this.__botezzSavedOnAccessUnit
+          : undefined;
+
     if (this.videoSender) {
       try {
         if (typeof this.videoSender.sendVideoAccessUnit === 'function') {
@@ -544,8 +576,8 @@ export function instrumentVideoEngineInstance(
           message: err instanceof Error ? err.message : String(err),
         });
       }
-    } else if (typeof this.onAccessUnit === 'function') {
-      this.onAccessUnit(au);
+    } else if (activeCallback) {
+      activeCallback.call(this, au);
     } else if (origEmitAccessUnit && origEmitAccessUnit !== patchedEmitAccessUnit) {
       origEmitAccessUnit.call(this, au);
     }
@@ -736,6 +768,8 @@ export function instrumentVideoEngineInstance(
       String(gop),
       '-keyint_min',
       String(gop),
+      '-sc_threshold',
+      '0',
       '-b:v',
       `${bitrateKbps}k`,
       '-maxrate',
@@ -840,7 +874,7 @@ export function instrumentVideoEngineInstance(
           );
           return;
         }
-        this.start?.();
+        this.start?.(this.__botezzSavedOnAccessUnit ?? this.onAccessUnit);
       }
     });
 
@@ -851,21 +885,55 @@ export function instrumentVideoEngineInstance(
     typeof videoEngine.start === 'function' ? videoEngine.start : undefined;
   videoEngine.start = function patchedVideoStart(
     this: InstrumentedVideoEngine,
-    ...args: unknown[]
+    onAccessUnit?: unknown,
+    ...restArgs: unknown[]
   ) {
+    if (typeof onAccessUnit === 'function') {
+      this.__botezzSavedOnAccessUnit = onAccessUnit as (au: Uint8Array) => void;
+    } else if (
+      typeof this.onAccessUnit === 'function' &&
+      !this.__botezzSavedOnAccessUnit
+    ) {
+      this.__botezzSavedOnAccessUnit = this.onAccessUnit;
+    }
+
+    const effectiveOnAccessUnit =
+      (typeof onAccessUnit === 'function'
+        ? (onAccessUnit as (au: Uint8Array) => void)
+        : undefined) ||
+      this.__botezzSavedOnAccessUnit ||
+      this.onAccessUnit;
+
+    if (typeof effectiveOnAccessUnit === 'function') {
+      this.onAccessUnit = effectiveOnAccessUnit;
+    }
+
+    // Prevent the mid-stream waitForKeyFrame trap when a watchdog calls `videoEngine.start()`
+    // without arguments while `ffmpeg` is already running and streaming frames.
+    if (
+      this.running &&
+      this.proc &&
+      !this.proc.killed &&
+      typeof onAccessUnit !== 'function'
+    ) {
+      return this.proc;
+    }
+
     this._deliberateStop = false;
     this.running = true;
     this.waitForKeyFrame = true;
     this.waitingForKeyFrame = true;
-    if (typeof args[0] === 'function') {
-      this.onAccessUnit = args[0] as (au: Uint8Array) => void;
-    }
+
     if (
       typeof origStart === 'function' &&
       origStart !== patchedVideoStart &&
       this.videoLoop !== false
     ) {
-      return origStart.apply(this, args);
+      const res = origStart.call(this, effectiveOnAccessUnit, ...restArgs);
+      if (typeof effectiveOnAccessUnit === 'function') {
+        this.onAccessUnit = effectiveOnAccessUnit;
+      }
+      return res;
     }
     return this.spawnFfmpeg?.();
   };
@@ -996,17 +1064,95 @@ export function instrumentMediaSessionInstance(
       this: typeof sessionWithAccept,
       ...args: unknown[]
     ) {
+      // Snapshot the bot's local outbound SRTP send context before handleCallAccept runs.
+      // In WhatsApp VoIP, outbound encryption (`protect`) MUST strictly use the bot's own `localCallKey`
+      // (`this.info?.callKey || this.info?.encryptionKey || this.localCallKey`), and NEVER `peerCallKey`!
+      const preAcceptLocalSendCtx =
+        this.videoSrtpSession?.sendCtx?.sessionKey instanceof Uint8Array
+          ? {
+              sessionKey: this.videoSrtpSession.sendCtx.sessionKey,
+              sessionSalt: this.videoSrtpSession.sendCtx.sessionSalt,
+              authKey: this.videoSrtpSession.sendCtx.authKey,
+              authTagLen: this.videoSrtpSession.sendCtx.authTagLen ?? 4,
+            }
+          : this.srtpSession?.sendCtx?.sessionKey instanceof Uint8Array
+            ? {
+                sessionKey: this.srtpSession.sendCtx.sessionKey,
+                sessionSalt: this.srtpSession.sendCtx.sessionSalt,
+                authKey: this.srtpSession.sendCtx.authKey,
+                authTagLen: this.srtpSession.sendCtx.authTagLen ?? 4,
+              }
+            : undefined;
+
+      const localCallKey =
+        (this.info?.callKey instanceof Uint8Array
+          ? this.info.callKey
+          : undefined) ||
+        (this.info?.encryptionKey instanceof Uint8Array
+          ? this.info.encryptionKey
+          : undefined) ||
+        (this.localCallKey instanceof Uint8Array
+          ? this.localCallKey
+          : undefined);
+      if (localCallKey) {
+        this.localCallKey = localCallKey;
+      }
+
       const res = await origHandleCallAccept.apply(this, args);
-      const primarySend = this.srtpSession?.sendCtx;
+
+      // Extract peerCallKey (from accept node or session property) and store it strictly on `this.__peerCallKey`
+      // for `VoipCallRecorder` inbound decryption (`unprotect`). NEVER put `peerCallKey` into `videoSrtpSession.sendCtx`!
+      const acceptArgObj =
+        args[0] && typeof args[0] === 'object'
+          ? (args[0] as { peerCallKey?: unknown })
+          : undefined;
+      const detectedPeerKey =
+        (acceptArgObj?.peerCallKey instanceof Uint8Array
+          ? acceptArgObj.peerCallKey
+          : undefined) ||
+        (this.peerCallKey instanceof Uint8Array ? this.peerCallKey : undefined) ||
+        (this.__peerCallKey instanceof Uint8Array
+          ? this.__peerCallKey
+          : undefined);
+      if (detectedPeerKey) {
+        this.__peerCallKey = detectedPeerKey;
+      }
+
+      // Outbound sendCtx MUST come from our local call key (`preAcceptLocalSendCtx` or `this.srtpSession.sendCtx`
+      // when derived from `ourCallKey`), and NEVER from `this.srtpSession.recvCtx` (`peerCallKey`).
+      const postAcceptSend = this.srtpSession?.sendCtx;
       const primaryRecv = this.srtpSession?.recvCtx;
 
+      // Guard: if `postAcceptSend` accidentally matches `primaryRecv` (e.g., if a caller overwrote `srtpSession`
+      // with `peerCallKey`), restore `preAcceptLocalSendCtx` as the outbound `localSend`.
+      const postSendMatchesPeerRecv =
+        postAcceptSend?.sessionKey instanceof Uint8Array &&
+        primaryRecv?.sessionKey instanceof Uint8Array &&
+        postAcceptSend.sessionKey.length === primaryRecv.sessionKey.length &&
+        postAcceptSend.sessionKey.every((b, idx) => b === primaryRecv.sessionKey![idx]);
+
+      const localOutboundSend =
+        postSendMatchesPeerRecv && preAcceptLocalSendCtx
+          ? preAcceptLocalSendCtx
+          : postAcceptSend?.sessionKey instanceof Uint8Array
+            ? postAcceptSend
+            : preAcceptLocalSendCtx;
+
+      if (primaryRecv?.sessionKey instanceof Uint8Array) {
+        this.__peerRecvCtx = {
+          sessionKey: primaryRecv.sessionKey,
+          sessionSalt: primaryRecv.sessionSalt,
+          authKey: primaryRecv.authKey,
+          authTagLen: primaryRecv.authTagLen ?? 4,
+        };
+      }
+
       // If `this.videoSrtpSession` was not created yet (because `srtpFromPeerKey` skipped `initSrtpKeys()`),
-      // create a dedicated video SRTP session cloned from `this.srtpSession` with independent ROC/seq counters.
+      // create a dedicated video SRTP session using `localOutboundSend` for `sendCtx` and `primaryRecv` for `recvCtx`.
       if (
         !this.videoSrtpSession &&
         this.srtpSession &&
-        primarySend &&
-        primaryRecv
+        localOutboundSend
       ) {
         const srtpCtor = (
           this.srtpSession as unknown as {
@@ -1014,7 +1160,7 @@ export function instrumentMediaSessionInstance(
           }
         ).constructor;
         const ctxCtor = (
-          primarySend as unknown as {
+          localOutboundSend as unknown as {
             constructor?: new (...cArgs: unknown[]) => unknown;
           }
         ).constructor;
@@ -1031,20 +1177,22 @@ export function instrumentMediaSessionInstance(
             const clonedSession = new srtpCtor(
               dummyKeying,
               dummyKeying,
-              primarySend.authTagLen ?? 4,
-              primaryRecv.authTagLen ?? 4
+              localOutboundSend.authTagLen ?? 4,
+              primaryRecv?.authTagLen ?? 4
             ) as {
               sendCtx?: Record<string, unknown>;
               recvCtx?: Record<string, unknown>;
               protect?: (pkt: unknown) => Uint8Array;
             };
             if (clonedSession.sendCtx && clonedSession.recvCtx) {
-              clonedSession.sendCtx.sessionKey = primarySend.sessionKey;
-              clonedSession.sendCtx.sessionSalt = primarySend.sessionSalt;
-              clonedSession.sendCtx.authKey = primarySend.authKey;
-              clonedSession.recvCtx.sessionKey = primaryRecv.sessionKey;
-              clonedSession.recvCtx.sessionSalt = primaryRecv.sessionSalt;
-              clonedSession.recvCtx.authKey = primaryRecv.authKey;
+              clonedSession.sendCtx.sessionKey = localOutboundSend.sessionKey;
+              clonedSession.sendCtx.sessionSalt = localOutboundSend.sessionSalt;
+              clonedSession.sendCtx.authKey = localOutboundSend.authKey;
+              if (primaryRecv) {
+                clonedSession.recvCtx.sessionKey = primaryRecv.sessionKey;
+                clonedSession.recvCtx.sessionSalt = primaryRecv.sessionSalt;
+                clonedSession.recvCtx.authKey = primaryRecv.authKey;
+              }
               this.videoSrtpSession = clonedSession as NonNullable<
                 typeof this.videoSrtpSession
               >;
@@ -1055,8 +1203,8 @@ export function instrumentMediaSessionInstance(
         }
         if (!this.videoSrtpSession) {
           this.videoSrtpSession = {
-            sendCtx: { ...primarySend },
-            recvCtx: { ...primaryRecv },
+            sendCtx: { ...localOutboundSend },
+            recvCtx: primaryRecv ? { ...primaryRecv } : { ...localOutboundSend },
             protect:
               typeof this.srtpSession.protect === 'function'
                 ? this.srtpSession.protect.bind(this.srtpSession)
@@ -1081,15 +1229,15 @@ export function instrumentMediaSessionInstance(
         | null
         | undefined;
       if (
-        primarySend &&
+        localOutboundSend &&
         videoSessionObj?.sendCtx &&
-        primarySend.sessionKey instanceof Uint8Array &&
-        primarySend.sessionSalt instanceof Uint8Array &&
-        primarySend.authKey instanceof Uint8Array
+        localOutboundSend.sessionKey instanceof Uint8Array &&
+        localOutboundSend.sessionSalt instanceof Uint8Array &&
+        localOutboundSend.authKey instanceof Uint8Array
       ) {
-        videoSessionObj.sendCtx.sessionKey = primarySend.sessionKey;
-        videoSessionObj.sendCtx.sessionSalt = primarySend.sessionSalt;
-        videoSessionObj.sendCtx.authKey = primarySend.authKey;
+        videoSessionObj.sendCtx.sessionKey = localOutboundSend.sessionKey;
+        videoSessionObj.sendCtx.sessionSalt = localOutboundSend.sessionSalt;
+        videoSessionObj.sendCtx.authKey = localOutboundSend.authKey;
       }
       if (
         primaryRecv &&
@@ -1102,6 +1250,32 @@ export function instrumentMediaSessionInstance(
         videoSessionObj.recvCtx.sessionSalt = primaryRecv.sessionSalt;
         videoSessionObj.recvCtx.authKey = primaryRecv.authKey;
       }
+
+      // Restart `videoEngine` from the beginning if it was already running mid-stream before accept,
+      // so the recipient immediately receives `SPS (7) + PPS (8) + IDR (5)` within the first 100ms!
+      this.videoKeyframeRequired = true;
+      if (this.videoEngine && typeof this.videoEngine === 'object') {
+        instrumentVideoEngineInstance(this.videoEngine);
+        const savedCb =
+          this.videoEngine.__botezzSavedOnAccessUnit ??
+          this.videoEngine.onAccessUnit;
+        if (
+          this.videoEngine.running &&
+          this.videoEngine.proc &&
+          typeof this.videoEngine.stop === 'function' &&
+          typeof this.videoEngine.start === 'function'
+        ) {
+          this.videoEngine.stop({ keepSource: true });
+          this.videoEngine.start(savedCb);
+        } else {
+          this.videoEngine.waitForKeyFrame = true;
+          this.videoEngine.waitingForKeyFrame = true;
+          if (savedCb) {
+            this.videoEngine.onAccessUnit = savedCb;
+          }
+        }
+      }
+
       return res;
     };
   }
