@@ -588,18 +588,64 @@ describe('Two-Way VoIP Video Call Recording (VoipCallRecorder)', () => {
       );
 
       const res10 = recorder.handleInboundVideoPacket(spsVideo10, fakeSession);
-      const resPps = recorder.handleInboundVideoPacket(ppsVideo10, fakeSession);
-      const res4 = recorder.handleInboundVideoPacket(idrVideo4, fakeSession);
-
       assert.ok(res10);
       assert.deepEqual(res10.nalTypes, [7]);
+      assert.ok(recorder.cachedSps);
+      assert.equal(recorder.cachedPps, null);
+
+      // Sending an IDR before PPS is received must be dropped (not written to remote_video.h264)
+      const idrBeforePps = protectRtpForTest(
+        buildRawRtpPacket({
+          payloadType: 96,
+          seq: 11,
+          timestamp: 9000,
+          ssrc: 0xbbbb2222,
+          marker: true,
+          payload: new Uint8Array([0x65, 0x11, 0x22, 0x33]),
+        }),
+        peerKeys10
+      );
+      recorder.handleInboundVideoPacket(idrBeforePps, fakeSession);
+      assert.equal(
+        fs.existsSync(recorder.remoteVideoTempPath)
+          ? fs.statSync(recorder.remoteVideoTempPath).size
+          : 0,
+        0,
+        'IDR frame without cachedPps must never be written to remote_video.h264'
+      );
+
+      const ppsVideoSeq12 = protectRtpForTest(
+        buildRawRtpPacket({
+          payloadType: 96,
+          seq: 12,
+          timestamp: 9000,
+          ssrc: 0xbbbb2222,
+          payload: new Uint8Array([0x68, 0xce, 0x3c, 0x80]),
+        }),
+        peerKeys10
+      );
+      const idrVideoSeq13 = protectRtpForTest(
+        buildRawRtpPacket({
+          payloadType: 96,
+          seq: 13,
+          timestamp: 9000,
+          ssrc: 0xbbbb2222,
+          marker: true,
+          payload: new Uint8Array([0x65, 0x88, 0x84, 0x21, 0xa0]),
+        }),
+        peerKeys4
+      );
+
+      const resPps = recorder.handleInboundVideoPacket(ppsVideoSeq12, fakeSession);
+      const res4 = recorder.handleInboundVideoPacket(idrVideoSeq13, fakeSession);
+
       assert.ok(resPps);
       assert.deepEqual(resPps.nalTypes, [8]);
       assert.ok(res4);
       assert.deepEqual(res4.nalTypes, [5]);
       assert.ok(recorder.cachedSps);
       assert.ok(recorder.cachedPps);
-      assert.equal(recorder.srtpBySsrc.get(0xbbbb2222)?.lastSeq, 12);
+      assert.equal(recorder.srtpBySsrc.get(0xbbbb2222)?.lastSeq, 13);
 
       // Verify remote_video.h264 starts with 0x00000001 + SPS (0x67) + 0x00000001 + PPS (0x68) + 0x00000001 + IDR (0x65)
       const h264Bytes = fs.readFileSync(recorder.remoteVideoTempPath);
@@ -608,6 +654,18 @@ describe('Two-Way VoIP Video Call Recording (VoipCallRecorder)', () => {
       assert.equal(h264Bytes[2], 0x00);
       assert.equal(h264Bytes[3], 0x01);
       assert.equal(h264Bytes[4], 0x67);
+      // After 4-byte start code + 8-byte SPS = offset 12: 0x00000001 + PPS (0x68)
+      assert.equal(h264Bytes[12], 0x00);
+      assert.equal(h264Bytes[13], 0x00);
+      assert.equal(h264Bytes[14], 0x00);
+      assert.equal(h264Bytes[15], 0x01);
+      assert.equal(h264Bytes[16], 0x68);
+      // After 4-byte start code + 4-byte PPS = offset 20: 0x00000001 + IDR (0x65)
+      assert.equal(h264Bytes[20], 0x00);
+      assert.equal(h264Bytes[21], 0x00);
+      assert.equal(h264Bytes[22], 0x00);
+      assert.equal(h264Bytes[23], 0x01);
+      assert.equal(h264Bytes[24], 0x65);
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }

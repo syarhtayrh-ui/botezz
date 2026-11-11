@@ -1493,7 +1493,7 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
     const onMessagesUpdate = (
       updates: Array<{
         key?: { id?: string | null; remoteJid?: string | null };
-        update?: { status?: number | null };
+        update?: { status?: number | string | null };
       }>
     ) => {
       this.handleMessagesUpdateForReadRevoke(updates);
@@ -2002,7 +2002,7 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
           participantAlt?: string | null;
         };
         update?: {
-          status?: number;
+          status?: number | string | null;
           message?: Record<string, unknown> | null;
           messageTimestamp?: number;
         };
@@ -2017,7 +2017,7 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
             statusNumber: u.update.status,
           });
         }
-        if (u?.key?.id && typeof u?.update?.status === 'number') {
+        if (u?.key?.id && u?.update?.status !== undefined && u?.update?.status !== null) {
           this.handleMessagesUpdateForReadRevoke([u]);
         }
         // Forward live message edits (emitted by @hiroosy/baileys-lite on messages.update)
@@ -2639,15 +2639,19 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
   private handleMessagesUpdateForReadRevoke(
     updates: Array<{
       key?: { id?: string | null; remoteJid?: string | null };
-      update?: { status?: number | null };
+      update?: { status?: number | string | null };
     }>
   ): void {
     if (!Array.isArray(updates)) return;
     for (const item of updates) {
       const id = item?.key?.id;
-      const status = item?.update?.status;
-      // status === 4 (READ) or 5 (PLAYED) in WAMessageStatus
-      if (id && (status === 4 || status === 5)) {
+      const rawStatus = item?.update?.status;
+      const isReadOrPlayed =
+        rawStatus === 4 ||
+        rawStatus === 5 ||
+        rawStatus === 'READ' ||
+        rawStatus === 'PLAYED';
+      if (id && isReadOrPlayed) {
         const msgId = String(id);
         const pendingOnRead = this.pendingOnReadRevokes.get(msgId);
         if (pendingOnRead) {
@@ -2808,8 +2812,12 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
 
   private findLidAttrInBinaryNode(node: BinaryNode | undefined): string | undefined {
     if (!node || typeof node !== 'object') return undefined;
-    if (node.tag === 'lid') {
-      const rawVal = node.attrs?.val || node.attrs?.jid || node.attrs?.id;
+    if (node.tag === 'lid' || node.tag === 'user') {
+      const rawVal =
+        node.attrs?.val ||
+        node.attrs?.lid ||
+        (node.attrs?.jid?.endsWith('@lid') ? node.attrs.jid : undefined) ||
+        (node.tag === 'lid' ? node.attrs?.id : undefined);
       const parsed = this.extractLidString(rawVal);
       if (parsed && parsed.endsWith('@lid')) {
         return parsed;
@@ -3124,6 +3132,7 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
       if (typeof sock.getUSyncDevices === 'function') {
         const jidsToFetch = [pnJid, lidJid].filter((j): j is string => Boolean(j));
         await sock.getUSyncDevices(jidsToFetch, false, false).catch(() => []);
+        await sock.getUSyncDevices([lidJid], true, false).catch(() => []);
       }
       if (pnJid && typeof sock.signalRepository?.migrateSession === 'function') {
         await sock.signalRepository

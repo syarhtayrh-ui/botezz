@@ -37,7 +37,7 @@ import {
   validateShortlinkTargetUrl,
 } from '../../security/validation';
 import { toSafeArabicError, WhatsAppConnectionError } from '../../utils/errors';
-import { escapeMarkdown } from '../../utils/markdown';
+import { escapeMarkdown, stripMarkdown } from '../../utils/markdown';
 import { renderBreadcrumb } from '../keyboards/ui-theme';
 
 export type ToolsInputStep =
@@ -2815,6 +2815,11 @@ export class ToolsHandler {
 
       const safeDigits = report.pnJid.split('@')[0].replace(/\W/g, '');
       const photoFileName = `profile_${safeDigits || 'user'}.jpg`;
+      const shortSummaryCaption =
+        `🖼️ الصورة الشخصية بدقة عالية (HD) — ${report.e164Phone}\n` +
+        `👤 الاسم: ${report.pushName || report.verifiedName || 'غير متاح'}\n` +
+        `🔗 JID: ${report.pnJid}` +
+        (report.lidJid ? `\n🕵️ LID: ${report.lidJid}` : '');
       const mediaAttachments: TelegramMediaAttachment[] = [];
       if (
         report.profilePicture.imageBuffer &&
@@ -2836,7 +2841,10 @@ export class ToolsHandler {
           fileName: photoFileName,
           mimeType: 'image/jpeg',
           buffer: report.profilePicture.imageBuffer,
-          caption: `🖼️ الصورة الشخصية بدقة عالية (HD) — ${report.e164Phone}`,
+          caption:
+            textReport.length <= 1024
+              ? stripMarkdown(textReport)
+              : shortSummaryCaption.slice(0, 480),
         });
       }
 

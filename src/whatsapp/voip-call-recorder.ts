@@ -36,6 +36,7 @@ export interface PerSsrcSrtpState {
   lastSeq: number;
   highestIndex: bigint;
   replayMask: bigint;
+  preferredTagLen?: number;
 }
 
 export interface H264DepacketizerState {
@@ -1322,13 +1323,14 @@ export class VoipCallRecorder {
       for (const naluWithStartCode of depacketized.annexBNalus) {
         if (naluWithStartCode.length <= 4) continue;
         const nalType = naluWithStartCode[4] & 0x1f;
+        const nalPayload = naluWithStartCode.subarray(4);
 
         if (nalType === 7) {
-          this.cachedSps = naluWithStartCode.subarray(4).slice();
+          this.cachedSps = nalPayload.slice();
           continue;
         }
         if (nalType === 8) {
-          this.cachedPps = naluWithStartCode.subarray(4).slice();
+          this.cachedPps = nalPayload.slice();
           continue;
         }
 
@@ -1337,25 +1339,12 @@ export class VoipCallRecorder {
           continue;
         }
 
-        try {
-          if (nalType === 5) {
-            if (this.cachedSps) {
-              const spsAnnexB = buildAnnexBNalu(this.cachedSps);
-              fs.writeSync(this.videoFd, spsAnnexB);
-              this.remoteVideoBytesWritten += spsAnnexB.length;
-            }
-            if (this.cachedPps) {
-              const ppsAnnexB = buildAnnexBNalu(this.cachedPps);
-              fs.writeSync(this.videoFd, ppsAnnexB);
-              this.remoteVideoBytesWritten += ppsAnnexB.length;
-            }
-            this.hasWrittenFirstIdr = true;
-          }
-          fs.writeSync(this.videoFd, naluWithStartCode);
-          this.remoteVideoBytesWritten += naluWithStartCode.length;
-        } catch {
-          // Ignore write error
+        if (nalType === 5) {
+          this.ensureRemoteVideoHasParameterSets(nalPayload);
+          continue;
         }
+
+        this.writeRemoteVideoNal(nalPayload);
       }
     }
 
@@ -1484,7 +1473,45 @@ export class VoipCallRecorder {
     return this.finalizePromise;
   }
 
-  private ensureRemoteVideoHasParameterSets(): void {
+  private writeRemoteVideoNal(nalPayload: Uint8Array): void {
+    if (this.videoFd === null || !nalPayload || nalPayload.length === 0) {
+      return;
+    }
+    const hasStartCode =
+      nalPayload.length >= 4 &&
+      nalPayload[0] === 0 &&
+      nalPayload[1] === 0 &&
+      nalPayload[2] === 0 &&
+      nalPayload[3] === 1;
+    const annexB = hasStartCode ? nalPayload : buildAnnexBNalu(nalPayload);
+    try {
+      fs.writeSync(this.videoFd, annexB);
+      this.remoteVideoBytesWritten += annexB.length;
+    } catch {
+      // Ignore write error
+    }
+  }
+
+  private ensureRemoteVideoHasParameterSets(nalPayload?: Uint8Array): void {
+    if (nalPayload && nalPayload.length > 0) {
+      // If we don't have both SPS and PPS yet, drop this IDR to avoid corrupting the file stream
+      if (!this.cachedSps || !this.cachedPps) {
+        log.debug(
+          'Dropping IDR frame: waiting for both SPS and PPS parameter sets'
+        );
+        return;
+      }
+
+      // Always inject SPS and PPS immediately before EVERY IDR frame for rock-solid stream decoding
+      this.writeRemoteVideoNal(this.cachedSps);
+      this.writeRemoteVideoNal(this.cachedPps);
+      this.hasWrittenFirstIdr = true;
+
+      // Write the actual IDR NAL unit
+      this.writeRemoteVideoNal(nalPayload);
+      return;
+    }
+
     if (
       !fs.existsSync(this.remoteVideoTempPath) ||
       !this.h264State.cachedRemoteSps ||
@@ -1529,7 +1556,8 @@ export class VoipCallRecorder {
     const hasRemoteVideoFrames =
       this.h264State.inboundVideoFramesRecorded > 0 &&
       this.remoteVideoBytesWritten > 0 &&
-      fs.existsSync(this.remoteVideoTempPath);
+      fs.existsSync(this.remoteVideoTempPath) &&
+      fs.statSync(this.remoteVideoTempPath).size > 0;
 
     const hasRemoteAudio =
       this.inboundAudioBytesRecorded > 0 &&
@@ -1547,6 +1575,8 @@ export class VoipCallRecorder {
             '-hide_banner',
             '-loglevel',
             'error',
+            '-threads',
+            '2',
             '-f',
             'h264',
             '-framerate',
@@ -1576,7 +1606,7 @@ export class VoipCallRecorder {
             '-pix_fmt',
             'yuv420p',
             '-preset',
-            'veryfast',
+            'ultrafast',
             '-c:a',
             'aac',
             '-b:a',
@@ -1602,6 +1632,8 @@ export class VoipCallRecorder {
               '-hide_banner',
               '-loglevel',
               'error',
+              '-threads',
+              '2',
               '-f',
               'h264',
               '-framerate',
@@ -1657,8 +1689,9 @@ export class VoipCallRecorder {
         this.recordedVideoFileName = undefined;
         this.recordedVideoSizeBytes = undefined;
         this.status = 'NO_REMOTE_CAMERA';
-        this.failureReason =
-          'ℹ️ انتهت المكالمة، ولم يتم إرسال فيديو تسجيل لأن الطرف المستقبل لم يفتح الكاميرا أثناء المكالمة.';
+        this.failureReason = hasRemoteAudio
+          ? 'ℹ️ تم إنهاء المكالمة وتسجيل الصوت فقط نظراً لأن الطرف المستلم لم يقم بتشغيل الكاميرا (لم يتم إرسال فيديو تسجيل لأن الطرف المستقبل لم يفتح الكاميرا أثناء المكالمة).'
+          : 'ℹ️ انتهت المكالمة، ولم يتم إرسال فيديو تسجيل لأن الطرف المستقبل لم يفتح الكاميرا أثناء المكالمة.';
       }
     } catch (err) {
       this.status = 'FAILED';

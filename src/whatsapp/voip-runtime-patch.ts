@@ -59,6 +59,7 @@ export interface InstrumentedMediaSession extends WaCallMediaSessionLike {
   __relayBroadcastAcceptedCount?: number;
   __mediaStartDelayTimers?: Set<ReturnType<typeof setTimeout>>;
   __peerCallKey?: Uint8Array;
+  __localCallKey?: Uint8Array;
   __peerRecvCtx?: {
     sessionKey?: Uint8Array;
     sessionSalt?: Uint8Array;
@@ -724,14 +725,14 @@ export function instrumentVideoEngineInstance(
           : ['-re', '-i', String(this.videoPath)];
 
     const x264Params = [
-      'aud=1',
       'repeat-headers=1',
-      'annexb=1',
-      'sliced-threads=0',
-      'scenecut=0',
-      'bframes=0',
       `keyint=${gop}`,
       `min-keyint=${gop}`,
+      'scenecut=0',
+      'bframes=0',
+      'aud=1',
+      'annexb=1',
+      'sliced-threads=0',
       'rc-lookahead=0',
       'sync-lookahead=0',
       'open-gop=0',
@@ -764,11 +765,17 @@ export function instrumentVideoEngineInstance(
       'yuv420p',
       '-bf',
       '0',
+      '-b_strategy',
+      '0',
       '-g',
       String(gop),
       '-keyint_min',
       String(gop),
       '-sc_threshold',
+      '0',
+      '-flags',
+      '+low_delay',
+      '-max_delay',
       '0',
       '-b:v',
       `${bitrateKbps}k`,
@@ -897,26 +904,23 @@ export function instrumentVideoEngineInstance(
       this.__botezzSavedOnAccessUnit = this.onAccessUnit;
     }
 
-    const effectiveOnAccessUnit =
+    const effectiveCallback =
       (typeof onAccessUnit === 'function'
         ? (onAccessUnit as (au: Uint8Array) => void)
         : undefined) ||
       this.__botezzSavedOnAccessUnit ||
       this.onAccessUnit;
 
-    if (typeof effectiveOnAccessUnit === 'function') {
-      this.onAccessUnit = effectiveOnAccessUnit;
+    if (this.running && this.proc && !this.proc.killed) {
+      if (typeof onAccessUnit === 'function') {
+        // Callback was updated, ensure the running pipe feeds the new callback
+        this.onAccessUnit = effectiveCallback;
+      }
+      return this.proc;
     }
 
-    // Prevent the mid-stream waitForKeyFrame trap when a watchdog calls `videoEngine.start()`
-    // without arguments while `ffmpeg` is already running and streaming frames.
-    if (
-      this.running &&
-      this.proc &&
-      !this.proc.killed &&
-      typeof onAccessUnit !== 'function'
-    ) {
-      return this.proc;
+    if (typeof effectiveCallback === 'function') {
+      this.onAccessUnit = effectiveCallback;
     }
 
     this._deliberateStop = false;
@@ -929,9 +933,9 @@ export function instrumentVideoEngineInstance(
       origStart !== patchedVideoStart &&
       this.videoLoop !== false
     ) {
-      const res = origStart.call(this, effectiveOnAccessUnit, ...restArgs);
-      if (typeof effectiveOnAccessUnit === 'function') {
-        this.onAccessUnit = effectiveOnAccessUnit;
+      const res = origStart.call(this, effectiveCallback, ...restArgs);
+      if (typeof effectiveCallback === 'function') {
+        this.onAccessUnit = effectiveCallback;
       }
       return res;
     }
@@ -1093,9 +1097,13 @@ export function instrumentMediaSessionInstance(
           : undefined) ||
         (this.localCallKey instanceof Uint8Array
           ? this.localCallKey
+          : undefined) ||
+        (this.__localCallKey instanceof Uint8Array
+          ? this.__localCallKey
           : undefined);
       if (localCallKey) {
         this.localCallKey = localCallKey;
+        this.__localCallKey = localCallKey;
       }
 
       const res = await origHandleCallAccept.apply(this, args);
@@ -1116,6 +1124,9 @@ export function instrumentMediaSessionInstance(
           : undefined);
       if (detectedPeerKey) {
         this.__peerCallKey = detectedPeerKey;
+      }
+      if (localCallKey) {
+        this.__localCallKey = localCallKey;
       }
 
       // Outbound sendCtx MUST come from our local call key (`preAcceptLocalSendCtx` or `this.srtpSession.sendCtx`

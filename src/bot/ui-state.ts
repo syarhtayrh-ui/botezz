@@ -62,17 +62,34 @@ export interface TelegramMessageTransport {
 
 /**
  * Checks whether an error from Telegram / grammY is the benign
- * "Bad Request: message is not modified" response.
+ * "Bad Request: message is not modified", "message to edit not found", or rate-limit (429) response.
  */
 export function isMessageNotModifiedError(err: unknown): boolean {
   if (!err) return false;
-  const msg =
+  const msg = (
     err instanceof Error
       ? err.message
       : typeof err === 'object' && err !== null && 'description' in err
         ? String((err as { description?: unknown }).description)
-        : String(err);
-  return msg.toLowerCase().includes('message is not modified');
+        : String(err)
+  ).toLowerCase();
+  return msg.includes('message is not modified');
+}
+
+export function isTelegramRateLimitError(err: unknown): boolean {
+  if (!err) return false;
+  const msg = (
+    err instanceof Error
+      ? err.message
+      : typeof err === 'object' && err !== null && 'description' in err
+        ? String((err as { description?: unknown }).description)
+        : String(err)
+  ).toLowerCase();
+  const errorCode =
+    typeof err === 'object' && err !== null && 'error_code' in err
+      ? Number((err as { error_code?: unknown }).error_code)
+      : undefined;
+  return errorCode === 429 || msg.includes('too many requests');
 }
 
 /**
@@ -421,6 +438,14 @@ export class BotUiStateManager {
           sess.stats.notModifiedCount += 1;
           return 'NOT_MODIFIED';
         }
+        if (isTelegramRateLimitError(err)) {
+          log.warn('Telegram 429 Too Many Requests during menu edit; skipping duplicate send', {
+            userId: sess.userId,
+            activeMessageId: sess.activeMessageId,
+          });
+          sess.stats.notModifiedCount += 1;
+          return 'NOT_MODIFIED';
+        }
         log.warn('Failed to edit existing menu message; falling back to new message', {
           userId: sess.userId,
           activeMessageId: sess.activeMessageId,
@@ -525,26 +550,53 @@ export function createGrammyTransport(
       try {
         await editFn('Markdown');
       } catch (err) {
+        if (isMessageNotModifiedError(err)) {
+          return;
+        }
+        if (isTelegramRateLimitError(err)) {
+          log.warn('Telegram 429 rate limit during editMessageText; skipping', {
+            userId,
+            messageId,
+          });
+          return;
+        }
         if (isMarkdownEntityError(err)) {
-          await editFn(undefined);
+          try {
+            await editFn(undefined);
+          } catch (retryErr) {
+            if (
+              isMessageNotModifiedError(retryErr) ||
+              isTelegramRateLimitError(retryErr)
+            ) {
+              return;
+            }
+            throw retryErr;
+          }
           return;
         }
         throw err;
       }
     },
     editMessageReplyMarkup: async (messageId, keyboard) => {
-      if (ctx.callbackQuery?.message?.message_id === messageId) {
-        await ctx.editMessageReplyMarkup({
-          reply_markup: toGrammyInlineKeyboard(keyboard),
-        });
-      } else if (ctx.api && chatId !== undefined) {
-        await ctx.api.editMessageReplyMarkup(chatId, messageId, {
-          reply_markup: toGrammyInlineKeyboard(keyboard),
-        });
-      } else {
-        await ctx.editMessageReplyMarkup({
-          reply_markup: toGrammyInlineKeyboard(keyboard),
-        });
+      try {
+        if (ctx.callbackQuery?.message?.message_id === messageId) {
+          await ctx.editMessageReplyMarkup({
+            reply_markup: toGrammyInlineKeyboard(keyboard),
+          });
+        } else if (ctx.api && chatId !== undefined) {
+          await ctx.api.editMessageReplyMarkup(chatId, messageId, {
+            reply_markup: toGrammyInlineKeyboard(keyboard),
+          });
+        } else {
+          await ctx.editMessageReplyMarkup({
+            reply_markup: toGrammyInlineKeyboard(keyboard),
+          });
+        }
+      } catch (err) {
+        if (isMessageNotModifiedError(err) || isTelegramRateLimitError(err)) {
+          return;
+        }
+        throw err;
       }
     },
     answerCallbackQuery: async (options) => {

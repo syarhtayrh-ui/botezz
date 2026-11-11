@@ -274,6 +274,47 @@ test('1. validateRecipient & LID Resolution + sendAnonymousLidMessage across all
     })
   );
 
+  // Layer 3c: Direct USync IQ <user jid="..."><lid val="..."/></user> fallback when onWhatsApp omits lid
+  const fakeUsyncXml = createFakeBaileysSocket({
+    onWhatsApp: async (jid: string) => [{ jid, exists: true }],
+    query: async (node: BinaryNode) => {
+      fake.queriedNodes.push(node);
+      return {
+        tag: 'iq',
+        attrs: { type: 'result' },
+        content: [
+          {
+            tag: 'usync',
+            attrs: {},
+            content: [
+              {
+                tag: 'list',
+                attrs: {},
+                content: [
+                  {
+                    tag: 'user',
+                    attrs: { jid: '966507778889@s.whatsapp.net' },
+                    content: [
+                      {
+                        tag: 'lid',
+                        attrs: { val: '77788899900011@lid' },
+                      },
+                    ],
+                  },
+                ],
+              },
+            ],
+          },
+        ],
+      };
+    },
+  });
+  driver.attachSocketForTesting(fakeUsyncXml.sock);
+  const viaRawUsyncIq = await driver.resolveLidForRecipient('+966507778889');
+  assert.equal(viaRawUsyncIq.pnJid, '966507778889@s.whatsapp.net');
+  assert.equal(viaRawUsyncIq.lidJid, '77788899900011@lid');
+  assert.equal(viaRawUsyncIq.source, 'ON_WHATSAPP_USYNC');
+
   await driver.disconnect();
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
@@ -474,6 +515,30 @@ test('4. Short-Timer Self-Destruct Message (sendShortEphemeralMessage): sends ep
       id: ephRead.messageId,
     },
   });
+
+  // Case C: ON_READ mode also accepts string status='READ' in messages.update
+  fake.sentMessages.length = 0;
+  const ephReadString = await driver.sendShortEphemeralMessage({
+    recipient: '+966501234567',
+    text: 'رسالة تحذف بعد القراءة بحالة نصية READ',
+    expirationSeconds: 1,
+    triggerMode: 'ON_READ',
+  });
+  assert.equal(driver.pendingOnReadRevokes.has(ephReadString.messageId), true);
+  fake.ev.emit('messages.update', [
+    {
+      key: {
+        id: ephReadString.messageId,
+        remoteJid: '966501234567@s.whatsapp.net',
+      },
+      update: {
+        status: 'READ',
+      },
+    },
+  ]);
+  assert.equal(driver.pendingOnReadRevokes.has(ephReadString.messageId), false);
+  await new Promise((r) => setTimeout(r, 1150));
+  assert.equal(fake.sentMessages.length, 2);
 
   await driver.disconnect();
   fs.rmSync(tmpDir, { recursive: true, force: true });
