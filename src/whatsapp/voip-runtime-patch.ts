@@ -499,7 +499,11 @@ export function instrumentAudioEngineInstance(
   audioEngine: InstrumentedAudioEngine | null | undefined,
   defaultTimeoutMs = 30_000
 ): void {
-  if (!audioEngine || typeof audioEngine !== 'object' || audioEngine.__botezzAudioPatched) {
+  if (
+    !audioEngine ||
+    typeof audioEngine !== 'object' ||
+    Object.prototype.hasOwnProperty.call(audioEngine, '__botezzAudioPatched')
+  ) {
     return;
   }
   audioEngine.__botezzAudioPatched = true;
@@ -635,14 +639,17 @@ export function instrumentAudioEngineInstance(
 export function instrumentVideoEngineInstance(
   videoEngine: InstrumentedVideoEngine | null | undefined
 ): void {
-  if (!videoEngine || typeof videoEngine !== 'object' || videoEngine.__botezzVideoPatched) {
+  if (!videoEngine || typeof videoEngine !== 'object') {
+    return;
+  }
+  // Always enforce 15fps real-time cadence on the instance even if prototype was already patched
+  videoEngine.frameRate = 15;
+  videoEngine.frameDurationMs = 1000 / 15;
+
+  if (Object.prototype.hasOwnProperty.call(videoEngine, '__botezzVideoPatched')) {
     return;
   }
   videoEngine.__botezzVideoPatched = true;
-
-  // Enforce 15fps real-time cadence for WhatsApp VoIP H.264 decoder stability
-  videoEngine.frameRate = 15;
-  videoEngine.frameDurationMs = 1000 / 15;
 
   const origEmitAccessUnit =
     typeof videoEngine.emitAccessUnit === 'function'
@@ -1043,21 +1050,30 @@ export function instrumentVideoEngineInstance(
     }
 
     this._deliberateStop = false;
-    this.running = true;
     this.waitForKeyFrame = true;
     this.waitingForKeyFrame = true;
+
+    // When `sourceKind` is configured ('file' or 'blank'), always spawn our patched FFmpeg pipeline directly.
+    // Note: Do NOT set `this.running = true` before calling `origStart` or `spawnFfmpeg`, because
+    // `WaVideoEngine.prototype.start` starts with `if (this.running) return;`!
+    if (this.sourceKind && typeof this.spawnFfmpeg === 'function') {
+      return this.spawnFfmpeg();
+    }
 
     if (
       typeof origStart === 'function' &&
       origStart !== patchedVideoStart &&
       this.videoLoop !== false
     ) {
+      this.running = false;
       const res = origStart.call(this, effectiveCallback, ...restArgs);
+      this.running = true;
       if (typeof effectiveCallback === 'function') {
         this.onAccessUnit = effectiveCallback;
       }
       return res;
     }
+    this.running = true;
     return this.spawnFfmpeg?.();
   };
 
@@ -1102,44 +1118,80 @@ export function instrumentVideoEngineInstance(
  * (`generateSecureSsrc(callId, ourDeviceJid, 2)`), fixing the `@hiroosy/baileys-lite` bug where
  * `handleCallAck` updates `selfSsrc` (`streamIndex=0`) to the `:33@lid` companion device JID
  * but leaves `videoSsrc` (`streamIndex=2`) on the bare `:0@lid` JID.
+ * Also computes and synchronizes `peerAudioSsrc` and `peerVideoSsrc` for inbound relay subscriptions.
  */
 function syncSessionVideoSsrcWithDeviceJid(
   session: InstrumentedMediaSession
 ): void {
   const callId = session.info?.callId || session.callId;
-  const activeDeviceJid = session.selfSsrcJid || session.selfLid;
-  if (!callId || !activeDeviceJid) {
+  if (!callId) {
     return;
   }
-  const normalizedDeviceJid =
+
+  const normalizeDeviceJid = (jid: string): string =>
     typeof session.ensureDeviceJid === 'function'
-      ? session.ensureDeviceJid(activeDeviceJid)
-      : activeDeviceJid.includes(':')
-        ? activeDeviceJid
-        : activeDeviceJid.replace('@', ':0@');
+      ? session.ensureDeviceJid(jid)
+      : jid.includes(':')
+        ? jid
+        : jid.replace('@', ':0@');
 
-  // Only recompute if `selfSsrcJid` is explicitly set (or if `videoSsrc` is missing)
-  if (!session.selfSsrcJid && session.videoSsrc !== undefined) {
-    return;
+  const activeDeviceJid = session.selfSsrcJid || session.selfLid;
+  if (activeDeviceJid && (session.selfSsrcJid || session.videoSsrc === undefined)) {
+    const normalizedDeviceJid = normalizeDeviceJid(activeDeviceJid);
+    const expectedVideoSsrc = computeWhatsAppSecureSsrc(
+      callId,
+      normalizedDeviceJid,
+      2
+    );
+    session.videoSsrc = expectedVideoSsrc;
+    if (session.videoRtpStream && typeof session.videoRtpStream === 'object') {
+      session.videoRtpStream.ssrc = expectedVideoSsrc;
+    }
+    if (session.sctpRelay && typeof session.sctpRelay === 'object') {
+      try {
+        session.sctpRelay.setVideoSsrc?.(expectedVideoSsrc);
+        const streamSsrcs = (session.sctpRelay as { streamSsrcs?: number[] })
+          .streamSsrcs;
+        if (Array.isArray(streamSsrcs) && streamSsrcs.length >= 4) {
+          streamSsrcs[3] = expectedVideoSsrc;
+        }
+      } catch {
+        // Ignore relay SSRC setter failure
+      }
+    }
   }
 
-  const expectedVideoSsrc = computeWhatsAppSecureSsrc(
-    callId,
-    normalizedDeviceJid,
-    2
-  );
-  session.videoSsrc = expectedVideoSsrc;
-  if (session.videoRtpStream && typeof session.videoRtpStream === 'object') {
-    session.videoRtpStream.ssrc = expectedVideoSsrc;
-  }
-  if (
-    session.sctpRelay &&
-    typeof session.sctpRelay.setVideoSsrc === 'function'
-  ) {
-    try {
-      session.sctpRelay.setVideoSsrc(expectedVideoSsrc);
-    } catch {
-      // Ignore relay SSRC setter failure
+  const sessionAny = session as InstrumentedMediaSession & {
+    acceptedByJid?: string;
+    peerJid?: string;
+    participantJids?: string[];
+    peerSsrcs?: number[];
+    peerAudioSsrc?: number;
+    peerVideoSsrc?: number;
+  };
+  const candidatePeerJid =
+    sessionAny.acceptedByJid ||
+    sessionAny.peerJid ||
+    (Array.isArray(sessionAny.participantJids)
+      ? sessionAny.participantJids[0]
+      : undefined);
+
+  if (candidatePeerJid && typeof candidatePeerJid === 'string') {
+    const normalizedPeerDeviceJid = normalizeDeviceJid(candidatePeerJid);
+    const peerAudioSsrc =
+      sessionAny.peerSsrcs?.[0] ||
+      computeWhatsAppSecureSsrc(callId, normalizedPeerDeviceJid, 0);
+    const peerVideoSsrc = computeWhatsAppSecureSsrc(
+      callId,
+      normalizedPeerDeviceJid,
+      2
+    );
+    sessionAny.peerAudioSsrc = peerAudioSsrc;
+    sessionAny.peerVideoSsrc = peerVideoSsrc;
+    if (session.sctpRelay && typeof session.sctpRelay === 'object') {
+      const relayAny = session.sctpRelay as Record<string, unknown>;
+      relayAny.peerAudioSsrc = peerAudioSsrc;
+      relayAny.peerVideoSsrc = peerVideoSsrc;
     }
   }
 }
@@ -1163,7 +1215,7 @@ export function instrumentMediaSessionInstance(
     );
   }
 
-  if (session.__botezzInstrumented) {
+  if (Object.prototype.hasOwnProperty.call(session, '__botezzInstrumented')) {
     return session;
   }
   session.__botezzInstrumented = true;
@@ -1183,6 +1235,64 @@ export function instrumentMediaSessionInstance(
     this.sendCapturedVideoAU?.([sps, pps, idr], true);
     return true;
   };
+
+  // Hook `connectRelays` and `initSrtpKeys` so `videoSsrc` is updated BEFORE `connectRelays` sends STUN Allocate
+  const sessionWithRelays = session as InstrumentedMediaSession & {
+    connectRelays?: (relays: unknown) => Promise<unknown>;
+    initSrtpKeys?: () => void;
+    onRelayData?: (data: Uint8Array) => void;
+    onRelayVideoData?: (data: Uint8Array) => void;
+  };
+  if (typeof sessionWithRelays.connectRelays === 'function') {
+    const origConnectRelays = sessionWithRelays.connectRelays;
+    sessionWithRelays.connectRelays = async function patchedConnectRelays(
+      this: typeof sessionWithRelays,
+      relays: unknown
+    ) {
+      syncSessionVideoSsrcWithDeviceJid(this);
+      const res = await origConnectRelays.call(this, relays);
+      wrapSctpRelayOnSession(this);
+      syncSessionVideoSsrcWithDeviceJid(this);
+      return res;
+    };
+  }
+
+  if (typeof sessionWithRelays.initSrtpKeys === 'function') {
+    const origInitSrtpKeys = sessionWithRelays.initSrtpKeys;
+    sessionWithRelays.initSrtpKeys = function patchedInitSrtpKeys(
+      this: typeof sessionWithRelays
+    ) {
+      syncSessionVideoSsrcWithDeviceJid(this);
+      const res = origInitSrtpKeys.call(this);
+      syncSessionVideoSsrcWithDeviceJid(this);
+      return res;
+    };
+  }
+
+  // Ensure dynamic H.264 payload types (96..127 excluding Opus 111/120) route to `onRelayVideoData`
+  if (typeof sessionWithRelays.onRelayData === 'function') {
+    const origOnRelayData = sessionWithRelays.onRelayData;
+    sessionWithRelays.onRelayData = function patchedOnRelayData(
+      this: typeof sessionWithRelays,
+      data: Uint8Array
+    ) {
+      if (data && data.length >= 12 && (data[0] & 0xc0) === 0x80) {
+        const pt = data[1] & 0x7f;
+        if (
+          pt >= 96 &&
+          pt <= 127 &&
+          pt !== 97 &&
+          pt !== 111 &&
+          pt !== 120 &&
+          typeof this.onRelayVideoData === 'function'
+        ) {
+          this.onRelayVideoData(data);
+          return;
+        }
+      }
+      return origOnRelayData.call(this, data);
+    };
+  }
 
   if (typeof session.handleCallAck === 'function') {
     const origHandleCallAck = session.handleCallAck;
@@ -1255,6 +1365,13 @@ export function instrumentMediaSessionInstance(
 
   const sessionWithAccept = session as InstrumentedMediaSession & {
     handleCallAccept?: (...args: unknown[]) => Promise<void>;
+    acceptedByJid?: string;
+    peerJid?: string;
+    deps?: {
+      lowLevelCoordinator?: {
+        sendNode?: (node: unknown) => Promise<unknown>;
+      };
+    };
     srtpSession?: {
       sendCtx?: {
         sessionKey?: Uint8Array;
@@ -1318,7 +1435,7 @@ export function instrumentMediaSessionInstance(
 
       const res = await origHandleCallAccept.apply(this, args);
 
-      // Ensure `videoSsrc` and `videoRtpStream.ssrc` match the resolved companion device JID (`selfSsrcJid`)
+      // Ensure `videoSsrc`, `videoRtpStream.ssrc`, `peerAudioSsrc`, and `peerVideoSsrc` match the resolved device JIDs
       syncSessionVideoSsrcWithDeviceJid(this);
 
       // Extract peerCallKey (from accept node or session property) and store it strictly on `this.__peerCallKey`
@@ -1367,7 +1484,7 @@ export function instrumentMediaSessionInstance(
           sessionKey: primaryRecv.sessionKey,
           sessionSalt: primaryRecv.sessionSalt,
           authKey: primaryRecv.authKey,
-          authTagLen: primaryRecv.authTagLen ?? 4,
+          authTagLen: primaryRecv.authTagLen ?? 10,
         };
       }
 
@@ -1403,7 +1520,7 @@ export function instrumentMediaSessionInstance(
               dummyKeying,
               dummyKeying,
               localOutboundSend.authTagLen ?? 4,
-              primaryRecv?.authTagLen ?? 4
+              primaryRecv?.authTagLen ?? 10
             ) as {
               sendCtx?: Record<string, unknown>;
               recvCtx?: Record<string, unknown>;
@@ -1477,6 +1594,58 @@ export function instrumentMediaSessionInstance(
         videoSessionObj.recvCtx.sessionKey = primaryRecv.sessionKey;
         videoSessionObj.recvCtx.sessionSalt = primaryRecv.sessionSalt;
         videoSessionObj.recvCtx.authKey = primaryRecv.authKey;
+      }
+
+      // Send relay sender subscriptions for the peer's audio + video SSRCs so the TURN/SFU relay
+      // forwards the recipient's camera H.264 stream to us.
+      try {
+        const relayWithSubs = this.sctpRelay as
+          | { sendPeerMediaSubscriptions?: () => void }
+          | null
+          | undefined;
+        relayWithSubs?.sendPeerMediaSubscriptions?.();
+      } catch {
+        // Non-fatal
+      }
+
+      // Send `<call><video state="1" dec="H264" device_orientation="0"/></call>` stanza on video call accept
+      // so the recipient's WhatsApp client immediately activates its remote video renderer and camera encoder.
+      const isVideoCall =
+        (this.info as { mediaType?: string } | undefined)?.mediaType ===
+          'video' || Boolean(this.videoRtpStream);
+      const acceptingPeerJid = this.acceptedByJid || this.peerJid;
+      const callId = this.info?.callId || this.callId;
+      const callCreator =
+        this.info?.callCreator || this.selfSsrcJid || this.selfLid;
+      if (
+        isVideoCall &&
+        acceptingPeerJid &&
+        callId &&
+        callCreator &&
+        typeof this.deps?.lowLevelCoordinator?.sendNode === 'function'
+      ) {
+        const videoStateStanza = {
+          tag: 'call',
+          attrs: {
+            to: acceptingPeerJid,
+            id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+          },
+          content: [
+            {
+              tag: 'video',
+              attrs: {
+                'call-id': callId,
+                'call-creator': callCreator,
+                state: '1',
+                dec: 'H264',
+                device_orientation: '0',
+              },
+            },
+          ],
+        };
+        this.deps.lowLevelCoordinator.sendNode(videoStateStanza).catch(() => {
+          // Ignore non-fatal video state stanza error
+        });
       }
 
       // Restart `videoEngine` from the beginning if it was already running mid-stream before accept,
@@ -1740,6 +1909,7 @@ export function instrumentMediaSessionInstance(
     if (this.videoRtpStream) {
       this.videoRtpStream.setTimestampStride?.(tsStep);
       this.videoRtpStream.timestamp = frameTimestamp;
+      this.videoRtpStream.firstPacket = true;
     }
 
     // Packetize each NALU individually (never concatenating SPS+PPS+IDR into a single FU-A!)
@@ -1962,7 +2132,7 @@ export function hasVerifiedRelayMediaAcceptance(
 
 /**
  * Applies idempotent prototype-level instrumentation to `@hiroosy/baileys-lite/voip` internal classes
- * (`WaCallMediaSession`, `WaAudioEngine`, `WaVideoEngine`, `WaCallManager`).
+ * (`WaCallMediaSession`, `WaAudioEngine`, `WaVideoEngine`, `WaCallManager`, `PreNegotiatedDataChannel`, `WaManualRelay`).
  */
 export async function ensureHiroosyVoipRuntimePatched(): Promise<void> {
   if (patchApplied) return;
@@ -2012,6 +2182,257 @@ export async function ensureHiroosyVoipRuntimePatched(): Promise<void> {
         };
         if (mod?.WaCallMediaSession?.prototype) {
           instrumentMediaSessionInstance(mod.WaCallMediaSession.prototype);
+        }
+      }
+
+      // Patch `PreNegotiatedDataChannel.prototype.handleDtlsPayload` so ordered inbound video RTP packets
+      // are never trapped in `SctpAssociation.#reorderBuffer` (`STALE_GAP_TSN_LIMIT = 512`) or dropped when
+      // `streamSeq < #inboundExpectedStreamSeq` or `streamId !== 0`.
+      const preNegotiatedPath = path.join(
+        pkgDir,
+        'src/voip/relay/datachannel/pre-negotiated.js'
+      );
+      if (fs.existsSync(preNegotiatedPath)) {
+        const mod = (await import(
+          /* webpackIgnore: true */ pathToFileURL(preNegotiatedPath).href
+        )) as {
+          PreNegotiatedDataChannel?: {
+            prototype?: {
+              __botezzDataChannelPatched?: boolean;
+              __botezzSeenRtpKeys?: Set<string>;
+              handleDtlsPayload?: (plaintext: Uint8Array) => void;
+              emit?: (event: string, ...args: unknown[]) => boolean;
+            };
+          };
+        };
+        const dcProto = mod?.PreNegotiatedDataChannel?.prototype;
+        if (
+          dcProto &&
+          !dcProto.__botezzDataChannelPatched &&
+          typeof dcProto.handleDtlsPayload === 'function'
+        ) {
+          dcProto.__botezzDataChannelPatched = true;
+          const origHandleDtlsPayload = dcProto.handleDtlsPayload;
+          dcProto.handleDtlsPayload = function patchedHandleDtlsPayload(
+            this: NonNullable<typeof dcProto>,
+            plaintext: Uint8Array
+          ) {
+            if (!plaintext || plaintext.length < 16) {
+              return origHandleDtlsPayload.call(this, plaintext);
+            }
+
+            this.__botezzSeenRtpKeys ??= new Set<string>();
+            const seenKeys = this.__botezzSeenRtpKeys;
+            const makeRtpKey = (pkt: Uint8Array): string | null => {
+              if (!pkt || pkt.length < 12 || (pkt[0] & 0xc0) !== 0x80) {
+                return null;
+              }
+              const pt = pkt[1] & 0x7f;
+              const seq = (pkt[2] << 8) | pkt[3];
+              const ts =
+                ((pkt[4] << 24) |
+                  (pkt[5] << 16) |
+                  (pkt[6] << 8) |
+                  pkt[7]) >>>
+                0;
+              const ssrc =
+                ((pkt[8] << 24) |
+                  (pkt[9] << 16) |
+                  (pkt[10] << 8) |
+                  pkt[11]) >>>
+                0;
+              return `${ssrc}:${pt}:${seq}:${ts}`;
+            };
+
+            const origEmit = this.emit;
+            if (typeof origEmit === 'function') {
+              this.emit = function trackedEmit(
+                this: unknown,
+                event: string,
+                ...args: unknown[]
+              ) {
+                if (event === 'message' && args[0] instanceof Uint8Array) {
+                  const key = makeRtpKey(args[0]);
+                  if (key) {
+                    if (seenKeys.has(key)) {
+                      return true;
+                    }
+                    seenKeys.add(key);
+                    if (seenKeys.size > 2048) {
+                      const first = seenKeys.values().next().value;
+                      if (first !== undefined) seenKeys.delete(first);
+                    }
+                  }
+                }
+                return origEmit.call(this, event, ...args);
+              };
+            }
+
+            try {
+              origHandleDtlsPayload.call(this, plaintext);
+            } finally {
+              if (typeof origEmit === 'function') {
+                this.emit = origEmit;
+              }
+            }
+
+            // Scan SCTP chunks (starting after 12-byte SCTP common header) for DATA chunks (`type === 0`)
+            // whose RTP payload was withheld by `SctpAssociation.#reorderBuffer` or dropped by streamSeq/streamId checks.
+            let offset = 12;
+            while (offset + 4 <= plaintext.length) {
+              const chunkType = plaintext[offset];
+              const chunkLen =
+                (plaintext[offset + 2] << 8) | plaintext[offset + 3];
+              if (chunkLen < 4 || offset + chunkLen > plaintext.length) {
+                break;
+              }
+              if (chunkType === 0 && chunkLen >= 16) {
+                const userData = plaintext.subarray(
+                  offset + 16,
+                  offset + chunkLen
+                );
+                const key = makeRtpKey(userData);
+                if (key && !seenKeys.has(key)) {
+                  seenKeys.add(key);
+                  if (seenKeys.size > 2048) {
+                    const first = seenKeys.values().next().value;
+                    if (first !== undefined) seenKeys.delete(first);
+                  }
+                  try {
+                    this.emit?.('message', userData);
+                  } catch {
+                    // Ignore emit error
+                  }
+                }
+              }
+              const paddedLen = (chunkLen + 3) & ~3;
+              offset += paddedLen;
+            }
+          };
+        }
+      }
+
+      // Patch `WaManualRelay.prototype` so `streamSsrcs[3]` always carries `videoSsrc` and
+      // `sendPeerMediaSubscriptions` subscribes to the remote peer's audio + video SSRCs on the relay.
+      const manualRelayPath = path.join(
+        pkgDir,
+        'src/voip/relay/WaManualRelay.js'
+      );
+      const stunPath = path.join(pkgDir, 'src/voip/relay/stun.js');
+      if (fs.existsSync(manualRelayPath) && fs.existsSync(stunPath)) {
+        const [relayMod, stunMod] = (await Promise.all([
+          import(/* webpackIgnore: true */ pathToFileURL(manualRelayPath).href),
+          import(/* webpackIgnore: true */ pathToFileURL(stunPath).href),
+        ])) as [
+          {
+            WaManualRelay?: {
+              prototype?: {
+                __botezzManualRelayPatched?: boolean;
+                videoSsrc?: number;
+                audioSsrc?: number;
+                subscriptionSsrc?: number;
+                peerAudioSsrc?: number;
+                peerVideoSsrc?: number;
+                streamSsrcs?: number[];
+                connections?: Map<
+                  string,
+                  {
+                    dc?: {
+                      isOpen?: boolean;
+                      send?: (data: Uint8Array, unordered?: boolean) => boolean;
+                    };
+                  }
+                >;
+                sendStunAllocateOnOpen?: (
+                  conn: unknown,
+                  streamSsrcs: number[]
+                ) => void;
+                sendPeerMediaSubscriptions?: () => void;
+              };
+            };
+          },
+          {
+            buildSenderSubscriptions?: (
+              entries: Array<{ ssrc: number; flags?: number }>
+            ) => Uint8Array;
+            buildMinimalBindingWithSubs?: (
+              subscriptions: Uint8Array,
+              extraAttrs?: unknown[]
+            ) => Uint8Array;
+          },
+        ];
+
+        const relayProto = relayMod?.WaManualRelay?.prototype;
+        if (relayProto && !relayProto.__botezzManualRelayPatched) {
+          relayProto.__botezzManualRelayPatched = true;
+
+          relayProto.sendPeerMediaSubscriptions =
+            function sendPeerMediaSubscriptions() {
+              if (
+                typeof stunMod?.buildSenderSubscriptions !== 'function' ||
+                typeof stunMod?.buildMinimalBindingWithSubs !== 'function' ||
+                !this.connections
+              ) {
+                return;
+              }
+              const candidateSsrcs = new Set<number>();
+              if (this.peerVideoSsrc && this.peerVideoSsrc > 0) {
+                candidateSsrcs.add(this.peerVideoSsrc >>> 0);
+              }
+              if (this.peerAudioSsrc && this.peerAudioSsrc > 0) {
+                candidateSsrcs.add(this.peerAudioSsrc >>> 0);
+              }
+              if (this.subscriptionSsrc && this.subscriptionSsrc > 0) {
+                candidateSsrcs.add(this.subscriptionSsrc >>> 0);
+              }
+              if (candidateSsrcs.size === 0) {
+                return;
+              }
+              const entries = Array.from(candidateSsrcs).map((ssrc) => ({
+                ssrc,
+                flags: 1,
+              }));
+              const subsAttr = stunMod.buildSenderSubscriptions(entries);
+              const subBinding = stunMod.buildMinimalBindingWithSubs(subsAttr);
+              for (const conn of this.connections.values()) {
+                if (conn?.dc?.isOpen && typeof conn.dc.send === 'function') {
+                  try {
+                    conn.dc.send(subBinding, false);
+                  } catch {
+                    // Ignore subscription send error
+                  }
+                }
+              }
+            };
+
+          if (typeof relayProto.sendStunAllocateOnOpen === 'function') {
+            const origSendStunAllocateOnOpen =
+              relayProto.sendStunAllocateOnOpen;
+            relayProto.sendStunAllocateOnOpen =
+              function patchedSendStunAllocateOnOpen(
+                conn: unknown,
+                streamSsrcs: number[]
+              ) {
+                if (
+                  Array.isArray(streamSsrcs) &&
+                  streamSsrcs.length >= 4 &&
+                  this.videoSsrc
+                ) {
+                  streamSsrcs[3] = this.videoSsrc >>> 0;
+                }
+                const res = origSendStunAllocateOnOpen.call(
+                  this,
+                  conn,
+                  streamSsrcs
+                );
+                try {
+                  this.sendPeerMediaSubscriptions?.();
+                } catch {
+                  // Ignore subscription error
+                }
+                return res;
+              };
+          }
         }
       }
 

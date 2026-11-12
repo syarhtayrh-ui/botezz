@@ -719,4 +719,199 @@ describe('Two-Way VoIP Video Call Recording (VoipCallRecorder)', () => {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
   });
+
+  it('spawns FFmpeg on WaVideoEngine when videoLoop is true and emits H.264 Access Units without short-circuiting on this.running', async () => {
+    const {
+      ensureHiroosyVoipRuntimePatched,
+      instrumentVideoEngineInstance,
+    } = await import('../../src/whatsapp/voip-runtime-patch');
+    await ensureHiroosyVoipRuntimePatched();
+
+    const fakeEngine: {
+      sourceKind: 'blank';
+      videoLoop: boolean;
+      width: number;
+      height: number;
+      frameRate: number;
+      frameDurationMs: number;
+      running: boolean;
+      pending: Uint8Array;
+      accessUnitsSent: number;
+      videoPath: string | null;
+      waitingForKeyFrame: boolean;
+      proc?: unknown;
+      lastGeneratedFfmpegArgs?: string[];
+      start: (onAccessUnit?: (au: Uint8Array) => void) => unknown;
+      stop?: () => void;
+    } = {
+      sourceKind: 'blank' as const,
+      videoLoop: true,
+      width: 320,
+      height: 240,
+      frameRate: 30,
+      frameDurationMs: 33.33,
+      running: false,
+      pending: new Uint8Array(0),
+      accessUnitsSent: 0,
+      videoPath: null,
+      waitingForKeyFrame: true,
+      // Simulate real WaVideoEngine.prototype.start which checks `if (this.running) return;`
+      start(onAccessUnit?: (au: Uint8Array) => void) {
+        if (this.running) return null;
+        if (onAccessUnit) {
+          (this as { onAccessUnit?: (au: Uint8Array) => void }).onAccessUnit =
+            onAccessUnit;
+        }
+        return (this as { spawnFfmpeg?: () => unknown }).spawnFfmpeg?.();
+      },
+    };
+
+    instrumentVideoEngineInstance(fakeEngine);
+    assert.equal(fakeEngine.frameRate, 15);
+    assert.equal(fakeEngine.frameDurationMs, 1000 / 15);
+
+    try {
+      const proc = fakeEngine.start(() => undefined);
+      assert.ok(
+        proc && fakeEngine.proc,
+        'WaVideoEngine.start with videoLoop=true must spawn FFmpeg process instead of short-circuiting on this.running'
+      );
+      assert.equal(fakeEngine.running, true);
+      assert.ok(
+        Array.isArray(fakeEngine.lastGeneratedFfmpegArgs) &&
+          fakeEngine.lastGeneratedFfmpegArgs.includes('libx264')
+      );
+    } finally {
+      fakeEngine.stop?.();
+    }
+  });
+
+  it('bypasses SCTP reorderBuffer head-of-line blocking for ordered inbound video RTP packets and captures relay_receive { ip, port, data } + delegate.emitInboundVideo(info, accessUnit)', async () => {
+    const { ensureHiroosyVoipRuntimePatched } = await import(
+      '../../src/whatsapp/voip-runtime-patch'
+    );
+    await ensureHiroosyVoipRuntimePatched();
+
+    const tmpDir = fs.mkdtempSync(
+      path.join(os.tmpdir(), 'botezz-sctp-cam-rec-')
+    );
+    try {
+      const recorder = new VoipCallRecorder({
+        callId: 'vcall_sctp_relay_obj',
+        sessionId: 'sess_sctp_1',
+        recipientJid: '966501234567@s.whatsapp.net',
+        outboundVideoPath: path.join(tmpDir, 'unused_outbound.mp4'),
+        recordingsDir: tmpDir,
+        isMockMode: false,
+      });
+
+      // Derive keys using per-JID HKDF (matching WaCallMediaSession.handleCallAccept)
+      const peerCallKey = crypto.randomBytes(30);
+      const acceptedByJid = '1234567890:0@lid';
+
+      const relayListeners = new Map<string, Array<(arg: unknown) => void>>();
+      const fakeSession: Record<string, unknown> = {
+        acceptedByJid,
+        __peerCallKey: new Uint8Array(peerCallKey),
+        peerVideoSsrc: 0x55667788,
+        sctpRelay: {
+          hasConnection: () => true,
+          broadcast: () => true,
+          on(event: string, cb: (arg: unknown) => void) {
+            const list = relayListeners.get(event) ?? [];
+            list.push(cb);
+            relayListeners.set(event, list);
+          },
+        },
+        delegate: {
+          emitInboundVideo: (_info: unknown, _au: Uint8Array) => undefined,
+        },
+      };
+
+      recorder.attachToMediaSession(fakeSession);
+
+      // 1. Test `relay_receive` emitting `{ ip, port, data }` object (exact WaManualRelay shape)
+      //    encrypted with per-JID HKDF key derived from `(peerCallKey, acceptedByJid)` and 10-byte auth tag
+      const perJidDerived = new Uint8Array(
+        crypto.hkdfSync(
+          'sha256',
+          peerCallKey,
+          new Uint8Array(0),
+          Buffer.from(acceptedByJid, 'utf8'),
+          30
+        )
+      );
+      const { deriveSrtpSessionKeysFromMaster } = await import(
+        '../../src/whatsapp/voip-call-recorder'
+      );
+      const perJidKeys10 = deriveSrtpSessionKeysFromMaster(
+        perJidDerived.subarray(0, 16),
+        perJidDerived.subarray(16, 30),
+        10
+      );
+
+      const spsPkt = protectRtpForTest(
+        buildRawRtpPacket({
+          payloadType: 97,
+          seq: 50,
+          timestamp: 18000,
+          ssrc: 0x55667788,
+          payload: new Uint8Array([
+            0x67, 0x42, 0xc0, 0x1f, 0xda, 0x02, 0x80, 0x2d,
+          ]),
+        }),
+        perJidKeys10
+      );
+      const ppsPkt = protectRtpForTest(
+        buildRawRtpPacket({
+          payloadType: 97,
+          seq: 51,
+          timestamp: 18000,
+          ssrc: 0x55667788,
+          payload: new Uint8Array([0x68, 0xce, 0x3c, 0x80]),
+        }),
+        perJidKeys10
+      );
+      const idrPkt = protectRtpForTest(
+        buildRawRtpPacket({
+          payloadType: 97,
+          seq: 52,
+          timestamp: 18000,
+          ssrc: 0x55667788,
+          marker: true,
+          payload: new Uint8Array([0x65, 0x88, 0x84, 0x21, 0xa0]),
+        }),
+        perJidKeys10
+      );
+
+      for (const pkt of [spsPkt, ppsPkt, idrPkt]) {
+        for (const cb of relayListeners.get('relay_receive') ?? []) {
+          cb({ ip: '157.240.1.1', port: 3478, data: pkt });
+        }
+      }
+
+      assert.equal(recorder.getSummary().inboundVideoPacketsReceived, 3);
+      assert.equal(recorder.getSummary().inboundVideoFramesRecorded, 1);
+
+      // 2. Test `delegate.emitInboundVideo(info, accessUnit)` (2-argument Annex-B signature)
+      const delegateObj = fakeSession.delegate as {
+        emitInboundVideo: (info: unknown, au: Uint8Array) => void;
+      };
+      const annexBPFrame = new Uint8Array([
+        0x00, 0x00, 0x00, 0x01, 0x41, 0x9a, 0x24, 0x6c,
+      ]);
+      delegateObj.emitInboundVideo({ callId: 'vcall_sctp_relay_obj' }, annexBPFrame);
+
+      assert.equal(recorder.getSummary().inboundVideoFramesRecorded, 2);
+
+      const summary = await recorder.finalizeRecording();
+      assert.equal(summary.recordingStatus, 'READY');
+      assert.equal(summary.remoteCameraCaptured, true);
+      assert.ok(summary.recordedVideoPath);
+      assert.ok(fs.existsSync(summary.recordedVideoPath));
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
 });
+

@@ -365,13 +365,15 @@ export class PerSsrcSrtpDecryptor {
 
   /**
    * Decrypts an inbound SRTP packet using `primaryKeys` (typically `session.srtpSession.recvCtx`
-   * which holds `peerCallKey`-derived keys) or `fallbackKeys` (`session.videoSrtpSession.recvCtx`).
-   * If neither key material is provided (e.g. raw RTP in unit tests), returns `packet` if it has a valid RTP v2 header.
+   * which holds `peerCallKey`-derived keys), `fallbackKeys` (`session.videoSrtpSession.recvCtx`),
+   * or any additional candidate key materials derived from peer/call JIDs.
+   * If no key material is provided (e.g. raw RTP in unit tests), returns `packet` if it has a valid RTP v2 header.
    */
   public unprotectRtpPacket(
     packet: Uint8Array,
     primaryKeys?: SrtpKeyMaterial | null,
-    fallbackKeys?: SrtpKeyMaterial | null
+    fallbackKeys?: SrtpKeyMaterial | null,
+    additionalCandidateKeys?: Array<SrtpKeyMaterial | null | undefined>
   ): Uint8Array | null {
     if (!packet || packet.length < 12) return null;
     const version = (packet[0] >> 6) & 0x03;
@@ -391,7 +393,24 @@ export class PerSsrcSrtpDecryptor {
       if (dec) return dec;
     }
 
-    if (!primaryKeys && !fallbackKeys) {
+    if (Array.isArray(additionalCandidateKeys)) {
+      for (const candidate of additionalCandidateKeys) {
+        if (
+          candidate?.sessionKey &&
+          candidate?.sessionSalt &&
+          candidate?.authKey
+        ) {
+          const dec = this.unprotectWithKeys(packet, candidate);
+          if (dec) return dec;
+        }
+      }
+    }
+
+    if (
+      !primaryKeys &&
+      !fallbackKeys &&
+      (!additionalCandidateKeys || additionalCandidateKeys.length === 0)
+    ) {
       return packet;
     }
 
@@ -401,9 +420,15 @@ export class PerSsrcSrtpDecryptor {
   public unprotectSrtpPacket(
     packet: Uint8Array,
     primaryKeys?: SrtpKeyMaterial | null,
-    fallbackKeys?: SrtpKeyMaterial | null
+    fallbackKeys?: SrtpKeyMaterial | null,
+    additionalCandidateKeys?: Array<SrtpKeyMaterial | null | undefined>
   ): Uint8Array | null {
-    return this.unprotectRtpPacket(packet, primaryKeys, fallbackKeys);
+    return this.unprotectRtpPacket(
+      packet,
+      primaryKeys,
+      fallbackKeys,
+      additionalCandidateKeys
+    );
   }
 }
 
@@ -686,7 +711,7 @@ function extractRecvKeyMaterial(
     return deriveSrtpSessionKeysFromMaster(
       srtpSessionLike.subarray(0, 16),
       srtpSessionLike.subarray(16, 30),
-      4
+      10
     );
   }
   if (typeof srtpSessionLike !== 'object') return null;
@@ -717,7 +742,7 @@ function extractRecvKeyMaterial(
       sessionKey: ctx.sessionKey,
       sessionSalt: ctx.sessionSalt,
       authKey: ctx.authKey,
-      authTagLen: ctx.authTagLen ?? 4,
+      authTagLen: ctx.authTagLen ?? 10,
     };
   }
   if (
@@ -730,10 +755,120 @@ function extractRecvKeyMaterial(
     return deriveSrtpSessionKeysFromMaster(
       ctx.masterKey,
       ctx.masterSalt,
-      ctx.authTagLen ?? 4
+      ctx.authTagLen ?? 10
     );
   }
   return null;
+}
+
+/**
+ * Derives per-JID SRTP session keys (`HKDF-SHA256(callKey, emptySalt, peerJid, 30)` -> AES-CM session keys)
+ * matching `@hiroosy/baileys-lite`'s `derivePerJidSrtpKey(callKey, jid)`.
+ */
+function derivePerJidCandidateRecvKeys(
+  callKey: Uint8Array,
+  jid: string
+): SrtpKeyMaterial | null {
+  if (!(callKey instanceof Uint8Array) || callKey.length < 16 || !jid) {
+    return null;
+  }
+  try {
+    const derived = new Uint8Array(
+      crypto.hkdfSync(
+        'sha256',
+        callKey,
+        new Uint8Array(0),
+        Buffer.from(jid, 'utf8'),
+        30
+      )
+    );
+    return deriveSrtpSessionKeysFromMaster(
+      derived.subarray(0, 16),
+      derived.subarray(16, 30),
+      10
+    );
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Collects all candidate SRTP receive key materials from a media session, including:
+ * - `session.__peerRecvCtx`, `session.srtpSession.recvCtx`, `session.videoSrtpSession.recvCtx`
+ * - Per-JID HKDF derivations for `(peerCallKey | localCallKey)` across `acceptedByJid`, `peerJid`, `participantJids`
+ *   (both `:device@` and bare `@` forms)
+ * - Direct 30-byte master key derivations from `__peerCallKey` / `peerCallKey` / `__localCallKey` / `localCallKey`
+ */
+function collectAdditionalCandidateRecvKeys(
+  session: Record<string, unknown> | null | undefined
+): SrtpKeyMaterial[] {
+  if (!session || typeof session !== 'object') return [];
+  const results: SrtpKeyMaterial[] = [];
+  const seenSessionKeys = new Set<string>();
+
+  const pushUnique = (km: SrtpKeyMaterial | null | undefined) => {
+    if (!km?.sessionKey || !km?.sessionSalt || !km?.authKey) return;
+    const hex = Buffer.from(km.sessionKey).toString('hex');
+    if (seenSessionKeys.has(hex)) return;
+    seenSessionKeys.add(hex);
+    results.push(km);
+  };
+
+  pushUnique(extractRecvKeyMaterial(session.videoSrtpSession));
+  pushUnique(extractRecvKeyMaterial(session.srtpSession));
+  pushUnique(extractRecvKeyMaterial(session.__peerCallKey));
+  pushUnique(extractRecvKeyMaterial(session.peerCallKey));
+
+  const callKeys: Uint8Array[] = [];
+  for (const rawKey of [
+    session.__peerCallKey,
+    session.peerCallKey,
+    (session.info as { callKey?: unknown } | undefined)?.callKey,
+    (session.info as { encryptionKey?: unknown } | undefined)?.encryptionKey,
+    session.__localCallKey,
+    session.localCallKey,
+  ]) {
+    if (rawKey instanceof Uint8Array && rawKey.length >= 16) {
+      callKeys.push(rawKey);
+    }
+  }
+
+  const jidCandidates = new Set<string>();
+  const addJidVariants = (jid: unknown) => {
+    if (typeof jid !== 'string' || !jid.includes('@')) return;
+    jidCandidates.add(jid);
+    if (!jid.includes(':')) {
+      jidCandidates.add(jid.replace('@', ':0@'));
+    } else {
+      jidCandidates.add(jid.replace(/:\d+@/, '@'));
+    }
+  };
+
+  addJidVariants(session.acceptedByJid);
+  addJidVariants(session.peerJid);
+  addJidVariants((session.info as { peerJid?: unknown } | undefined)?.peerJid);
+  if (Array.isArray(session.participantJids)) {
+    for (const pj of session.participantJids) {
+      addJidVariants(pj);
+    }
+  }
+
+  for (const ck of callKeys) {
+    for (const jid of jidCandidates) {
+      pushUnique(derivePerJidCandidateRecvKeys(ck, jid));
+    }
+    pushUnique(extractRecvKeyMaterial(ck));
+  }
+
+  const srtpSend = (session.srtpSession as { sendCtx?: unknown } | undefined)
+    ?.sendCtx;
+  const videoSend = (
+    session.videoSrtpSession as { sendCtx?: unknown } | undefined
+  )?.sendCtx;
+  pushUnique(extractRecvKeyMaterial(srtpSend));
+  pushUnique(extractRecvKeyMaterial(videoSend));
+
+  return results;
 }
 
 /**
@@ -983,7 +1118,10 @@ export class VoipCallRecorder {
     this.attachedSession = session;
     syncPeerRecvKeysOnMediaSession(session);
 
-    if (session.__botezzRecorderAttached === this) {
+    if (
+      Object.prototype.hasOwnProperty.call(session, '__botezzRecorderAttached') &&
+      session.__botezzRecorderAttached === this
+    ) {
       return;
     }
     session.__botezzRecorderAttached = this;
@@ -1032,14 +1170,26 @@ export class VoipCallRecorder {
         onData?: (data: Uint8Array, ...rest: unknown[]) => unknown;
         handleSctpPacket?: (data: Uint8Array, ...rest: unknown[]) => unknown;
       };
-      if (relay.__botezzRelayHooked !== this) {
+      if (
+        !Object.prototype.hasOwnProperty.call(relay, '__botezzRelayHooked') ||
+        relay.__botezzRelayHooked !== this
+      ) {
         relay.__botezzRelayHooked = this;
         const handleRelayChunk = (chunk: unknown) => {
-          if (chunk instanceof Uint8Array || Buffer.isBuffer(chunk)) {
+          // `WaManualRelay` emits `{ ip, port, data: Uint8Array }` on `'relay_receive'`
+          const rawBytes =
+            chunk instanceof Uint8Array || Buffer.isBuffer(chunk)
+              ? chunk
+              : chunk && typeof chunk === 'object' && 'data' in chunk
+                ? (chunk as { data?: unknown }).data
+                : undefined;
+          if (rawBytes instanceof Uint8Array || Buffer.isBuffer(rawBytes)) {
             syncPeerRecvKeysOnMediaSession(session);
             try {
               this.inspectRawRelayPacket(
-                chunk instanceof Uint8Array ? chunk : new Uint8Array(chunk),
+                rawBytes instanceof Uint8Array
+                  ? rawBytes
+                  : new Uint8Array(rawBytes),
                 session
               );
             } catch {
@@ -1073,33 +1223,63 @@ export class VoipCallRecorder {
     }
 
     // 4. Hook `session.delegate.emitInboundVideo` if present
+    // Note: `WaCallMediaSession.onRelayVideoData` invokes `this.delegate.emitInboundVideo?.(this.info, accessUnit)`
+    // where the 2nd argument (`rest[0]`) is a reassembled Annex-B `Uint8Array`, whereas unit tests may pass `rtpPacket` as the 1st argument.
     if (session.delegate && typeof session.delegate === 'object') {
       const delegate = session.delegate as Record<string, unknown> & {
         __botezzDelegateHooked?: VoipCallRecorder;
-        emitInboundVideo?: (data: Uint8Array, ...rest: unknown[]) => unknown;
+        emitInboundVideo?: (data: unknown, ...rest: unknown[]) => unknown;
       };
       if (
-        delegate.__botezzDelegateHooked !== this &&
+        (!Object.prototype.hasOwnProperty.call(
+          delegate,
+          '__botezzDelegateHooked'
+        ) ||
+          delegate.__botezzDelegateHooked !== this) &&
         typeof delegate.emitInboundVideo === 'function'
       ) {
         delegate.__botezzDelegateHooked = this;
         const origEmitInboundVideo = delegate.emitInboundVideo.bind(delegate);
         delegate.emitInboundVideo = (
-          data: Uint8Array,
+          dataOrInfo: unknown,
           ...rest: unknown[]
         ) => {
-          if (data instanceof Uint8Array || Buffer.isBuffer(data)) {
+          const candidateBytes =
+            dataOrInfo instanceof Uint8Array || Buffer.isBuffer(dataOrInfo)
+              ? dataOrInfo
+              : rest[0] instanceof Uint8Array || Buffer.isBuffer(rest[0])
+                ? rest[0]
+                : undefined;
+          if (
+            candidateBytes instanceof Uint8Array ||
+            Buffer.isBuffer(candidateBytes)
+          ) {
             syncPeerRecvKeysOnMediaSession(session);
             try {
-              this.handleInboundVideoPacket(
-                data instanceof Uint8Array ? data : new Uint8Array(data),
-                session
-              );
+              const bytes =
+                candidateBytes instanceof Uint8Array
+                  ? candidateBytes
+                  : new Uint8Array(candidateBytes);
+              const isAnnexB =
+                (bytes.length >= 4 &&
+                  bytes[0] === 0 &&
+                  bytes[1] === 0 &&
+                  bytes[2] === 0 &&
+                  bytes[3] === 1) ||
+                (bytes.length >= 3 &&
+                  bytes[0] === 0 &&
+                  bytes[1] === 0 &&
+                  bytes[2] === 1);
+              if (isAnnexB) {
+                this.handleInboundAnnexBAccessUnit(bytes);
+              } else {
+                this.handleInboundVideoPacket(bytes, session);
+              }
             } catch {
               // Ignore delegate hook error
             }
           }
-          return origEmitInboundVideo(data, ...rest);
+          return origEmitInboundVideo(dataOrInfo, ...rest);
         };
       }
     }
@@ -1167,6 +1347,90 @@ export class VoipCallRecorder {
     if (this.pliInterval) {
       clearInterval(this.pliInterval);
       this.pliInterval = null;
+    }
+  }
+
+  /**
+   * Handles a pre-reassembled Annex-B H.264 Access Unit (e.g. from `delegate.emitInboundVideo(info, accessUnit)`),
+   * applying the same strict `SPS + PPS + IDR` gate before writing to `remote_video.h264`.
+   */
+  public handleInboundAnnexBAccessUnit(accessUnit: Uint8Array): void {
+    if (this.status !== 'RECORDING' || !accessUnit || accessUnit.length < 4) {
+      return;
+    }
+
+    // Split Annex-B start codes (`00 00 00 01` or `00 00 01`)
+    const nalPayloads: Uint8Array[] = [];
+    let start = -1;
+    let i = 0;
+    while (i < accessUnit.length) {
+      const scLen =
+        i + 3 < accessUnit.length &&
+        accessUnit[i] === 0 &&
+        accessUnit[i + 1] === 0 &&
+        accessUnit[i + 2] === 0 &&
+        accessUnit[i + 3] === 1
+          ? 4
+          : i + 2 < accessUnit.length &&
+              accessUnit[i] === 0 &&
+              accessUnit[i + 1] === 0 &&
+              accessUnit[i + 2] === 1
+            ? 3
+            : 0;
+      if (scLen > 0) {
+        if (start >= 0 && i > start) {
+          nalPayloads.push(accessUnit.subarray(start, i));
+        }
+        i += scLen;
+        start = i;
+        continue;
+      }
+      i++;
+    }
+    if (start >= 0 && start < accessUnit.length) {
+      nalPayloads.push(accessUnit.subarray(start));
+    }
+
+    if (nalPayloads.length === 0) return;
+
+    for (const nalPayload of nalPayloads) {
+      if (!nalPayload || nalPayload.length === 0) continue;
+      const nalType = nalPayload[0] & 0x1f;
+      if (nalType === 7) {
+        this.cachedSps = nalPayload.slice();
+        this.h264State.cachedRemoteSps = this.cachedSps;
+        this.h264State.wroteParameterSets = true;
+        continue;
+      }
+      if (nalType === 8) {
+        this.cachedPps = nalPayload.slice();
+        this.h264State.cachedRemotePps = this.cachedPps;
+        this.h264State.wroteParameterSets = true;
+        continue;
+      }
+      if (nalType === 1 && !this.hasWrittenFirstIdr) {
+        continue;
+      }
+      if (nalType === 5) {
+        if (this.cachedSps && this.cachedPps) {
+          const prevWritten = this.remoteVideoBytesWritten;
+          this.ensureRemoteVideoHasParameterSets(nalPayload);
+          if (this.remoteVideoBytesWritten > prevWritten) {
+            this.h264State.inboundVideoPacketsReceived++;
+            this.h264State.inboundVideoFramesRecorded++;
+            this.h264State.inboundKeyframesRecorded++;
+          }
+        }
+        continue;
+      }
+      if (nalType === 1 && this.hasWrittenFirstIdr) {
+        const prevWritten = this.remoteVideoBytesWritten;
+        this.writeRemoteVideoNal(nalPayload);
+        if (this.remoteVideoBytesWritten > prevWritten) {
+          this.h264State.inboundVideoPacketsReceived++;
+          this.h264State.inboundVideoFramesRecorded++;
+        }
+      }
     }
   }
 
@@ -1293,11 +1557,14 @@ export class VoipCallRecorder {
     const fallbackKeys =
       extractRecvKeyMaterial(effectiveSession?.videoSrtpSession) ??
       extractRecvKeyMaterial(effectiveSession?.__peerCallKey);
+    const additionalCandidates =
+      collectAdditionalCandidateRecvKeys(effectiveSession);
 
     const plainRtp = this.srtpDecryptor.unprotectRtpPacket(
       packet,
       primaryKeys,
-      fallbackKeys
+      fallbackKeys,
+      additionalCandidates.length > 0 ? additionalCandidates : undefined
     );
     if (!plainRtp) {
       return null;
