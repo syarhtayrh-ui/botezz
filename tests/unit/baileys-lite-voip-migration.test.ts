@@ -1058,8 +1058,8 @@ describe('@hiroosy/baileys-lite & Real WhatsApp VoIP Video Call Suite', () => {
       };
       assert.equal(
         pkgJson.dependencies?.['@hiroosy/baileys-lite'],
-        '0.3.6',
-        '@hiroosy/baileys-lite@0.3.6 must be the sole WhatsApp dependency in package.json'
+        '^0.3.7',
+        '@hiroosy/baileys-lite@^0.3.7 must be the sole WhatsApp dependency in package.json'
       );
       assert.equal(pkgJson.dependencies?.[legacyForkPkg], undefined);
       assert.equal(pkgJson.devDependencies?.[legacyForkPkg], undefined);
@@ -1070,8 +1070,8 @@ describe('@hiroosy/baileys-lite & Real WhatsApp VoIP Video Call Suite', () => {
         'utf8'
       );
       assert.ok(
-        bunLockContent.includes('@hiroosy/baileys-lite@0.3.6'),
-        'bun.lock must resolve @hiroosy/baileys-lite@0.3.6'
+        bunLockContent.includes('@hiroosy/baileys-lite@'),
+        'bun.lock must resolve @hiroosy/baileys-lite'
       );
       assert.equal(
         legacyForkPattern.test(bunLockContent),

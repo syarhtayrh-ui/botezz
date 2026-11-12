@@ -87,6 +87,8 @@ export class ToolsHandler {
     number,
     'composing' | 'recording' | 'available'
   >();
+  private readonly presenceTrackDurationByAdmin = new Map<number, number>();
+  private readonly lastTrackedRecipientByAdmin = new Map<number, string>();
   public readonly functionLabRepo: FunctionLabRepository;
   public readonly functionRegistry: FunctionRegistry;
   public readonly functionValidator: FunctionValidator;
@@ -881,7 +883,11 @@ export class ToolsHandler {
       this.cancel(adminId);
       const mode =
         this.presenceHeartbeatModeByAdmin.get(adminId) || 'composing';
-      return this.executePresenceHeartbeat(adminId, `${mode} ${rawText}`);
+      return this.executePresenceHeartbeat(
+        adminId,
+        `${mode} ${rawText}`,
+        onProgressUpdate
+      );
     }
     if (step === 'AWAITING_FULL_PROFILE_INPUT') {
       this.cancel(adminId);
@@ -2426,42 +2432,161 @@ export class ToolsHandler {
 
   public promptPresenceTool(adminId: number): BotViewResponse {
     this.inputStates.set(adminId, 'AWAITING_PRESENCE_TRACK_INPUT');
+    const selectedDur = this.presenceTrackDurationByAdmin.get(adminId) || 15;
+    const lastTarget = this.lastTrackedRecipientByAdmin.get(adminId);
+    const shortTarget =
+      lastTarget && Buffer.byteLength(lastTarget, 'utf8') <= 22
+        ? lastTarget
+        : undefined;
+
+    const rows: InlineKeyboardRows = [
+      [
+        {
+          text: `👁️ إعداد الرادار اللحظي المتقدم (${selectedDur}ث)`,
+          callbackData: 'tools:presence_mode_track',
+        },
+      ],
+      [
+        {
+          text: `${selectedDur === 15 ? '✅ ' : ''}⏱️ 15ث`,
+          callbackData: 'tools:presence_dur:15',
+        },
+        {
+          text: `${selectedDur === 30 ? '✅ ' : ''}⏱️ 30ث`,
+          callbackData: 'tools:presence_dur:30',
+        },
+        {
+          text: `${selectedDur === 60 ? '✅ ' : ''}⏱️ 60ث`,
+          callbackData: 'tools:presence_dur:60',
+        },
+        {
+          text: `${selectedDur === 120 ? '✅ ' : ''}⏱️ 120ث`,
+          callbackData: 'tools:presence_dur:120',
+        },
+      ],
+    ];
+
+    if (shortTarget) {
+      rows.push([
+        {
+          text: `🚀 رصد فوري لآخر هدف (${shortTarget}) — ${selectedDur}ث`,
+          callbackData: `tools:presence_run:${shortTarget}:${selectedDur}`,
+        },
+      ]);
+    }
+
+    rows.push(
+      [
+        {
+          text: '⌨️ بث نبض: يكتب الآن... (composing)',
+          callbackData: 'tools:presence_hb:composing',
+        },
+        {
+          text: '🎙️ بث نبض: يسجل صوتاً... (recording)',
+          callbackData: 'tools:presence_hb:recording',
+        },
+      ],
+      [
+        {
+          text: '🟢 بث نبض: متصل الآن (available)',
+          callbackData: 'tools:presence_hb:available',
+        },
+      ],
+      buildBackCancelRow('menu:tools')
+    );
+
     return {
       text:
-        `${renderBreadcrumb(['الرئيسية', 'الأدوات', 'تتبع التواجد والنبض'])}\n` +
-        `👁️ *محرك تتبع التواجد وبث النبض الحي (Presence & Heartbeat — /presence)*\n` +
+        `${renderBreadcrumb(['الرئيسية', 'الأدوات', 'التتبع اللحظي والنبض'])}\n` +
+        `👁️ *رادار التتبع اللحظي المتقدم وبث النبض (Live Presence Radar — /presence)*\n` +
         `━━━━━━━━━━━━━━━━━━\n` +
-        `اختر وضع التشغيل من الأزرار أدناه أو أرسل مباشرة **رقم الهاتف والمدة بالثواني** لبدء الرصد الحي:\n` +
-        `• **رصد التواجد الحي:** يلتقط حالات \`available\`, \`composing\`, \`recording\`, \`paused\`, \`unavailable\` عبر كل من \`@s.whatsapp.net\` و\`@lid\` ويحسب إجمالي مدة الاتصال.\n` +
-        `• **بث النبض المستمر (Heartbeat):** يرسل نبضات \`composing\` أو \`recording\` كل 7.5 ثانية حتى لا ينطفئ المؤشر لدى الطرف الآخر.\n\n` +
-        `📌 *مثال للرصد الفوري:* \`+966501234567 15\``,
-      keyboard: [
-        [
-          {
-            text: '👁️ رصد تواجد المستلم الحي',
-            callbackData: 'tools:presence_mode_track',
-          },
-        ],
-        [
-          {
-            text: '⌨️ بث نبض: يكتب الآن... (composing)',
-            callbackData: 'tools:presence_hb:composing',
-          },
-          {
-            text: '🎙️ بث نبض: يسجل صوتاً... (recording)',
-            callbackData: 'tools:presence_hb:recording',
-          },
-        ],
-        [
-          {
-            text: '🟢 بث نبض: متصل الآن (available)',
-            callbackData: 'tools:presence_hb:available',
-          },
-        ],
-        buildBackCancelRow('menu:tools'),
-      ],
-      toastText: '👁️ اختر وضع الرصد أو البث أو أرسل الرقم',
+        `يرصد نشاط المستلم في الوقت الفعلي عبر **5 قنوات بروتوكولية متزامنة**:\n` +
+        `1️⃣ حزم التواجد المباشرة (\`available\` / \`unavailable\` / \`lastSeen\`) عبر \`@s.whatsapp.net\` و \`@lid\`.\n` +
+        `2️⃣ حزم حالة المحادثة الخام (\`composing\` / \`recording\` / \`paused\`) مع تحديد الجهاز المرسل (\`📱 الهاتف\` أو \`💻 ويب\`).\n` +
+        `3️⃣ مسبار الأجهزة وزمن الاستجابة (\`USync Device & RTT Probe\`) لرصد الأجهزة المرتبطة وزمن الكمون بالمللي ثانية.\n` +
+        `4️⃣ استنتاج النشاط من الرسائل وإيصالات القراءة/الاستلام الحية.\n` +
+        `5️⃣ بث النبض المستمر (\`Heartbeat\`) كل 7.5 ثانية لمنع انطفاء مؤشر الكتابة/التسجيل.\n\n` +
+        `⏱️ *مدة الرصد الافتراضية المختارة:* \`${selectedDur} ثانية\`\n` +
+        `📌 *أرسل الآن رقم الهاتف فقط* (أو الرقم متبوعاً بالمدة مثل: \`+966501234567 30\`):`,
+      keyboard: rows,
+      toastText: '👁️ اختر مدة الرصد أو أرسل الرقم مباشرة',
       route: 'tools:prompt_presence',
+    };
+  }
+
+  public promptPresenceTrackMode(
+    adminId: number,
+    presetDurationSeconds?: number
+  ): BotViewResponse {
+    if (
+      typeof presetDurationSeconds === 'number' &&
+      Number.isFinite(presetDurationSeconds) &&
+      presetDurationSeconds >= 5
+    ) {
+      this.presenceTrackDurationByAdmin.set(
+        adminId,
+        Math.min(300, Math.floor(presetDurationSeconds))
+      );
+    }
+    const selectedDur = this.presenceTrackDurationByAdmin.get(adminId) || 15;
+    const lastTarget = this.lastTrackedRecipientByAdmin.get(adminId);
+    const shortTarget =
+      lastTarget && Buffer.byteLength(lastTarget, 'utf8') <= 22
+        ? lastTarget
+        : undefined;
+
+    this.inputStates.set(adminId, 'AWAITING_PRESENCE_TRACK_INPUT');
+
+    const rows: InlineKeyboardRows = [
+      [
+        {
+          text: `${selectedDur === 15 ? '✅ ' : ''}15 ثانية`,
+          callbackData: 'tools:presence_dur:15',
+        },
+        {
+          text: `${selectedDur === 30 ? '✅ ' : ''}30 ثانية`,
+          callbackData: 'tools:presence_dur:30',
+        },
+        {
+          text: `${selectedDur === 60 ? '✅ ' : ''}60 ثانية`,
+          callbackData: 'tools:presence_dur:60',
+        },
+      ],
+      [
+        {
+          text: `${selectedDur === 120 ? '✅ ' : ''}120 ثانية`,
+          callbackData: 'tools:presence_dur:120',
+        },
+        {
+          text: `${selectedDur === 300 ? '✅ ' : ''}300 ثانية (5د)`,
+          callbackData: 'tools:presence_dur:300',
+        },
+      ],
+    ];
+
+    if (shortTarget) {
+      rows.push([
+        {
+          text: `🚀 بدء رصد (${shortTarget}) لمدة ${selectedDur}ث`,
+          callbackData: `tools:presence_run:${shortTarget}:${selectedDur}`,
+        },
+      ]);
+    }
+
+    rows.push(buildBackCancelRow('tools:prompt_presence'));
+
+    return {
+      text:
+        `${renderBreadcrumb(['الرئيسية', 'الأدوات', 'التتبع اللحظي', 'إعداد الرادار'])}\n` +
+        `🛰️ *وضع رادار التتبع اللحظي المتقدم (Advanced Live Presence Radar)*\n` +
+        `━━━━━━━━━━━━━━━━━━\n` +
+        `• *المدة المختارة حالياً:* \`${selectedDur} ثانية\`\n` +
+        `• *التحديث الحي:* يتم تحديث البطاقة تلقائياً كل ثانيتين وفور حدوث أي تحول (\`متصل\`, \`يكتب\`, \`يسجل صوتاً\`, \`توقف مؤقتاً\`, \`غير متصل\`).\n` +
+        `• *المسبار النشط:* يفحص الأجهزة المرتبطة (\` الهواتف + واتساب ويب \`) ويقيس زمن استجابة الشبكة (\`RTT ms\`).\n\n` +
+        `📥 *أرسل الآن رقم الهاتف الدولي أو معرف \`@lid\` لبدء التتبع اللحظي فوراً:*`,
+      keyboard: rows,
+      toastText: `🛰️ جاهز للرصد اللحظي (${selectedDur} ثانية)`,
+      route: 'tools:presence_mode_track',
     };
   }
 
@@ -2565,7 +2690,11 @@ export class ToolsHandler {
       first === 'recording' ||
       first === 'available'
     ) {
-      return this.executePresenceHeartbeat(adminId, tokens.join(' '));
+      return this.executePresenceHeartbeat(
+        adminId,
+        tokens.join(' '),
+        onProgressUpdate
+      );
     }
     if (first === 'track' || first === 'watch' || first === 'monitor') {
       return this.executePresenceTracking(
@@ -2592,14 +2721,24 @@ export class ToolsHandler {
         return this.promptPresenceTool(adminId);
       }
       const recipient = tokens[0];
-      const requestedDuration = tokens[1] ? Number(tokens[1]) : 10;
+      const defaultDur = this.presenceTrackDurationByAdmin.get(adminId) || 15;
+      const requestedDuration = tokens[1] ? Number(tokens[1]) : defaultDur;
       const durationSeconds = Math.min(
         300,
         Math.max(
           1,
-          Number.isFinite(requestedDuration) ? Math.floor(requestedDuration) : 10
+          Number.isFinite(requestedDuration)
+            ? Math.floor(requestedDuration)
+            : defaultDur
         )
       );
+
+      const cleanTargetShort = recipient.includes('@')
+        ? recipient.trim()
+        : recipient.replace(/[^\d+]/g, '');
+      if (cleanTargetShort && Buffer.byteLength(cleanTargetShort, 'utf8') <= 22) {
+        this.lastTrackedRecipientByAdmin.set(adminId, cleanTargetShort);
+      }
 
       const { session, driver } =
         this.getPrimaryConnectedSessionAndDriver(adminId);
@@ -2619,6 +2758,32 @@ export class ToolsHandler {
         }
       };
 
+      const formatDeviceBadge = (devOrJid?: string) => {
+        if (!devOrJid) return '📱 الهاتف الأساسي';
+        const userPart = devOrJid.split('@')[0] || '';
+        if (userPart.includes(':')) {
+          const devNum = Number(userPart.split(':')[1] || 0);
+          if (devNum === 0) return '📱 الهاتف الأساسي (:0)';
+          return `💻 جهاز مرافق/ويب (:${devNum})`;
+        }
+        return '📱 الهاتف الأساسي (:0)';
+      };
+
+      const formatSourceAr = (src?: string) => {
+        switch (src) {
+          case 'chatstate':
+            return '⚡ نبضة محادثة';
+          case 'message':
+            return '💬 رسالة حية';
+          case 'receipt':
+            return '✓✓ إيصال قراءة/استلام';
+          case 'usync_probe':
+            return '🛰️ مسبار USync';
+          default:
+            return '📡 حزمة تواجد';
+        }
+      };
+
       const renderLivePresenceView = (
         rec: {
           chatJid: string;
@@ -2626,77 +2791,171 @@ export class ToolsHandler {
           currentState: string;
           lastSeenTimestampSec?: number;
           totalOnlineDurationMs: number;
+          probeRttMs?: number;
+          minRttMs?: number;
+          maxRttMs?: number;
+          linkedDevices?: string[];
+          activeDevices?: string[];
+          privacyLastSeenDenied?: boolean;
+          elapsedSeconds?: number;
+          targetDurationSeconds?: number;
+          lastActivitySource?: string;
           transitions: Array<{
             state: string;
             timestampMs: number;
             participantJid: string;
+            deviceJid?: string;
+            source?: string;
           }>;
         },
         isFinal: boolean
       ): BotViewResponse => {
+        const elapsedSec =
+          rec.elapsedSeconds !== undefined
+            ? Math.min(durationSeconds, Math.max(0, rec.elapsedSeconds))
+            : isFinal
+              ? durationSeconds
+              : 0;
+        const pct = Math.min(
+          100,
+          Math.round((elapsedSec / Math.max(1, durationSeconds)) * 100)
+        );
+        const filledBlocks = Math.min(10, Math.max(0, Math.round(pct / 10)));
+        const progressBar =
+          '🟩'.repeat(filledBlocks) + '⬜'.repeat(10 - filledBlocks);
+
         const transitionsLines =
           rec.transitions.length > 0
             ? rec.transitions
                 .slice(-10)
                 .map(
                   (t, idx) =>
-                    `${idx + 1}. \`${new Date(t.timestampMs).toISOString().slice(11, 19)}\` — ${formatStateAr(t.state)} (\`${t.participantJid}\`)`
+                    `${idx + 1}. \`${new Date(t.timestampMs).toISOString().slice(11, 19)}\` — ${formatStateAr(t.state)} | ${formatDeviceBadge(t.deviceJid || t.participantJid)} (${formatSourceAr(t.source)})`
                 )
                 .join('\n')
             : isFinal
-              ? '• لم ترد تغييرات حالة خلال نافذة الرصد (أو أن الخصوصية محجوبة).'
-              : '• جاري الاستماع الحي لحزم التواجد من خوادم واتساب...';
+              ? '• لم ترد تغييرات حالة خلال نافذة الرصد (الهدف غير متصل حالياً أو يخفي حالة التواجد).'
+              : '• جاري الاستماع الحي لحزم التواجد وفحص الأجهزة المرتبطة...';
 
-        const lastSeenText =
-          rec.lastSeenTimestampSec && rec.lastSeenTimestampSec > 0
+        const lastSeenText = rec.privacyLastSeenDenied
+          ? '🔴 محجوب صراحةً من إعدادات خصوصية الهدف (`last="deny"`)'
+          : rec.lastSeenTimestampSec && rec.lastSeenTimestampSec > 0
             ? `\`${new Date(rec.lastSeenTimestampSec * 1000).toISOString()}\``
             : 'محجوب أو غير معلن';
 
+        const rttLine =
+          rec.probeRttMs !== undefined
+            ? `⚡ *زمن استجابة المسبار (RTT):* \`${rec.probeRttMs} ms\`${
+                rec.minRttMs !== undefined && rec.maxRttMs !== undefined
+                  ? ` (أدنى: \`${rec.minRttMs}ms\` / أقصى: \`${rec.maxRttMs}ms\`)`
+                  : ''
+              }\n`
+            : '';
+
+        const linkedDevicesList = Array.isArray(rec.linkedDevices)
+          ? rec.linkedDevices
+          : [];
+        const activeDevicesList = Array.isArray(rec.activeDevices)
+          ? rec.activeDevices
+          : [];
+        const devicesLine =
+          linkedDevicesList.length > 0 || activeDevicesList.length > 0
+            ? `📱 *الأجهزة المرتبطة (${linkedDevicesList.length || 1}):* ${
+                linkedDevicesList.length > 0
+                  ? linkedDevicesList.map((d) => formatDeviceBadge(d)).join(' ، ')
+                  : formatDeviceBadge(rec.chatJid)
+              }\n` +
+              (activeDevicesList.length > 0
+                ? `🟢 *الأجهزة النشطة المرصودة:* ${activeDevicesList
+                    .map((d) => formatDeviceBadge(d))
+                    .join(' ، ')}\n`
+                : '')
+            : '';
+
+        const safePhoneDigits = (rec.chatJid || recipient)
+          .split('@')[0]
+          .replace(/\D/g, '')
+          .slice(0, 18);
+
+        const finalKeyboard: InlineKeyboardRows = [];
+        if (safePhoneDigits) {
+          finalKeyboard.push(
+            [
+              {
+                text: `🔄 إعادة الرصد (${durationSeconds}ث)`,
+                callbackData: `tools:presence_run:${safePhoneDigits}:${durationSeconds}`,
+              },
+              {
+                text: '⏱️ رصد مطول (60ث)',
+                callbackData: `tools:presence_run:${safePhoneDigits}:60`,
+              },
+            ],
+            [
+              {
+                text: '⌨️ بث يكتب الآن...',
+                callbackData: `tools:presence_hb_q:composing:${safePhoneDigits}`,
+              },
+              {
+                text: '🎙️ بث يسجل صوتاً...',
+                callbackData: `tools:presence_hb_q:recording:${safePhoneDigits}`,
+              },
+            ],
+            [
+              {
+                text: '🔍 فحص الملف الشخصي الكامل',
+                callbackData: `tools:presence_prof:${safePhoneDigits}`,
+              },
+            ]
+          );
+        }
+        finalKeyboard.push([
+          {
+            text: '👁️ إعداد الرصد',
+            callbackData: 'tools:prompt_presence',
+          },
+          { text: '🔙 قائمة الأدوات', callbackData: 'menu:tools' },
+        ]);
+
         return {
           text:
-            `${isFinal ? '👁️ *تقرير رصد التواجد الحي (/presence)*' : '📡 *جاري الرصد الحي لتواجد الهدف (/presence)...*'}\n` +
+            `${isFinal ? '👁️ *تقرير رصد التواجد الحي — رادار التتبع اللحظي المتقدم (/presence)*' : '📡 *جاري الرصد الحي لتواجد الهدف — رادار التتبع اللحظي (/presence)...*'}\n` +
             `━━━━━━━━━━━━━━━━━━\n` +
             `🆔 *الجلسة:* \`${session.id}\`\n` +
             `📱 *المستلم (Chat JID):* \`${rec.chatJid}\`\n` +
             (rec.resolvedLid
               ? `🕵️ *الهوية المخفية المدمجة (LID):* \`${rec.resolvedLid}\`\n`
               : '') +
-            `📡 *الحالة الحالية:* ${formatStateAr(rec.currentState)}\n` +
-            `🕒 *آخر ظهور (Last Seen):* ${lastSeenText}\n` +
-            `⏱️ *نافذة الرصد:* \`${durationSeconds} ثانية\`\n` +
+            `📡 *الحالة اللحظية:* ${formatStateAr(rec.currentState)}\n` +
+            `🕒 *آخر ظهور / الخصوصية:* ${lastSeenText}\n` +
+            rttLine +
+            devicesLine +
+            `⏳ *التقدم الزمني:* ${progressBar} \`${elapsedSec}/${durationSeconds}s (${pct}%)\`\n` +
             `📊 *إجمالي زمن الاتصال النشط:* \`${(rec.totalOnlineDurationMs / 1000).toFixed(1)} ثانية\`\n\n` +
-            `📜 *سجل التحولات الزمنية (${rec.transitions.length}):*\n${transitionsLines}`,
+            `📜 *سجل التحولات الزمنية والأجهزة (${rec.transitions.length}):*\n${transitionsLines}`,
           keyboard: isFinal
-            ? [
-                [
-                  {
-                    text: '🔄 إعادة الرصد',
-                    callbackData: 'tools:prompt_presence',
-                  },
-                  { text: '🔙 قائمة الأدوات', callbackData: 'menu:tools' },
-                ],
-              ]
+            ? finalKeyboard
             : [
                 [
                   {
-                    text: '⏹️ إيقاف الرصد الحي والاكتفاء بالتقرير',
+                    text: '⏹️ إيقاف الرصد الحي والاكتفاء بالتقرير الآن',
                     callbackData: 'tools:presence_stop',
                   },
                 ],
                 [
                   {
-                    text: '🔄 إعادة الرصد',
+                    text: '👁️ إعدادات الرادار',
                     callbackData: 'tools:prompt_presence',
                   },
                   { text: '🔙 قائمة الأدوات', callbackData: 'menu:tools' },
                 ],
               ],
-          ...(isFinal ? { toastText: '✅ اكتمل رصد التواجد الحي' } : {}),
+          ...(isFinal ? { toastText: '✅ اكتمل رصد التواجد اللحظي' } : {}),
         };
       };
 
       let lastProgressSentAt = 0;
       let lastProgressText = '';
+      let lastProgressState = '';
 
       if (onProgressUpdate) {
         const initialView = renderLivePresenceView(
@@ -2704,6 +2963,8 @@ export class ToolsHandler {
             chatJid: recipient,
             currentState: 'unavailable',
             totalOnlineDurationMs: 0,
+            elapsedSeconds: 0,
+            targetDurationSeconds: durationSeconds,
             transitions: [],
           },
           false
@@ -2719,16 +2980,18 @@ export class ToolsHandler {
         onUpdate: onProgressUpdate
           ? (liveRec) => {
               const now = Date.now();
-              if (
-                now - lastProgressSentAt < 1500 &&
-                liveRec.transitions.length > 1
-              ) {
+              const stateChanged = liveRec.currentState !== lastProgressState;
+              if (!stateChanged && now - lastProgressSentAt < 1500) {
+                return;
+              }
+              if (stateChanged && now - lastProgressSentAt < 650) {
                 return;
               }
               const liveView = renderLivePresenceView(liveRec, false);
               if (liveView.text === lastProgressText) {
                 return;
               }
+              lastProgressState = liveRec.currentState;
               lastProgressText = liveView.text;
               lastProgressSentAt = now;
               void onProgressUpdate(liveView).catch(() => undefined);
@@ -2745,6 +3008,7 @@ export class ToolsHandler {
           sessionId: session.id,
           durationSeconds,
           transitionsCount: record.transitions.length,
+          probeRttMs: record.probeRttMs,
         },
       });
 
@@ -2765,7 +3029,8 @@ export class ToolsHandler {
 
   public async executePresenceHeartbeat(
     adminId: number,
-    rawInput: string
+    rawInput: string,
+    onProgressUpdate?: (view: BotViewResponse) => Promise<void>
   ): Promise<BotViewResponse> {
     try {
       const tokens = (rawInput || '').trim().split(/\s+/).filter(Boolean);
@@ -2796,10 +3061,58 @@ export class ToolsHandler {
 
       const { session, driver } =
         this.getPrimaryConnectedSessionAndDriver(adminId);
+
+      let lastHeartbeatUiAt = 0;
+      if (onProgressUpdate) {
+        lastHeartbeatUiAt = Date.now();
+        await onProgressUpdate({
+          text:
+            `📡 *جاري بث نبضات التواجد الحية (Presence Heartbeat)...*\n` +
+            `━━━━━━━━━━━━━━━━━━\n` +
+            `🆔 *الجلسة:* \`${session.id}\`\n` +
+            `🎯 *المستلم:* \`${recipient}\`\n` +
+            `⚡ *نوع النبض:* \`${mode}\`\n` +
+            `⏱️ *المدة المطلوبة:* \`${durationSeconds} ثانية\``,
+          keyboard: [
+            [
+              {
+                text: '⏹️ إيقاف البث الفوري',
+                callbackData: 'tools:heartbeat_stop',
+              },
+            ],
+          ],
+        }).catch(() => undefined);
+      }
+
       const res = await driver.startPresenceHeartbeatBroadcast({
         recipient,
         mode,
         durationSeconds,
+        onProgress: onProgressUpdate
+          ? (info) => {
+              const now = Date.now();
+              if (now - lastHeartbeatUiAt < 1500) return;
+              lastHeartbeatUiAt = now;
+              void onProgressUpdate({
+                text:
+                  `📡 *جاري بث نبضات التواجد الحية (Presence Heartbeat)...*\n` +
+                  `━━━━━━━━━━━━━━━━━━\n` +
+                  `🆔 *الجلسة:* \`${session.id}\`\n` +
+                  `🎯 *المستلم:* \`${info.targetJid}\`\n` +
+                  `⚡ *نوع النبض:* \`${info.mode}\`\n` +
+                  `🔁 *عدد النبضات المرسلة:* \`${info.pulsesSent} نبضة\`\n` +
+                  `⏳ *التقدم:* \`${info.elapsedSeconds}/${info.durationSeconds} ثانية\``,
+                keyboard: [
+                  [
+                    {
+                      text: '⏹️ إيقاف البث الفوري',
+                      callbackData: 'tools:heartbeat_stop',
+                    },
+                  ],
+                ],
+              }).catch(() => undefined);
+            }
+          : undefined,
       });
 
       this.auditRepo.record({
@@ -2815,6 +3128,11 @@ export class ToolsHandler {
         },
       });
 
+      const safePhoneDigits = res.targetJid
+        .split('@')[0]
+        .replace(/\D/g, '')
+        .slice(0, 18);
+
       return {
         text:
           `📡 *اكتمل بث نبضات التواجد الحي (Presence Heartbeat)*\n` +
@@ -2826,6 +3144,20 @@ export class ToolsHandler {
           `⏱️ *المدة الفعلية:* \`${(res.durationMs / 1000).toFixed(1)} ثانية\`\n` +
           `✅ *الإغلاق النظيف:* تم إرسال \`paused\` في نهاية البث.`,
         keyboard: [
+          ...(safePhoneDigits
+            ? [
+                [
+                  {
+                    text: '👁️ رصد تواجد الهدف الآن',
+                    callbackData: `tools:presence_run:${safePhoneDigits}:15`,
+                  },
+                  {
+                    text: '🔁 إعادة بث النبض',
+                    callbackData: `tools:presence_hb_q:${mode}:${safePhoneDigits}`,
+                  },
+                ],
+              ]
+            : []),
           [
             {
               text: '📡 بث نبض جديد',

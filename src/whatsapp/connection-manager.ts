@@ -110,6 +110,8 @@ export interface PresenceStateTransition {
   state: WAPresence;
   timestampMs: number;
   participantJid: string;
+  deviceJid?: string;
+  source?: 'presence' | 'chatstate' | 'message' | 'receipt' | 'usync_probe';
 }
 
 export interface TrackedPresenceRecord {
@@ -121,6 +123,15 @@ export interface TrackedPresenceRecord {
   transitions: PresenceStateTransition[];
   totalOnlineDurationMs: number;
   onlineSessionStartedAtMs?: number;
+  probeRttMs?: number;
+  minRttMs?: number;
+  maxRttMs?: number;
+  linkedDevices?: string[];
+  activeDevices?: string[];
+  privacyLastSeenDenied?: boolean;
+  elapsedSeconds?: number;
+  targetDurationSeconds?: number;
+  lastActivitySource?: 'presence' | 'chatstate' | 'message' | 'receipt' | 'usync_probe';
 }
 
 export interface WhatsAppFullProfileReport {
@@ -544,10 +555,23 @@ export class SessionMemoryStore {
     state: WAPresence;
     lastSeen?: number;
     timestampMs?: number;
+    deviceJid?: string;
+    source?: 'presence' | 'chatstate' | 'message' | 'receipt' | 'usync_probe';
+    privacyLastSeenDenied?: boolean;
+    probeRttMs?: number;
+    linkedDevices?: string[];
   }): TrackedPresenceRecord {
     const now = params.timestampMs ?? Date.now();
     const rawChat = jidNormalizedUser(params.chatJid);
-    const rawParticipant = jidNormalizedUser(params.participantJid || params.chatJid);
+    const rawParticipantInput = params.participantJid || params.chatJid;
+    const rawParticipant = jidNormalizedUser(rawParticipantInput);
+    const rawDeviceCandidate =
+      params.deviceJid ||
+      (rawParticipantInput && rawParticipantInput.includes(':')
+        ? rawParticipantInput
+        : params.chatJid && params.chatJid.includes(':')
+          ? params.chatJid
+          : undefined);
 
     const mappedPn = rawChat.endsWith('@lid')
       ? this.lidToPnMap.get(rawChat)
@@ -571,11 +595,24 @@ export class SessionMemoryStore {
         totalOnlineDurationMs: 0,
       };
 
+    // Guard against baileys-lite's internal `if (type === 'paused') type = 'available'` rewrite
+    // overwriting a raw `CB:chatstate` `<paused/>` transition captured milliseconds earlier.
+    let effectiveState = params.state;
+    if (
+      existing.currentState === 'paused' &&
+      existing.lastActivitySource === 'chatstate' &&
+      params.state === 'available' &&
+      (!params.source || params.source === 'presence') &&
+      Math.abs(now - existing.lastUpdatedMs) < 250
+    ) {
+      effectiveState = 'paused';
+    }
+
     const isOnlineState =
-      params.state === 'available' ||
-      params.state === 'composing' ||
-      params.state === 'recording' ||
-      params.state === 'paused';
+      effectiveState === 'available' ||
+      effectiveState === 'composing' ||
+      effectiveState === 'recording' ||
+      effectiveState === 'paused';
 
     const wasPreviouslyOnline =
       existing.onlineSessionStartedAtMs !== undefined ||
@@ -591,7 +628,7 @@ export class SessionMemoryStore {
       if (onlineSessionStartedAtMs === undefined) {
         onlineSessionStartedAtMs = now;
       }
-    } else if (params.state === 'unavailable') {
+    } else if (effectiveState === 'unavailable') {
       if (onlineSessionStartedAtMs !== undefined) {
         totalOnlineDurationMs += Math.max(0, now - onlineSessionStartedAtMs);
         onlineSessionStartedAtMs = undefined;
@@ -600,33 +637,83 @@ export class SessionMemoryStore {
 
     const transitions = [...existing.transitions];
     const lastTransition = transitions[transitions.length - 1];
-    if (!lastTransition || lastTransition.state !== params.state) {
+    if (!lastTransition || lastTransition.state !== effectiveState) {
       transitions.push({
-        state: params.state,
+        state: effectiveState,
         timestampMs: now,
         participantJid: rawParticipant,
+        deviceJid: rawDeviceCandidate,
+        source: params.source || 'presence',
       });
       if (transitions.length > 50) {
         transitions.shift();
       }
+    } else if (lastTransition && rawDeviceCandidate && !lastTransition.deviceJid) {
+      lastTransition.deviceJid = rawDeviceCandidate;
     }
 
     const computedLastSeenSec =
       typeof params.lastSeen === 'number' && params.lastSeen > 0
         ? params.lastSeen
-        : params.state === 'unavailable' && wasPreviouslyOnline
+        : effectiveState === 'unavailable' && wasPreviouslyOnline
           ? Math.floor(now / 1000)
           : existing.lastSeenTimestampSec;
 
+    const activeDevicesSet = new Set<string>(existing.activeDevices || []);
+    if (rawDeviceCandidate) {
+      activeDevicesSet.add(rawDeviceCandidate);
+    } else if (isOnlineState && rawParticipant) {
+      activeDevicesSet.add(rawParticipant);
+    }
+
+    const linkedDevicesSet = new Set<string>(existing.linkedDevices || []);
+    if (Array.isArray(params.linkedDevices)) {
+      for (const dev of params.linkedDevices) {
+        if (dev) linkedDevicesSet.add(dev);
+      }
+    }
+
+    const probeRttMs =
+      typeof params.probeRttMs === 'number' && params.probeRttMs >= 0
+        ? params.probeRttMs
+        : existing.probeRttMs;
+    const minRttMs =
+      typeof probeRttMs === 'number'
+        ? existing.minRttMs !== undefined
+          ? Math.min(existing.minRttMs, probeRttMs)
+          : probeRttMs
+        : existing.minRttMs;
+    const maxRttMs =
+      typeof probeRttMs === 'number'
+        ? existing.maxRttMs !== undefined
+          ? Math.max(existing.maxRttMs, probeRttMs)
+          : probeRttMs
+        : existing.maxRttMs;
+
+    const privacyLastSeenDenied =
+      params.privacyLastSeenDenied === true
+        ? true
+        : typeof params.lastSeen === 'number' && params.lastSeen > 0
+          ? false
+          : existing.privacyLastSeenDenied;
+
     const updated: TrackedPresenceRecord = {
+      ...existing,
       chatJid: primaryChatJid,
       resolvedLid: mappedLid || existing.resolvedLid,
-      currentState: params.state,
+      currentState: effectiveState,
       lastSeenTimestampSec: computedLastSeenSec,
       lastUpdatedMs: now,
       transitions,
       totalOnlineDurationMs,
       onlineSessionStartedAtMs,
+      probeRttMs,
+      minRttMs,
+      maxRttMs,
+      linkedDevices: linkedDevicesSet.size > 0 ? Array.from(linkedDevicesSet) : existing.linkedDevices,
+      activeDevices: activeDevicesSet.size > 0 ? Array.from(activeDevicesSet) : existing.activeDevices,
+      privacyLastSeenDenied,
+      lastActivitySource: params.source || existing.lastActivitySource || 'presence',
     };
 
     this.presences.set(primaryChatJid, updated);
@@ -647,6 +734,124 @@ export class SessionMemoryStore {
           }
         }
       }
+    }
+
+    return updated;
+  }
+
+  public updatePresenceTelemetry(
+    chatJid: string,
+    telemetry: {
+      probeRttMs?: number;
+      linkedDevices?: string[];
+      activeDevices?: string[];
+      privacyLastSeenDenied?: boolean;
+      elapsedSeconds?: number;
+      targetDurationSeconds?: number;
+      notify?: boolean;
+    }
+  ): TrackedPresenceRecord {
+    const rawChat = jidNormalizedUser(chatJid);
+    const mappedPn = rawChat.endsWith('@lid') ? this.lidToPnMap.get(rawChat) : undefined;
+    const mappedLid = rawChat.endsWith('@lid')
+      ? rawChat
+      : this.pnToLidMap.get(rawChat);
+    const primaryChatJid = mappedPn || rawChat;
+    const now = Date.now();
+    const existing = this.presences.get(primaryChatJid) ||
+      (mappedLid ? this.presences.get(mappedLid) : undefined) || {
+        chatJid: primaryChatJid,
+        resolvedLid: mappedLid,
+        currentState: 'unavailable' as WAPresence,
+        lastUpdatedMs: now,
+        transitions: [],
+        totalOnlineDurationMs: 0,
+      };
+
+    const linkedSet = new Set<string>(existing.linkedDevices || []);
+    if (Array.isArray(telemetry.linkedDevices)) {
+      for (const d of telemetry.linkedDevices) {
+        if (d) linkedSet.add(d);
+      }
+    }
+
+    const activeSet = new Set<string>(existing.activeDevices || []);
+    if (Array.isArray(telemetry.activeDevices)) {
+      for (const d of telemetry.activeDevices) {
+        if (d) activeSet.add(d);
+      }
+    }
+
+    const probeRttMs =
+      typeof telemetry.probeRttMs === 'number' && telemetry.probeRttMs >= 0
+        ? telemetry.probeRttMs
+        : existing.probeRttMs;
+    const minRttMs =
+      typeof probeRttMs === 'number'
+        ? existing.minRttMs !== undefined
+          ? Math.min(existing.minRttMs, probeRttMs)
+          : probeRttMs
+        : existing.minRttMs;
+    const maxRttMs =
+      typeof probeRttMs === 'number'
+        ? existing.maxRttMs !== undefined
+          ? Math.max(existing.maxRttMs, probeRttMs)
+          : probeRttMs
+        : existing.maxRttMs;
+
+    const updated: TrackedPresenceRecord = {
+      ...existing,
+      chatJid: primaryChatJid,
+      resolvedLid: mappedLid || existing.resolvedLid,
+      probeRttMs,
+      minRttMs,
+      maxRttMs,
+      linkedDevices: linkedSet.size > 0 ? Array.from(linkedSet) : existing.linkedDevices,
+      activeDevices: activeSet.size > 0 ? Array.from(activeSet) : existing.activeDevices,
+      privacyLastSeenDenied:
+        telemetry.privacyLastSeenDenied !== undefined
+          ? telemetry.privacyLastSeenDenied
+          : existing.privacyLastSeenDenied,
+      elapsedSeconds:
+        telemetry.elapsedSeconds !== undefined
+          ? telemetry.elapsedSeconds
+          : existing.elapsedSeconds,
+      targetDurationSeconds:
+        telemetry.targetDurationSeconds !== undefined
+          ? telemetry.targetDurationSeconds
+          : existing.targetDurationSeconds,
+    };
+
+    this.presences.set(primaryChatJid, updated);
+    if (updated.resolvedLid) {
+      this.presences.set(updated.resolvedLid, updated);
+    }
+
+    if (telemetry.notify) {
+      const liveSnapshot: TrackedPresenceRecord =
+        updated.onlineSessionStartedAtMs !== undefined
+          ? {
+              ...updated,
+              totalOnlineDurationMs:
+                updated.totalOnlineDurationMs +
+                Math.max(0, now - updated.onlineSessionStartedAtMs),
+            }
+          : updated;
+      const notifyTargets = new Set<string>([primaryChatJid, rawChat]);
+      if (updated.resolvedLid) notifyTargets.add(updated.resolvedLid);
+      for (const targetKey of notifyTargets) {
+        const listeners = this.presenceListeners.get(targetKey);
+        if (listeners) {
+          for (const cb of listeners) {
+            try {
+              cb(liveSnapshot);
+            } catch {
+              // Ignore listener errors
+            }
+          }
+        }
+      }
+      return liveSnapshot;
     }
 
     return updated;
@@ -744,11 +949,13 @@ export class SessionMemoryStore {
   public bind(ev: WASocket['ev']): () => void {
     const onMessagesUpsert = ({
       messages: newMessages,
+      type,
     }: {
       messages: Array<{
         key?: {
           remoteJid?: string | null;
           id?: string | null;
+          fromMe?: boolean | null;
           remoteJidAlt?: string | null;
           participant?: string | null;
           participantAlt?: string | null;
@@ -792,6 +999,26 @@ export class SessionMemoryStore {
           this.cacheSentMessage(chatId, msgId, msg.message);
         }
         if (!chatId) continue;
+
+        // Cross-signal activity inference: incoming live message proves target is active right now
+        if (
+          !msg?.key?.fromMe &&
+          type === 'notify' &&
+          (chatId.endsWith('@s.whatsapp.net') || chatId.endsWith('@lid'))
+        ) {
+          try {
+            this.applyPresenceTransition({
+              chatJid: chatId,
+              participantJid: msg.key?.participant || chatId,
+              deviceJid: msg.key?.participant || chatId,
+              state: 'available',
+              source: 'message',
+            });
+          } catch {
+            // Ignore presence inference error
+          }
+        }
+
         const list = this.messages.get(chatId) || [];
         list.push(msg);
         if (list.length > 100) {
@@ -933,8 +1160,10 @@ export class SessionMemoryStore {
         this.applyPresenceTransition({
           chatJid: update.id,
           participantJid: participant || update.id,
+          deviceJid: participant || update.id,
           state,
           lastSeen: pData?.lastSeen,
+          source: 'presence',
         });
       }
     };
@@ -1085,6 +1314,13 @@ export interface WhatsAppSessionDriver {
     mode: 'composing' | 'recording' | 'available';
     durationSeconds: number;
     pulseIntervalMs?: number;
+    onProgress?: (info: {
+      pulsesSent: number;
+      elapsedSeconds: number;
+      durationSeconds: number;
+      mode: 'composing' | 'recording' | 'available';
+      targetJid: string;
+    }) => void;
   }): Promise<{
     pulsesSent: number;
     targetJid: string;
@@ -1723,6 +1959,7 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
         'CB:message',
         'CB:call',
         'CB:presence',
+        'CB:chatstate',
         'CB:receipt',
         'CB:notification',
         'CB:ack',
@@ -1731,11 +1968,60 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
         const fn = (rawNode: unknown) => {
           try {
             if (rawNode && typeof rawNode === 'object' && 'tag' in (rawNode as object)) {
+              const bNode = rawNode as BinaryNode;
               monitor.recordWhatsAppStanza({
                 sessionId: this.sessionId,
                 direction: 'INBOUND',
-                node: rawNode as InspectableBinaryNode,
+                node: bNode as InspectableBinaryNode,
               });
+
+              // Intercept raw <chatstate> and <presence> stanzas before baileys-lite
+              // rewrites `<paused/>` to `'available'` or strips device JIDs (`:0`, `:33`) and `last="deny"`.
+              if (evt === 'CB:chatstate' && bNode.attrs?.from) {
+                const fromJid = String(bNode.attrs.from);
+                const participantRaw = String(bNode.attrs.participant || fromJid);
+                const firstChild = Array.isArray(bNode.content)
+                  ? bNode.content[0]
+                  : undefined;
+                if (firstChild && typeof firstChild === 'object' && 'tag' in firstChild) {
+                  let state: WAPresence | undefined;
+                  if (firstChild.tag === 'paused') {
+                    state = 'paused';
+                  } else if (firstChild.tag === 'composing') {
+                    state =
+                      firstChild.attrs?.media === 'audio' ? 'recording' : 'composing';
+                  }
+                  if (state) {
+                    this.memoryStore.applyPresenceTransition({
+                      chatJid: fromJid,
+                      participantJid: participantRaw,
+                      deviceJid: participantRaw,
+                      state,
+                      source: 'chatstate',
+                    });
+                  }
+                }
+              } else if (evt === 'CB:presence' && bNode.attrs?.from) {
+                const fromJid = String(bNode.attrs.from);
+                const participantRaw = String(bNode.attrs.participant || fromJid);
+                const typeAttr = bNode.attrs.type;
+                const lastAttr = bNode.attrs.last;
+                const state: WAPresence =
+                  typeAttr === 'unavailable' ? 'unavailable' : 'available';
+                const lastSeenNum =
+                  lastAttr && lastAttr !== 'deny' && !Number.isNaN(Number(lastAttr))
+                    ? Number(lastAttr)
+                    : undefined;
+                this.memoryStore.applyPresenceTransition({
+                  chatJid: fromJid,
+                  participantJid: participantRaw,
+                  deviceJid: participantRaw,
+                  state,
+                  lastSeen: lastSeenNum,
+                  privacyLastSeenDenied: lastAttr === 'deny' ? true : undefined,
+                  source: 'presence',
+                });
+              }
             }
           } catch {
             // Never disrupt socket pipeline
@@ -2870,6 +3156,57 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
   }
 
   /**
+   * Ensures `authState.creds.me.name` is populated so `@hiroosy/baileys-lite`'s `sendPresenceUpdate('available')`
+   * never silently aborts (`if (!me.name) return`), and transmits `<presence type="available"/>` so WhatsApp
+   * servers unlock real-time presence and `lastSeen` streaming for subscribed contacts.
+   */
+  private async ensureSelfPresenceAvailable(
+    sock: WASocket,
+    targetJid?: string
+  ): Promise<void> {
+    try {
+      const anySock = sock as unknown as {
+        authState?: { creds?: { me?: { id?: string; name?: string } } };
+        user?: { id?: string; name?: string; verifiedName?: string };
+        sendNode?: (node: BinaryNode) => Promise<void>;
+      };
+      const fallbackName =
+        (
+          anySock.authState?.creds?.me?.name ||
+          anySock.user?.name ||
+          anySock.user?.verifiedName ||
+          'WhatsApp'
+        )
+          .replace(/@/g, '')
+          .trim() || 'WhatsApp';
+
+      if (anySock.authState?.creds?.me && !anySock.authState.creds.me.name) {
+        anySock.authState.creds.me.name = fallbackName;
+      }
+      if (anySock.user && !anySock.user.name) {
+        anySock.user.name = fallbackName;
+      }
+
+      await sock.sendPresenceUpdate('available').catch(async () => {
+        if (typeof anySock.sendNode === 'function') {
+          await anySock
+            .sendNode({
+              tag: 'presence',
+              attrs: { name: fallbackName, type: 'available' },
+            })
+            .catch(() => undefined);
+        }
+      });
+
+      if (targetJid) {
+        await sock.sendPresenceUpdate('available', targetJid).catch(() => undefined);
+      }
+    } catch {
+      // Best-effort self-presence activation
+    }
+  }
+
+  /**
    * Safe presence wrapper (adapted from Nebula `createSafeSock`).
    */
   public async sendPresenceUpdate(
@@ -2878,6 +3215,9 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
   ): Promise<void> {
     const sock = this.ensureSocket();
     try {
+      if (state === 'available' || state === 'unavailable') {
+        await this.ensureSelfPresenceAvailable(sock);
+      }
       await sock.presenceSubscribe(jid);
       await sock.sendPresenceUpdate(state, jid);
     } catch {
@@ -2887,19 +3227,47 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
 
   private handleMessagesUpdateForReadRevoke(
     updates: Array<{
-      key?: { id?: string | null; remoteJid?: string | null };
+      key?: { id?: string | null; remoteJid?: string | null; participant?: string | null };
       update?: { status?: number | string | null };
     }>
   ): void {
     if (!Array.isArray(updates)) return;
     for (const item of updates) {
       const id = item?.key?.id;
+      const remoteJid = item?.key?.remoteJid;
       const rawStatus = item?.update?.status;
       const isReadOrPlayed =
         rawStatus === 4 ||
         rawStatus === 5 ||
         rawStatus === 'READ' ||
         rawStatus === 'PLAYED';
+      const isDelivered =
+        rawStatus === 3 || rawStatus === 'DELIVERY_ACK';
+
+      if (
+        remoteJid &&
+        (isReadOrPlayed || isDelivered) &&
+        (remoteJid.endsWith('@s.whatsapp.net') || remoteJid.endsWith('@lid'))
+      ) {
+        try {
+          if (isReadOrPlayed) {
+            this.memoryStore.applyPresenceTransition({
+              chatJid: remoteJid,
+              participantJid: item?.key?.participant || remoteJid,
+              deviceJid: item?.key?.participant || remoteJid,
+              state: 'available',
+              source: 'receipt',
+            });
+          } else if (item?.key?.participant && item.key.participant.includes(':')) {
+            this.memoryStore.updatePresenceTelemetry(remoteJid, {
+              activeDevices: [item.key.participant],
+            });
+          }
+        } catch {
+          // Ignore presence inference error
+        }
+      }
+
       if (id && isReadOrPlayed) {
         const msgId = String(id);
         const pendingOnRead = this.pendingOnReadRevokes.get(msgId);
@@ -2919,8 +3287,9 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
 
   private handleReceiptUpdates(
     updates: Array<{
-      key?: { id?: string | null; remoteJid?: string | null };
+      key?: { id?: string | null; remoteJid?: string | null; participant?: string | null };
       receipt?: {
+        userJid?: string | null;
         readTimestamp?: unknown;
         playedTimestamp?: unknown;
         receiptTimestamp?: unknown;
@@ -2931,6 +3300,7 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
     for (const r of updates) {
       if (!r?.key?.id || !r?.receipt) continue;
       const msgId = String(r.key.id);
+      const remoteJid = r.key.remoteJid;
       const receiptType = r.receipt.readTimestamp
         ? 'read'
         : r.receipt.playedTimestamp
@@ -2942,6 +3312,30 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
           messageId: msgId,
           receiptType,
         });
+      }
+      if (
+        remoteJid &&
+        (remoteJid.endsWith('@s.whatsapp.net') || remoteJid.endsWith('@lid'))
+      ) {
+        const deviceSender =
+          r.receipt.userJid || r.key.participant || remoteJid;
+        if (r.receipt.readTimestamp || r.receipt.playedTimestamp) {
+          try {
+            this.memoryStore.applyPresenceTransition({
+              chatJid: remoteJid,
+              participantJid: deviceSender,
+              deviceJid: deviceSender,
+              state: 'available',
+              source: 'receipt',
+            });
+          } catch {
+            // Ignore
+          }
+        } else if (r.receipt.receiptTimestamp && deviceSender.includes(':')) {
+          this.memoryStore.updatePresenceTelemetry(remoteJid, {
+            activeDevices: [deviceSender],
+          });
+        }
       }
       if (r.receipt.readTimestamp || r.receipt.playedTimestamp) {
         const pendingOnRead = this.pendingOnReadRevokes.get(msgId);
@@ -3523,8 +3917,49 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
   }
 
   /**
+   * Performs a non-intrusive USync device & LID probe to measure round-trip latency (`probeRttMs`)
+   * and enumerate all linked devices (`:0` primary phone + `:N` companion web/desktop devices).
+   */
+  private async probeRecipientDevicesAndRtt(
+    sock: WASocket,
+    pnOrTargetJid: string,
+    lidJid?: string
+  ): Promise<{ rttMs?: number; linkedDevices: string[] }> {
+    const linkedDevices: string[] = [];
+    const probeTargets = [pnOrTargetJid];
+    if (lidJid && lidJid !== pnOrTargetJid) {
+      probeTargets.push(lidJid);
+    }
+    const startMs = Date.now();
+    try {
+      if (typeof sock.getUSyncDevices === 'function') {
+        const rawDevices = await sock.getUSyncDevices(probeTargets, false, false);
+        const rttMs = Math.max(1, Date.now() - startMs);
+        if (Array.isArray(rawDevices)) {
+          for (const d of rawDevices) {
+            if (!d || typeof d !== 'object') continue;
+            const user = String((d as { user?: string }).user || '').trim();
+            const devId = Number((d as { device?: number }).device ?? 0);
+            const server = user.length >= 14 && !pnOrTargetJid.startsWith(user)
+              ? 'lid'
+              : 's.whatsapp.net';
+            if (user) {
+              linkedDevices.push(`${user}:${devId}@${server}`);
+            }
+          }
+        }
+        return { rttMs, linkedDevices };
+      }
+    } catch {
+      // Ignore probe error
+    }
+    return { linkedDevices };
+  }
+
+  /**
    * Subscribes to and tracks real-time recipient presence (`available`, `unavailable`, `composing`, `recording`, `paused`)
-   * across both `@s.whatsapp.net` and `@lid` JIDs, auto-expiring stale composing states after 12s of silence.
+   * across both `@s.whatsapp.net` and `@lid` JIDs, combining raw WebSocket `<chatstate>`/`<presence>` stanzas,
+   * active USync device & RTT probing, cross-signal message/receipt activity inference, and auto-expiring stale composing states.
    */
   public async trackRecipientPresence(params: {
     recipient: string;
@@ -3556,9 +3991,14 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
     let pnJid = targetJid.endsWith('@s.whatsapp.net') ? targetJid : undefined;
     let lidJid = targetJid.endsWith('@lid') ? targetJid : undefined;
 
+    const trackingStartedAtMs = Date.now();
+    const resolveStartMs = Date.now();
     const resolved = await this.resolveLidForRecipient(cleanRecipient).catch(
       () => null
     );
+    const initialResolveRttMs = resolved
+      ? Math.max(1, Date.now() - resolveStartMs)
+      : undefined;
     if (resolved) {
       pnJid = resolved.pnJid || pnJid;
       lidJid = resolved.lidJid || lidJid;
@@ -3569,21 +4009,53 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
     }
 
     const primaryKey = pnJid || lidJid || targetJid;
+    const digitsKey = primaryKey.split('@')[0].replace(/\D/g, '');
+    const candidateKeys = Array.from(
+      new Set(
+        [primaryKey, pnJid, lidJid, targetJid, digitsKey].filter(
+          (k): k is string => Boolean(k)
+        )
+      )
+    );
+
+    // Seed initial telemetry (targetDurationSeconds, elapsedSeconds=0, initial RTT if measured)
+    this.memoryStore.updatePresenceTelemetry(primaryKey, {
+      probeRttMs: initialResolveRttMs,
+      elapsedSeconds: 0,
+      targetDurationSeconds: durationSec,
+    });
 
     // 1. Register onUpdate listener BEFORE subscribing so the immediate initial `<presence>` stanza is captured!
+    const emitLiveUpdate = (record: TrackedPresenceRecord) => {
+      if (!params.onUpdate) return;
+      const now = Date.now();
+      const elapsedSeconds = Math.min(
+        durationSec,
+        Math.max(0, Math.floor((now - trackingStartedAtMs) / 1000))
+      );
+      const liveTotalOnlineMs =
+        record.onlineSessionStartedAtMs !== undefined
+          ? record.totalOnlineDurationMs +
+            Math.max(0, now - record.onlineSessionStartedAtMs)
+          : record.totalOnlineDurationMs;
+      params.onUpdate({
+        ...record,
+        elapsedSeconds,
+        targetDurationSeconds: durationSec,
+        totalOnlineDurationMs: liveTotalOnlineMs,
+      });
+    };
+
     const unsubListener = params.onUpdate
-      ? this.memoryStore.onPresenceChange(primaryKey, params.onUpdate)
+      ? this.memoryStore.onPresenceChange(primaryKey, emitLiveUpdate)
       : () => undefined;
 
-    // 2. Activate our own presence (globally and directed to target) so WhatsApp servers stream presence + lastSeen
-    await sock.sendPresenceUpdate('available').catch(() => undefined);
-    await sock
-      .sendPresenceUpdate('available', pnJid || primaryKey)
-      .catch(() => undefined);
+    // 2. Activate our own presence (ensuring creds.me.name is populated) so WhatsApp servers stream presence + lastSeen
+    await this.ensureSelfPresenceAvailable(sock, pnJid || primaryKey);
 
     // 3. Subscribe to both PN and LID JIDs
     const subscribeBoth = async () => {
-      await sock.sendPresenceUpdate('available').catch(() => undefined);
+      await this.ensureSelfPresenceAvailable(sock);
       if (pnJid) {
         await sock.presenceSubscribe(pnJid).catch(() => undefined);
       }
@@ -3596,15 +4068,69 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
     };
     await subscribeBoth();
 
-    // 4. Re-subscribe every 45s to keep WhatsApp's server-side subscription active
+    // 3b. Fire non-blocking active USync device + RTT probe
+    const runProbe = async (notifyListeners: boolean) => {
+      if (!this.sock || !this.wsOpen) return;
+      const probeRes = await this.probeRecipientDevicesAndRtt(
+        sock,
+        pnJid || primaryKey,
+        lidJid
+      );
+      if (probeRes.rttMs !== undefined || probeRes.linkedDevices.length > 0) {
+        const elapsedSeconds = Math.min(
+          durationSec,
+          Math.max(0, Math.floor((Date.now() - trackingStartedAtMs) / 1000))
+        );
+        this.memoryStore.updatePresenceTelemetry(primaryKey, {
+          probeRttMs: probeRes.rttMs,
+          linkedDevices: probeRes.linkedDevices,
+          elapsedSeconds,
+          targetDurationSeconds: durationSec,
+          notify: notifyListeners,
+        });
+      }
+    };
+    void runProbe(true);
+
+    // 4. Re-subscribe every 25s and re-probe RTT/devices every 6s to keep radar active
     const resubscribeInterval = setInterval(() => {
       void subscribeBoth();
-    }, 45_000);
+    }, 25_000);
     if (typeof resubscribeInterval.unref === 'function') {
       resubscribeInterval.unref();
     }
 
-    // 5. Watchdog for stale composing/recording (>12s without paused/message)
+    const activeProbeInterval =
+      durationSec >= 5
+        ? setInterval(() => {
+            void subscribeBoth();
+            void runProbe(false);
+          }, 6_000)
+        : undefined;
+    if (activeProbeInterval && typeof activeProbeInterval.unref === 'function') {
+      activeProbeInterval.unref();
+    }
+
+    // 5. Periodic live progress ticker (every 2s when duration >= 3s) so elapsed time & active online counter tick smoothly
+    const liveProgressInterval =
+      durationSec >= 3 && params.onUpdate
+        ? setInterval(() => {
+            const elapsedSeconds = Math.min(
+              durationSec,
+              Math.max(0, Math.floor((Date.now() - trackingStartedAtMs) / 1000))
+            );
+            this.memoryStore.updatePresenceTelemetry(primaryKey, {
+              elapsedSeconds,
+              targetDurationSeconds: durationSec,
+              notify: true,
+            });
+          }, 2_000)
+        : undefined;
+    if (liveProgressInterval && typeof liveProgressInterval.unref === 'function') {
+      liveProgressInterval.unref();
+    }
+
+    // 6. Watchdog for stale composing/recording (>12s without paused/message)
     const staleWatchdogInterval = setInterval(() => {
       const rec =
         this.memoryStore.presences.get(primaryKey) ||
@@ -3618,6 +4144,7 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
           chatJid: primaryKey,
           participantJid: rec.resolvedLid || primaryKey,
           state: 'available',
+          source: 'presence',
         });
       }
     }, Math.min(1_000, Math.max(50, Math.floor(staleTimeoutMs / 2))));
@@ -3633,14 +4160,18 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
       const cleanup = () => {
         clearTimeout(doneTimer);
         clearInterval(resubscribeInterval);
+        if (activeProbeInterval) clearInterval(activeProbeInterval);
+        if (liveProgressInterval) clearInterval(liveProgressInterval);
         clearInterval(staleWatchdogInterval);
         unsubListener();
         this.activePresenceCleanups.delete(cleanup);
-        const keySet = this.activePresenceTrackersByKey.get(primaryKey);
-        if (keySet) {
-          keySet.delete(cleanup);
-          if (keySet.size === 0) {
-            this.activePresenceTrackersByKey.delete(primaryKey);
+        for (const k of candidateKeys) {
+          const keySet = this.activePresenceTrackersByKey.get(k);
+          if (keySet) {
+            keySet.delete(cleanup);
+            if (keySet.size === 0) {
+              this.activePresenceTrackersByKey.delete(k);
+            }
           }
         }
         if (!settled) {
@@ -3649,14 +4180,20 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
         }
       };
       this.activePresenceCleanups.add(cleanup);
-      let keySet = this.activePresenceTrackersByKey.get(primaryKey);
-      if (!keySet) {
-        keySet = new Set();
-        this.activePresenceTrackersByKey.set(primaryKey, keySet);
+      for (const k of candidateKeys) {
+        let keySet = this.activePresenceTrackersByKey.get(k);
+        if (!keySet) {
+          keySet = new Set();
+          this.activePresenceTrackersByKey.set(k, keySet);
+        }
+        keySet.add(cleanup);
       }
-      keySet.add(cleanup);
     });
 
+    const elapsedFinalSec = Math.min(
+      durationSec,
+      Math.max(1, Math.round((Date.now() - trackingStartedAtMs) / 1000))
+    );
     const finalRecord =
       this.memoryStore.presences.get(primaryKey) ||
       (lidJid ? this.memoryStore.presences.get(lidJid) : undefined) || {
@@ -3668,17 +4205,23 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
         totalOnlineDurationMs: 0,
       };
 
-    if (finalRecord.onlineSessionStartedAtMs !== undefined) {
+    const finalWithTelemetry: TrackedPresenceRecord = {
+      ...finalRecord,
+      elapsedSeconds: elapsedFinalSec,
+      targetDurationSeconds: durationSec,
+    };
+
+    if (finalWithTelemetry.onlineSessionStartedAtMs !== undefined) {
       const now = Date.now();
       return {
-        ...finalRecord,
+        ...finalWithTelemetry,
         totalOnlineDurationMs:
-          finalRecord.totalOnlineDurationMs +
-          Math.max(0, now - finalRecord.onlineSessionStartedAtMs),
+          finalWithTelemetry.totalOnlineDurationMs +
+          Math.max(0, now - finalWithTelemetry.onlineSessionStartedAtMs),
       };
     }
 
-    return finalRecord;
+    return finalWithTelemetry;
   }
 
   /**
@@ -3686,12 +4229,16 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
    */
   public stopTrackingRecipientPresence(recipient?: string): number {
     let stoppedCount = 0;
+    const uniqueCleanups = new Set<() => void>();
     if (!recipient) {
       for (const set of this.activePresenceTrackersByKey.values()) {
-        for (const fn of Array.from(set)) {
-          fn();
-          stoppedCount++;
+        for (const fn of set) {
+          uniqueCleanups.add(fn);
         }
+      }
+      for (const fn of uniqueCleanups) {
+        fn();
+        stoppedCount++;
       }
       this.activePresenceTrackersByKey.clear();
       return stoppedCount;
@@ -3700,19 +4247,35 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
     const clean = recipient.includes('@')
       ? recipient.trim()
       : recipient.replace(/[\s\-()]+/g, '');
-    let normalizedKey = clean;
+    const digitsOnly = clean.split('@')[0].replace(/\D/g, '');
+    const lookupKeys = new Set<string>([clean]);
+    if (digitsOnly) {
+      lookupKeys.add(digitsOnly);
+      lookupKeys.add(`${digitsOnly}@s.whatsapp.net`);
+    }
     try {
-      normalizedKey = jidNormalizedUser(validateRecipient(clean).jid);
+      const norm = jidNormalizedUser(validateRecipient(clean).jid);
+      lookupKeys.add(norm);
+      const mappedLid = this.memoryStore.getLidForPn(norm);
+      if (mappedLid) lookupKeys.add(mappedLid);
+      const mappedPn = this.memoryStore.getPnForLid(norm);
+      if (mappedPn) lookupKeys.add(mappedPn);
     } catch {
       // keep raw
     }
-    const matchingSet = this.activePresenceTrackersByKey.get(normalizedKey);
-    if (matchingSet) {
-      for (const fn of Array.from(matchingSet)) {
-        fn();
-        stoppedCount++;
+
+    for (const key of lookupKeys) {
+      const matchingSet = this.activePresenceTrackersByKey.get(key);
+      if (matchingSet) {
+        for (const fn of matchingSet) {
+          uniqueCleanups.add(fn);
+        }
+        this.activePresenceTrackersByKey.delete(key);
       }
-      this.activePresenceTrackersByKey.delete(normalizedKey);
+    }
+    for (const fn of uniqueCleanups) {
+      fn();
+      stoppedCount++;
     }
     return stoppedCount;
   }
@@ -3727,6 +4290,13 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
     mode: 'composing' | 'recording' | 'available';
     durationSeconds: number;
     pulseIntervalMs?: number;
+    onProgress?: (info: {
+      pulsesSent: number;
+      elapsedSeconds: number;
+      durationSeconds: number;
+      mode: 'composing' | 'recording' | 'available';
+      targetJid: string;
+    }) => void;
   }): Promise<{
     pulsesSent: number;
     targetJid: string;
@@ -3752,15 +4322,34 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
     const resolvedJid = validated.jid.endsWith('@s.whatsapp.net')
       ? await this.resolveDirectRecipientJid(sock, validated.jid)
       : jidNormalizedUser(validated.jid);
+    const digitsKey = resolvedJid.split('@')[0].replace(/\D/g, '');
+    const candidateKeys = Array.from(
+      new Set([resolvedJid, validated.jid, digitsKey].filter(Boolean))
+    );
 
     const startedAt = Date.now();
+    await this.ensureSelfPresenceAvailable(sock, resolvedJid);
     await sock.presenceSubscribe(resolvedJid).catch(() => undefined);
 
     let pulsesSent = 0;
     const sendPulse = async () => {
       if (!this.sock || !this.wsOpen) return;
-      await sock.sendPresenceUpdate(params.mode, resolvedJid).catch(() => undefined);
+      if (params.mode === 'available') {
+        await this.ensureSelfPresenceAvailable(sock, resolvedJid);
+      } else {
+        await sock.sendPresenceUpdate(params.mode, resolvedJid).catch(() => undefined);
+      }
       pulsesSent++;
+      params.onProgress?.({
+        pulsesSent,
+        elapsedSeconds: Math.min(
+          durationSec,
+          Math.max(0, Math.floor((Date.now() - startedAt) / 1000))
+        ),
+        durationSeconds: durationSec,
+        mode: params.mode,
+        targetJid: resolvedJid,
+      });
     };
 
     await sendPulse();
@@ -3782,11 +4371,13 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
         clearInterval(pulseTimer);
         clearTimeout(endTimer);
         this.activePresenceCleanups.delete(cleanup);
-        const hbSet = this.activePresenceHeartbeatsByKey.get(resolvedJid);
-        if (hbSet) {
-          hbSet.delete(cleanup);
-          if (hbSet.size === 0) {
-            this.activePresenceHeartbeatsByKey.delete(resolvedJid);
+        for (const k of candidateKeys) {
+          const hbSet = this.activePresenceHeartbeatsByKey.get(k);
+          if (hbSet) {
+            hbSet.delete(cleanup);
+            if (hbSet.size === 0) {
+              this.activePresenceHeartbeatsByKey.delete(k);
+            }
           }
         }
         if (!settled) {
@@ -3795,12 +4386,14 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
         }
       };
       this.activePresenceCleanups.add(cleanup);
-      let hbSet = this.activePresenceHeartbeatsByKey.get(resolvedJid);
-      if (!hbSet) {
-        hbSet = new Set();
-        this.activePresenceHeartbeatsByKey.set(resolvedJid, hbSet);
+      for (const k of candidateKeys) {
+        let hbSet = this.activePresenceHeartbeatsByKey.get(k);
+        if (!hbSet) {
+          hbSet = new Set();
+          this.activePresenceHeartbeatsByKey.set(k, hbSet);
+        }
+        hbSet.add(cleanup);
       }
-      hbSet.add(cleanup);
     });
 
     if (this.sock && this.wsOpen) {
@@ -3819,12 +4412,16 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
    */
   public stopPresenceHeartbeat(recipient?: string): number {
     let stoppedCount = 0;
+    const uniqueCleanups = new Set<() => void>();
     if (!recipient) {
       for (const set of this.activePresenceHeartbeatsByKey.values()) {
-        for (const fn of Array.from(set)) {
-          fn();
-          stoppedCount++;
+        for (const fn of set) {
+          uniqueCleanups.add(fn);
         }
+      }
+      for (const fn of uniqueCleanups) {
+        fn();
+        stoppedCount++;
       }
       this.activePresenceHeartbeatsByKey.clear();
       return stoppedCount;
@@ -3833,19 +4430,33 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
     const clean = recipient.includes('@')
       ? recipient.trim()
       : recipient.replace(/[\s\-()]+/g, '');
-    let normalizedKey = clean;
+    const digitsOnly = clean.split('@')[0].replace(/\D/g, '');
+    const lookupKeys = new Set<string>([clean]);
+    if (digitsOnly) {
+      lookupKeys.add(digitsOnly);
+      lookupKeys.add(`${digitsOnly}@s.whatsapp.net`);
+    }
     try {
-      normalizedKey = jidNormalizedUser(validateRecipient(clean).jid);
+      normalizedKeyAdd: {
+        const norm = jidNormalizedUser(validateRecipient(clean).jid);
+        lookupKeys.add(norm);
+        break normalizedKeyAdd;
+      }
     } catch {
       // keep raw
     }
-    const matchingSet = this.activePresenceHeartbeatsByKey.get(normalizedKey);
-    if (matchingSet) {
-      for (const fn of Array.from(matchingSet)) {
-        fn();
-        stoppedCount++;
+    for (const key of lookupKeys) {
+      const matchingSet = this.activePresenceHeartbeatsByKey.get(key);
+      if (matchingSet) {
+        for (const fn of matchingSet) {
+          uniqueCleanups.add(fn);
+        }
+        this.activePresenceHeartbeatsByKey.delete(key);
       }
-      this.activePresenceHeartbeatsByKey.delete(normalizedKey);
+    }
+    for (const fn of uniqueCleanups) {
+      fn();
+      stoppedCount++;
     }
     return stoppedCount;
   }
@@ -5353,6 +5964,13 @@ export class MockWhatsAppSessionDriver implements WhatsAppSessionDriver {
     }
     const resolved = await this.resolveLidForRecipient(params.recipient);
     const chatJid = resolved.pnJid || resolved.lidJid;
+    const userDigits = chatJid.split('@')[0];
+    const primaryDeviceJid = `${userDigits}:0@s.whatsapp.net`;
+    const companionDeviceJid = `${userDigits}:33@s.whatsapp.net`;
+    const durationSec = Math.min(
+      300,
+      Math.max(1, Math.floor(Number(params.durationSeconds) || 15))
+    );
     const now = Date.now();
     const record: TrackedPresenceRecord = {
       chatJid,
@@ -5360,24 +5978,46 @@ export class MockWhatsAppSessionDriver implements WhatsAppSessionDriver {
       currentState: 'available',
       lastSeenTimestampSec: Math.floor(now / 1000),
       lastUpdatedMs: now,
+      probeRttMs: 42,
+      minRttMs: 38,
+      maxRttMs: 49,
+      linkedDevices: [primaryDeviceJid, companionDeviceJid],
+      activeDevices: [primaryDeviceJid],
+      privacyLastSeenDenied: false,
+      elapsedSeconds: durationSec,
+      targetDurationSeconds: durationSec,
+      lastActivitySource: 'chatstate',
       transitions: [
         {
           state: 'available',
           timestampMs: now - 1500,
           participantJid: chatJid,
+          deviceJid: primaryDeviceJid,
+          source: 'presence',
         },
         {
           state: 'composing',
-          timestampMs: now - 800,
+          timestampMs: now - 900,
           participantJid: resolved.lidJid,
+          deviceJid: primaryDeviceJid,
+          source: 'chatstate',
+        },
+        {
+          state: 'paused',
+          timestampMs: now - 400,
+          participantJid: resolved.lidJid,
+          deviceJid: primaryDeviceJid,
+          source: 'chatstate',
         },
         {
           state: 'available',
           timestampMs: now,
           participantJid: chatJid,
+          deviceJid: primaryDeviceJid,
+          source: 'presence',
         },
       ],
-      totalOnlineDurationMs: Math.min(params.durationSeconds * 1000, 3500),
+      totalOnlineDurationMs: Math.min(durationSec * 1000, 3500),
     };
     params.onUpdate?.(record);
     return record;
@@ -5388,6 +6028,13 @@ export class MockWhatsAppSessionDriver implements WhatsAppSessionDriver {
     mode: 'composing' | 'recording' | 'available';
     durationSeconds: number;
     pulseIntervalMs?: number;
+    onProgress?: (info: {
+      pulsesSent: number;
+      elapsedSeconds: number;
+      durationSeconds: number;
+      mode: 'composing' | 'recording' | 'available';
+      targetJid: string;
+    }) => void;
   }): Promise<{
     pulsesSent: number;
     targetJid: string;
@@ -5403,6 +6050,13 @@ export class MockWhatsAppSessionDriver implements WhatsAppSessionDriver {
     );
     const intervalMs = Math.max(50, params.pulseIntervalMs ?? 7_500);
     const pulsesSent = Math.max(1, Math.ceil((durationSec * 1000) / intervalMs));
+    params.onProgress?.({
+      pulsesSent,
+      elapsedSeconds: durationSec,
+      durationSeconds: durationSec,
+      mode: params.mode,
+      targetJid: validated.jid,
+    });
     return {
       pulsesSent,
       targetJid: validated.jid,

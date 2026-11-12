@@ -340,8 +340,11 @@ export class TelegramBotController {
     this.activeConversationMode.set(adminId, 'NONE');
   }
 
-  private async runWithTimeout<T>(work: () => Promise<T>): Promise<T> {
-    const timeoutMs = this.uiState.callbackTimeoutMs;
+  private async runWithTimeout<T>(
+    work: () => Promise<T>,
+    customTimeoutMs?: number
+  ): Promise<T> {
+    const timeoutMs = customTimeoutMs ?? this.uiState.callbackTimeoutMs;
     return new Promise<T>((resolve, reject) => {
       const timer = setTimeout(() => {
         reject(new Error('انتهت مهلة معالجة الزر التفاعلي. يرجى المحاولة مرة أخرى.'));
@@ -410,19 +413,56 @@ export class TelegramBotController {
     }
 
     let callbackAnswered = false;
+    const isLongPresenceCallback =
+      callbackData.startsWith('tools:presence_run:') ||
+      callbackData.startsWith('tools:presence_hb_q:') ||
+      callbackData.startsWith('tools:presence_prof:');
+
     try {
-      const view = await this.runWithTimeout(() =>
-        this.routeCallbackQueryInternal(actorUserId, callbackData)
+      if (isLongPresenceCallback && options?.transport?.answerCallbackQuery) {
+        this.uiState.recordCallbackAnswered(actorUserId);
+        callbackAnswered = true;
+        await options.transport
+          .answerCallbackQuery({
+            text: '📡 جاري تشغيل رادار التتبع اللحظي...',
+            showAlert: false,
+          })
+          .catch(() => undefined);
+      }
+
+      const onProgressUpdate = async (progressView: BotViewResponse) => {
+        const currentSess = this.uiState.getOrCreateSession(actorUserId);
+        await this.uiState.deliverView({
+          userId: actorUserId,
+          view: progressView,
+          pendingWorkflow: this.getConversationMode(actorUserId),
+          preferEdit: currentSess.activeMessageId !== undefined,
+          transport: options?.transport,
+        });
+      };
+
+      const view = await this.runWithTimeout(
+        () =>
+          this.routeCallbackQueryInternal(
+            actorUserId,
+            callbackData,
+            onProgressUpdate
+          ),
+        isLongPresenceCallback
+          ? Math.max(this.uiState.callbackTimeoutMs, 320_000)
+          : undefined
       );
 
       // Answer callback query promptly before or alongside message edit
-      this.uiState.recordCallbackAnswered(actorUserId);
-      callbackAnswered = true;
-      if (options?.transport?.answerCallbackQuery) {
-        await options.transport.answerCallbackQuery({
-          text: view.toastText,
-          showAlert: view.showAlert,
-        });
+      if (!callbackAnswered) {
+        this.uiState.recordCallbackAnswered(actorUserId);
+        callbackAnswered = true;
+        if (options?.transport?.answerCallbackQuery) {
+          await options.transport.answerCallbackQuery({
+            text: view.toastText,
+            showAlert: view.showAlert,
+          });
+        }
       }
 
       const sess = this.uiState.getOrCreateSession(actorUserId);
@@ -473,7 +513,8 @@ export class TelegramBotController {
 
   private async routeCallbackQueryInternal(
     actorUserId: number,
-    callbackData: string
+    callbackData: string,
+    onProgressUpdate?: (view: BotViewResponse) => Promise<void>
   ): Promise<BotViewResponse> {
     const isOwner = this.isOwnerUser(actorUserId);
 
@@ -1197,13 +1238,57 @@ export class TelegramBotController {
       this.activeConversationMode.set(actorUserId, 'TOOLS');
       return this.toolsHandler.promptAnonymousLidMessage(actorUserId);
     }
-    if (
-      callbackData === 'tools:prompt_presence' ||
-      callbackData === 'tools:presence_mode_track'
-    ) {
+    if (callbackData === 'tools:prompt_presence') {
       this.cancelAllWorkflowsForAdmin(actorUserId);
       this.activeConversationMode.set(actorUserId, 'TOOLS');
       return this.toolsHandler.promptPresenceTool(actorUserId);
+    }
+    if (callbackData === 'tools:presence_mode_track') {
+      this.cancelAllWorkflowsForAdmin(actorUserId);
+      this.activeConversationMode.set(actorUserId, 'TOOLS');
+      return this.toolsHandler.promptPresenceTrackMode(actorUserId);
+    }
+    if (callbackData.startsWith('tools:presence_dur:')) {
+      const durSec = Number(callbackData.slice('tools:presence_dur:'.length));
+      this.cancelAllWorkflowsForAdmin(actorUserId);
+      this.activeConversationMode.set(actorUserId, 'TOOLS');
+      return this.toolsHandler.promptPresenceTrackMode(
+        actorUserId,
+        Number.isFinite(durSec) && durSec >= 5 ? durSec : 15
+      );
+    }
+    if (callbackData.startsWith('tools:presence_run:')) {
+      const rest = callbackData.slice('tools:presence_run:'.length);
+      const lastColon = rest.lastIndexOf(':');
+      const target = lastColon > 0 ? rest.slice(0, lastColon) : rest;
+      const durSec =
+        lastColon > 0 ? Number(rest.slice(lastColon + 1)) || 15 : 15;
+      this.cancelAllWorkflowsForAdmin(actorUserId);
+      this.activeConversationMode.set(actorUserId, 'NONE');
+      return this.toolsHandler.executePresenceTracking(
+        actorUserId,
+        `${target} ${durSec}`,
+        onProgressUpdate
+      );
+    }
+    if (callbackData.startsWith('tools:presence_hb_q:')) {
+      const rest = callbackData.slice('tools:presence_hb_q:'.length);
+      const firstColon = rest.indexOf(':');
+      const modeRaw = firstColon > 0 ? rest.slice(0, firstColon) : 'composing';
+      const target = firstColon > 0 ? rest.slice(firstColon + 1) : '';
+      this.cancelAllWorkflowsForAdmin(actorUserId);
+      this.activeConversationMode.set(actorUserId, 'NONE');
+      return this.toolsHandler.executePresenceHeartbeat(
+        actorUserId,
+        `${modeRaw} ${target} 15`,
+        onProgressUpdate
+      );
+    }
+    if (callbackData.startsWith('tools:presence_prof:')) {
+      const target = callbackData.slice('tools:presence_prof:'.length);
+      this.cancelAllWorkflowsForAdmin(actorUserId);
+      this.activeConversationMode.set(actorUserId, 'NONE');
+      return this.toolsHandler.executeFullProfileLookup(actorUserId, target);
     }
     if (callbackData === 'tools:presence_stop') {
       return this.toolsHandler.stopPresenceTrackingForAdmin(actorUserId);

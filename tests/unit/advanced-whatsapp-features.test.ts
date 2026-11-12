@@ -923,3 +923,137 @@ test('6. Root-Cause Remediation Suite: RFC 6184 H.264 RTP Marker Bit, In-Band SP
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
 
+test('7. Advanced Live Presence Radar: raw CB:chatstate <paused/> protection, device JID attribution, last="deny" privacy detection, creds.me.name fallback, USync RTT probe, and interactive callbacks', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'botezz-adv-radar-'));
+  const wsEmitter = new EventEmitter();
+  const driver = new HiroosyBaileysSessionDriver('sess_radar_1', tmpDir);
+
+  // Simulate a paired session where creds.me.name is initially empty (which previously caused baileys-lite sendPresenceUpdate('available') to abort)
+  const fake = createFakeBaileysSocket({
+    ws: wsEmitter,
+    user: {
+      id: '966500000001:1@s.whatsapp.net',
+      lid: '10000000000001:1@lid',
+      name: '',
+      verifiedName: 'Botezz Radar Node',
+    },
+    authState: {
+      creds: {
+        registered: true,
+        me: {
+          id: '966500000001:1@s.whatsapp.net',
+          lid: '10000000000001:1@lid',
+          name: '',
+        },
+      },
+      keys: {
+        get: async () => ({}),
+        set: async () => undefined,
+      },
+    },
+  });
+  driver.attachSocketForTesting(fake.sock);
+
+  const liveUpdates: Array<{ state: string; rtt?: number; linked?: string[] }> = [];
+  const trackPromise = driver.trackRecipientPresence({
+    recipient: '+966 50 123 4567',
+    durationSeconds: 3,
+    onUpdate: (rec) => {
+      liveUpdates.push({
+        state: rec.currentState,
+        rtt: rec.probeRttMs,
+        linked: rec.linkedDevices,
+      });
+    },
+  });
+
+  await new Promise((r) => setTimeout(r, 80));
+
+  // Verify creds.me.name was automatically populated by ensureSelfPresenceAvailable
+  assert.equal(
+    (fake.sock as any).authState.creds.me.name,
+    'Botezz Radar Node',
+    'ensureSelfPresenceAvailable must populate empty creds.me.name'
+  );
+  assert.ok(
+    fake.presenceUpdates.some((u) => u.type === 'available'),
+    'Must send available presence update'
+  );
+
+  // 1. Emit raw CB:chatstate <composing/> from companion web device :33
+  wsEmitter.emit('CB:chatstate', {
+    tag: 'chatstate',
+    attrs: {
+      from: '966501234567@s.whatsapp.net',
+      participant: '966501234567:33@s.whatsapp.net',
+    },
+    content: [{ tag: 'composing', attrs: {} }],
+  });
+
+  // 2. Emit raw CB:chatstate <paused/> followed immediately by baileys-lite's rewritten presence.update 'available'
+  wsEmitter.emit('CB:chatstate', {
+    tag: 'chatstate',
+    attrs: {
+      from: '966501234567@s.whatsapp.net',
+      participant: '966501234567:33@s.whatsapp.net',
+    },
+    content: [{ tag: 'paused', attrs: {} }],
+  });
+  fake.ev.emit('presence.update', {
+    id: '966501234567@s.whatsapp.net',
+    presences: {
+      '966501234567@s.whatsapp.net': {
+        lastKnownPresence: 'available',
+      },
+    },
+  });
+
+  const midRecord = driver.memoryStore.presences.get(
+    '966501234567@s.whatsapp.net'
+  )!;
+  assert.equal(
+    midRecord.currentState,
+    'paused',
+    'Raw CB:chatstate <paused/> must NOT be overwritten by baileys-lite immediate available rewrite'
+  );
+  assert.ok(
+    midRecord.activeDevices?.includes('966501234567:33@s.whatsapp.net'),
+    'Companion device :33 must be recorded in activeDevices'
+  );
+
+  // 3. Emit raw CB:presence unavailable with last="deny"
+  wsEmitter.emit('CB:presence', {
+    tag: 'presence',
+    attrs: {
+      from: '966501234567:0@s.whatsapp.net',
+      type: 'unavailable',
+      last: 'deny',
+    },
+  });
+
+  // 4. Stop tracking early using plain phone digits (verifying multi-key stopTrackingRecipientPresence)
+  const stoppedCount = driver.stopTrackingRecipientPresence('966501234567');
+  assert.equal(stoppedCount, 1);
+
+  const finalRecord = await trackPromise;
+  assert.equal(finalRecord.currentState, 'unavailable');
+  assert.equal(finalRecord.privacyLastSeenDenied, true);
+  assert.ok(
+    typeof finalRecord.probeRttMs === 'number' && finalRecord.probeRttMs >= 1,
+    'Active USync probe must record probeRttMs'
+  );
+  assert.ok(
+    finalRecord.linkedDevices?.includes('966501234567:0@s.whatsapp.net') &&
+      finalRecord.linkedDevices?.includes('966501234567:33@s.whatsapp.net'),
+    'Active USync probe must populate linkedDevices (:0 and :33)'
+  );
+  assert.ok(
+    finalRecord.transitions.some((t) => t.state === 'paused'),
+    'Transition log must preserve paused state'
+  );
+
+  await driver.disconnect();
+  fs.rmSync(tmpDir, { recursive: true, force: true });
+});
+
+

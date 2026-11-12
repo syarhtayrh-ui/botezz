@@ -1203,6 +1203,55 @@ export function instrumentMediaSessionInstance(
     return undefined;
   }
   const session = rawSession as InstrumentedMediaSession;
+
+  // For real `@hiroosy/baileys-lite` `WaCallMediaSession` instances, NEVER monkey-patch or override
+  // outbound audio/video engines (`WaVideoEngine`, `WaAudioEngine`, `sendCapturedVideoAU`, `videoSrtpSession`).
+  // Attach ONLY a 100% passive, read-only inbound tap (`__peerRecvCtx`) for `VoipCallRecorder`.
+  const isNativeWaCallMediaSession =
+    (session as { constructor?: { name?: string } }).constructor?.name ===
+    'WaCallMediaSession';
+  if (isNativeWaCallMediaSession) {
+    if (Object.prototype.hasOwnProperty.call(session, '__botezzInstrumented')) {
+      return session;
+    }
+    session.__botezzInstrumented = true;
+    const nativeWithAccept = session as InstrumentedMediaSession & {
+      handleCallAccept?: (...args: unknown[]) => Promise<unknown>;
+      srtpSession?: {
+        recvCtx?: {
+          sessionKey?: Uint8Array;
+          sessionSalt?: Uint8Array;
+          authKey?: Uint8Array;
+          authTagLen?: number;
+        };
+      } | null;
+    };
+    if (typeof nativeWithAccept.handleCallAccept === 'function') {
+      const origAccept = nativeWithAccept.handleCallAccept;
+      nativeWithAccept.handleCallAccept = async function passiveAcceptTap(
+        this: typeof nativeWithAccept,
+        ...args: unknown[]
+      ) {
+        const res = await origAccept.apply(this, args);
+        try {
+          const recv = this.srtpSession?.recvCtx;
+          if (recv?.sessionKey instanceof Uint8Array) {
+            this.__peerRecvCtx = {
+              sessionKey: recv.sessionKey,
+              sessionSalt: recv.sessionSalt,
+              authKey: recv.authKey,
+              authTagLen: recv.authTagLen ?? 4,
+            };
+          }
+        } catch {
+          // Passive read-only tap must never throw
+        }
+        return res;
+      };
+    }
+    return session;
+  }
+
   wrapSctpRelayOnSession(session);
   if (session.audioEngine && typeof session.audioEngine === 'object') {
     instrumentAudioEngineInstance(
@@ -2131,8 +2180,9 @@ export function hasVerifiedRelayMediaAcceptance(
 }
 
 /**
- * Applies idempotent prototype-level instrumentation to `@hiroosy/baileys-lite/voip` internal classes
- * (`WaCallMediaSession`, `WaAudioEngine`, `WaVideoEngine`, `WaCallManager`, `PreNegotiatedDataChannel`, `WaManualRelay`).
+ * Applies ONLY a 100% passive, read-only inbound tap for `VoipCallRecorder` and `<reject>` stanza cleanup.
+ * Does NOT monkey-patch `WaVideoEngine`, `WaAudioEngine`, `WaManualRelay`, `PreNegotiatedDataChannel`,
+ * or outbound `sendCapturedVideoAU` / `videoSrtpSession` on `@hiroosy/baileys-lite/voip` (`^0.3.7`).
  */
 export async function ensureHiroosyVoipRuntimePatched(): Promise<void> {
   if (patchApplied) return;
@@ -2146,30 +2196,8 @@ export async function ensureHiroosyVoipRuntimePatched(): Promise<void> {
       const pkgDir = resolveBaileysLitePackageDir();
       if (!pkgDir) return;
 
-      const videoEnginePath = path.join(pkgDir, 'src/voip/media/WaVideoEngine.js');
-      if (fs.existsSync(videoEnginePath)) {
-        const mod = (await import(
-          /* webpackIgnore: true */ pathToFileURL(videoEnginePath).href
-        )) as {
-          WaVideoEngine?: { prototype?: InstrumentedVideoEngine };
-        };
-        if (mod?.WaVideoEngine?.prototype) {
-          instrumentVideoEngineInstance(mod.WaVideoEngine.prototype);
-        }
-      }
-
-      const audioEnginePath = path.join(pkgDir, 'src/voip/media/WaAudioEngine.js');
-      if (fs.existsSync(audioEnginePath)) {
-        const mod = (await import(
-          /* webpackIgnore: true */ pathToFileURL(audioEnginePath).href
-        )) as {
-          WaAudioEngine?: { prototype?: InstrumentedAudioEngine };
-        };
-        if (mod?.WaAudioEngine?.prototype) {
-          instrumentAudioEngineInstance(mod.WaAudioEngine.prototype);
-        }
-      }
-
+      // Passive read-only tap on `WaCallMediaSession.prototype.handleCallAccept` to expose `srtpSession.recvCtx`
+      // as `__peerRecvCtx` for `VoipCallRecorder` without mutating any outbound media or SRTP state.
       const mediaSessionPath = path.join(
         pkgDir,
         'src/voip/call/WaCallMediaSession.js'
@@ -2178,265 +2206,54 @@ export async function ensureHiroosyVoipRuntimePatched(): Promise<void> {
         const mod = (await import(
           /* webpackIgnore: true */ pathToFileURL(mediaSessionPath).href
         )) as {
-          WaCallMediaSession?: { prototype?: InstrumentedMediaSession };
-        };
-        if (mod?.WaCallMediaSession?.prototype) {
-          instrumentMediaSessionInstance(mod.WaCallMediaSession.prototype);
-        }
-      }
-
-      // Patch `PreNegotiatedDataChannel.prototype.handleDtlsPayload` so ordered inbound video RTP packets
-      // are never trapped in `SctpAssociation.#reorderBuffer` (`STALE_GAP_TSN_LIMIT = 512`) or dropped when
-      // `streamSeq < #inboundExpectedStreamSeq` or `streamId !== 0`.
-      const preNegotiatedPath = path.join(
-        pkgDir,
-        'src/voip/relay/datachannel/pre-negotiated.js'
-      );
-      if (fs.existsSync(preNegotiatedPath)) {
-        const mod = (await import(
-          /* webpackIgnore: true */ pathToFileURL(preNegotiatedPath).href
-        )) as {
-          PreNegotiatedDataChannel?: {
-            prototype?: {
-              __botezzDataChannelPatched?: boolean;
-              __botezzSeenRtpKeys?: Set<string>;
-              handleDtlsPayload?: (plaintext: Uint8Array) => void;
-              emit?: (event: string, ...args: unknown[]) => boolean;
+          WaCallMediaSession?: {
+            prototype?: InstrumentedMediaSession & {
+              __botezzPassiveTapApplied?: boolean;
+              handleCallAccept?: (...args: unknown[]) => Promise<unknown>;
+              srtpSession?: {
+                recvCtx?: {
+                  sessionKey?: Uint8Array;
+                  sessionSalt?: Uint8Array;
+                  authKey?: Uint8Array;
+                  authTagLen?: number;
+                };
+              } | null;
             };
           };
         };
-        const dcProto = mod?.PreNegotiatedDataChannel?.prototype;
+        const sessionProto = mod?.WaCallMediaSession?.prototype;
         if (
-          dcProto &&
-          !dcProto.__botezzDataChannelPatched &&
-          typeof dcProto.handleDtlsPayload === 'function'
+          sessionProto &&
+          !sessionProto.__botezzPassiveTapApplied &&
+          typeof sessionProto.handleCallAccept === 'function'
         ) {
-          dcProto.__botezzDataChannelPatched = true;
-          const origHandleDtlsPayload = dcProto.handleDtlsPayload;
-          dcProto.handleDtlsPayload = function patchedHandleDtlsPayload(
-            this: NonNullable<typeof dcProto>,
-            plaintext: Uint8Array
-          ) {
-            if (!plaintext || plaintext.length < 16) {
-              return origHandleDtlsPayload.call(this, plaintext);
-            }
-
-            this.__botezzSeenRtpKeys ??= new Set<string>();
-            const seenKeys = this.__botezzSeenRtpKeys;
-            const makeRtpKey = (pkt: Uint8Array): string | null => {
-              if (!pkt || pkt.length < 12 || (pkt[0] & 0xc0) !== 0x80) {
-                return null;
+          sessionProto.__botezzPassiveTapApplied = true;
+          const origHandleCallAccept = sessionProto.handleCallAccept;
+          sessionProto.handleCallAccept =
+            async function passiveHandleCallAcceptTap(
+              this: NonNullable<typeof sessionProto>,
+              ...args: unknown[]
+            ) {
+              const res = await origHandleCallAccept.apply(this, args);
+              try {
+                const recv = this.srtpSession?.recvCtx;
+                if (recv?.sessionKey instanceof Uint8Array) {
+                  this.__peerRecvCtx = {
+                    sessionKey: recv.sessionKey,
+                    sessionSalt: recv.sessionSalt,
+                    authKey: recv.authKey,
+                    authTagLen: recv.authTagLen ?? 4,
+                  };
+                }
+              } catch {
+                // Passive read-only tap must never throw
               }
-              const pt = pkt[1] & 0x7f;
-              const seq = (pkt[2] << 8) | pkt[3];
-              const ts =
-                ((pkt[4] << 24) |
-                  (pkt[5] << 16) |
-                  (pkt[6] << 8) |
-                  pkt[7]) >>>
-                0;
-              const ssrc =
-                ((pkt[8] << 24) |
-                  (pkt[9] << 16) |
-                  (pkt[10] << 8) |
-                  pkt[11]) >>>
-                0;
-              return `${ssrc}:${pt}:${seq}:${ts}`;
+              return res;
             };
-
-            const origEmit = this.emit;
-            if (typeof origEmit === 'function') {
-              this.emit = function trackedEmit(
-                this: unknown,
-                event: string,
-                ...args: unknown[]
-              ) {
-                if (event === 'message' && args[0] instanceof Uint8Array) {
-                  const key = makeRtpKey(args[0]);
-                  if (key) {
-                    if (seenKeys.has(key)) {
-                      return true;
-                    }
-                    seenKeys.add(key);
-                    if (seenKeys.size > 2048) {
-                      const first = seenKeys.values().next().value;
-                      if (first !== undefined) seenKeys.delete(first);
-                    }
-                  }
-                }
-                return origEmit.call(this, event, ...args);
-              };
-            }
-
-            try {
-              origHandleDtlsPayload.call(this, plaintext);
-            } finally {
-              if (typeof origEmit === 'function') {
-                this.emit = origEmit;
-              }
-            }
-
-            // Scan SCTP chunks (starting after 12-byte SCTP common header) for DATA chunks (`type === 0`)
-            // whose RTP payload was withheld by `SctpAssociation.#reorderBuffer` or dropped by streamSeq/streamId checks.
-            let offset = 12;
-            while (offset + 4 <= plaintext.length) {
-              const chunkType = plaintext[offset];
-              const chunkLen =
-                (plaintext[offset + 2] << 8) | plaintext[offset + 3];
-              if (chunkLen < 4 || offset + chunkLen > plaintext.length) {
-                break;
-              }
-              if (chunkType === 0 && chunkLen >= 16) {
-                const userData = plaintext.subarray(
-                  offset + 16,
-                  offset + chunkLen
-                );
-                const key = makeRtpKey(userData);
-                if (key && !seenKeys.has(key)) {
-                  seenKeys.add(key);
-                  if (seenKeys.size > 2048) {
-                    const first = seenKeys.values().next().value;
-                    if (first !== undefined) seenKeys.delete(first);
-                  }
-                  try {
-                    this.emit?.('message', userData);
-                  } catch {
-                    // Ignore emit error
-                  }
-                }
-              }
-              const paddedLen = (chunkLen + 3) & ~3;
-              offset += paddedLen;
-            }
-          };
         }
       }
 
-      // Patch `WaManualRelay.prototype` so `streamSsrcs[3]` always carries `videoSsrc` and
-      // `sendPeerMediaSubscriptions` subscribes to the remote peer's audio + video SSRCs on the relay.
-      const manualRelayPath = path.join(
-        pkgDir,
-        'src/voip/relay/WaManualRelay.js'
-      );
-      const stunPath = path.join(pkgDir, 'src/voip/relay/stun.js');
-      if (fs.existsSync(manualRelayPath) && fs.existsSync(stunPath)) {
-        const [relayMod, stunMod] = (await Promise.all([
-          import(/* webpackIgnore: true */ pathToFileURL(manualRelayPath).href),
-          import(/* webpackIgnore: true */ pathToFileURL(stunPath).href),
-        ])) as [
-          {
-            WaManualRelay?: {
-              prototype?: {
-                __botezzManualRelayPatched?: boolean;
-                videoSsrc?: number;
-                audioSsrc?: number;
-                subscriptionSsrc?: number;
-                peerAudioSsrc?: number;
-                peerVideoSsrc?: number;
-                streamSsrcs?: number[];
-                connections?: Map<
-                  string,
-                  {
-                    dc?: {
-                      isOpen?: boolean;
-                      send?: (data: Uint8Array, unordered?: boolean) => boolean;
-                    };
-                  }
-                >;
-                sendStunAllocateOnOpen?: (
-                  conn: unknown,
-                  streamSsrcs: number[]
-                ) => void;
-                sendPeerMediaSubscriptions?: () => void;
-              };
-            };
-          },
-          {
-            buildSenderSubscriptions?: (
-              entries: Array<{ ssrc: number; flags?: number }>
-            ) => Uint8Array;
-            buildMinimalBindingWithSubs?: (
-              subscriptions: Uint8Array,
-              extraAttrs?: unknown[]
-            ) => Uint8Array;
-          },
-        ];
-
-        const relayProto = relayMod?.WaManualRelay?.prototype;
-        if (relayProto && !relayProto.__botezzManualRelayPatched) {
-          relayProto.__botezzManualRelayPatched = true;
-
-          relayProto.sendPeerMediaSubscriptions =
-            function sendPeerMediaSubscriptions() {
-              if (
-                typeof stunMod?.buildSenderSubscriptions !== 'function' ||
-                typeof stunMod?.buildMinimalBindingWithSubs !== 'function' ||
-                !this.connections
-              ) {
-                return;
-              }
-              const candidateSsrcs = new Set<number>();
-              if (this.peerVideoSsrc && this.peerVideoSsrc > 0) {
-                candidateSsrcs.add(this.peerVideoSsrc >>> 0);
-              }
-              if (this.peerAudioSsrc && this.peerAudioSsrc > 0) {
-                candidateSsrcs.add(this.peerAudioSsrc >>> 0);
-              }
-              if (this.subscriptionSsrc && this.subscriptionSsrc > 0) {
-                candidateSsrcs.add(this.subscriptionSsrc >>> 0);
-              }
-              if (candidateSsrcs.size === 0) {
-                return;
-              }
-              const entries = Array.from(candidateSsrcs).map((ssrc) => ({
-                ssrc,
-                flags: 1,
-              }));
-              const subsAttr = stunMod.buildSenderSubscriptions(entries);
-              const subBinding = stunMod.buildMinimalBindingWithSubs(subsAttr);
-              for (const conn of this.connections.values()) {
-                if (conn?.dc?.isOpen && typeof conn.dc.send === 'function') {
-                  try {
-                    conn.dc.send(subBinding, false);
-                  } catch {
-                    // Ignore subscription send error
-                  }
-                }
-              }
-            };
-
-          if (typeof relayProto.sendStunAllocateOnOpen === 'function') {
-            const origSendStunAllocateOnOpen =
-              relayProto.sendStunAllocateOnOpen;
-            relayProto.sendStunAllocateOnOpen =
-              function patchedSendStunAllocateOnOpen(
-                conn: unknown,
-                streamSsrcs: number[]
-              ) {
-                if (
-                  Array.isArray(streamSsrcs) &&
-                  streamSsrcs.length >= 4 &&
-                  this.videoSsrc
-                ) {
-                  streamSsrcs[3] = this.videoSsrc >>> 0;
-                }
-                const res = origSendStunAllocateOnOpen.call(
-                  this,
-                  conn,
-                  streamSsrcs
-                );
-                try {
-                  this.sendPeerMediaSubscriptions?.();
-                } catch {
-                  // Ignore subscription error
-                }
-                return res;
-              };
-          }
-        }
-      }
-
-      // Also patch WaCallManager to properly clean up calls when a `<reject>` stanza arrives (`P0-B` + `BZ-021`)
+      // Clean up calls when a `<reject>` stanza arrives (`P0-B` + `BZ-021`)
       const callManagerPath = path.join(
         pkgDir,
         'src/voip/call/WaCallManager.js'
@@ -2449,7 +2266,9 @@ export async function ensureHiroosyVoipRuntimePatched(): Promise<void> {
             prototype?: {
               __botezzCallManagerPatched?: boolean;
               calls?: Map<string, InstrumentedMediaSession>;
-              resolveSessionFromNode?: (node: unknown) => InstrumentedMediaSession | null;
+              resolveSessionFromNode?: (
+                node: unknown
+              ) => InstrumentedMediaSession | null;
               handleCallTerminate?: (node: unknown) => Promise<void>;
               handleCallReject?: (node: unknown) => Promise<void>;
               emitState?: (info: unknown) => void;
@@ -2470,7 +2289,10 @@ export async function ensureHiroosyVoipRuntimePatched(): Promise<void> {
               const infoAny = session.info as
                 | {
                     callId?: string;
-                    applyTransition?: (t: { type: string; reason: string }) => void;
+                    applyTransition?: (t: {
+                      type: string;
+                      reason: string;
+                    }) => void;
                   }
                 | undefined;
               infoAny?.applyTransition?.({
@@ -2493,7 +2315,7 @@ export async function ensureHiroosyVoipRuntimePatched(): Promise<void> {
 
       patchApplied = true;
     } catch {
-      // Fall back to instance-level instrumentation if prototype import fails
+      // Ignore optional runtime tap errors
     }
   })();
 

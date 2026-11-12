@@ -726,6 +726,8 @@ declare module '@hiroosy/baileys-lite/voip' {
     raiseHand(value?: boolean): void;
     shareScreen(value?: boolean): void;
     react(emoji: string): boolean;
+    sendReaction?(emoji: string): Promise<void>;
+    toggleMute?(): Promise<boolean>;
     upgradeToVideo(): Promise<void>;
     hangup(): Promise<void>;
     end?(): Promise<void>;
@@ -792,6 +794,8 @@ declare module '@hiroosy/baileys-lite/voip' {
     ): Promise<VoipCallInstance>;
     reject(callId: string, reason?: string): Promise<void>;
     hangup(callId?: string): Promise<void>;
+    sendReaction?(emoji: string): Promise<void>;
+    toggleMute?(): Promise<boolean>;
     end(force?: boolean): Promise<void>;
     on(event: string, listener: (...args: any[]) => void): this;
     off(event: string, listener: (...args: any[]) => void): this;

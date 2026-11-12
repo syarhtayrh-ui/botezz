@@ -571,10 +571,14 @@ export function depacketizeH264RtpPacket(
     const nalType = cleanNalu[0] & 0x1f;
     if (nalType === 7) {
       state.cachedRemoteSps = cleanNalu.slice();
-      state.wroteParameterSets = true;
+      state.wroteParameterSets = Boolean(
+        state.cachedRemoteSps && state.cachedRemotePps
+      );
     } else if (nalType === 8) {
       state.cachedRemotePps = cleanNalu.slice();
-      state.wroteParameterSets = true;
+      state.wroteParameterSets = Boolean(
+        state.cachedRemoteSps && state.cachedRemotePps
+      );
     }
 
     if (nalType === 5 && !state.wroteParameterSets) {
@@ -1327,8 +1331,9 @@ export class VoipCallRecorder {
         this.stopPliWatchdog();
         return;
       }
-      // Keep requesting PLI every 1.5s until we have captured both SPS/PPS and at least 1 keyframe
+      // Keep requesting PLI every 1.5s until we have captured both SPS/PPS and written at least 1 IDR keyframe
       if (
+        !this.hasWrittenFirstIdr ||
         this.h264State.inboundKeyframesRecorded === 0 ||
         !this.h264State.cachedRemoteSps ||
         !this.h264State.cachedRemotePps
@@ -1399,13 +1404,17 @@ export class VoipCallRecorder {
       if (nalType === 7) {
         this.cachedSps = nalPayload.slice();
         this.h264State.cachedRemoteSps = this.cachedSps;
-        this.h264State.wroteParameterSets = true;
+        this.h264State.wroteParameterSets = Boolean(
+          this.cachedSps && this.cachedPps
+        );
         continue;
       }
       if (nalType === 8) {
         this.cachedPps = nalPayload.slice();
         this.h264State.cachedRemotePps = this.cachedPps;
-        this.h264State.wroteParameterSets = true;
+        this.h264State.wroteParameterSets = Boolean(
+          this.cachedSps && this.cachedPps
+        );
         continue;
       }
       if (nalType === 1 && !this.hasWrittenFirstIdr) {

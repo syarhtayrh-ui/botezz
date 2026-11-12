@@ -119,7 +119,7 @@ export async function getUSyncDevices(
 }
 
 export const BAILEYS_LITE_LIBRARY_NAME = '@hiroosy/baileys-lite' as const;
-export const BAILEYS_LITE_LIBRARY_VERSION = '0.3.6' as const;
+export const BAILEYS_LITE_LIBRARY_VERSION = '0.3.7' as const;
 export const BAILEYS_LITE_DISPLAY_TAG = `${BAILEYS_LITE_LIBRARY_NAME}@${BAILEYS_LITE_LIBRARY_VERSION}` as const;
 
 export type EngineeringFailureClass =

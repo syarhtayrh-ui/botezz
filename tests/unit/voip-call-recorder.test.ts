@@ -913,5 +913,73 @@ describe('Two-Way VoIP Video Call Recording (VoipCallRecorder)', () => {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
   });
+
+  it('preserves native WaCallMediaSession outbound methods untouched while passively tapping __peerRecvCtx for VoipCallRecorder', async () => {
+    const {
+      ensureHiroosyVoipRuntimePatched,
+      instrumentMediaSessionInstance,
+    } = await import('../../src/whatsapp/voip-runtime-patch');
+    await ensureHiroosyVoipRuntimePatched();
+
+    const nativeSendCapturedVideoAU = function () {
+      return 'native_video_au';
+    };
+    const nativeSendCapturedAudio = function () {
+      return 'native_audio';
+    };
+    const nativeStartMediaFlow = function () {
+      return 'native_start_flow';
+    };
+    const peerRecvKey = crypto.randomBytes(16);
+    const peerRecvSalt = crypto.randomBytes(14);
+    const peerAuthKey = crypto.randomBytes(20);
+
+    class WaCallMediaSession {
+      sendCapturedVideoAU = nativeSendCapturedVideoAU;
+      sendCapturedAudio = nativeSendCapturedAudio;
+      startMediaFlow = nativeStartMediaFlow;
+      srtpSession = {
+        recvCtx: {
+          sessionKey: new Uint8Array(peerRecvKey),
+          sessionSalt: new Uint8Array(peerRecvSalt),
+          authKey: new Uint8Array(peerAuthKey),
+          authTagLen: 4,
+        },
+      };
+      async handleCallAccept() {
+        return 'accepted';
+      }
+    }
+
+    const session = new WaCallMediaSession();
+    const instrumented = instrumentMediaSessionInstance(
+      session as unknown as Record<string, unknown>
+    )!;
+
+    assert.equal(
+      instrumented.sendCapturedVideoAU,
+      nativeSendCapturedVideoAU,
+      'Native WaCallMediaSession.sendCapturedVideoAU must never be overridden'
+    );
+    assert.equal(
+      instrumented.sendCapturedAudio,
+      nativeSendCapturedAudio,
+      'Native WaCallMediaSession.sendCapturedAudio must never be overridden'
+    );
+    assert.equal(
+      instrumented.startMediaFlow,
+      nativeStartMediaFlow,
+      'Native WaCallMediaSession.startMediaFlow must never be overridden'
+    );
+
+    await (
+      instrumented as unknown as { handleCallAccept: () => Promise<string> }
+    ).handleCallAccept();
+    assert.ok(
+      (instrumented as { __peerRecvCtx?: { sessionKey?: Uint8Array } })
+        .__peerRecvCtx?.sessionKey instanceof Uint8Array,
+      'Passive accept tap must expose __peerRecvCtx for VoipCallRecorder'
+    );
+  });
 });
 
