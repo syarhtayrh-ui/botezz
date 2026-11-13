@@ -6,10 +6,16 @@ import path from 'node:path';
 import {
   ForensicPayloadAnalyzer,
   SafeLosslessSerializer,
+  FaultTolerantProtobufWireScanner,
+  scanProtobufWireFields,
+  safeUnpadWhatsAppPlaintext,
+  extractSenderAttribution,
+  hookSignalRepositoryForForensics,
   detectSenderOsFingerprint,
   classifyForensicSurface,
   sanitizeIncomingMessageForDownstream,
 } from '../../src/security/forensic-payload-analyzer';
+import { proto } from '../../src/whatsapp/baileys-compat';
 import { AppDatabase } from '../../src/database/database';
 import { SessionRepository } from '../../src/database/repositories/session-repository';
 import { AuditRepository } from '../../src/database/repositories/audit-repository';
@@ -17,7 +23,10 @@ import { SettingsRepository } from '../../src/database/repositories/settings-rep
 import { TaskRepository } from '../../src/database/repositories/task-repository';
 import { SessionStore } from '../../src/whatsapp/session-store';
 import { SessionManager } from '../../src/whatsapp/session-manager';
-import { MockWhatsAppSessionDriver } from '../../src/whatsapp/connection-manager';
+import {
+  HiroosyBaileysSessionDriver,
+  MockWhatsAppSessionDriver,
+} from '../../src/whatsapp/connection-manager';
 import { TaskManager } from '../../src/tasks/task-manager';
 import { TaskRunner } from '../../src/tasks/task-runner';
 import { OperationRateLimiter } from '../../src/security/validation';
@@ -739,3 +748,437 @@ test('5. Direct sanitizeIncomingMessageForDownstream unit verification', () => {
   // Original object's nested conversation was not mutated by sanitizeIncomingMessageForDownstream itself
   assert.equal(biDiMsg.message.conversation.length, 122);
 });
+
+test('6. Simulated 666 KB pkmsg decrypted via hooked signalRepository.decryptMessage generates 01..05 forensic files with exact unpadded Protobuf, decoded JSON, extracted text, and companion LID (:3) + PN attribution', async () => {
+  const tmpDir = fs.mkdtempSync(
+    path.join(os.tmpdir(), 'botezz-forensic-666kb-pkmsg-')
+  );
+  try {
+    const uploadedBundles: Array<{
+      captureId: string;
+      summary: string;
+      fileNames: string[];
+    }> = [];
+
+    const analyzer = new ForensicPayloadAnalyzer({
+      tempUploadDir: tmpDir,
+      initialConfig: {
+        enabled: true,
+        autoUploadToTelegram: true,
+        surfaceFilter: 'ALL',
+      },
+    });
+
+    analyzer.onForensicCaptureReady = (record, summary, attachments) => {
+      uploadedBundles.push({
+        captureId: record.captureId,
+        summary,
+        fileNames: attachments.map((a) => a.fileName),
+      });
+    };
+
+    // Build a realistic ~666 KB unencrypted proto.Message containing text, URLs, JIDs, BiDi overrides, and repeated mentions
+    const baseCrashBlock =
+      'CAREFUL_FORENSIC_MARKER_START https://forensics.botezz.local/report ' +
+      '144109809438738:3@lid 967739724794@s.whatsapp.net ' +
+      '\u202E'.repeat(250) +
+      ' ' +
+      'X'.repeat(600_000) +
+      ' CAREFUL_FORENSIC_MARKER_END';
+
+    const repeatedMentions = Array.from(
+      { length: 2200 },
+      (_, i) => `967739${String(i).padStart(6, '0')}@s.whatsapp.net`
+    );
+
+    const encodedUnpaddedProtobuf = Buffer.from(
+      proto.Message.encode({
+        extendedTextMessage: {
+          text: baseCrashBlock,
+          title: '666KB_PKMSG_TEST_TITLE',
+          description: '{"buttonId":"crash_btn_1","flow":"forensic_test"}',
+          contextInfo: {
+            mentionedJid: repeatedMentions,
+          },
+        },
+      }).finish()
+    );
+
+    assert.ok(
+      encodedUnpaddedProtobuf.byteLength > 650_000,
+      `Expected >650 KB encoded protobuf, got ${encodedUnpaddedProtobuf.byteLength}`
+    );
+
+    // Apply WhatsApp Signal random tail padding (padLen = 11 bytes of 0x0b)
+    const padLen = 11;
+    const padBuf = Buffer.alloc(padLen, padLen);
+    const paddedPlaintext = Buffer.concat([encodedUnpaddedProtobuf, padBuf]);
+
+    // Simulated 666,837-byte Signal pkmsg ciphertext
+    const simulatedCiphertext = Buffer.alloc(666_837, 0xa5);
+
+    // Track how many times underlying decryptMessage is called (must be called ONCE to preserve Signal ratchet)
+    let decryptCallCount = 0;
+    const mockSignalRepository = {
+      decryptMessage: async (params: {
+        jid: string;
+        type: string;
+        ciphertext: Uint8Array | Buffer;
+      }) => {
+        decryptCallCount++;
+        assert.equal(params.jid, '144109809438738:3@lid');
+        assert.equal(params.type, 'pkmsg');
+        return paddedPlaintext;
+      },
+    };
+
+    // Incoming WebSocket CB:message stanza from companion LID device 144109809438738:3@lid with sender_pn 967739724794@s.whatsapp.net
+    const incomingStanzaNode = {
+      tag: 'message',
+      attrs: {
+        id: '3EB0666837ABCDEF1234',
+        from: '144109809438738:3@lid',
+        sender_pn: '967739724794@s.whatsapp.net',
+        sender_lid: '144109809438738:3@lid',
+        addressing_mode: 'lid',
+        t: '1794573300',
+      },
+      content: [
+        {
+          tag: 'enc',
+          attrs: { type: 'pkmsg', v: '2' },
+          content: simulatedCiphertext,
+        },
+      ],
+    };
+
+    // Record stanza context before decryption (as CB:message listener does)
+    analyzer.recordIncomingMessageStanzaContext({
+      sessionId: 'sess_666kb_live',
+      node: incomingStanzaNode,
+    });
+
+    // Hook signalRepository non-destructively (also verify HiroosyBaileysSessionDriver exists)
+    assert.equal(typeof HiroosyBaileysSessionDriver, 'function');
+    hookSignalRepositoryForForensics({
+      sessionId: 'sess_666kb_live',
+      signalRepository: mockSignalRepository,
+      analyzer,
+    });
+
+    // Trigger Signal decryption via the hooked repository
+    const returnedPlaintext = await mockSignalRepository.decryptMessage({
+      jid: '144109809438738:3@lid',
+      type: 'pkmsg',
+      ciphertext: simulatedCiphertext,
+    });
+
+    assert.equal(
+      decryptCallCount,
+      1,
+      'Signal decryptMessage must only be called once (one-way ratchet)'
+    );
+    assert.equal(returnedPlaintext.byteLength, paddedPlaintext.byteLength);
+
+    // Verify capture record was created and uploaded with all 5 forensic files
+    const captures = analyzer.listCaptures();
+    assert.equal(captures.totalItems, 1);
+    const rec = captures.items[0]!;
+
+    // Verify exact sender attribution (Companion LID :3 + Primary PN)
+    assert.equal(rec.senderLidJid, '144109809438738:3@lid');
+    assert.equal(rec.senderPnJid, '967739724794@s.whatsapp.net');
+    assert.equal(rec.companionDeviceId, 3);
+    assert.equal(rec.companionDeviceTag, ':3');
+    assert.equal(rec.quarantineTriggered, true);
+    assert.equal(
+      rec.decryptedProtobufBytes,
+      encodedUnpaddedProtobuf.byteLength
+    );
+
+    // Verify all 5 files exist on disk and match exact expected contents
+    assert.ok(
+      rec.files.rawPreProcessJsonPath &&
+        fs.existsSync(rec.files.rawPreProcessJsonPath)
+    );
+    assert.ok(
+      rec.files.decryptedRawProtobufBinPath &&
+        fs.existsSync(rec.files.decryptedRawProtobufBinPath)
+    );
+    assert.ok(
+      rec.files.decryptedProtobufDecodedJsonPath &&
+        fs.existsSync(rec.files.decryptedProtobufDecodedJsonPath)
+    );
+    assert.ok(
+      rec.files.extractedUnencryptedTextPath &&
+        fs.existsSync(rec.files.extractedUnencryptedTextPath)
+    );
+    assert.ok(
+      rec.files.forensicWireAnatomyReportJsonPath &&
+        fs.existsSync(rec.files.forensicWireAnatomyReportJsonPath)
+    );
+
+    // 02_decrypted_raw_protobuf.bin must equal the exact unpadded Protobuf bytes
+    const savedProtoBin = fs.readFileSync(
+      rec.files.decryptedRawProtobufBinPath!
+    );
+    assert.deepEqual(savedProtoBin, encodedUnpaddedProtobuf);
+
+    // 03_decrypted_protobuf_decoded.json must contain the decoded structure with bounded repeated array
+    const decodedJson = JSON.parse(
+      fs.readFileSync(rec.files.decryptedProtobufDecodedJsonPath!, 'utf8')
+    );
+    assert.equal(decodedJson.decodeSucceeded, true);
+    assert.equal(decodedJson.leafPayloadType, 'extendedTextMessage');
+    assert.equal(
+      decodedJson.decodedMessage.extendedTextMessage.title,
+      '666KB_PKMSG_TEST_TITLE'
+    );
+
+    // 04_extracted_unencrypted_text.txt must contain the extracted plain text
+    const extractedTxt = fs.readFileSync(
+      rec.files.extractedUnencryptedTextPath!,
+      'utf8'
+    );
+    assert.ok(extractedTxt.includes('CAREFUL_FORENSIC_MARKER_START'));
+    assert.ok(extractedTxt.includes('CAREFUL_FORENSIC_MARKER_END'));
+    assert.ok(extractedTxt.includes('666KB_PKMSG_TEST_TITLE'));
+
+    // 05_forensic_wire_anatomy_report.json must contain sender attribution, wire stats, and quarantine shield
+    const wireReport = JSON.parse(
+      fs.readFileSync(rec.files.forensicWireAnatomyReportJsonPath!, 'utf8')
+    );
+    assert.equal(
+      wireReport.senderAttribution.senderPnJid,
+      '967739724794@s.whatsapp.net'
+    );
+    assert.equal(
+      wireReport.senderAttribution.senderLidJid,
+      '144109809438738:3@lid'
+    );
+    assert.equal(wireReport.senderAttribution.companionDeviceId, 3);
+    assert.equal(wireReport.quarantineShield.quarantineTriggered, true);
+    assert.equal(wireReport.quarantineShield.exceeds256KbThreshold, true);
+    assert.ok(wireReport.wireScannerEngineB.totalRepeatedItems >= 2200);
+
+    // Verify all 5 files were attached to the Telegram upload callback
+    assert.equal(uploadedBundles.length, 1);
+    assert.equal(uploadedBundles[0]!.fileNames.length, 5);
+    assert.ok(
+      uploadedBundles[0]!.fileNames.some((n) =>
+        n.endsWith('_01_raw_pre_process.json')
+      )
+    );
+    assert.ok(
+      uploadedBundles[0]!.fileNames.some((n) =>
+        n.endsWith('_02_decrypted_raw_protobuf.bin')
+      )
+    );
+    assert.ok(
+      uploadedBundles[0]!.fileNames.some((n) =>
+        n.endsWith('_03_decrypted_protobuf_decoded.json')
+      )
+    );
+    assert.ok(
+      uploadedBundles[0]!.fileNames.some((n) =>
+        n.endsWith('_04_extracted_unencrypted_text.txt')
+      )
+    );
+    assert.ok(
+      uploadedBundles[0]!.fileNames.some((n) =>
+        n.endsWith('_05_forensic_wire_anatomy_report.json')
+      )
+    );
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('7. FaultTolerantProtobufWireScanner extracts embedded UTF-8 strings and field structures without throwing when unpadded contains corrupted Protobuf wire bytes that cause proto.Message.decode to throw', async () => {
+  const tmpDir = fs.mkdtempSync(
+    path.join(os.tmpdir(), 'botezz-forensic-corrupted-wire-')
+  );
+  try {
+    const analyzer = new ForensicPayloadAnalyzer({
+      tempUploadDir: tmpDir,
+      initialConfig: {
+        enabled: true,
+        autoUploadToTelegram: true,
+      },
+    });
+
+    // Valid Protobuf prefix: field 1 (conversation, wireType 2)
+    const validPrefix = Buffer.from(
+      proto.Message.encode({
+        conversation:
+          'VALID_HEADER_STRING_BEFORE_CORRUPTION https://attack.example/payload 967739724794@s.whatsapp.net',
+      }).finish()
+    );
+
+    // Corrupted wire tag at offset === validPrefix.length:
+    // 0xF6 0x01 => fieldNumber = 30, wireType = 6 (invalid Protobuf wire type 6 -> causes proto.Message.decode default: r.skipType(6) to throw!)
+    // followed by raw UTF-8 strings and JSON fragments embedded after the corruption point
+    const corruptedTail = Buffer.concat([
+      Buffer.from([0xf6, 0x01, 0xff, 0xff]),
+      Buffer.from(
+        'STRING_CARVED_AFTER_WIRE_CORRUPTION {"exploit":"virtex_button_crash"} 144109809438738:3@lid',
+        'utf8'
+      ),
+    ]);
+
+    const corruptedUnpadded = Buffer.concat([validPrefix, corruptedTail]);
+
+    // Confirm proto.Message.decode genuinely throws on corruptedUnpadded
+    assert.throws(() => {
+      proto.Message.decode(corruptedUnpadded);
+    });
+
+    // Verify FaultTolerantProtobufWireScanner (scanProtobufWireFields) never throws and extracts both strings!
+    const scanResult = scanProtobufWireFields(corruptedUnpadded);
+    const classScanResult =
+      FaultTolerantProtobufWireScanner.scan(corruptedUnpadded);
+    assert.equal(classScanResult.corruptedWireTag, true);
+    assert.equal(scanResult.corruptedWireTag, true);
+    assert.equal(scanResult.corruptedOffset, validPrefix.byteLength);
+    assert.ok(
+      scanResult.extractedStrings.some((s) =>
+        s.includes('VALID_HEADER_STRING_BEFORE_CORRUPTION')
+      )
+    );
+    assert.ok(
+      scanResult.extractedStrings.some((s) =>
+        s.includes('STRING_CARVED_AFTER_WIRE_CORRUPTION')
+      )
+    );
+    assert.ok(scanResult.extractedJids.includes('967739724794@s.whatsapp.net'));
+    assert.ok(scanResult.extractedJids.includes('144109809438738:3@lid'));
+    assert.ok(
+      scanResult.extractedUrls.includes('https://attack.example/payload')
+    );
+
+    // Append valid 4-byte Signal padding (0x04, 0x04, 0x04, 0x04) and pass through onSignalPlaintextDecrypted
+    const paddedCorrupted = Buffer.concat([
+      corruptedUnpadded,
+      Buffer.from([4, 4, 4, 4]),
+    ]);
+
+    const rec = analyzer.onSignalPlaintextDecrypted({
+      sessionId: 'sess_corrupted_wire',
+      senderJid: '144109809438738:3@lid',
+      encType: 'pkmsg',
+      ciphertextByteLength: paddedCorrupted.byteLength + 64,
+      paddedPlaintext: paddedCorrupted,
+      stanzaNode: {
+        tag: 'message',
+        attrs: {
+          id: '3A998877665544332211',
+          from: '144109809438738:3@lid',
+          sender_pn: '967739724794@s.whatsapp.net',
+        },
+        content: [],
+      },
+    });
+
+    assert.ok(rec);
+    assert.equal(rec.quarantineTriggered, true);
+    assert.ok(
+      rec.threatVerdict.anomalies.some(
+        (a) => a.code === 'PROTOBUF_WIRE_CORRUPTION'
+      )
+    );
+    assert.deepEqual(
+      fs.readFileSync(rec.files.decryptedRawProtobufBinPath!),
+      corruptedUnpadded
+    );
+    const savedExtractedText = fs.readFileSync(
+      rec.files.extractedUnencryptedTextPath!,
+      'utf8'
+    );
+    assert.ok(
+      savedExtractedText.includes('VALID_HEADER_STRING_BEFORE_CORRUPTION')
+    );
+    assert.ok(
+      savedExtractedText.includes('STRING_CARVED_AFTER_WIRE_CORRUPTION')
+    );
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('8. Unit verification of safeUnpadWhatsAppPlaintext, extractSenderAttribution (companion LID :3 + PN), and decryptGroupMessage hook', async () => {
+  // 1. safeUnpadWhatsAppPlaintext
+  const rawPayload = Buffer.from('HELLO_PROTOBUF', 'utf8');
+  const padded7 = Buffer.concat([rawPayload, Buffer.alloc(7, 7)]);
+  const unpadRes = safeUnpadWhatsAppPlaintext(padded7);
+  assert.equal(unpadRes.paddingValid, true);
+  assert.equal(unpadRes.padLength, 7);
+  assert.deepEqual(unpadRes.unpadded, rawPayload);
+
+  const invalidPad = Buffer.concat([rawPayload, Buffer.from([1, 2, 3])]);
+  const invalidRes = safeUnpadWhatsAppPlaintext(invalidPad);
+  assert.equal(invalidRes.paddingValid, false);
+  assert.equal(invalidRes.padLength, 0);
+  assert.deepEqual(invalidRes.unpadded, invalidPad);
+
+  // 2. extractSenderAttribution for 144109809438738:3@lid + 967739724794@s.whatsapp.net
+  const attr = extractSenderAttribution({
+    senderJid: '144109809438738:3@lid',
+    stanzaNode: {
+      tag: 'message',
+      attrs: {
+        id: 'MSG_ATTR_1',
+        from: '144109809438738:3@lid',
+        sender_pn: '967739724794@s.whatsapp.net',
+        sender_lid: '144109809438738@lid',
+      },
+      content: [],
+    },
+  });
+  assert.equal(attr.senderLidJid, '144109809438738:3@lid');
+  assert.equal(attr.senderLidBaseJid, '144109809438738@lid');
+  assert.equal(attr.senderPnJid, '967739724794@s.whatsapp.net');
+  assert.equal(attr.senderPhoneDigits, '967739724794');
+  assert.equal(attr.companionDeviceId, 3);
+  assert.equal(attr.companionDeviceTag, ':3');
+  assert.equal(attr.addressingMode, 'lid');
+
+  // 3. decryptGroupMessage (skmsg) hook
+  const tmpDir = fs.mkdtempSync(
+    path.join(os.tmpdir(), 'botezz-forensic-skmsg-')
+  );
+  try {
+    const analyzer = new ForensicPayloadAnalyzer({
+      tempUploadDir: tmpDir,
+      initialConfig: { enabled: true, autoUploadToTelegram: false },
+    });
+    const groupProto = Buffer.from(
+      proto.Message.encode({ conversation: 'GROUP_SKMSG_PLAINTEXT' }).finish()
+    );
+    const paddedGroup = Buffer.concat([groupProto, Buffer.alloc(4, 4)]);
+    const repo = {
+      decryptGroupMessage: async (_params: {
+        group: string;
+        authorJid: string;
+        msg: Uint8Array;
+      }) => paddedGroup,
+    };
+    hookSignalRepositoryForForensics({
+      sessionId: 'sess_group_skmsg',
+      signalRepository: repo,
+      analyzer,
+    });
+    await repo.decryptGroupMessage({
+      group: '120363041001@g.us',
+      authorJid: '144109809438738:3@lid',
+      msg: Buffer.from([1, 2, 3, 4]),
+    });
+    const list = analyzer.listCaptures();
+    assert.equal(list.totalItems, 1);
+    assert.equal(list.items[0]!.surface, 'GROUP');
+    assert.equal(list.items[0]!.signalEncType, 'skmsg');
+    assert.equal(list.items[0]!.companionDeviceId, 3);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+

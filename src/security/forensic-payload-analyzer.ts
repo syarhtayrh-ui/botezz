@@ -4,7 +4,10 @@ import path from 'node:path';
 import crypto from 'node:crypto';
 import {
   downloadMediaMessage,
+  getAllBinaryNodeChildren,
   isJidStatusBroadcast,
+  jidDecode,
+  proto,
   type BinaryNode,
   type WASocket,
 } from '../whatsapp/baileys-compat';
@@ -33,6 +36,8 @@ export type ForensicSurfaceKind =
 
 export type RawForensicEventType =
   | 'messages.upsert'
+  | 'signal.decrypt'
+  | 'signal.decrypt_failed'
   | 'ws.CB:message'
   | 'ws.CB:iq'
   | 'ws.CB:call'
@@ -51,7 +56,11 @@ export type ForensicAnomalyCode =
   | 'INVALID_COORDINATES_OR_DIMENSIONS'
   | 'CORRUPTED_MEDIA_HEADER'
   | 'SPOOFED_QUOTED_CONTEXT'
-  | 'STAGE2_DISSECTION_FAILURE';
+  | 'STAGE2_DISSECTION_FAILURE'
+  | 'OVERSIZED_QUARANTINE_PAYLOAD'
+  | 'PROTOBUF_WIRE_CORRUPTION'
+  | 'REPEATED_FIELD_BOMB'
+  | 'SIGNAL_DECRYPTION_FAILURE';
 
 export interface SecurityAnalyzerConfig {
   enabled: boolean;
@@ -72,6 +81,8 @@ export const DEFAULT_FORENSIC_ANALYZER_CONFIG: SecurityAnalyzerConfig = {
   captureMediaBuffers: true,
   maxMediaCaptureBytes: 25 * 1024 * 1024,
 };
+
+export const QUARANTINE_PLAINTEXT_SIZE_BYTES = 256 * 1024; // 256 KB
 
 export interface SerializedBinaryBuffer {
   __type: 'BinaryBuffer';
@@ -136,6 +147,84 @@ export interface ForensicCaptureFiles {
   rawTextUtf8Path?: string;
   mediaArtifactPath?: string;
   mediaArtifactFileName?: string;
+  // Signal Post-Decryption Forensic Artifacts (Steps 2 & 3):
+  decryptedRawProtobufBinPath?: string; // 02_decrypted_raw_protobuf.bin
+  decryptedProtobufDecodedJsonPath?: string; // 03_decrypted_protobuf_decoded.json
+  extractedUnencryptedTextPath?: string; // 04_extracted_unencrypted_text.txt
+  forensicWireAnatomyReportJsonPath?: string; // 05_forensic_wire_anatomy_report.json
+}
+
+export interface SenderForensicAttribution {
+  senderPnJid?: string;
+  senderPhoneDigits?: string;
+  senderLidJid?: string;
+  senderLidBaseJid?: string;
+  companionDeviceId?: number;
+  companionDeviceTag?: string;
+  companionDeviceLabel: string;
+  rawSenderJid: string;
+  groupJid?: string;
+  addressingMode: 'lid' | 'pn';
+}
+
+export interface StanzaEncNodeSummary {
+  type: string;
+  v?: string;
+  mediatype?: string;
+  byteLength: number;
+}
+
+export interface IncomingStanzaCorrelationContext {
+  sessionId: string;
+  stanzaId: string;
+  fromJid: string;
+  participantJid?: string;
+  senderPnJid?: string;
+  senderLidJid?: string;
+  companionDeviceId?: number;
+  companionDeviceTag?: string;
+  addressingMode: 'lid' | 'pn';
+  encNodes: StanzaEncNodeSummary[];
+  rawBinaryNode: BinaryNode;
+  recordedAtMs: number;
+}
+
+export interface ProtobufWireFieldSummary {
+  fieldPath: string;
+  fieldNumber: number;
+  fieldName?: string;
+  wireType: number;
+  wireTypeName:
+    | 'varint'
+    | 'fixed64'
+    | 'length_delimited'
+    | 'start_group'
+    | 'end_group'
+    | 'fixed32'
+    | 'invalid';
+  occurrences: number;
+  totalBytes: number;
+  maxSingleBytes: number;
+  sampleStringPreview?: string;
+}
+
+export interface ProtobufWireScanResult {
+  totalBytes: number;
+  totalWireFieldsScanned: number;
+  totalRepeatedItems: number;
+  maxNestingDepth: number;
+  corruptedWireTag: boolean;
+  corruptedOffset?: number;
+  corruptedOffsets: number[];
+  corruptionReasons: string[];
+  fieldSummaries: ProtobufWireFieldSummary[];
+  repeatedFieldSummaries: string[];
+  extractedStrings: string[];
+  extractedJids: string[];
+  extractedUrls: string[];
+  extractedJsonFragments: string[];
+  unicodeMap: UnicodeForensicMap;
+  unparsedTailHex?: string;
 }
 
 export interface ForensicCaptureRecord {
@@ -150,6 +239,8 @@ export interface ForensicCaptureRecord {
   participantJid?: string;
   senderPnJid?: string;
   senderLidJid?: string;
+  companionDeviceId?: number;
+  companionDeviceTag?: string;
   addressingMode?: string;
   senderOs: SenderOsFingerprint;
   payloadType: string;
@@ -160,6 +251,11 @@ export interface ForensicCaptureRecord {
   preProcessRawBytes: number;
   postProcessBytes: number;
   mediaBytes: number;
+  signalEncType?: string;
+  ciphertextBytes?: number;
+  decryptedProtobufBytes?: number;
+  quarantineTriggered?: boolean;
+  wireScanSummary?: ProtobufWireScanResult;
   processingError?: string;
   files: ForensicCaptureFiles;
 }
@@ -180,6 +276,30 @@ export interface CaptureIncomingPayloadInput {
   /** Custom HTTP fetcher override for encrypted media fallback testing */
   customRawMediaFetcher?: (url: string) => Promise<Buffer>;
   /** When true, runs capture even if analyzer.config.enabled is currently false */
+  forceCapture?: boolean;
+}
+
+export interface SignalPlaintextDecryptedInput {
+  sessionId: string;
+  senderJid: string;
+  groupJid?: string;
+  encType: 'pkmsg' | 'msg' | 'skmsg' | string;
+  ciphertextByteLength: number;
+  paddedPlaintext: Buffer | Uint8Array;
+  ciphertext?: Buffer | Uint8Array;
+  stanzaNode?: BinaryNode | Record<string, unknown> | null;
+  forceCapture?: boolean;
+}
+
+export interface SignalDecryptionFailedInput {
+  sessionId: string;
+  senderJid: string;
+  groupJid?: string;
+  encType: 'pkmsg' | 'msg' | 'skmsg' | string;
+  ciphertextByteLength: number;
+  ciphertext: Buffer | Uint8Array;
+  error: unknown;
+  stanzaNode?: BinaryNode | Record<string, unknown> | null;
   forceCapture?: boolean;
 }
 
@@ -213,12 +333,261 @@ const LOCAL_SECRET_PROPERTY_NAMES = new Set([
   'botToken',
 ]);
 
+const KNOWN_TOP_LEVEL_WA_PROTO_FIELDS: Record<number, string> = {
+  1: 'conversation',
+  2: 'senderKeyDistributionMessage',
+  3: 'imageMessage',
+  4: 'contactMessage',
+  5: 'locationMessage',
+  6: 'extendedTextMessage',
+  7: 'documentMessage',
+  8: 'audioMessage',
+  9: 'videoMessage',
+  10: 'call',
+  12: 'protocolMessage',
+  13: 'contactsArrayMessage',
+  14: 'highlyStructuredMessage',
+  16: 'sendPaymentMessage',
+  17: 'liveLocationMessage',
+  25: 'templateMessage',
+  26: 'stickerMessage',
+  28: 'groupInviteMessage',
+  29: 'templateButtonReplyMessage',
+  30: 'productMessage',
+  31: 'deviceSentMessage',
+  35: 'messageContextInfo',
+  36: 'listMessage',
+  37: 'viewOnceMessage',
+  38: 'orderMessage',
+  39: 'listResponseMessage',
+  40: 'ephemeralMessage',
+  42: 'buttonsMessage',
+  43: 'buttonsResponseMessage',
+  45: 'interactiveMessage',
+  46: 'reactionMessage',
+  49: 'interactiveResponseMessage',
+  50: 'pollCreationMessage',
+  51: 'pollUpdateMessage',
+  53: 'documentWithCaptionMessage',
+  55: 'viewOnceMessageV2',
+  58: 'editedMessage',
+  59: 'viewOnceMessageV2Extension',
+  60: 'pollCreationMessageV2',
+  64: 'pollCreationMessageV3',
+  66: 'ptvMessage',
+  74: 'lottieStickerMessage',
+  75: 'eventMessage',
+};
+
+/**
+ * WhatsApp Signal Unpadding (`safeUnpadWhatsAppPlaintext`).
+ * WhatsApp pads Signal plaintext with `1..16` bytes where the last byte `padLen = buf[buf.length - 1]`
+ * indicates the number of padding bytes.
+ */
+export function safeUnpadWhatsAppPlaintext(padded: Buffer): {
+  unpadded: Buffer;
+  padLength: number;
+  paddingValid: boolean;
+} {
+  if (!padded || padded.length === 0) {
+    return { unpadded: Buffer.alloc(0), padLength: 0, paddingValid: false };
+  }
+  const padLen = padded[padded.length - 1]!;
+  if (padLen >= 1 && padLen <= 16 && padLen <= padded.length) {
+    // Verify all padding bytes equal padLen
+    let valid = true;
+    for (let i = padded.length - padLen; i < padded.length; i++) {
+      if (padded[i] !== padLen) {
+        valid = false;
+        break;
+      }
+    }
+    if (valid) {
+      return {
+        unpadded: padded.subarray(0, padded.length - padLen),
+        padLength: padLen,
+        paddingValid: true,
+      };
+    }
+  }
+  // Fallback: return untouched if non-standard padding
+  return { unpadded: padded, padLength: 0, paddingValid: false };
+}
+
+/**
+ * Extracts comprehensive sender attribution including Companion LID (`144109809438738:3@lid` -> Device `#3`)
+ * and linked primary phone number (`967739724794@s.whatsapp.net`).
+ */
+export function extractSenderAttribution(input: {
+  senderJid?: string;
+  groupJid?: string;
+  stanzaNode?: BinaryNode | Record<string, unknown> | null;
+  rawWaMessage?: Record<string, unknown> | null;
+  correlatedContext?: IncomingStanzaCorrelationContext | null;
+}): SenderForensicAttribution {
+  const rawNode = input.stanzaNode as BinaryNode | undefined | null;
+  const nodeAttrs = (rawNode?.attrs ?? {}) as Record<string, string>;
+  const rawMsg = input.rawWaMessage as Record<string, unknown> | undefined | null;
+  const msgKey = (rawMsg?.key ?? {}) as Record<string, unknown>;
+  const rawStanzaMeta = (rawMsg?.__rawStanzaMeta ?? {}) as Record<string, unknown>;
+  const ctx = input.correlatedContext;
+
+  const candidateStrings: string[] = [
+    input.senderJid,
+    ctx?.senderLidJid,
+    ctx?.senderPnJid,
+    ctx?.fromJid,
+    ctx?.participantJid,
+    nodeAttrs.sender_lid,
+    nodeAttrs.participant_lid,
+    nodeAttrs.peer_recipient_lid,
+    nodeAttrs.from,
+    nodeAttrs.participant,
+    nodeAttrs.sender_pn,
+    nodeAttrs.participant_pn,
+    nodeAttrs.peer_recipient_pn,
+    nodeAttrs.recipient_pn,
+    typeof msgKey.remoteJid === 'string' ? msgKey.remoteJid : undefined,
+    typeof msgKey.participant === 'string' ? msgKey.participant : undefined,
+    typeof msgKey.remoteJidAlt === 'string' ? msgKey.remoteJidAlt : undefined,
+    typeof msgKey.participantAlt === 'string' ? msgKey.participantAlt : undefined,
+    typeof rawStanzaMeta.senderPn === 'string' ? rawStanzaMeta.senderPn : undefined,
+    typeof rawStanzaMeta.rawFrom === 'string' ? rawStanzaMeta.rawFrom : undefined,
+    typeof rawStanzaMeta.rawParticipant === 'string'
+      ? rawStanzaMeta.rawParticipant
+      : undefined,
+  ]
+    .filter((s): s is string => typeof s === 'string' && s.trim().length > 0)
+    .map((s) => s.trim());
+
+  let senderLidJid: string | undefined;
+  let senderLidWithDevice: string | undefined;
+  let senderPnJid: string | undefined;
+  let senderPhoneDigits: string | undefined;
+  let companionDeviceId: number | undefined;
+  let groupJid = input.groupJid;
+
+  for (const cand of candidateStrings) {
+    if (cand.endsWith('@g.us') && !groupJid) {
+      groupJid = cand;
+    }
+
+    if (cand.endsWith('@lid') || cand.endsWith('@hosted.lid')) {
+      if (!senderLidJid) {
+        senderLidJid = cand;
+      }
+      const devMatch = /:(\d+)@(?:hosted\.)?lid$/i.exec(cand);
+      if (devMatch) {
+        if (!senderLidWithDevice) {
+          senderLidWithDevice = cand;
+        }
+        if (companionDeviceId === undefined) {
+          companionDeviceId = Number(devMatch[1]);
+        }
+      }
+    } else if (
+      cand.endsWith('@s.whatsapp.net') ||
+      cand.endsWith('@hosted') ||
+      cand.endsWith('@c.us')
+    ) {
+      const userPart = cand.split('@')[0] || '';
+      const [digitsPart, devPart] = userPart.split(':');
+      const cleanDigits = (digitsPart || '').replace(/\D/g, '');
+      if (cleanDigits && !senderPnJid) {
+        senderPhoneDigits = cleanDigits;
+        senderPnJid = `${cleanDigits}@s.whatsapp.net`;
+      }
+      if (devPart && /^\d+$/.test(devPart) && companionDeviceId === undefined) {
+        companionDeviceId = Number(devPart);
+      }
+    }
+  }
+
+  // Also check explicit PN attributes if they were provided as bare digits
+  for (const pnAttr of [
+    nodeAttrs.sender_pn,
+    nodeAttrs.peer_recipient_pn,
+    nodeAttrs.participant_pn,
+    nodeAttrs.recipient_pn,
+  ]) {
+    if (typeof pnAttr === 'string' && pnAttr.trim()) {
+      const cleanDigits = pnAttr.split('@')[0]?.split(':')[0]?.replace(/\D/g, '') || '';
+      if (cleanDigits.length >= 6 && !senderPnJid) {
+        senderPhoneDigits = cleanDigits;
+        senderPnJid = `${cleanDigits}@s.whatsapp.net`;
+      }
+    }
+  }
+
+  // Prefer the @lid string that preserves the companion device suffix (e.g. 144109809438738:3@lid)
+  if (senderLidWithDevice) {
+    senderLidJid = senderLidWithDevice;
+  }
+
+  let senderLidBaseJid: string | undefined;
+  if (senderLidJid) {
+    const lidUser = senderLidJid.split('@')[0]?.split(':')[0] || '';
+    if (lidUser) {
+      senderLidBaseJid = `${lidUser}@lid`;
+    }
+  }
+
+  if (companionDeviceId === undefined && input.senderJid) {
+    const decoded = jidDecode(input.senderJid);
+    if (typeof decoded?.device === 'number' && Number.isFinite(decoded.device)) {
+      companionDeviceId = decoded.device;
+    }
+  }
+
+  if (companionDeviceId === undefined && ctx?.companionDeviceId !== undefined) {
+    companionDeviceId = ctx.companionDeviceId;
+  }
+
+  const companionDeviceTag =
+    companionDeviceId !== undefined ? `:${companionDeviceId}` : undefined;
+  const companionDeviceLabel =
+    companionDeviceId !== undefined && companionDeviceId > 0
+      ? `Device #${companionDeviceId} (:${companionDeviceId})`
+      : companionDeviceId === 0
+        ? 'Primary Device #0 (:0)'
+        : 'Primary / Unspecified (:0)';
+
+  const rawSenderJid =
+    input.senderJid ||
+    senderLidJid ||
+    senderPnJid ||
+    nodeAttrs.from ||
+    ctx?.fromJid ||
+    '';
+
+  const addressingMode: 'lid' | 'pn' =
+    nodeAttrs.addressing_mode === 'lid' ||
+    rawSenderJid.includes('@lid') ||
+    Boolean(senderLidJid && (!nodeAttrs.from || nodeAttrs.from.includes('@lid')))
+      ? 'lid'
+      : 'pn';
+
+  return {
+    senderPnJid,
+    senderPhoneDigits,
+    senderLidJid,
+    senderLidBaseJid,
+    companionDeviceId,
+    companionDeviceTag,
+    companionDeviceLabel,
+    rawSenderJid,
+    groupJid,
+    addressingMode,
+  };
+}
+
 /**
  * Lossless Binary & Malformed-String Serializer (`SafeLosslessSerializer`).
  * - Converts any `Buffer` or `Uint8Array` into `{ __type: "BinaryBuffer", byteLength, base64, hexPreview }`.
  * - Converts `BigInt` or Protobuf `Long` (`{ low, high, unsigned }`) into exact string/number representations.
  * - Preserves malformed UTF-16 surrogates, null bytes (`\u0000`), and BiDi/Zero-Width control characters verbatim.
  * - Redacts ONLY the bot's own local session secrets (`TELEGRAM_BOT_TOKEN`, local `noiseKey.private`, `signedIdentityKey.private`).
+ * - Supports bounded array serialization (`maxArrayItems`) to prevent `JSON.stringify` OOM on 666 KB repeated-field bombs.
  */
 export class SafeLosslessSerializer {
   public static formatHexPreview(bytes: Uint8Array, maxBytes = 32): string {
@@ -272,9 +641,12 @@ export class SafeLosslessSerializer {
     input: unknown,
     options?: {
       botTokenToRedact?: string;
+      maxArrayItems?: number;
+      maxDepth?: number;
     },
     seen = new WeakSet<object>(),
-    currentPath = '$'
+    currentPath = '$',
+    depth = 0
   ): unknown {
     if (input === null || input === undefined) {
       return input;
@@ -292,10 +664,7 @@ export class SafeLosslessSerializer {
       }
       return input;
     }
-    if (
-      typeof input === 'number' ||
-      typeof input === 'boolean'
-    ) {
+    if (typeof input === 'number' || typeof input === 'boolean') {
       if (typeof input === 'number' && !Number.isFinite(input)) {
         return String(input); // Preserve NaN / Infinity/-Infinity losslessly
       }
@@ -323,6 +692,15 @@ export class SafeLosslessSerializer {
     }
 
     if (typeof input === 'object') {
+      const maxDepth = options?.maxDepth ?? 32;
+      if (depth > maxDepth) {
+        return {
+          __type: 'MaxDepthExceeded',
+          path: currentPath,
+          maxDepth,
+        };
+      }
+
       // Check BufferJSON serialized shape `{ type: 'Buffer', data: [...] }`
       const maybeBufJson = input as { type?: unknown; data?: unknown };
       if (
@@ -356,12 +734,36 @@ export class SafeLosslessSerializer {
       seen.add(input);
 
       if (Array.isArray(input)) {
+        const maxItems = options?.maxArrayItems;
+        if (
+          typeof maxItems === 'number' &&
+          maxItems > 0 &&
+          input.length > maxItems
+        ) {
+          const head = input.slice(0, maxItems).map((item, idx) =>
+            SafeLosslessSerializer.toLosslessJsonValue(
+              item,
+              options,
+              seen,
+              `${currentPath}[${idx}]`,
+              depth + 1
+            )
+          );
+          head.push({
+            __type: 'BoundedRepeatedArraySummary',
+            totalArrayLength: input.length,
+            serializedItemsCount: maxItems,
+            omittedRepeatedItemsCount: input.length - maxItems,
+          });
+          return head;
+        }
         return input.map((item, idx) =>
           SafeLosslessSerializer.toLosslessJsonValue(
             item,
             options,
             seen,
-            `${currentPath}[${idx}]`
+            `${currentPath}[${idx}]`,
+            depth + 1
           )
         );
       }
@@ -393,7 +795,8 @@ export class SafeLosslessSerializer {
             propVal,
             options,
             seen,
-            `${currentPath}.${key}`
+            `${currentPath}.${key}`,
+            depth + 1
           );
         } catch (getterErr) {
           out[key] = {
@@ -413,7 +816,12 @@ export class SafeLosslessSerializer {
 
   public static stringify(
     input: unknown,
-    options?: { botTokenToRedact?: string; space?: number }
+    options?: {
+      botTokenToRedact?: string;
+      space?: number;
+      maxArrayItems?: number;
+      maxDepth?: number;
+    }
   ): string {
     const lossless = SafeLosslessSerializer.toLosslessJsonValue(input, options);
     return JSON.stringify(lossless, null, options?.space ?? 2);
@@ -556,6 +964,786 @@ export class SafeLosslessSerializer {
 }
 
 /**
+ * Pure TypeScript Fault-Tolerant Protobuf Wire Scanner (`FaultTolerantProtobufWireScanner` / `scanProtobufWireFields`).
+ * Always succeeds without throwing even when `proto.Message.decode` fails on malformed wire tags,
+ * truncated varints, or oversized repeated-field bombs.
+ */
+export class FaultTolerantProtobufWireScanner {
+  public static readVarint64(
+    buf: Buffer,
+    offset: number,
+    end: number
+  ): {
+    valueBigInt: bigint;
+    nextOffset: number;
+    valid: boolean;
+  } {
+    let result = BigInt(0);
+    let shift = BigInt(0);
+    let pos = offset;
+
+    for (let byteIdx = 0; byteIdx < 10; byteIdx++) {
+      if (pos >= end) {
+        return { valueBigInt: result, nextOffset: pos, valid: false };
+      }
+      const b = buf[pos]!;
+      pos++;
+      result |= BigInt(b & 0x7f) << shift;
+      if ((b & 0x80) === 0) {
+        if (byteIdx === 9 && b > 0x01) {
+          // 10th byte overflow for 64-bit integer
+          return { valueBigInt: result, nextOffset: pos, valid: false };
+        }
+        return { valueBigInt: result, nextOffset: pos, valid: true };
+      }
+      shift += BigInt(7);
+    }
+
+    return { valueBigInt: result, nextOffset: pos, valid: false };
+  }
+
+  public static wireTypeToName(
+    wireType: number
+  ): ProtobufWireFieldSummary['wireTypeName'] {
+    switch (wireType) {
+      case 0:
+        return 'varint';
+      case 1:
+        return 'fixed64';
+      case 2:
+        return 'length_delimited';
+      case 3:
+        return 'start_group';
+      case 4:
+        return 'end_group';
+      case 5:
+        return 'fixed32';
+      default:
+        return 'invalid';
+    }
+  }
+
+  /**
+   * Checks whether a buffer slice is valid printable/human/Unicode UTF-8 text
+   * (including Arabic, Latin, Emoji, BiDi control characters, Zero-Width chars, JSON, URLs, JIDs)
+   * without binary Protobuf framing control bytes (`0x01..0x08`, `0x0E..0x1F`).
+   */
+  public static isPrintableOrUnicodeUtf8Slice(slice: Buffer): {
+    isText: boolean;
+    decoded: string;
+  } {
+    if (!slice || slice.length === 0) {
+      return { isText: false, decoded: '' };
+    }
+    const sampleLen = Math.min(slice.length, 4096);
+    let binaryControlCount = 0;
+    for (let i = 0; i < sampleLen; i++) {
+      const b = slice[i]!;
+      if ((b >= 0x01 && b <= 0x08) || (b >= 0x0b && b <= 0x0c) || (b >= 0x0e && b <= 0x1f)) {
+        binaryControlCount++;
+      }
+    }
+    if (binaryControlCount > 0) {
+      return { isText: false, decoded: '' };
+    }
+
+    const decoded = slice.toString('utf8');
+    if (decoded.length === 0) {
+      return { isText: false, decoded: '' };
+    }
+
+    // Count replacement characters U+FFFD
+    let replacementCount = 0;
+    const checkChars = Math.min(decoded.length, 2048);
+    for (let i = 0; i < checkChars; i++) {
+      if (decoded.charCodeAt(i) === 0xfffd) {
+        replacementCount++;
+      }
+    }
+    if (replacementCount > Math.max(1, Math.floor(checkChars * 0.05))) {
+      return { isText: false, decoded: '' };
+    }
+
+    return { isText: true, decoded };
+  }
+
+  /**
+   * Carves contiguous printable UTF-8 / ASCII / Unicode runs from an arbitrary binary or corrupted slice.
+   */
+  public static carveUtf8StringsFromBinary(
+    slice: Buffer,
+    minChars = 4
+  ): string[] {
+    if (!slice || slice.length === 0) return [];
+    const results: string[] = [];
+    let currentBytes: number[] = [];
+
+    const flushRun = () => {
+      if (currentBytes.length < minChars) {
+        currentBytes = [];
+        return;
+      }
+      const str = Buffer.from(currentBytes)
+        .toString('utf8')
+        .replace(/\uFFFD+/g, '')
+        .trim();
+      currentBytes = [];
+      if (str.length >= minChars) {
+        results.push(str);
+      }
+    };
+
+    for (let i = 0; i < slice.length; i++) {
+      const b = slice[i]!;
+      // Printable ASCII (0x20..0x7E), tab/newline/CR, or UTF-8 multi-byte lead/continuation (0x80..0xF4)
+      if (
+        (b >= 0x20 && b <= 0x7e) ||
+        b === 0x09 ||
+        b === 0x0a ||
+        b === 0x0d ||
+        (b >= 0x80 && b <= 0xf4)
+      ) {
+        currentBytes.push(b);
+      } else {
+        flushRun();
+      }
+    }
+    flushRun();
+    return results;
+  }
+
+  public static scan(buf: Buffer): ProtobufWireScanResult {
+    return scanProtobufWireFields(buf);
+  }
+}
+
+/**
+ * Pure TypeScript Fault-Tolerant Protobuf Wire Scanner (`scanProtobufWireFields`).
+ * Iterates over `unpadded` using standard Protobuf wire rules (`tag = varint >>> 3`, `wireType = varint & 0x7`),
+ * recursively scanning nested sub-messages up to depth `12`, counting repeated fields, extracting
+ * all printable UTF-8 strings/JIDs/URLs/JSON fragments, and recording corrupted offsets without throwing.
+ */
+export function scanProtobufWireFields(buf: Buffer): ProtobufWireScanResult {
+  const safeBuf = Buffer.isBuffer(buf) ? buf : Buffer.from(buf || []);
+  const fieldStatsByPath = new Map<string, ProtobufWireFieldSummary>();
+  const extractedStrings: string[] = [];
+  const seenExtractedStrings = new Set<string>();
+  const extractedJids = new Set<string>();
+  const extractedUrls = new Set<string>();
+  const extractedJsonFragments: string[] = [];
+  const corruptedOffsets: number[] = [];
+  const corruptionReasons: string[] = [];
+  let totalWireFieldsScanned = 0;
+  let maxNestingDepth = 0;
+  let unparsedTailHex: string | undefined;
+
+  const harvestTextMetadata = (text: string) => {
+    const trimmed = text.trim();
+    if (!trimmed) return;
+    if (!seenExtractedStrings.has(text) && extractedStrings.length < 2000) {
+      seenExtractedStrings.add(text);
+      extractedStrings.push(text);
+    }
+
+    // Extract JIDs
+    const jidMatches = text.match(
+      /[0-9a-zA-Z._:-]{3,64}@(?:s\.whatsapp\.net|lid|hosted\.lid|g\.us|newsletter|broadcast)/g
+    );
+    if (jidMatches) {
+      for (const jm of jidMatches) {
+        if (extractedJids.size < 1000) {
+          extractedJids.add(jm);
+        }
+      }
+    }
+
+    // Extract URLs
+    const urlMatches = text.match(/https?:\/\/[^\s"'<>\\]+/gi);
+    if (urlMatches) {
+      for (const um of urlMatches) {
+        if (extractedUrls.size < 500) {
+          extractedUrls.add(um);
+        }
+      }
+    }
+
+    // Check JSON fragments
+    if (
+      ((trimmed.startsWith('{') && trimmed.endsWith('}')) ||
+        (trimmed.startsWith('[') && trimmed.endsWith(']'))) &&
+      extractedJsonFragments.length < 200
+    ) {
+      extractedJsonFragments.push(
+        trimmed.length > 4096 ? `${trimmed.slice(0, 4096)}...` : trimmed
+      );
+    }
+  };
+
+  const recordFieldOccurrence = (
+    fieldPath: string,
+    fieldNumber: number,
+    wireType: number,
+    byteCount: number,
+    depth: number,
+    sampleStr?: string
+  ) => {
+    totalWireFieldsScanned++;
+    const existing = fieldStatsByPath.get(fieldPath);
+    const knownName =
+      depth === 1 ? KNOWN_TOP_LEVEL_WA_PROTO_FIELDS[fieldNumber] : undefined;
+    if (existing) {
+      existing.occurrences++;
+      existing.totalBytes += byteCount;
+      if (byteCount > existing.maxSingleBytes) {
+        existing.maxSingleBytes = byteCount;
+      }
+      if (!existing.sampleStringPreview && sampleStr) {
+        existing.sampleStringPreview = sampleStr.slice(0, 120);
+      }
+    } else {
+      fieldStatsByPath.set(fieldPath, {
+        fieldPath,
+        fieldNumber,
+        fieldName: knownName,
+        wireType,
+        wireTypeName: FaultTolerantProtobufWireScanner.wireTypeToName(wireType),
+        occurrences: 1,
+        totalBytes: byteCount,
+        maxSingleBytes: byteCount,
+        sampleStringPreview: sampleStr ? sampleStr.slice(0, 120) : undefined,
+      });
+    }
+  };
+
+  const recordCorruption = (
+    offset: number,
+    reason: string,
+    remainingStart: number,
+    remainingEnd: number
+  ) => {
+    if (!corruptedOffsets.includes(offset)) {
+      corruptedOffsets.push(offset);
+    }
+    corruptionReasons.push(reason);
+    if (remainingStart < remainingEnd) {
+      const tailSlice = safeBuf.subarray(remainingStart, remainingEnd);
+      if (!unparsedTailHex) {
+        unparsedTailHex = SafeLosslessSerializer.formatHexPreview(tailSlice, 64);
+      }
+      const carved =
+        FaultTolerantProtobufWireScanner.carveUtf8StringsFromBinary(
+          tailSlice,
+          4
+        );
+      for (const c of carved) {
+        harvestTextMetadata(c);
+      }
+    }
+  };
+
+  const looksLikeSubMessage = (
+    sliceStart: number,
+    sliceEnd: number,
+    depth: number,
+    fieldNumber: number
+  ): boolean => {
+    const len = sliceEnd - sliceStart;
+    if (len < 2 || depth >= 12) return false;
+
+    // At depth 1 in proto.Message, field 1 is conversation (string); all other valid fields (2..100) are sub-messages
+    if (depth === 1 && fieldNumber !== 1 && fieldNumber >= 2 && fieldNumber <= 120) {
+      return true;
+    }
+
+    // Check first tag inside slice
+    const firstTag = FaultTolerantProtobufWireScanner.readVarint64(
+      safeBuf,
+      sliceStart,
+      sliceEnd
+    );
+    if (!firstTag.valid) return false;
+    const innerField = Number(firstTag.valueBigInt >> BigInt(3));
+    const innerWire = Number(firstTag.valueBigInt & BigInt(0x07));
+    if (
+      innerField <= 0 ||
+      innerField > 500 ||
+      (innerWire !== 0 && innerWire !== 1 && innerWire !== 2 && innerWire !== 5)
+    ) {
+      return false;
+    }
+    if (innerWire === 2) {
+      const innerLen = FaultTolerantProtobufWireScanner.readVarint64(
+        safeBuf,
+        firstTag.nextOffset,
+        sliceEnd
+      );
+      if (!innerLen.valid) return false;
+      const decl = Number(innerLen.valueBigInt);
+      return decl >= 0 && innerLen.nextOffset + decl <= sliceEnd;
+    }
+    return true;
+  };
+
+  const scanRange = (
+    start: number,
+    end: number,
+    parentPath: string,
+    depth: number
+  ): void => {
+    if (depth > maxNestingDepth) {
+      maxNestingDepth = depth;
+    }
+    let offset = start;
+
+    while (offset < end) {
+      const tagStart = offset;
+      const tagVarint = FaultTolerantProtobufWireScanner.readVarint64(
+        safeBuf,
+        offset,
+        end
+      );
+      if (!tagVarint.valid) {
+        recordCorruption(
+          tagStart,
+          `Truncated or invalid varint wire tag at byte offset ${tagStart}`,
+          tagStart,
+          end
+        );
+        return;
+      }
+
+      const fieldNumber = Number(tagVarint.valueBigInt >> BigInt(3));
+      const wireType = Number(tagVarint.valueBigInt & BigInt(0x07));
+      const fieldLabel =
+        depth === 1 && KNOWN_TOP_LEVEL_WA_PROTO_FIELDS[fieldNumber]
+          ? `${fieldNumber}(${KNOWN_TOP_LEVEL_WA_PROTO_FIELDS[fieldNumber]})`
+          : String(fieldNumber);
+      const fieldPath = parentPath ? `${parentPath}.${fieldLabel}` : `field_${fieldLabel}`;
+
+      if (
+        fieldNumber <= 0 ||
+        fieldNumber > 536870911 ||
+        wireType === 3 ||
+        wireType === 4 ||
+        wireType === 6 ||
+        wireType === 7
+      ) {
+        recordFieldOccurrence(
+          fieldPath,
+          fieldNumber,
+          wireType,
+          end - tagStart,
+          depth
+        );
+        recordCorruption(
+          tagStart,
+          `Corrupted Protobuf wire tag at offset ${tagStart} (fieldNumber=${fieldNumber}, wireType=${wireType})`,
+          tagStart,
+          end
+        );
+        return;
+      }
+
+      offset = tagVarint.nextOffset;
+
+      if (wireType === 0) {
+        // Varint
+        const valVarint = FaultTolerantProtobufWireScanner.readVarint64(
+          safeBuf,
+          offset,
+          end
+        );
+        if (!valVarint.valid) {
+          recordFieldOccurrence(
+            fieldPath,
+            fieldNumber,
+            wireType,
+            end - tagStart,
+            depth
+          );
+          recordCorruption(
+            offset,
+            `Truncated varint value for ${fieldPath} at offset ${offset}`,
+            offset,
+            end
+          );
+          return;
+        }
+        recordFieldOccurrence(
+          fieldPath,
+          fieldNumber,
+          wireType,
+          valVarint.nextOffset - tagStart,
+          depth
+        );
+        offset = valVarint.nextOffset;
+      } else if (wireType === 1) {
+        // 64-bit fixed
+        if (offset + 8 > end) {
+          recordFieldOccurrence(
+            fieldPath,
+            fieldNumber,
+            wireType,
+            end - tagStart,
+            depth
+          );
+          recordCorruption(
+            offset,
+            `Truncated fixed64 value for ${fieldPath} at offset ${offset} (need 8B, remaining ${end - offset}B)`,
+            offset,
+            end
+          );
+          return;
+        }
+        recordFieldOccurrence(
+          fieldPath,
+          fieldNumber,
+          wireType,
+          offset + 8 - tagStart,
+          depth
+        );
+        offset += 8;
+      } else if (wireType === 5) {
+        // 32-bit fixed
+        if (offset + 4 > end) {
+          recordFieldOccurrence(
+            fieldPath,
+            fieldNumber,
+            wireType,
+            end - tagStart,
+            depth
+          );
+          recordCorruption(
+            offset,
+            `Truncated fixed32 value for ${fieldPath} at offset ${offset} (need 4B, remaining ${end - offset}B)`,
+            offset,
+            end
+          );
+          return;
+        }
+        recordFieldOccurrence(
+          fieldPath,
+          fieldNumber,
+          wireType,
+          offset + 4 - tagStart,
+          depth
+        );
+        offset += 4;
+      } else if (wireType === 2) {
+        // Length-delimited
+        const lenVarint = FaultTolerantProtobufWireScanner.readVarint64(
+          safeBuf,
+          offset,
+          end
+        );
+        if (!lenVarint.valid) {
+          recordFieldOccurrence(
+            fieldPath,
+            fieldNumber,
+            wireType,
+            end - tagStart,
+            depth
+          );
+          recordCorruption(
+            offset,
+            `Invalid length varint for ${fieldPath} at offset ${offset}`,
+            offset,
+            end
+          );
+          return;
+        }
+
+        const payloadStart = lenVarint.nextOffset;
+        const declaredLen = Number(lenVarint.valueBigInt);
+        let payloadEnd = payloadStart + declaredLen;
+
+        if (
+          declaredLen < 0 ||
+          !Number.isSafeInteger(declaredLen) ||
+          payloadEnd > end
+        ) {
+          recordCorruption(
+            tagStart,
+            `Length-delimited field ${fieldPath} at offset ${tagStart} declared ${declaredLen} bytes, exceeding remaining ${end - payloadStart} bytes (clamped to remaining buffer)`,
+            payloadStart,
+            end
+          );
+          payloadEnd = end;
+        }
+
+        const payloadSlice = safeBuf.subarray(payloadStart, payloadEnd);
+        const textCheck =
+          depth === 1 && fieldNumber !== 1
+            ? { isText: false, decoded: '' }
+            : FaultTolerantProtobufWireScanner.isPrintableOrUnicodeUtf8Slice(
+                payloadSlice
+              );
+
+        if (textCheck.isText) {
+          harvestTextMetadata(textCheck.decoded);
+          recordFieldOccurrence(
+            fieldPath,
+            fieldNumber,
+            wireType,
+            payloadEnd - tagStart,
+            depth,
+            textCheck.decoded
+          );
+        } else if (
+          looksLikeSubMessage(payloadStart, payloadEnd, depth, fieldNumber)
+        ) {
+          recordFieldOccurrence(
+            fieldPath,
+            fieldNumber,
+            wireType,
+            payloadEnd - tagStart,
+            depth
+          );
+          scanRange(payloadStart, payloadEnd, fieldPath, depth + 1);
+        } else {
+          recordFieldOccurrence(
+            fieldPath,
+            fieldNumber,
+            wireType,
+            payloadEnd - tagStart,
+            depth
+          );
+          // Carve any embedded printable strings inside mixed/binary payload
+          const carved =
+            FaultTolerantProtobufWireScanner.carveUtf8StringsFromBinary(
+              payloadSlice,
+              4
+            );
+          for (const c of carved) {
+            harvestTextMetadata(c);
+          }
+        }
+
+        offset = payloadEnd;
+      }
+    }
+  };
+
+  try {
+    if (safeBuf.length > 0) {
+      scanRange(0, safeBuf.length, '', 1);
+    }
+  } catch (unexpectedScanErr) {
+    recordCorruption(
+      0,
+      `Unexpected scanner recovery: ${
+        unexpectedScanErr instanceof Error
+          ? unexpectedScanErr.message
+          : String(unexpectedScanErr)
+      }`,
+      0,
+      safeBuf.length
+    );
+  }
+
+  const fieldSummaries = Array.from(fieldStatsByPath.values()).sort(
+    (a, b) => b.totalBytes - a.totalBytes || b.occurrences - a.occurrences
+  );
+
+  let totalRepeatedItems = 0;
+  const repeatedFieldSummaries: string[] = [];
+  for (const summary of fieldSummaries) {
+    if (summary.occurrences > 1) {
+      totalRepeatedItems += summary.occurrences;
+    }
+    const label = summary.fieldName
+      ? `Field ${summary.fieldNumber} (${summary.fieldName})`
+      : summary.fieldPath;
+    repeatedFieldSummaries.push(
+      `${label}: ${summary.occurrences}x (${summary.totalBytes} bytes)`
+    );
+  }
+
+  const combinedText = extractedStrings.join('\n');
+  const unicodeMap = SafeLosslessSerializer.analyzeUnicodeString(combinedText);
+
+  return {
+    totalBytes: safeBuf.length,
+    totalWireFieldsScanned,
+    totalRepeatedItems,
+    maxNestingDepth,
+    corruptedWireTag: corruptedOffsets.length > 0,
+    corruptedOffset: corruptedOffsets[0],
+    corruptedOffsets,
+    corruptionReasons,
+    fieldSummaries,
+    repeatedFieldSummaries,
+    extractedStrings,
+    extractedJids: Array.from(extractedJids),
+    extractedUrls: Array.from(extractedUrls),
+    extractedJsonFragments,
+    unicodeMap,
+    unparsedTailHex,
+  };
+}
+
+/**
+ * Non-destructively wraps `sock.signalRepository.decryptMessage` and `decryptGroupMessage`
+ * so `ForensicPayloadAnalyzer` receives a copy of the decrypted plaintext buffer inline
+ * at the exact moment Signal decryption succeeds (before `proto.Message.decode` runs),
+ * without advancing the one-way Signal ratchet a second time!
+ */
+export function hookSignalRepositoryForForensics(params: {
+  sessionId: string;
+  signalRepository: Record<string, unknown> | undefined | null;
+  analyzer?: ForensicPayloadAnalyzer;
+  getStanzaNode?: () => BinaryNode | undefined;
+}): void {
+  const repo = params.signalRepository as Record<string, any> | undefined | null;
+  if (!repo || typeof repo !== 'object') return;
+
+  if (typeof repo.decryptMessage === 'function' && !repo.__botezzForensicHooked) {
+    const origDecryptMessage = repo.decryptMessage.bind(repo);
+    repo.__botezzForensicHooked = true;
+    repo.decryptMessage = async (decryptParams: {
+      jid: string;
+      type: 'pkmsg' | 'msg' | string;
+      ciphertext: Uint8Array | Buffer;
+    }) => {
+      const activeAnalyzer = params.analyzer ?? getForensicPayloadAnalyzer();
+      try {
+        const paddedPlaintext: Uint8Array | Buffer =
+          await origDecryptMessage(decryptParams);
+        try {
+          const copyPlaintext = Buffer.isBuffer(paddedPlaintext)
+            ? Buffer.from(paddedPlaintext)
+            : Buffer.from(
+                paddedPlaintext.buffer,
+                paddedPlaintext.byteOffset,
+                paddedPlaintext.byteLength
+              );
+          const copyCiphertext = decryptParams.ciphertext
+            ? Buffer.isBuffer(decryptParams.ciphertext)
+              ? Buffer.from(decryptParams.ciphertext)
+              : Buffer.from(
+                  decryptParams.ciphertext.buffer,
+                  decryptParams.ciphertext.byteOffset,
+                  decryptParams.ciphertext.byteLength
+                )
+            : undefined;
+          activeAnalyzer?.onSignalPlaintextDecrypted({
+            sessionId: params.sessionId,
+            senderJid: decryptParams.jid,
+            encType: decryptParams.type,
+            ciphertextByteLength: decryptParams.ciphertext?.byteLength ?? 0,
+            paddedPlaintext: copyPlaintext,
+            ciphertext: copyCiphertext,
+            stanzaNode: params.getStanzaNode?.(),
+          });
+        } catch {
+          // Never disrupt Signal decryption pipeline
+        }
+        return paddedPlaintext;
+      } catch (decryptErr) {
+        try {
+          const copyCiphertext = decryptParams.ciphertext
+            ? Buffer.isBuffer(decryptParams.ciphertext)
+              ? Buffer.from(decryptParams.ciphertext)
+              : Buffer.from(
+                  decryptParams.ciphertext.buffer,
+                  decryptParams.ciphertext.byteOffset,
+                  decryptParams.ciphertext.byteLength
+                )
+            : Buffer.alloc(0);
+          activeAnalyzer?.onSignalDecryptionFailed({
+            sessionId: params.sessionId,
+            senderJid: decryptParams.jid,
+            encType: decryptParams.type,
+            ciphertextByteLength: decryptParams.ciphertext?.byteLength ?? 0,
+            ciphertext: copyCiphertext,
+            error: decryptErr,
+            stanzaNode: params.getStanzaNode?.(),
+          });
+        } catch {
+          // Never disrupt error propagation
+        }
+        throw decryptErr;
+      }
+    };
+  }
+
+  if (
+    typeof repo.decryptGroupMessage === 'function' &&
+    !repo.__botezzForensicGroupHooked
+  ) {
+    const origDecryptGroupMessage = repo.decryptGroupMessage.bind(repo);
+    repo.__botezzForensicGroupHooked = true;
+    repo.decryptGroupMessage = async (groupParams: {
+      group: string;
+      authorJid: string;
+      msg: Uint8Array | Buffer;
+    }) => {
+      const activeAnalyzer = params.analyzer ?? getForensicPayloadAnalyzer();
+      try {
+        const paddedPlaintext: Uint8Array | Buffer =
+          await origDecryptGroupMessage(groupParams);
+        try {
+          const copyPlaintext = Buffer.isBuffer(paddedPlaintext)
+            ? Buffer.from(paddedPlaintext)
+            : Buffer.from(
+                paddedPlaintext.buffer,
+                paddedPlaintext.byteOffset,
+                paddedPlaintext.byteLength
+              );
+          const copyCiphertext = groupParams.msg
+            ? Buffer.isBuffer(groupParams.msg)
+              ? Buffer.from(groupParams.msg)
+              : Buffer.from(
+                  groupParams.msg.buffer,
+                  groupParams.msg.byteOffset,
+                  groupParams.msg.byteLength
+                )
+            : undefined;
+          activeAnalyzer?.onSignalPlaintextDecrypted({
+            sessionId: params.sessionId,
+            senderJid: groupParams.authorJid,
+            groupJid: groupParams.group,
+            encType: 'skmsg',
+            ciphertextByteLength: groupParams.msg?.byteLength ?? 0,
+            paddedPlaintext: copyPlaintext,
+            ciphertext: copyCiphertext,
+            stanzaNode: params.getStanzaNode?.(),
+          });
+        } catch {
+          // Never disrupt group decryption pipeline
+        }
+        return paddedPlaintext;
+      } catch (decryptErr) {
+        try {
+          const copyCiphertext = groupParams.msg
+            ? Buffer.isBuffer(groupParams.msg)
+              ? Buffer.from(groupParams.msg)
+              : Buffer.from(
+                  groupParams.msg.buffer,
+                  groupParams.msg.byteOffset,
+                  groupParams.msg.byteLength
+                )
+            : Buffer.alloc(0);
+          activeAnalyzer?.onSignalDecryptionFailed({
+            sessionId: params.sessionId,
+            senderJid: groupParams.authorJid,
+            groupJid: groupParams.group,
+            encType: 'skmsg',
+            ciphertextByteLength: groupParams.msg?.byteLength ?? 0,
+            ciphertext: copyCiphertext,
+            error: decryptErr,
+            stanzaNode: params.getStanzaNode?.(),
+          });
+        } catch {
+          // Ignore
+        }
+        throw decryptErr;
+      }
+    };
+  }
+}
+
+/**
  * Fingerprints the sender's operating system/client from the WhatsApp stanza `key.id`.
  */
 export function detectSenderOsFingerprint(messageId: string): SenderOsFingerprint {
@@ -596,7 +1784,11 @@ export function classifyForensicSurface(
   if (jid.endsWith('@newsletter')) {
     return 'NEWSLETTER';
   }
-  if (jid.endsWith('@s.whatsapp.net') || jid.endsWith('@lid')) {
+  if (
+    jid.endsWith('@s.whatsapp.net') ||
+    jid.endsWith('@lid') ||
+    jid.endsWith('@hosted.lid')
+  ) {
     return 'PRIVATE_CHAT';
   }
   return jid ? 'PRIVATE_CHAT' : 'PROTOCOL_STANZA';
@@ -718,10 +1910,10 @@ function extensionFromMimeOrKind(mimeType?: string, mediaKind?: string): string 
 /**
  * Pre-processing sanitizer guard for downstream normalizers (`SessionMemoryStore`,
  * `IncomingMessageReceiver`, `StatusDownloader`).
- * If an incoming message has extreme BiDi overrides (`> 100`), oversized text (`> 65536`),
- * or a mention array bomb (`mentionedJid.length > 500`), this function returns a sanitized
- * shallow/deep copy for downstream consumers so the bot process never hangs or runs out of memory,
- * AFTER Stage 1 has already archived the 100% unmodified original payload!
+ * If an incoming message has extreme BiDi overrides (`> 100`), zero-width chars (`> 200`),
+ * oversized text (`> 65536`), or repeated array bombs (`mentionedJid.length > 500`, `buttons.length > 200`, etc.),
+ * this function returns a sanitized copy for downstream consumers so the bot process never hangs or runs out of memory,
+ * AFTER Stage 1 / Signal Inline Capture has already archived the 100% unmodified original payload!
  */
 export function sanitizeIncomingMessageForDownstream(
   rawMessage: Record<string, unknown>
@@ -737,23 +1929,29 @@ export function sanitizeIncomingMessageForDownstream(
   const reasons: string[] = [];
   let wasSanitized = false;
 
-  const sanitizeStringField = (val: string): string => {
+  const sanitizeStringField = (val: string, fieldName: string): string => {
     let result = val;
     const uMap = SafeLosslessSerializer.analyzeUnicodeString(result);
-    if (uMap.bidiOverrideCount > 100 || uMap.combiningMarkCount > 250) {
+    if (
+      uMap.bidiOverrideCount > 100 ||
+      uMap.combiningMarkCount > 250 ||
+      uMap.zeroWidthCount > 500
+    ) {
       result = result.replace(
-        /[\u202A-\u202E\u2066-\u2069\u061C\u0300-\u036F]/g,
+        /[\u202A-\u202E\u2066-\u2069\u061C\u200B-\u200F\u2060-\u2064\uFEFF\u0300-\u036F]/g,
         ''
       );
       wasSanitized = true;
       reasons.push(
-        `Stripped hostile BiDi/combining crash characters (bidi=${uMap.bidiOverrideCount}, combining=${uMap.combiningMarkCount})`
+        `Stripped hostile BiDi/ZeroWidth/combining crash characters in ${fieldName} (bidi=${uMap.bidiOverrideCount}, zeroWidth=${uMap.zeroWidthCount}, combining=${uMap.combiningMarkCount})`
       );
     }
     if (result.length > 65536) {
       result = `${result.slice(0, 65536)}... [TRUNCATED_BY_SECURITY_GUARD]`;
       wasSanitized = true;
-      reasons.push(`Truncated oversized text payload (${val.length} chars)`);
+      reasons.push(
+        `Truncated oversized text payload in ${fieldName} (${val.length} chars)`
+      );
     }
     return result;
   };
@@ -762,31 +1960,47 @@ export function sanitizeIncomingMessageForDownstream(
     node: Record<string, unknown>,
     depth = 0
   ): Record<string, unknown> => {
-    if (!node || typeof node !== 'object' || depth > 10) return node;
+    if (!node || typeof node !== 'object' || depth > 12) return node;
     const clone: Record<string, unknown> = { ...node };
 
     for (const [k, v] of Object.entries(clone)) {
-      if (typeof v === 'string' && (k === 'conversation' || k === 'text' || k === 'caption' || k === 'title' || k === 'description')) {
-        clone[k] = sanitizeStringField(v);
-      } else if (k === 'contextInfo' && v && typeof v === 'object') {
-        const ctxClone = { ...(v as Record<string, unknown>) };
-        if (
-          Array.isArray(ctxClone.mentionedJid) &&
-          ctxClone.mentionedJid.length > 500
-        ) {
+      if (typeof v === 'string') {
+        if (v.length > 100) {
+          clone[k] = sanitizeStringField(v, k);
+        }
+      } else if (Array.isArray(v)) {
+        const threshold = k === 'mentionedJid' ? 500 : 200;
+        let workingArr = v;
+        if (v.length > threshold) {
           reasons.push(
-            `Truncated Mention Array Bomb (${ctxClone.mentionedJid.length} mentions -> 50)`
+            `Truncated ${k === 'mentionedJid' ? 'Mention Array Bomb' : `Repeated Array Bomb (${k})`} (${v.length} items -> 50)`
           );
-          ctxClone.mentionedJid = ctxClone.mentionedJid.slice(0, 50);
+          workingArr = v.slice(0, 50);
           wasSanitized = true;
         }
-        clone[k] = ctxClone;
+        clone[k] = workingArr.map((item) => {
+          if (typeof item === 'string' && item.length > 100) {
+            return sanitizeStringField(item, `${k}[]`);
+          }
+          if (
+            item &&
+            typeof item === 'object' &&
+            !Buffer.isBuffer(item) &&
+            !(item instanceof Uint8Array) &&
+            !Array.isArray(item)
+          ) {
+            return sanitizeMessageNode(
+              item as Record<string, unknown>,
+              depth + 1
+            );
+          }
+          return item;
+        });
       } else if (
         v &&
         typeof v === 'object' &&
         !Buffer.isBuffer(v) &&
-        !(v instanceof Uint8Array) &&
-        !Array.isArray(v)
+        !(v instanceof Uint8Array)
       ) {
         clone[k] = sanitizeMessageNode(v as Record<string, unknown>, depth + 1);
       }
@@ -821,11 +2035,12 @@ export function sanitizeIncomingMessageForDownstream(
 
 /**
  * Forensic Security Payload Analyzer Engine (`ForensicPayloadAnalyzer`).
- * Implements the mandatory 2-Stage Capture Pipeline:
- * - Stage 1: Raw Pre-Processing Capture (`01_raw_pre_process.json` & `01_raw_payload.bin`)
- * - Stage 2: Fault-Tolerant Post-Processing Dissection, OS Fingerprinting, Threat Detection,
- *            and Unmodified / Encrypted Media Extraction (`02_post_process_forensics.json`,
- *            `03_raw_text_utf8.txt`, `04_media_payload_original.<ext>` / `04_raw_encrypted_media.enc`)
+ * Implements:
+ * - Inline Signal Decryption Interception (`onSignalPlaintextDecrypted` & `onSignalDecryptionFailed`)
+ *   with `01_raw_pre_process.json`, `02_decrypted_raw_protobuf.bin`, `03_decrypted_protobuf_decoded.json`,
+ *   `04_extracted_unencrypted_text.txt`, and `05_forensic_wire_anatomy_report.json`.
+ * - Two-Stage Capture Pipeline (`captureIncomingPayload`) for `messages.upsert` and raw binary stanzas.
+ * - Pre-Decode Crash Protection Shield (`Quarantine Mode` for >256 KB or hostile wire payloads).
  */
 export class ForensicPayloadAnalyzer {
   private config: SecurityAnalyzerConfig;
@@ -835,6 +2050,17 @@ export class ForensicPayloadAnalyzer {
   private readonly capturesRingBuffer: ForensicCaptureRecord[] = [];
   private readonly maxRingBufferSize = 200;
   private captureSeq = 0;
+
+  // Short-lived correlation state for incoming <message> stanzas prior to Signal decryption
+  private readonly pendingStanzaByKey = new Map<
+    string,
+    IncomingStanzaCorrelationContext
+  >();
+  private readonly latestStanzaBySession = new Map<
+    string,
+    IncomingStanzaCorrelationContext
+  >();
+  private readonly signalCapturedStanzaIds = new Set<string>();
 
   public onForensicCaptureReady?: (
     record: ForensicCaptureRecord,
@@ -895,7 +2121,10 @@ export class ForensicPayloadAnalyzer {
     const cfg = this.getConfig();
     if (!cfg.enabled) return false;
     if (cfg.targetSessionIds === 'ALL') return true;
-    return Array.isArray(cfg.targetSessionIds) && cfg.targetSessionIds.includes(sessionId);
+    return (
+      Array.isArray(cfg.targetSessionIds) &&
+      cfg.targetSessionIds.includes(sessionId)
+    );
   }
 
   public matchesSurfaceFilter(
@@ -904,9 +2133,1026 @@ export class ForensicPayloadAnalyzer {
   ): boolean {
     if (filter === 'ALL') return true;
     if (filter === 'ANOMALIES_ONLY') {
-      return record.threatVerdict.isAnomalous || Boolean(record.processingError);
+      return (
+        record.threatVerdict.isAnomalous || Boolean(record.processingError)
+      );
     }
     return record.surface === filter;
+  }
+
+  public hasSignalCaptureForStanza(
+    sessionId: string,
+    stanzaId: string
+  ): boolean {
+    if (!stanzaId) return false;
+    return this.signalCapturedStanzaIds.has(`${sessionId}:${stanzaId}`);
+  }
+
+  /**
+   * STEP 1.1: Tracks incoming `CB:message` stanza metadata (`stanzaId`, `fromJid`, `participantJid`,
+   * `sender_pn`, `sender_lid`, `companionDeviceId`, and `<enc>` nodes) immediately before Signal decryption.
+   */
+  public recordIncomingMessageStanzaContext(params: {
+    sessionId: string;
+    node: BinaryNode;
+  }): IncomingStanzaCorrelationContext | null {
+    const { sessionId, node } = params;
+    if (!node || typeof node !== 'object') return null;
+
+    const attrs = (node.attrs ?? {}) as Record<string, string>;
+    const stanzaId = String(attrs.id || `stanza_${Date.now()}`);
+    const fromJid = String(attrs.from || '');
+    const participantJid =
+      typeof attrs.participant === 'string' && attrs.participant
+        ? attrs.participant
+        : undefined;
+
+    const attribution = extractSenderAttribution({
+      stanzaNode: node,
+    });
+
+    const encNodes: StanzaEncNodeSummary[] = [];
+    const children = getAllBinaryNodeChildren(node);
+    for (const child of children) {
+      if (child.tag === 'enc') {
+        const byteLength =
+          child.content instanceof Uint8Array || Buffer.isBuffer(child.content)
+            ? child.content.byteLength
+            : 0;
+        encNodes.push({
+          type: String(child.attrs?.type || 'msg'),
+          v: child.attrs?.v ? String(child.attrs.v) : undefined,
+          mediatype: child.attrs?.mediatype
+            ? String(child.attrs.mediatype)
+            : undefined,
+          byteLength,
+        });
+      }
+    }
+
+    const ctx: IncomingStanzaCorrelationContext = {
+      sessionId,
+      stanzaId,
+      fromJid,
+      participantJid,
+      senderPnJid: attribution.senderPnJid,
+      senderLidJid: attribution.senderLidJid,
+      companionDeviceId: attribution.companionDeviceId,
+      companionDeviceTag: attribution.companionDeviceTag,
+      addressingMode: attribution.addressingMode,
+      encNodes,
+      rawBinaryNode: node,
+      recordedAtMs: Date.now(),
+    };
+
+    // Evict stale entries (> 60s or > 200 entries)
+    if (this.pendingStanzaByKey.size > 200) {
+      const firstKey = this.pendingStanzaByKey.keys().next().value;
+      if (firstKey) this.pendingStanzaByKey.delete(firstKey);
+    }
+
+    this.pendingStanzaByKey.set(`${sessionId}:id:${stanzaId}`, ctx);
+    if (fromJid) {
+      this.pendingStanzaByKey.set(`${sessionId}:jid:${fromJid}`, ctx);
+    }
+    if (participantJid) {
+      this.pendingStanzaByKey.set(`${sessionId}:jid:${participantJid}`, ctx);
+    }
+    if (attribution.senderLidJid) {
+      this.pendingStanzaByKey.set(
+        `${sessionId}:jid:${attribution.senderLidJid}`,
+        ctx
+      );
+    }
+    if (attribution.senderPnJid) {
+      this.pendingStanzaByKey.set(
+        `${sessionId}:jid:${attribution.senderPnJid}`,
+        ctx
+      );
+    }
+    this.latestStanzaBySession.set(sessionId, ctx);
+
+    return ctx;
+  }
+
+  private resolveCorrelatedStanzaContext(params: {
+    sessionId: string;
+    senderJid: string;
+    groupJid?: string;
+    encType: string;
+    ciphertextByteLength: number;
+    stanzaNode?: BinaryNode | Record<string, unknown> | null;
+  }): IncomingStanzaCorrelationContext | undefined {
+    if (
+      params.stanzaNode &&
+      typeof params.stanzaNode === 'object' &&
+      'tag' in params.stanzaNode
+    ) {
+      return (
+        this.recordIncomingMessageStanzaContext({
+          sessionId: params.sessionId,
+          node: params.stanzaNode as BinaryNode,
+        }) ?? undefined
+      );
+    }
+
+    // 1. Direct lookup by senderJid or groupJid
+    const directCandidates = [params.senderJid, params.groupJid].filter(
+      (j): j is string => Boolean(j)
+    );
+    for (const jid of directCandidates) {
+      const hit = this.pendingStanzaByKey.get(`${params.sessionId}:jid:${jid}`);
+      if (hit && Date.now() - hit.recordedAtMs < 30_000) {
+        return hit;
+      }
+    }
+
+    // 2. Match by encType + ciphertextByteLength on same session
+    for (const ctx of this.pendingStanzaByKey.values()) {
+      if (
+        ctx.sessionId === params.sessionId &&
+        Date.now() - ctx.recordedAtMs < 30_000 &&
+        ctx.encNodes.some(
+          (e) =>
+            e.type === params.encType &&
+            (params.ciphertextByteLength === 0 ||
+              e.byteLength === params.ciphertextByteLength)
+        )
+      ) {
+        return ctx;
+      }
+    }
+
+    // 3. Fallback to most recent stanza on this session within 15s
+    const latest = this.latestStanzaBySession.get(params.sessionId);
+    if (latest && Date.now() - latest.recordedAtMs < 15_000) {
+      return latest;
+    }
+
+    return undefined;
+  }
+
+  /**
+   * STEP 2 & STEP 3: Inline Signal Plaintext Decryption Handler (`onSignalPlaintextDecrypted`).
+   * Executes synchronously right after `signalRepository.decryptMessage` (or `decryptGroupMessage`)
+   * returns `paddedPlaintext` and BEFORE Baileys invokes `proto.Message.decode`:
+   * 1. Unpads WhatsApp Signal padding via `safeUnpadWhatsAppPlaintext`.
+   * 2. Immediately writes `01_raw_pre_process.json` and `02_decrypted_raw_protobuf.bin` to disk.
+   * 3. Runs Dual-Engine Dissection:
+   *    - Engine A: `proto.Message.decode` -> `03_decrypted_protobuf_decoded.json` (bounded against OOM).
+   *    - Engine B: `FaultTolerantProtobufWireScanner` (`scanProtobufWireFields`) -> `04_extracted_unencrypted_text.txt`
+   *                and `05_forensic_wire_anatomy_report.json`.
+   * 4. Triggers Quarantine Mode & immediate Telegram Document upload when enabled or when crash signatures are detected.
+   */
+  public onSignalPlaintextDecrypted(
+    input: SignalPlaintextDecryptedInput
+  ): ForensicCaptureRecord | null {
+    const paddedBuf = Buffer.isBuffer(input.paddedPlaintext)
+      ? input.paddedPlaintext
+      : Buffer.from(
+          input.paddedPlaintext.buffer,
+          input.paddedPlaintext.byteOffset,
+          input.paddedPlaintext.byteLength
+        );
+
+    const { unpadded, padLength, paddingValid } =
+      safeUnpadWhatsAppPlaintext(paddedBuf);
+
+    const isOversizedPayload =
+      unpadded.byteLength > QUARANTINE_PLAINTEXT_SIZE_BYTES;
+
+    const cfg = this.getConfig();
+    if (!input.forceCapture && !cfg.enabled) {
+      return null;
+    }
+    if (
+      !input.forceCapture &&
+      cfg.targetSessionIds !== 'ALL' &&
+      Array.isArray(cfg.targetSessionIds) &&
+      !cfg.targetSessionIds.includes(input.sessionId)
+    ) {
+      return null;
+    }
+
+    const correlatedCtx = this.resolveCorrelatedStanzaContext({
+      sessionId: input.sessionId,
+      senderJid: input.senderJid,
+      groupJid: input.groupJid,
+      encType: input.encType,
+      ciphertextByteLength: input.ciphertextByteLength,
+      stanzaNode: input.stanzaNode,
+    });
+
+    const rawBinaryNode =
+      (input.stanzaNode as BinaryNode | undefined) ??
+      correlatedCtx?.rawBinaryNode;
+
+    const attribution = extractSenderAttribution({
+      senderJid: input.senderJid,
+      groupJid: input.groupJid,
+      stanzaNode: rawBinaryNode,
+      correlatedContext: correlatedCtx,
+    });
+
+    this.captureSeq = (this.captureSeq + 1) % 1_000_000;
+    const randHex = crypto.randomBytes(3).toString('hex');
+    const captureId = `fcap_${Date.now()}_${randHex}`;
+    const shortId = `${this.captureSeq.toString(36)}${randHex}`;
+    const capturedAtIso = new Date().toISOString();
+
+    const captureDir = path.join(this.baseForensicsDir, captureId);
+    try {
+      fs.mkdirSync(captureDir, { recursive: true, mode: 0o700 });
+      try {
+        fs.chmodSync(captureDir, 0o700);
+      } catch {
+        // Ignore
+      }
+    } catch {
+      // Ignore
+    }
+
+    const rawPreProcessJsonPath = path.join(
+      captureDir,
+      '01_raw_pre_process.json'
+    );
+    const decryptedRawProtobufBinPath = path.join(
+      captureDir,
+      '02_decrypted_raw_protobuf.bin'
+    );
+    const decryptedProtobufDecodedJsonPath = path.join(
+      captureDir,
+      '03_decrypted_protobuf_decoded.json'
+    );
+    const extractedUnencryptedTextPath = path.join(
+      captureDir,
+      '04_extracted_unencrypted_text.txt'
+    );
+    const forensicWireAnatomyReportJsonPath = path.join(
+      captureDir,
+      '05_forensic_wire_anatomy_report.json'
+    );
+
+    const messageId =
+      correlatedCtx?.stanzaId ||
+      (rawBinaryNode?.attrs?.id ? String(rawBinaryNode.attrs.id) : '') ||
+      `sig_${shortId}`;
+    const remoteJid =
+      attribution.groupJid ||
+      correlatedCtx?.fromJid ||
+      rawBinaryNode?.attrs?.from ||
+      attribution.senderLidJid ||
+      attribution.senderPnJid ||
+      input.senderJid;
+    const participantJid =
+      correlatedCtx?.participantJid ||
+      (rawBinaryNode?.attrs?.participant
+        ? String(rawBinaryNode.attrs.participant)
+        : undefined) ||
+      (attribution.groupJid ? input.senderJid : undefined);
+
+    if (messageId) {
+      this.signalCapturedStanzaIds.add(`${input.sessionId}:${messageId}`);
+      if (this.signalCapturedStanzaIds.size > 500) {
+        const oldest = this.signalCapturedStanzaIds.values().next().value;
+        if (oldest) this.signalCapturedStanzaIds.delete(oldest);
+      }
+    }
+
+    // =========================================================================
+    // 1. Write 01_raw_pre_process.json & 02_decrypted_raw_protobuf.bin IMMEDIATELY
+    // =========================================================================
+    let preProcessRawBytes = 0;
+    let decryptedProtobufBytes = 0;
+    try {
+      const stage1Envelope = {
+        captureId,
+        shortId,
+        sessionId: input.sessionId,
+        capturedAtIso,
+        captureStage: 'PRE_PROCESS_RAW' as const,
+        rawEventType: 'signal.decrypt' as const,
+        sender_pn: attribution.senderPnJid ?? null,
+        sender_lid: attribution.senderLidJid ?? null,
+        companionDeviceId: attribution.companionDeviceId ?? null,
+        companionDevice: attribution.companionDeviceLabel,
+        signalEnvelope: {
+          encType: input.encType,
+          senderJid: input.senderJid,
+          groupJid: attribution.groupJid ?? null,
+          ciphertextByteLength: input.ciphertextByteLength,
+          paddedPlaintextByteLength: paddedBuf.byteLength,
+          unpaddedPlaintextByteLength: unpadded.byteLength,
+          padLength,
+          paddingValid,
+        },
+        rawBinaryNode: rawBinaryNode ?? null,
+      };
+      const stage1Json = SafeLosslessSerializer.stringify(stage1Envelope, {
+        botTokenToRedact: this.botTokenToRedact,
+        space: 2,
+        maxArrayItems: 5000,
+      });
+      preProcessRawBytes = this.writeFileAtomicSync(
+        rawPreProcessJsonPath,
+        stage1Json
+      );
+    } catch {
+      // Never fail
+    }
+
+    try {
+      decryptedProtobufBytes = this.writeFileAtomicSync(
+        decryptedRawProtobufBinPath,
+        unpadded
+      );
+    } catch {
+      // Never fail
+    }
+
+    // =========================================================================
+    // 2. Engine A (`proto.Message.decode`) + Engine B (`FaultTolerantProtobufWireScanner`)
+    // =========================================================================
+    let decodeSucceeded = false;
+    let decodeError: string | undefined;
+    let decodedPlainObject: Record<string, unknown> | null = null;
+    const wrapperChain: string[] = [];
+    let leafPayloadType = `signal:${input.encType}`;
+    const engineATextStrings: string[] = [];
+
+    try {
+      let decodedMsg: proto.Message | undefined;
+      try {
+        decodedMsg = proto.Message.decode(unpadded);
+      } catch (primaryDecodeErr) {
+        // Fallback: if caller passed an already-unpadded buffer whose last byte happened to match 1..16
+        if (paddingValid && paddedBuf.byteLength !== unpadded.byteLength) {
+          try {
+            decodedMsg = proto.Message.decode(paddedBuf);
+          } catch {
+            throw primaryDecodeErr;
+          }
+        } else {
+          throw primaryDecodeErr;
+        }
+      }
+
+      if (decodedMsg) {
+        const plainObj = proto.Message.toObject(decodedMsg, {
+          defaults: false,
+          arrays: true,
+          bytes: String,
+          longs: String,
+        }) as Record<string, unknown>;
+        const nonMetaKeys = Object.keys(plainObj || {});
+        if (nonMetaKeys.length > 0) {
+          decodeSucceeded = true;
+          decodedPlainObject = plainObj;
+        } else if (unpadded.byteLength > 0) {
+          // Empty object decoded from non-empty buffer implies unknown/corrupted wire tags
+          decodeSucceeded = false;
+          decodeError = 'Decoded Protobuf object had 0 known proto.Message fields';
+        } else {
+          decodeSucceeded = true;
+          decodedPlainObject = plainObj;
+        }
+      }
+    } catch (err) {
+      decodeSucceeded = false;
+      decodeError =
+        err instanceof Error ? `${err.name}: ${err.message}` : String(err);
+    }
+
+    // Inspect decodedPlainObject if Engine A succeeded
+    if (decodedPlainObject) {
+      let currentContainer: Record<string, unknown> | undefined =
+        decodedPlainObject;
+      let depth = 0;
+      while (currentContainer && depth < 16) {
+        let nextInner: Record<string, unknown> | undefined;
+        for (const wk of WRAPPER_MESSAGE_KEYS) {
+          const wv = currentContainer[wk] as Record<string, unknown> | undefined;
+          if (wv && typeof wv === 'object') {
+            wrapperChain.push(wk);
+            const inner =
+              (wv.message as Record<string, unknown> | undefined) ||
+              (
+                wv.futureproofMessage as
+                  | { message?: Record<string, unknown> }
+                  | undefined
+              )?.message;
+            if (inner && typeof inner === 'object') {
+              nextInner = inner;
+            }
+            break;
+          }
+        }
+        if (!nextInner) break;
+        currentContainer = nextInner;
+        depth++;
+      }
+
+      if (currentContainer) {
+        const keys = Object.keys(currentContainer).filter(
+          (k) =>
+            k !== 'messageContextInfo' &&
+            currentContainer![k] !== null &&
+            currentContainer![k] !== undefined
+        );
+        if (keys.length > 0) {
+          leafPayloadType = keys[0]!;
+        } else if (wrapperChain.length > 0) {
+          leafPayloadType = wrapperChain[wrapperChain.length - 1]!;
+        }
+      }
+
+      // Collect strings from decodedPlainObject (bounded walk)
+      const collectDecodedStrings = (node: unknown, d = 0) => {
+        if (!node || d > 10 || engineATextStrings.length >= 1000) return;
+        if (typeof node === 'string') {
+          if (node.trim().length > 0) {
+            engineATextStrings.push(node);
+          }
+          return;
+        }
+        if (Array.isArray(node)) {
+          const limit = Math.min(node.length, 200);
+          for (let i = 0; i < limit; i++) {
+            collectDecodedStrings(node[i], d + 1);
+          }
+          return;
+        }
+        if (typeof node === 'object') {
+          for (const [k, v] of Object.entries(node as Record<string, unknown>)) {
+            if (
+              k === 'mediaKey' ||
+              k === 'fileSha256' ||
+              k === 'fileEncSha256' ||
+              k === 'jpegThumbnail'
+            ) {
+              continue;
+            }
+            collectDecodedStrings(v, d + 1);
+          }
+        }
+      };
+      collectDecodedStrings(decodedPlainObject);
+    }
+
+    // Engine B: FaultTolerantProtobufWireScanner ALWAYS runs on `unpadded`
+    const wireScan = scanProtobufWireFields(unpadded);
+    if (
+      leafPayloadType.startsWith('signal:') &&
+      wireScan.fieldSummaries.length > 0
+    ) {
+      const topNamed = wireScan.fieldSummaries.find((f) => f.fieldName);
+      if (topNamed?.fieldName) {
+        leafPayloadType = topNamed.fieldName;
+      }
+    }
+
+    // Write 03_decrypted_protobuf_decoded.json (bounded against OOM)
+    let postProcessBytes = 0;
+    try {
+      const decodedJsonPayload = {
+        captureId,
+        shortId,
+        sessionId: input.sessionId,
+        capturedAtIso,
+        decodeSucceeded,
+        decodeError: decodeError ?? null,
+        senderAttribution: attribution,
+        wrapperChain,
+        leafPayloadType,
+        decodedMessage: decodedPlainObject,
+        wireScannerFallbackFields: !decodeSucceeded
+          ? wireScan.fieldSummaries.slice(0, 100)
+          : undefined,
+      };
+      const jsonStr = SafeLosslessSerializer.stringify(decodedJsonPayload, {
+        botTokenToRedact: this.botTokenToRedact,
+        space: 2,
+        maxArrayItems: 5000,
+      });
+      postProcessBytes = this.writeFileAtomicSync(
+        decryptedProtobufDecodedJsonPath,
+        jsonStr
+      );
+    } catch {
+      // Never fail
+    }
+
+    // Combine extracted text from Engine A + Engine B and write 04_extracted_unencrypted_text.txt
+    const allExtractedStrings: string[] = [];
+    const seenStr = new Set<string>();
+    for (const s of [...engineATextStrings, ...wireScan.extractedStrings]) {
+      if (s && !seenStr.has(s)) {
+        seenStr.add(s);
+        allExtractedStrings.push(s);
+      }
+    }
+
+    const extractedTextDocument =
+      allExtractedStrings.length > 0
+        ? allExtractedStrings.join('\n')
+        : `[No printable UTF-8 text fields found in ${unpadded.byteLength}B Protobuf payload. Hex preview: ${SafeLosslessSerializer.formatHexPreview(
+            unpadded,
+            128
+          )}]`;
+
+    try {
+      this.writeFileAtomicSync(
+        extractedUnencryptedTextPath,
+        Buffer.from(extractedTextDocument, 'utf8')
+      );
+    } catch {
+      // Never fail
+    }
+
+    const unicodeMap =
+      allExtractedStrings.length > 0
+        ? SafeLosslessSerializer.analyzeUnicodeString(
+            allExtractedStrings.join('\n')
+          )
+        : wireScan.unicodeMap;
+
+    // =========================================================================
+    // 3. Evaluate Anomalies & Pre-Decode Crash Protection Shield (Quarantine Mode)
+    // =========================================================================
+    const anomalies: ForensicAnomalyFlag[] = [];
+    const quarantineReasons: string[] = [];
+
+    if (isOversizedPayload) {
+      quarantineReasons.push(
+        `Oversized decrypted Protobuf (${unpadded.byteLength} bytes > ${QUARANTINE_PLAINTEXT_SIZE_BYTES} bytes)`
+      );
+      anomalies.push({
+        code: 'OVERSIZED_QUARANTINE_PAYLOAD',
+        severity: 'CRITICAL',
+        descriptionArabic: `حمولة فك تشفير ضخمة تتجاوز حد الأمان (${(
+          unpadded.byteLength / 1024
+        ).toFixed(1)} KB > 256 KB) — تم تفعيل وضع العزل الجنائي`,
+        technicalDetail: `unpadded.byteLength = ${unpadded.byteLength} bytes (encType=${input.encType}, ciphertext=${input.ciphertextByteLength}B)`,
+      });
+    }
+
+    if (wireScan.corruptedWireTag || !decodeSucceeded) {
+      quarantineReasons.push(
+        `Corrupted Protobuf wire structure (corruptedOffset=${
+          wireScan.corruptedOffset ?? 'decode_error'
+        })`
+      );
+      anomalies.push({
+        code: 'PROTOBUF_WIRE_CORRUPTION',
+        severity: 'CRITICAL',
+        descriptionArabic: `تلف أو تشويه متعمد في وسم سلك Protobuf عند الإزاحة ${
+          wireScan.corruptedOffset ?? 0
+        } (${decodeError || wireScan.corruptionReasons[0] || 'wire error'})`,
+        technicalDetail: `corruptedOffset=${
+          wireScan.corruptedOffset ?? 'N/A'
+        }, reasons=${wireScan.corruptionReasons.join('; ') || decodeError || 'unknown'}`,
+      });
+    }
+
+    if (wireScan.totalRepeatedItems > 2000) {
+      quarantineReasons.push(
+        `Repeated Protobuf field bomb (totalRepeatedItems=${wireScan.totalRepeatedItems} > 2000)`
+      );
+      anomalies.push({
+        code: 'REPEATED_FIELD_BOMB',
+        severity: 'CRITICAL',
+        descriptionArabic: `قنبلة حقول متكررة في Protobuf (${wireScan.totalRepeatedItems} عنصر مكرر لاستنزاف الذاكرة)`,
+        technicalDetail: `totalRepeatedItems=${wireScan.totalRepeatedItems}, topRepeated=${wireScan.repeatedFieldSummaries
+          .slice(0, 3)
+          .join(', ')}`,
+      });
+    }
+
+    if (
+      unicodeMap.bidiOverrideCount > 200 ||
+      unicodeMap.bidiOverrideCount >= 5 ||
+      unicodeMap.zeroWidthCount > 200 ||
+      unicodeMap.combiningMarkCount >= 25 ||
+      unicodeMap.loneSurrogateCount > 0 ||
+      unicodeMap.nullByteCount > 0 ||
+      unicodeMap.charLength > 65536
+    ) {
+      if (unicodeMap.bidiOverrideCount > 200) {
+        quarantineReasons.push(
+          `Unicode BiDi crash bomb (bidiOverrideCount=${unicodeMap.bidiOverrideCount} > 200)`
+        );
+      }
+      anomalies.push({
+        code: 'UNICODE_CRASH_VECTOR',
+        severity: 'CRITICAL',
+        descriptionArabic:
+          'حمولة نصية مشوهة أو هجومية بعد فك تشفير Signal (رموز BiDi عكسية / Virtex / بدائل UTF-16)',
+        technicalDetail: `bidi=${unicodeMap.bidiOverrideCount}, zeroWidth=${unicodeMap.zeroWidthCount}, combining=${unicodeMap.combiningMarkCount}, loneSurrogates=${unicodeMap.loneSurrogateCount}, nullBytes=${unicodeMap.nullByteCount}, len=${unicodeMap.charLength}`,
+      });
+    }
+
+    if (wrapperChain.length > 5 || wireScan.maxNestingDepth > 8) {
+      anomalies.push({
+        code: 'DEEP_WRAPPER_NESTING',
+        severity: 'CRITICAL',
+        descriptionArabic: `تداخل عميق لأغلفة الرسالة أو بنية Protobuf (العمق: ${Math.max(
+          wrapperChain.length,
+          wireScan.maxNestingDepth
+        )})`,
+        technicalDetail: `wrapperDepth=${wrapperChain.length}, wireMaxDepth=${wireScan.maxNestingDepth}`,
+      });
+    }
+
+    const quarantineTriggered = quarantineReasons.length > 0;
+    const hasCritical = anomalies.some((a) => a.severity === 'CRITICAL');
+    const isAnomalous = anomalies.length > 0;
+
+    const threatVerdict: ForensicThreatVerdict = {
+      isAnomalous,
+      riskLevel: hasCritical
+        ? 'HOSTILE_CRASH_VECTOR'
+        : isAnomalous
+          ? 'SUSPICIOUS'
+          : 'CLEAN',
+      verdictSummaryArabic: isAnomalous
+        ? `🚨 تحذير جنائي: حمولة مشوهة / هجومية مفكوكة التشفير [${anomalies
+            .map((a) => a.code)
+            .join(' + ')}]`
+        : '🟢 سليم (تم فك تشفير Signal وفحص البنية السلكية بنجاح)',
+      anomalies,
+    };
+
+    const surface = classifyForensicSurface(remoteJid, 'messages.upsert');
+    const senderOs = detectSenderOsFingerprint(messageId);
+
+    // =========================================================================
+    // 4. Write 05_forensic_wire_anatomy_report.json
+    // =========================================================================
+    try {
+      const wireAnatomyReport = {
+        captureId,
+        shortId,
+        sessionId: input.sessionId,
+        capturedAtIso,
+        captureStage: 'SIGNAL_POST_DECRYPTION_WIRE_ANATOMY' as const,
+        surface,
+        senderAttribution: {
+          senderPnJid: attribution.senderPnJid ?? null,
+          senderPhoneDigits: attribution.senderPhoneDigits ?? null,
+          senderLidJid: attribution.senderLidJid ?? null,
+          senderLidBaseJid: attribution.senderLidBaseJid ?? null,
+          companionDeviceId: attribution.companionDeviceId ?? null,
+          companionDeviceTag: attribution.companionDeviceTag ?? null,
+          companionDeviceLabel: attribution.companionDeviceLabel,
+          rawSenderJid: attribution.rawSenderJid,
+          groupJid: attribution.groupJid ?? null,
+          addressingMode: attribution.addressingMode,
+          senderOs,
+          messageId,
+        },
+        signalLayer: {
+          encType: input.encType,
+          ciphertextByteLength: input.ciphertextByteLength,
+          paddedPlaintextByteLength: paddedBuf.byteLength,
+          unpaddedPlaintextByteLength: unpadded.byteLength,
+          padLength,
+          paddingValid,
+          unpaddedSha256Hex: crypto
+            .createHash('sha256')
+            .update(unpadded)
+            .digest('hex'),
+        },
+        protobufEngineA: {
+          decodeSucceeded,
+          decodeError: decodeError ?? null,
+          wrapperChain,
+          leafPayloadType,
+        },
+        wireScannerEngineB: {
+          totalBytes: wireScan.totalBytes,
+          totalWireFieldsScanned: wireScan.totalWireFieldsScanned,
+          totalRepeatedItems: wireScan.totalRepeatedItems,
+          maxNestingDepth: wireScan.maxNestingDepth,
+          corruptedWireTag: wireScan.corruptedWireTag,
+          corruptedOffset: wireScan.corruptedOffset ?? null,
+          corruptedOffsets: wireScan.corruptedOffsets,
+          corruptionReasons: wireScan.corruptionReasons,
+          repeatedFieldSummaries: wireScan.repeatedFieldSummaries.slice(0, 100),
+          topFieldsByBytes: wireScan.fieldSummaries.slice(0, 50),
+          extractedJids: wireScan.extractedJids,
+          extractedUrls: wireScan.extractedUrls,
+          extractedJsonFragmentsCount: wireScan.extractedJsonFragments.length,
+          unparsedTailHex: wireScan.unparsedTailHex ?? null,
+        },
+        unicodeForensics: unicodeMap,
+        quarantineShield: {
+          quarantineTriggered,
+          exceeds256KbThreshold: isOversizedPayload,
+          quarantineReasons,
+        },
+        threatVerdict,
+      };
+
+      const reportJson = SafeLosslessSerializer.stringify(wireAnatomyReport, {
+        botTokenToRedact: this.botTokenToRedact,
+        space: 2,
+        maxArrayItems: 5000,
+      });
+      this.writeFileAtomicSync(forensicWireAnatomyReportJsonPath, reportJson);
+    } catch {
+      // Never fail
+    }
+
+    const record: ForensicCaptureRecord = {
+      captureId,
+      shortId,
+      sessionId: input.sessionId,
+      capturedAtIso,
+      rawEventType: 'signal.decrypt',
+      surface,
+      messageId,
+      remoteJid,
+      participantJid,
+      senderPnJid: attribution.senderPnJid,
+      senderLidJid: attribution.senderLidJid,
+      companionDeviceId: attribution.companionDeviceId,
+      companionDeviceTag: attribution.companionDeviceTag,
+      addressingMode: attribution.addressingMode,
+      senderOs,
+      payloadType: leafPayloadType,
+      wrapperChain,
+      threatVerdict,
+      unicodeMap,
+      mediaInfo: {
+        hasMedia: false,
+        decryptionSucceeded: true,
+        encryptedFallbackUsed: false,
+      },
+      preProcessRawBytes,
+      postProcessBytes,
+      mediaBytes: decryptedProtobufBytes,
+      signalEncType: input.encType,
+      ciphertextBytes: input.ciphertextByteLength,
+      decryptedProtobufBytes,
+      quarantineTriggered,
+      wireScanSummary: wireScan,
+      processingError: decodeError,
+      files: {
+        captureDir,
+        rawPreProcessJsonPath,
+        postProcessForensicsJsonPath: forensicWireAnatomyReportJsonPath,
+        rawTextUtf8Path: extractedUnencryptedTextPath,
+        decryptedRawProtobufBinPath,
+        decryptedProtobufDecodedJsonPath,
+        extractedUnencryptedTextPath,
+        forensicWireAnatomyReportJsonPath,
+      },
+    };
+
+    // Store in ring buffer (newest first, max 200)
+    this.capturesRingBuffer.unshift(record);
+    while (this.capturesRingBuffer.length > this.maxRingBufferSize) {
+      const evicted = this.capturesRingBuffer.pop();
+      if (evicted?.files.captureDir) {
+        try {
+          fs.rmSync(evicted.files.captureDir, { recursive: true, force: true });
+        } catch {
+          // Ignore
+        }
+      }
+    }
+
+    // Trigger automatic Telegram upload when enabled (or unconditionally when quarantineTriggered & autoUploadToTelegram)
+    if (
+      this.onForensicCaptureReady &&
+      cfg.autoUploadToTelegram &&
+      (quarantineTriggered || this.matchesSurfaceFilter(record, cfg.surfaceFilter))
+    ) {
+      try {
+        const summaryText = this.formatSanitizedTelegramSummary(record);
+        const attachments = this.buildCaptureDocumentAttachments(record);
+        this.onForensicCaptureReady(record, summaryText, attachments);
+      } catch (cbErr) {
+        log.warn('Error in onForensicCaptureReady callback for Signal plaintext', {
+          captureId,
+          error: cbErr instanceof Error ? cbErr.message : String(cbErr),
+        });
+      }
+    }
+
+    return record;
+  }
+
+  /**
+   * STEP 1.2: Captures Signal decryption failures (`onSignalDecryptionFailed`) with full stanza context
+   * and the raw ciphertext buffer (`01_raw_payload.bin`).
+   */
+  public onSignalDecryptionFailed(
+    input: SignalDecryptionFailedInput
+  ): ForensicCaptureRecord | null {
+    const cfg = this.getConfig();
+    if (!input.forceCapture && !cfg.enabled) {
+      return null;
+    }
+    if (
+      !input.forceCapture &&
+      cfg.targetSessionIds !== 'ALL' &&
+      Array.isArray(cfg.targetSessionIds) &&
+      !cfg.targetSessionIds.includes(input.sessionId)
+    ) {
+      return null;
+    }
+
+    const correlatedCtx = this.resolveCorrelatedStanzaContext({
+      sessionId: input.sessionId,
+      senderJid: input.senderJid,
+      groupJid: input.groupJid,
+      encType: input.encType,
+      ciphertextByteLength: input.ciphertextByteLength,
+      stanzaNode: input.stanzaNode,
+    });
+
+    const rawBinaryNode =
+      (input.stanzaNode as BinaryNode | undefined) ??
+      correlatedCtx?.rawBinaryNode;
+
+    const attribution = extractSenderAttribution({
+      senderJid: input.senderJid,
+      groupJid: input.groupJid,
+      stanzaNode: rawBinaryNode,
+      correlatedContext: correlatedCtx,
+    });
+
+    this.captureSeq = (this.captureSeq + 1) % 1_000_000;
+    const randHex = crypto.randomBytes(3).toString('hex');
+    const captureId = `fcap_${Date.now()}_${randHex}`;
+    const shortId = `${this.captureSeq.toString(36)}${randHex}`;
+    const capturedAtIso = new Date().toISOString();
+    const captureDir = path.join(this.baseForensicsDir, captureId);
+
+    try {
+      fs.mkdirSync(captureDir, { recursive: true, mode: 0o700 });
+    } catch {
+      // Ignore
+    }
+
+    const rawPreProcessJsonPath = path.join(
+      captureDir,
+      '01_raw_pre_process.json'
+    );
+    const rawPayloadBinPath = path.join(captureDir, '01_raw_payload.bin');
+    const postProcessForensicsJsonPath = path.join(
+      captureDir,
+      '02_post_process_forensics.json'
+    );
+
+    const errMsg =
+      input.error instanceof Error
+        ? `${input.error.name}: ${input.error.message}`
+        : String(input.error);
+
+    const cipherBuf = Buffer.isBuffer(input.ciphertext)
+      ? input.ciphertext
+      : Buffer.from(
+          input.ciphertext.buffer,
+          input.ciphertext.byteOffset,
+          input.ciphertext.byteLength
+        );
+
+    let preProcessRawBytes = 0;
+    let postProcessBytes = 0;
+    try {
+      preProcessRawBytes = this.writeFileAtomicSync(
+        rawPreProcessJsonPath,
+        SafeLosslessSerializer.stringify(
+          {
+            captureId,
+            shortId,
+            sessionId: input.sessionId,
+            capturedAtIso,
+            captureStage: 'PRE_PROCESS_RAW',
+            rawEventType: 'signal.decrypt_failed',
+            sender_pn: attribution.senderPnJid ?? null,
+            sender_lid: attribution.senderLidJid ?? null,
+            companionDeviceId: attribution.companionDeviceId ?? null,
+            signalError: errMsg,
+            rawBinaryNode: rawBinaryNode ?? null,
+          },
+          { botTokenToRedact: this.botTokenToRedact, space: 2 }
+        )
+      );
+      if (cipherBuf.byteLength > 0) {
+        this.writeFileAtomicSync(rawPayloadBinPath, cipherBuf);
+      }
+      postProcessBytes = this.writeFileAtomicSync(
+        postProcessForensicsJsonPath,
+        SafeLosslessSerializer.stringify(
+          {
+            captureId,
+            shortId,
+            sessionId: input.sessionId,
+            capturedAtIso,
+            senderAttribution: attribution,
+            encType: input.encType,
+            ciphertextByteLength: input.ciphertextByteLength,
+            decryptionError: errMsg,
+          },
+          { botTokenToRedact: this.botTokenToRedact, space: 2 }
+        )
+      );
+    } catch {
+      // Ignore
+    }
+
+    const messageId =
+      correlatedCtx?.stanzaId ||
+      (rawBinaryNode?.attrs?.id ? String(rawBinaryNode.attrs.id) : '') ||
+      `sigfail_${shortId}`;
+    const remoteJid =
+      attribution.groupJid ||
+      correlatedCtx?.fromJid ||
+      attribution.senderLidJid ||
+      attribution.senderPnJid ||
+      input.senderJid;
+
+    const anomalies: ForensicAnomalyFlag[] = [
+      {
+        code: 'SIGNAL_DECRYPTION_FAILURE',
+        severity: 'CRITICAL',
+        descriptionArabic: `فشل فك تشفير طبقة Signal (${input.encType}): ${errMsg}`,
+        technicalDetail: `encType=${input.encType}, ciphertext=${input.ciphertextByteLength}B, err=${errMsg}`,
+      },
+    ];
+
+    const record: ForensicCaptureRecord = {
+      captureId,
+      shortId,
+      sessionId: input.sessionId,
+      capturedAtIso,
+      rawEventType: 'signal.decrypt_failed',
+      surface: classifyForensicSurface(remoteJid, 'messages.upsert'),
+      messageId,
+      remoteJid,
+      senderPnJid: attribution.senderPnJid,
+      senderLidJid: attribution.senderLidJid,
+      companionDeviceId: attribution.companionDeviceId,
+      companionDeviceTag: attribution.companionDeviceTag,
+      addressingMode: attribution.addressingMode,
+      senderOs: detectSenderOsFingerprint(messageId),
+      payloadType: `signal_failed:${input.encType}`,
+      wrapperChain: [],
+      threatVerdict: {
+        isAnomalous: true,
+        riskLevel: 'HOSTILE_CRASH_VECTOR',
+        verdictSummaryArabic: `🚨 تحذير جنائي: فشل فك تشفير Signal [SIGNAL_DECRYPTION_FAILURE]`,
+        anomalies,
+      },
+      mediaInfo: {
+        hasMedia: false,
+        decryptionSucceeded: false,
+        encryptedFallbackUsed: true,
+      },
+      preProcessRawBytes,
+      postProcessBytes,
+      mediaBytes: cipherBuf.byteLength,
+      signalEncType: input.encType,
+      ciphertextBytes: input.ciphertextByteLength,
+      processingError: errMsg,
+      files: {
+        captureDir,
+        rawPreProcessJsonPath,
+        rawPayloadBinPath: cipherBuf.byteLength > 0 ? rawPayloadBinPath : undefined,
+        postProcessForensicsJsonPath,
+      },
+    };
+
+    this.capturesRingBuffer.unshift(record);
+    while (this.capturesRingBuffer.length > this.maxRingBufferSize) {
+      const evicted = this.capturesRingBuffer.pop();
+      if (evicted?.files.captureDir) {
+        try {
+          fs.rmSync(evicted.files.captureDir, { recursive: true, force: true });
+        } catch {
+          // Ignore
+        }
+      }
+    }
+
+    if (
+      this.onForensicCaptureReady &&
+      cfg.autoUploadToTelegram &&
+      this.matchesSurfaceFilter(record, cfg.surfaceFilter)
+    ) {
+      try {
+        const summaryText = this.formatSanitizedTelegramSummary(record);
+        const attachments = this.buildCaptureDocumentAttachments(record);
+        this.onForensicCaptureReady(record, summaryText, attachments);
+      } catch {
+        // Ignore
+      }
+    }
+
+    return record;
   }
 
   public listCaptures(options?: {
@@ -964,12 +3210,17 @@ export class ForensicPayloadAnalyzer {
       }
     }
     this.capturesRingBuffer.length = 0;
+    this.pendingStanzaByKey.clear();
+    this.latestStanzaBySession.clear();
+    this.signalCapturedStanzaIds.clear();
     return count;
   }
 
   private writeFileAtomicSync(filePath: string, data: Buffer | string): number {
     const buf = Buffer.isBuffer(data) ? data : Buffer.from(data, 'utf8');
-    const tmpPath = `${filePath}.tmp.${process.pid}.${Date.now()}`;
+    const tmpPath = `${filePath}.tmp.${process.pid}.${Date.now()}.${Math.random()
+      .toString(36)
+      .slice(2, 7)}`;
     fs.writeFileSync(tmpPath, buf, { mode: 0o600 });
     fs.renameSync(tmpPath, filePath);
     try {
@@ -1022,6 +3273,11 @@ export class ForensicPayloadAnalyzer {
     let rawPayloadBinPath: string | undefined;
     let preProcessRawBytes = 0;
 
+    const attribution = extractSenderAttribution({
+      stanzaNode: input.rawBinaryNode,
+      rawWaMessage: input.rawWaMessage,
+    });
+
     // =========================================================================
     // STAGE 1: Pre-Processing Raw Capture (Must Never Throw or Fail)
     // =========================================================================
@@ -1040,6 +3296,9 @@ export class ForensicPayloadAnalyzer {
         capturedAtIso,
         captureStage: 'PRE_PROCESS_RAW' as const,
         rawEventType: input.rawEventType,
+        sender_pn: attribution.senderPnJid ?? null,
+        sender_lid: attribution.senderLidJid ?? null,
+        companionDeviceId: attribution.companionDeviceId ?? null,
         rawBinaryNode: input.rawBinaryNode ?? null,
         rawWaMessage: input.rawWaMessage ?? null,
       };
@@ -1047,6 +3306,7 @@ export class ForensicPayloadAnalyzer {
       const stage1Json = SafeLosslessSerializer.stringify(stage1Envelope, {
         botTokenToRedact: this.botTokenToRedact,
         space: 2,
+        maxArrayItems: 5000,
       });
       preProcessRawBytes = this.writeFileAtomicSync(
         rawPreProcessJsonPath,
@@ -1115,8 +3375,10 @@ export class ForensicPayloadAnalyzer {
     let messageId = '';
     let remoteJid = '';
     let participantJid: string | undefined;
-    let senderPnJid: string | undefined;
-    let senderLidJid: string | undefined;
+    let senderPnJid: string | undefined = attribution.senderPnJid;
+    let senderLidJid: string | undefined = attribution.senderLidJid;
+    const companionDeviceId: number | undefined = attribution.companionDeviceId;
+    const companionDeviceTag: string | undefined = attribution.companionDeviceTag;
     let addressingMode: string | undefined;
     let senderOs: SenderOsFingerprint = 'Desktop / Companion';
     let payloadType: string = input.rawEventType;
@@ -1148,12 +3410,8 @@ export class ForensicPayloadAnalyzer {
       >;
       const nodeAttrs = (rawNode?.attrs ?? {}) as Record<string, string>;
 
-      messageId = String(
-        msgKey.id || nodeAttrs.id || `stanza_${shortId}`
-      );
-      remoteJid = String(
-        msgKey.remoteJid || nodeAttrs.from || ''
-      );
+      messageId = String(msgKey.id || nodeAttrs.id || `stanza_${shortId}`);
+      remoteJid = String(msgKey.remoteJid || nodeAttrs.from || '');
       participantJid =
         typeof msgKey.participant === 'string' && msgKey.participant
           ? msgKey.participant
@@ -1170,34 +3428,21 @@ export class ForensicPayloadAnalyzer {
       );
 
       // Extract PN & LID JIDs across all candidate fields
-      const candidateJids = [
-        remoteJid,
-        participantJid,
-        typeof msgKey.remoteJidAlt === 'string' ? msgKey.remoteJidAlt : undefined,
-        typeof msgKey.participantAlt === 'string' ? msgKey.participantAlt : undefined,
-        typeof rawStanzaMeta.senderPn === 'string' ? rawStanzaMeta.senderPn : undefined,
-        typeof rawStanzaMeta.rawFrom === 'string' ? rawStanzaMeta.rawFrom : undefined,
-        typeof rawStanzaMeta.rawParticipant === 'string'
-          ? rawStanzaMeta.rawParticipant
-          : undefined,
-        nodeAttrs.sender_pn,
-        nodeAttrs.participant_pn,
-        nodeAttrs.recipient_pn,
-      ].filter((j): j is string => typeof j === 'string' && j.length > 0);
-
-      for (const cj of candidateJids) {
-        if (cj.endsWith('@s.whatsapp.net') && !senderPnJid) {
-          senderPnJid = cj;
-        } else if (cj.endsWith('@lid') && !senderLidJid) {
-          senderLidJid = cj;
-        }
+      if (!senderPnJid) {
+        senderPnJid = attribution.senderPnJid;
+      }
+      if (!senderLidJid) {
+        senderLidJid = attribution.senderLidJid;
       }
 
       surface = classifyForensicSurface(remoteJid, input.rawEventType);
       senderOs = detectSenderOsFingerprint(messageId);
 
       // Check if payload explicitly triggers a simulated/corrupted dissection error
-      if (rawMsg && typeof rawMsg.__simulateCorruptedDissectionThrow === 'function') {
+      if (
+        rawMsg &&
+        typeof rawMsg.__simulateCorruptedDissectionThrow === 'function'
+      ) {
         (rawMsg.__simulateCorruptedDissectionThrow as () => void)();
       }
 
@@ -1218,11 +3463,11 @@ export class ForensicPayloadAnalyzer {
             wrapperChain.push(wrapperKey);
             const innerMsg =
               (wrapperVal.message as Record<string, unknown> | undefined) ||
-              ((
-                wrapperVal. futureproofMessage as
+              (
+                wrapperVal.futureproofMessage as
                   | { message?: Record<string, unknown> }
                   | undefined
-              )?.message);
+              )?.message;
             if (innerMsg && typeof innerMsg === 'object') {
               unwrappedNext = innerMsg;
             }
@@ -1255,13 +3500,13 @@ export class ForensicPayloadAnalyzer {
             currentMessageContainer![k] !== undefined
         );
         if (keys.length > 0) {
-          payloadType = keys[0];
+          payloadType = keys[0]!;
           const candidateLeaf = currentMessageContainer[payloadType];
           if (candidateLeaf && typeof candidateLeaf === 'object') {
             leafContentObj = candidateLeaf as Record<string, unknown>;
           }
         } else if (wrapperChain.length > 0) {
-          payloadType = wrapperChain[wrapperChain.length - 1];
+          payloadType = wrapperChain[wrapperChain.length - 1]!;
         }
       } else if (rawNode?.tag) {
         payloadType = `stanza:${rawNode.tag}`;
@@ -1353,8 +3598,8 @@ export class ForensicPayloadAnalyzer {
               selfJids.some(
                 (sj) =>
                   sj === quotedParticipant ||
-                  sj.split('@')[0].split(':')[0] ===
-                    quotedParticipant.split('@')[0].split(':')[0]
+                  sj.split('@')[0]!.split(':')[0] ===
+                    quotedParticipant.split('@')[0]!.split(':')[0]
               ));
           if (
             claimsToBeFromBot &&
@@ -1674,6 +3919,8 @@ export class ForensicPayloadAnalyzer {
           participantJid,
           senderPnJid,
           senderLidJid,
+          companionDeviceId,
+          companionDeviceTag,
           addressingMode,
           senderOs,
         },
@@ -1689,6 +3936,7 @@ export class ForensicPayloadAnalyzer {
       const stage2Json = SafeLosslessSerializer.stringify(stage2Report, {
         botTokenToRedact: this.botTokenToRedact,
         space: 2,
+        maxArrayItems: 5000,
       });
       postProcessBytes = this.writeFileAtomicSync(
         postProcessForensicsJsonPath,
@@ -1710,6 +3958,8 @@ export class ForensicPayloadAnalyzer {
       participantJid,
       senderPnJid,
       senderLidJid,
+      companionDeviceId,
+      companionDeviceTag,
       addressingMode,
       senderOs,
       payloadType,
@@ -1794,7 +4044,28 @@ export class ForensicPayloadAnalyzer {
     const safeLid = record.senderLidJid
       ? escapeMarkdown(record.senderLidJid.slice(0, 64))
       : '—';
+    const deviceSuffix =
+      record.companionDeviceId !== undefined
+        ? ` (الجهاز المرافق: \`#${record.companionDeviceId}\` / \`${record.companionDeviceTag || `:${record.companionDeviceId}`}\`)`
+        : '';
     const safeMsgId = escapeMarkdown(record.messageId.slice(0, 64));
+
+    const signalLine =
+      record.decryptedProtobufBytes !== undefined
+        ? `\n🔓 *طبقة تشفير Signal (\`${escapeMarkdown(record.signalEncType || 'msg')}\`):* المشفر \`${
+            record.ciphertextBytes ?? 0
+          } B\` ⬅️ المفكوك الخام (Protobuf): \`${record.decryptedProtobufBytes} B\`${
+            record.quarantineTriggered ? ' 🛡️ *(وضع العزل الفوري مفعّل)*' : ''
+          }`
+        : '';
+
+    const wireLine = record.wireScanSummary
+      ? `\n🧬 *تشريح سلك Protobuf:* الحقول: \`${record.wireScanSummary.totalWireFieldsScanned}\` | العناصر المكررة: \`${record.wireScanSummary.totalRepeatedItems}\` | أقصى عمق: \`${record.wireScanSummary.maxNestingDepth}\` | تلف سلكي: \`${
+          record.wireScanSummary.corruptedWireTag
+            ? `نعم (عند ${record.wireScanSummary.corruptedOffset ?? 0})`
+            : 'لا'
+        }\``
+      : '';
 
     const anomalyLines =
       record.threatVerdict.anomalies.length > 0
@@ -1814,9 +4085,9 @@ export class ForensicPayloadAnalyzer {
       : '';
 
     const errorLine = record.processingError
-      ? `\n⚠️ *ملاحظة مرحلة التشريح 2:* \`${escapeMarkdown(
+      ? `\n⚠️ *ملاحظة مرحلة التشريح:* \`${escapeMarkdown(
           record.processingError.slice(0, 160)
-        )}\` (تم حفظ النسخة الخام في المرحلة 1 بالكامل)`
+        )}\` (تم حفظ الحمولة المفكوكة والنسخة الخام بالكامل)`
       : '';
 
     return (
@@ -1826,14 +4097,16 @@ export class ForensicPayloadAnalyzer {
       `📱 *الجلسة:* \`${escapeMarkdown(record.sessionId)}\` | 🕒 *الوقت:* \`${record.capturedAtIso}\`\n` +
       `🌐 *السطح (Surface):* ${surfaceLabel}\n` +
       `🎯 *المصدر (JID):* \`${safeRemote}\`\n` +
-      `📞 *هاتف المرسل (PN):* \`${safePn}\` | 🎭 *معرف LID:* \`${safeLid}\`\n` +
+      `📞 *هاتف المرسل (PN):* \`${safePn}\` | 🎭 *معرف LID:* \`${safeLid}\`${deviceSuffix}\n` +
       `💻 *بصمة نظام المرسل (OS):* \`${record.senderOs}\` (المعرف: \`${safeMsgId}\`)\n` +
       `📦 *نوع الحمولة وسلسلة الأغلفة:* \`${escapeMarkdown(wrapperPath)}\`\n` +
       `⚖️ *الحكم الجنائي:* ${record.threatVerdict.verdictSummaryArabic}\n` +
       `📊 *أحجام الملفات المحفوظة بدون تعديل:*\n` +
       `• المرحلة 1 (Raw Pre-Process): \`${record.preProcessRawBytes} B\`\n` +
-      `• المرحلة 2 (Post-Process Forensics): \`${record.postProcessBytes} B\`\n` +
-      `• حجم الوسائط الخام: \`${record.mediaBytes} B\`` +
+      `• المرحلة 2 (Post-Process / Decoded): \`${record.postProcessBytes} B\`\n` +
+      `• حجم الحمولة الثنائية / الوسائط: \`${record.mediaBytes} B\`` +
+      signalLine +
+      wireLine +
       unicodeLine +
       anomalyLines +
       errorLine
@@ -1862,10 +4135,86 @@ export class ForensicPayloadAnalyzer {
         fileName: `${record.captureId}_01_raw_pre_process.json`,
         mimeType: 'application/json',
         buffer: buf,
-        caption: `🛡️ [${record.captureId}] المرحلة 1: الحمولة الخام قبل أي معالجة (Pre-Process Raw Capture)`,
+        caption: `🛡️ [${record.captureId}] 01: العقدة الخام والهوية (PN: ${record.senderPnJid || '—'} | LID: ${record.senderLidJid || '—'})`,
       });
     }
 
+    // If this is a Signal Post-Decryption capture, attach the 5-file decrypted forensic bundle:
+    if (
+      record.files.decryptedRawProtobufBinPath &&
+      fs.existsSync(record.files.decryptedRawProtobufBinPath)
+    ) {
+      // 2. <captureId>_02_decrypted_raw_protobuf.bin
+      const rawProtoBuf = fs.readFileSync(
+        record.files.decryptedRawProtobufBinPath
+      );
+      attachments.push({
+        kind: 'document',
+        filePath: record.files.decryptedRawProtobufBinPath,
+        fileName: `${record.captureId}_02_decrypted_raw_protobuf.bin`,
+        mimeType: 'application/octet-stream',
+        buffer: rawProtoBuf,
+        caption: `🔓 [${record.captureId}] 02: بايتات Protobuf الخام المفكوكة بعد إزالة تشفير Signal (${rawProtoBuf.byteLength} B)`,
+      });
+
+      // 3. <captureId>_03_decrypted_protobuf_decoded.json
+      if (
+        record.files.decryptedProtobufDecodedJsonPath &&
+        fs.existsSync(record.files.decryptedProtobufDecodedJsonPath)
+      ) {
+        const decodedJsonBuf = fs.readFileSync(
+          record.files.decryptedProtobufDecodedJsonPath
+        );
+        attachments.push({
+          kind: 'document',
+          filePath: record.files.decryptedProtobufDecodedJsonPath,
+          fileName: `${record.captureId}_03_decrypted_protobuf_decoded.json`,
+          mimeType: 'application/json',
+          buffer: decodedJsonBuf,
+          caption: `🧬 [${record.captureId}] 03: الهيكل الكامل للرسالة المفكوكة (Decoded Protobuf JSON)`,
+        });
+      }
+
+      // 4. <captureId>_04_extracted_unencrypted_text.txt
+      if (
+        record.files.extractedUnencryptedTextPath &&
+        fs.existsSync(record.files.extractedUnencryptedTextPath)
+      ) {
+        const extractedTxtBuf = fs.readFileSync(
+          record.files.extractedUnencryptedTextPath
+        );
+        attachments.push({
+          kind: 'document',
+          filePath: record.files.extractedUnencryptedTextPath,
+          fileName: `${record.captureId}_04_extracted_unencrypted_text.txt`,
+          mimeType: 'application/octet-stream',
+          buffer: extractedTxtBuf,
+          caption: `📄 [${record.captureId}] 04: جميع النصوص السليمة والمشوهة والروابط والمعرفات المستخرجة من الحمولة المفكوكة`,
+        });
+      }
+
+      // 5. <captureId>_05_forensic_wire_anatomy_report.json
+      if (
+        record.files.forensicWireAnatomyReportJsonPath &&
+        fs.existsSync(record.files.forensicWireAnatomyReportJsonPath)
+      ) {
+        const wireReportBuf = fs.readFileSync(
+          record.files.forensicWireAnatomyReportJsonPath
+        );
+        attachments.push({
+          kind: 'document',
+          filePath: record.files.forensicWireAnatomyReportJsonPath,
+          fileName: `${record.captureId}_05_forensic_wire_anatomy_report.json`,
+          mimeType: 'application/json',
+          buffer: wireReportBuf,
+          caption: `🔬 [${record.captureId}] 05: تقرير التشريح السلكي وإحصائيات الحقول المكررة وهوية الجهاز المرافق`,
+        });
+      }
+
+      return attachments;
+    }
+
+    // Standard Stage 2 Post-Process Forensics Bundle:
     // 2. <captureId>_02_post_process_forensics.json
     if (
       record.files.postProcessForensicsJsonPath &&
@@ -1917,9 +4266,10 @@ export class ForensicPayloadAnalyzer {
       fs.existsSync(record.files.mediaArtifactPath)
     ) {
       const buf = fs.readFileSync(record.files.mediaArtifactPath);
-      const ext = path
-        .extname(record.files.mediaArtifactFileName || '.bin')
-        .replace(/^\./, '') || 'bin';
+      const ext =
+        path
+          .extname(record.files.mediaArtifactFileName || '.bin')
+          .replace(/^\./, '') || 'bin';
       const docName = record.mediaInfo.encryptedFallbackUsed
         ? `${record.captureId}_04_raw_encrypted_media.enc`
         : `${record.captureId}_04_media_original.${ext}`;

@@ -47,6 +47,7 @@ import {
 import {
   ForensicPayloadAnalyzer,
   getForensicPayloadAnalyzer,
+  hookSignalRepositoryForForensics,
   RawForensicEventType,
   sanitizeIncomingMessageForDownstream,
 } from '../security/forensic-payload-analyzer';
@@ -1743,8 +1744,21 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
         : optionsOrSender?.messageSender;
   }
 
+  private lastActiveIncomingStanza: BinaryNode | undefined;
+
   public get forensicAnalyzer(): ForensicPayloadAnalyzer {
     return getForensicPayloadAnalyzer();
+  }
+
+  public instrumentSignalRepositoryForForensics(sock: WASocket): void {
+    hookSignalRepositoryForForensics({
+      sessionId: this.sessionId,
+      signalRepository: sock.signalRepository as unknown as
+        | Record<string, unknown>
+        | undefined,
+      analyzer: this.forensicAnalyzer,
+      getStanzaNode: () => this.lastActiveIncomingStanza,
+    });
   }
 
   /**
@@ -1756,6 +1770,7 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
     this.authenticatedOpen = true;
     this.handshakeReady = true;
     this.connectionState = 'CONNECTED';
+    this.instrumentSignalRepositoryForForensics(sock);
     const unbind = this.memoryStore.bind(sock.ev);
     const onReceipt = (
       updates: Array<{
@@ -1799,12 +1814,14 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
       ws?: {
         on?: (event: string, cb: (node: unknown) => void) => void;
         off?: (event: string, cb: (node: unknown) => void) => void;
+        prependListener?: (event: string, cb: (node: unknown) => void) => void;
       };
     };
     if (anySock.__botezzTelemetryInstrumented) {
       return () => undefined;
     }
     anySock.__botezzTelemetryInstrumented = true;
+    this.instrumentSignalRepositoryForForensics(sock);
     const monitor = getNetworkTrafficMonitor();
 
     if (typeof sock.query === 'function') {
@@ -2168,8 +2185,34 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
                 node: bNode as InspectableBinaryNode,
               });
 
-              if (
-                evt === 'CB:message' ||
+              if (evt === 'CB:message') {
+                this.lastActiveIncomingStanza = bNode;
+                const stanzaCtx =
+                  this.forensicAnalyzer.recordIncomingMessageStanzaContext({
+                    sessionId: this.sessionId,
+                    node: bNode,
+                  });
+                const hasSignalEnc = Boolean(
+                  stanzaCtx &&
+                    stanzaCtx.encNodes.some(
+                      (e) =>
+                        e.type === 'pkmsg' ||
+                        e.type === 'msg' ||
+                        e.type === 'skmsg'
+                    ) &&
+                    sock.signalRepository
+                );
+                if (!hasSignalEnc) {
+                  void this.forensicAnalyzer
+                    .captureIncomingPayload({
+                      sessionId: this.sessionId,
+                      rawEventType: 'ws.CB:message',
+                      rawBinaryNode: bNode,
+                      sock,
+                    })
+                    .catch(() => undefined);
+                }
+              } else if (
                 evt === 'CB:call' ||
                 evt === 'CB:iq' ||
                 evt === 'CB:notification'
@@ -2236,7 +2279,11 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
             // Never disrupt socket pipeline
           }
         };
-        ws.on(evt, fn);
+        if (evt === 'CB:message' && typeof ws.prependListener === 'function') {
+          ws.prependListener(evt, fn);
+        } else {
+          ws.on(evt, fn);
+        }
         wsCallbacks.push({ event: evt, fn });
       }
     }
@@ -2411,6 +2458,7 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
     });
 
     this.sock = sock;
+    this.instrumentSignalRepositoryForForensics(sock);
 
     const rawStanzaNodeByMsgId = new Map<string, BinaryNode>();
 
@@ -2434,26 +2482,33 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
             sock.user?.lid || state.creds?.me?.lid || '',
           ].filter(Boolean);
 
-          // Preserve an untouched shallow/inner reference of `msg` for Stage 1 & Stage 2 forensic capture
-          const untouchedForForensics: Record<string, unknown> = {
-            ...msg,
-            message:
-              msg.message && typeof msg.message === 'object'
-                ? { ...(msg.message as Record<string, unknown>) }
-                : msg.message,
-          };
+          // Only invoke captureIncomingPayload if Signal inline hook didn't already capture this stanzaId
+          if (
+            !this.forensicAnalyzer.hasSignalCaptureForStanza(
+              this.sessionId,
+              msgId
+            )
+          ) {
+            const untouchedForForensics: Record<string, unknown> = {
+              ...msg,
+              message:
+                msg.message && typeof msg.message === 'object'
+                  ? { ...(msg.message as Record<string, unknown>) }
+                  : msg.message,
+            };
 
-          void this.forensicAnalyzer
-            .captureIncomingPayload({
-              sessionId: this.sessionId,
-              rawEventType: 'messages.upsert',
-              rawBinaryNode: rawNode,
-              rawWaMessage: untouchedForForensics,
-              sock,
-              botKnownMessageIds: this.memoryStore.messages,
-              botSelfJids: selfJids,
-            })
-            .catch(() => undefined);
+            void this.forensicAnalyzer
+              .captureIncomingPayload({
+                sessionId: this.sessionId,
+                rawEventType: 'messages.upsert',
+                rawBinaryNode: rawNode,
+                rawWaMessage: untouchedForForensics,
+                sock,
+                botKnownMessageIds: this.memoryStore.messages,
+                botSelfJids: selfJids,
+              })
+              .catch(() => undefined);
+          }
 
           // Pre-processing sanitizer guard to protect downstream normalizers from OOM / BiDi / Mention bombs
           const { sanitizedMessage, wasSanitized } =

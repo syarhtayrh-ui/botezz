@@ -529,7 +529,12 @@ declare module '@hiroosy/baileys-lite' {
 
   export namespace proto {
     export type IMessage = Record<string, unknown>;
+    export type Message = IMessage;
     export const Message: {
+      encode(message: IMessage | Record<string, unknown>): { finish(): Uint8Array };
+      decode(reader: Uint8Array | Buffer, length?: number): IMessage & Record<string, unknown>;
+      toObject(message: unknown, options?: Record<string, unknown>): Record<string, unknown>;
+      fromObject(object: Record<string, unknown>): IMessage & Record<string, unknown>;
       AppStateSyncKeyData: {
         fromObject(obj: unknown): unknown;
       };
