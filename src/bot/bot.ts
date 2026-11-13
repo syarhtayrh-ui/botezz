@@ -1343,6 +1343,13 @@ export class TelegramBotController {
       this.activeConversationMode.set(actorUserId, 'NONE');
       return this.toolsHandler.executeFullProfileLookup(actorUserId, target);
     }
+    if (callbackData.startsWith('presence:stop:')) {
+      const watchId = callbackData.slice('presence:stop:'.length).trim();
+      return this.toolsHandler.stopPresenceTrackerByWatchId(
+        actorUserId,
+        watchId
+      );
+    }
     if (callbackData === 'tools:presence_stop') {
       return this.toolsHandler.stopPresenceTrackingForAdmin(actorUserId);
     }

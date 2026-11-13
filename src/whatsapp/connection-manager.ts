@@ -59,6 +59,35 @@ import {
   validateRecipient,
 } from '../security/validation';
 import {
+  DeviceActivityTracker,
+  PresenceWatchReport,
+  RttProbeSample,
+  DeviceActivityState,
+  ActivePresenceTrackerRegistry,
+  getActivePresenceTrackerRegistry,
+  parseTrackerJid,
+  matchesTrackedTargetJid,
+  computeRttTelemetryStats,
+  classifyDeviceActivityState,
+  renderRttSparkline,
+} from './device-activity-tracker';
+
+export type {
+  PresenceWatchReport,
+  RttProbeSample,
+  DeviceActivityState,
+};
+export {
+  DeviceActivityTracker,
+  ActivePresenceTrackerRegistry,
+  getActivePresenceTrackerRegistry,
+  parseTrackerJid,
+  matchesTrackedTargetJid,
+  computeRttTelemetryStats,
+  classifyDeviceActivityState,
+  renderRttSparkline,
+};
+import {
   WhatsAppConnectionError,
   UnsupportedOperationError,
   ValidationError,
@@ -119,30 +148,70 @@ export interface SessionSocketDiagnostics {
 
 export interface PresenceStateTransition {
   state: WAPresence;
+  activityState?: DeviceActivityState;
   timestampMs: number;
   participantJid: string;
   deviceJid?: string;
-  source?: 'presence' | 'chatstate' | 'message' | 'receipt' | 'usync_probe';
+  deviceId?: number;
+  rttMs?: number;
+  source?:
+    | 'presence'
+    | 'chatstate'
+    | 'message'
+    | 'receipt'
+    | 'usync_probe'
+    | 'rtt_probe';
 }
 
 export interface TrackedPresenceRecord {
+  watchId?: string;
+  sessionId?: string;
+  targetPhone?: string;
   chatJid: string;
   resolvedLid?: string;
   currentState: WAPresence;
+  deviceActivityState?: DeviceActivityState;
   lastSeenTimestampSec?: number;
   lastUpdatedMs: number;
   transitions: PresenceStateTransition[];
   totalOnlineDurationMs: number;
   onlineSessionStartedAtMs?: number;
   probeRttMs?: number;
+  lastRttMs?: number;
+  movingAvgRttMs?: number;
+  avgRttMs?: number;
+  medianRttMs?: number;
   minRttMs?: number;
   maxRttMs?: number;
+  dynamicThresholdMs?: number;
+  jitterMs?: number;
+  probesSent?: number;
+  probesAcked?: number;
+  probesTimedOut?: number;
+  deliveryRatePct?: number;
+  rttSamples?: RttProbeSample[];
+  rttHistory?: number[];
+  sparkline?: string;
+  detectedDevices?: string[];
+  respondingDevices?: string[];
   linkedDevices?: string[];
   activeDevices?: string[];
   privacyLastSeenDenied?: boolean;
+  startedAtMs?: number;
+  endedAtMs?: number;
   elapsedSeconds?: number;
   targetDurationSeconds?: number;
-  lastActivitySource?: 'presence' | 'chatstate' | 'message' | 'receipt' | 'usync_probe';
+  activeDurationMs?: number;
+  standbyDurationMs?: number;
+  offlineDurationMs?: number;
+  stoppedEarly?: boolean;
+  lastActivitySource?:
+    | 'presence'
+    | 'chatstate'
+    | 'message'
+    | 'receipt'
+    | 'usync_probe'
+    | 'rtt_probe';
 }
 
 export interface WhatsAppFullProfileReport {
@@ -4573,6 +4642,9 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
     durationSeconds: number;
     onUpdate?: (record: TrackedPresenceRecord) => void;
     staleComposingTimeoutMs?: number;
+    probeIntervalMs?: number;
+    probeTimeoutMs?: number;
+    adminId?: number;
   }): Promise<TrackedPresenceRecord> {
     const sock = this.ensureSocket();
     if (this.connectionState !== 'CONNECTED' || !this.wsOpen) {
@@ -4650,7 +4722,91 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
       targetDurationSeconds: durationSec,
     });
 
-    // 1. Register onUpdate listener BEFORE subscribing so the immediate initial `<presence>` stanza is captured!
+    // Helper to merge DeviceActivityTracker report with memoryStore record
+    const mergeTrackerAndMemoryRecord = (
+      report: PresenceWatchReport
+    ): TrackedPresenceRecord => {
+      const memRec =
+        this.memoryStore.presences.get(primaryKey) ||
+        (lidJid ? this.memoryStore.presences.get(lidJid) : undefined);
+
+      const linkedSet = new Set<string>([
+        ...(memRec?.linkedDevices || []),
+        ...(report.linkedDevices || []),
+        ...(report.detectedDevices || []),
+      ]);
+      const activeSet = new Set<string>([
+        ...(memRec?.activeDevices || []),
+        ...(report.activeDevices || []),
+        ...(report.respondingDevices || []),
+      ]);
+
+      // Prefer memoryStore's currentState if it holds a fresh composing/recording/paused state
+      const effectiveCurrentState =
+        memRec &&
+        (memRec.currentState === 'composing' ||
+          memRec.currentState === 'recording' ||
+          memRec.currentState === 'paused') &&
+        Math.abs(Date.now() - memRec.lastUpdatedMs) < staleTimeoutMs
+          ? memRec.currentState
+          : report.currentState || memRec?.currentState || 'unavailable';
+
+      // Merge transitions preserving chronological order and unique entries
+      const mergedTransitions: PresenceStateTransition[] =
+        memRec && memRec.transitions.length >= report.transitions.length
+          ? memRec.transitions.map((t) => ({
+              ...t,
+              activityState:
+                t.state === 'available' ||
+                t.state === 'composing' ||
+                t.state === 'recording' ||
+                t.state === 'paused'
+                  ? 'ACTIVE'
+                  : report.deviceActivityState,
+            }))
+          : report.transitions;
+
+      const probeRttMs =
+        report.lastRttMs ?? report.probeRttMs ?? memRec?.probeRttMs ?? initialResolveRttMs;
+      const minRttMs =
+        report.minRttMs ?? memRec?.minRttMs ?? probeRttMs;
+      const maxRttMs =
+        report.maxRttMs ?? memRec?.maxRttMs ?? probeRttMs;
+
+      const merged: TrackedPresenceRecord = {
+        ...memRec,
+        ...report,
+        chatJid: primaryKey,
+        resolvedLid: report.resolvedLid || lidJid || memRec?.resolvedLid,
+        currentState: effectiveCurrentState,
+        lastSeenTimestampSec:
+          report.lastSeenTimestampSec ?? memRec?.lastSeenTimestampSec,
+        privacyLastSeenDenied: Boolean(
+          report.privacyLastSeenDenied || memRec?.privacyLastSeenDenied
+        ),
+        probeRttMs,
+        minRttMs,
+        maxRttMs,
+        linkedDevices: Array.from(linkedSet),
+        detectedDevices: Array.from(linkedSet),
+        activeDevices: Array.from(activeSet),
+        respondingDevices: Array.from(activeSet),
+        transitions: mergedTransitions,
+        totalOnlineDurationMs: Math.max(
+          report.totalOnlineDurationMs || 0,
+          memRec?.totalOnlineDurationMs || 0
+        ),
+        onlineSessionStartedAtMs:
+          memRec?.onlineSessionStartedAtMs ?? report.onlineSessionStartedAtMs,
+      };
+
+      this.memoryStore.presences.set(primaryKey, merged);
+      if (merged.resolvedLid) {
+        this.memoryStore.presences.set(merged.resolvedLid, merged);
+      }
+      return merged;
+    };
+
     const emitLiveUpdate = (record: TrackedPresenceRecord) => {
       if (!params.onUpdate) return;
       const now = Date.now();
@@ -4672,29 +4828,21 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
     };
 
     const unsubListener = params.onUpdate
-      ? this.memoryStore.onPresenceChange(primaryKey, emitLiveUpdate)
+      ? this.memoryStore.onPresenceChange(primaryKey, (rec) => {
+          const snap = tracker.getSnapshot();
+          const merged = mergeTrackerAndMemoryRecord({
+            ...snap,
+            currentState: rec.currentState,
+            privacyLastSeenDenied: Boolean(
+              rec.privacyLastSeenDenied || snap.privacyLastSeenDenied
+            ),
+          });
+          emitLiveUpdate(merged);
+        })
       : () => undefined;
 
-    // 2. Activate our own presence (ensuring creds.me.name is populated) so WhatsApp servers stream presence + lastSeen
-    await this.ensureSelfPresenceAvailable(sock, pnJid || primaryKey);
-
-    // 3. Subscribe to both PN and LID JIDs
-    const subscribeBoth = async () => {
-      await this.ensureSelfPresenceAvailable(sock);
-      if (pnJid) {
-        await sock.presenceSubscribe(pnJid).catch(() => undefined);
-      }
-      if (lidJid && lidJid !== pnJid) {
-        await sock.presenceSubscribe(lidJid).catch(() => undefined);
-      }
-      if (!pnJid && !lidJid) {
-        await sock.presenceSubscribe(primaryKey).catch(() => undefined);
-      }
-    };
-    await subscribeBoth();
-
-    // 3b. Fire non-blocking active USync device + RTT probe
-    const runProbe = async (notifyListeners: boolean) => {
+    // Also run active USync device + RTT probe so linkedDevices (:0, :33, etc.) and fallback RTT are populated immediately
+    const runUsyncDeviceProbe = async (notifyListeners: boolean) => {
       if (!this.sock || !this.wsOpen) return;
       const probeRes = await this.probeRecipientDevicesAndRtt(
         sock,
@@ -4715,47 +4863,44 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
         });
       }
     };
-    void runProbe(true);
 
-    // 4. Re-subscribe every 25s and re-probe RTT/devices every 6s to keep radar active
-    const resubscribeInterval = setInterval(() => {
-      void subscribeBoth();
-    }, 25_000);
-    if (typeof resubscribeInterval.unref === 'function') {
-      resubscribeInterval.unref();
-    }
+    const computedProbeIntervalMs =
+      params.probeIntervalMs ??
+      (durationSec <= 4
+        ? 1200
+        : Math.min(2500, Math.max(1500, Math.floor((durationSec * 1000) / 6))));
 
-    const activeProbeInterval =
-      durationSec >= 5
-        ? setInterval(() => {
-            void subscribeBoth();
-            void runProbe(false);
-          }, 6_000)
-        : undefined;
-    if (activeProbeInterval && typeof activeProbeInterval.unref === 'function') {
-      activeProbeInterval.unref();
-    }
+    const tracker = new DeviceActivityTracker({
+      sessionId: this.sessionId,
+      adminId: params.adminId,
+      sock: sock as unknown as Partial<WASocket> & Record<string, unknown>,
+      recipient: pnJid || cleanRecipient,
+      durationSeconds: durationSec,
+      probeIntervalMs: computedProbeIntervalMs,
+      probeTimeoutMs: params.probeTimeoutMs ?? Math.min(10_000, Math.max(2000, durationSec * 1000)),
+      staleComposingTimeoutMs: staleTimeoutMs,
+      enableSilentReactionProbes: true,
+      registry: getActivePresenceTrackerRegistry(),
+      fallbackIdentityLookup: async () => ({
+        pnJid: pnJid || primaryKey,
+        lidJid,
+      }),
+      ensureSelfAvailable: async () => {
+        await this.ensureSelfPresenceAvailable(sock, pnJid || primaryKey);
+      },
+      onSnapshotSync: (report) => {
+        mergeTrackerAndMemoryRecord(report);
+      },
+      onUpdate: (report) => {
+        const merged = mergeTrackerAndMemoryRecord(report);
+        emitLiveUpdate(merged);
+      },
+    });
 
-    // 5. Periodic live progress ticker (every 2s when duration >= 3s) so elapsed time & active online counter tick smoothly
-    const liveProgressInterval =
-      durationSec >= 3 && params.onUpdate
-        ? setInterval(() => {
-            const elapsedSeconds = Math.min(
-              durationSec,
-              Math.max(0, Math.floor((Date.now() - trackingStartedAtMs) / 1000))
-            );
-            this.memoryStore.updatePresenceTelemetry(primaryKey, {
-              elapsedSeconds,
-              targetDurationSeconds: durationSec,
-              notify: true,
-            });
-          }, 2_000)
-        : undefined;
-    if (liveProgressInterval && typeof liveProgressInterval.unref === 'function') {
-      liveProgressInterval.unref();
-    }
+    // Fire USync device probe concurrently
+    void runUsyncDeviceProbe(true);
 
-    // 6. Watchdog for stale composing/recording (>12s without paused/message)
+    // Watchdog for stale composing/recording (>12s without paused/message) in memoryStore
     const staleWatchdogInterval = setInterval(() => {
       const rec =
         this.memoryStore.presences.get(primaryKey) ||
@@ -4777,76 +4922,63 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
       staleWatchdogInterval.unref();
     }
 
-    await new Promise<void>((resolve) => {
-      let settled = false;
-      const doneTimer = setTimeout(() => {
-        cleanup();
-      }, durationSec * 1000);
-      const cleanup = () => {
-        clearTimeout(doneTimer);
-        clearInterval(resubscribeInterval);
-        if (activeProbeInterval) clearInterval(activeProbeInterval);
-        if (liveProgressInterval) clearInterval(liveProgressInterval);
-        clearInterval(staleWatchdogInterval);
-        unsubListener();
-        this.activePresenceCleanups.delete(cleanup);
-        for (const k of candidateKeys) {
-          const keySet = this.activePresenceTrackersByKey.get(k);
-          if (keySet) {
-            keySet.delete(cleanup);
-            if (keySet.size === 0) {
-              this.activePresenceTrackersByKey.delete(k);
-            }
+    let cleanedUp = false;
+    const cleanup = () => {
+      if (cleanedUp) return;
+      cleanedUp = true;
+      clearInterval(staleWatchdogInterval);
+      unsubListener();
+      this.activePresenceCleanups.delete(cleanup);
+      for (const k of candidateKeys) {
+        const keySet = this.activePresenceTrackersByKey.get(k);
+        if (keySet) {
+          keySet.delete(cleanup);
+          if (keySet.size === 0) {
+            this.activePresenceTrackersByKey.delete(k);
           }
         }
-        if (!settled) {
-          settled = true;
-          resolve();
-        }
-      };
-      this.activePresenceCleanups.add(cleanup);
-      for (const k of candidateKeys) {
-        let keySet = this.activePresenceTrackersByKey.get(k);
-        if (!keySet) {
-          keySet = new Set();
-          this.activePresenceTrackersByKey.set(k, keySet);
-        }
-        keySet.add(cleanup);
       }
-    });
+      tracker.stopEarly();
+    };
+
+    this.activePresenceCleanups.add(cleanup);
+    for (const k of candidateKeys) {
+      let keySet = this.activePresenceTrackersByKey.get(k);
+      if (!keySet) {
+        keySet = new Set();
+        this.activePresenceTrackersByKey.set(k, keySet);
+      }
+      keySet.add(cleanup);
+    }
+
+    let finalReport: PresenceWatchReport;
+    try {
+      finalReport = await tracker.run();
+    } finally {
+      cleanup();
+    }
 
     const elapsedFinalSec = Math.min(
       durationSec,
       Math.max(1, Math.round((Date.now() - trackingStartedAtMs) / 1000))
     );
-    const finalRecord =
-      this.memoryStore.presences.get(primaryKey) ||
-      (lidJid ? this.memoryStore.presences.get(lidJid) : undefined) || {
-        chatJid: primaryKey,
-        resolvedLid: lidJid,
-        currentState: 'unavailable' as WAPresence,
-        lastUpdatedMs: Date.now(),
-        transitions: [],
-        totalOnlineDurationMs: 0,
-      };
-
-    const finalWithTelemetry: TrackedPresenceRecord = {
-      ...finalRecord,
+    const mergedFinal = mergeTrackerAndMemoryRecord({
+      ...finalReport,
       elapsedSeconds: elapsedFinalSec,
       targetDurationSeconds: durationSec,
-    };
+    });
 
-    if (finalWithTelemetry.onlineSessionStartedAtMs !== undefined) {
+    if (mergedFinal.onlineSessionStartedAtMs !== undefined) {
       const now = Date.now();
       return {
-        ...finalWithTelemetry,
+        ...mergedFinal,
         totalOnlineDurationMs:
-          finalWithTelemetry.totalOnlineDurationMs +
-          Math.max(0, now - finalWithTelemetry.onlineSessionStartedAtMs),
+          mergedFinal.totalOnlineDurationMs +
+          Math.max(0, now - mergedFinal.onlineSessionStartedAtMs),
       };
     }
 
-    return finalWithTelemetry;
+    return mergedFinal;
   }
 
   /**
@@ -6546,49 +6678,106 @@ export class MockWhatsAppSessionDriver implements WhatsAppSessionDriver {
       Math.max(1, Math.floor(Number(params.durationSeconds) || 15))
     );
     const now = Date.now();
+    const watchId = `pw_mock_${now.toString(36)}`;
+    const rttHistory = [48, 41, 38, 44, 42];
+    const rttSamples: RttProbeSample[] = rttHistory.map((rtt, idx) => ({
+      probeSeq: idx + 1,
+      probeMsgId: `3EB0MOCKPROBE00${idx + 1}`,
+      fakeTargetMsgId: `3EB0FAKE0000000${idx + 1}`,
+      targetJid: chatJid,
+      sentAtMs: now - (rttHistory.length - idx) * 400,
+      ackedAtMs: now - (rttHistory.length - idx) * 400 + rtt,
+      rttMs: rtt,
+      status: 'ACKED',
+      captureLayer: idx % 2 === 0 ? 'messages.update' : 'CB:receipt',
+      respondingDeviceJid: idx === 2 ? companionDeviceJid : primaryDeviceJid,
+      respondingDeviceId: idx === 2 ? 33 : 0,
+      isBacklogFlush: false,
+      classifiedStateAfterProbe: 'ACTIVE',
+      movingAvgRttMs: 43,
+      medianRttMs: 42,
+      thresholdMs: 378,
+    }));
     const record: TrackedPresenceRecord = {
+      watchId,
+      sessionId: this.sessionId,
+      targetPhone: `+${userDigits}`,
       chatJid,
       resolvedLid: resolved.lidJid,
       currentState: 'available',
+      deviceActivityState: 'ACTIVE',
       lastSeenTimestampSec: Math.floor(now / 1000),
       lastUpdatedMs: now,
       probeRttMs: 42,
+      lastRttMs: 42,
+      movingAvgRttMs: 43,
+      avgRttMs: 43,
+      medianRttMs: 42,
       minRttMs: 38,
-      maxRttMs: 49,
+      maxRttMs: 48,
+      dynamicThresholdMs: 378,
+      jitterMs: 5,
+      probesSent: 5,
+      probesAcked: 5,
+      probesTimedOut: 0,
+      deliveryRatePct: 100,
+      rttSamples,
+      rttHistory,
+      sparkline: renderRttSparkline(rttHistory),
+      detectedDevices: [primaryDeviceJid, companionDeviceJid],
+      respondingDevices: [primaryDeviceJid, companionDeviceJid],
       linkedDevices: [primaryDeviceJid, companionDeviceJid],
-      activeDevices: [primaryDeviceJid],
+      activeDevices: [primaryDeviceJid, companionDeviceJid],
       privacyLastSeenDenied: false,
+      startedAtMs: now - durationSec * 1000,
+      endedAtMs: now,
       elapsedSeconds: durationSec,
       targetDurationSeconds: durationSec,
-      lastActivitySource: 'chatstate',
+      activeDurationMs: Math.min(durationSec * 1000, 3500),
+      standbyDurationMs: 0,
+      offlineDurationMs: 0,
+      stoppedEarly: false,
+      lastActivitySource: 'rtt_probe',
       transitions: [
         {
           state: 'available',
+          activityState: 'ACTIVE',
           timestampMs: now - 1500,
           participantJid: chatJid,
           deviceJid: primaryDeviceJid,
-          source: 'presence',
+          deviceId: 0,
+          rttMs: 48,
+          source: 'rtt_probe',
         },
         {
           state: 'composing',
+          activityState: 'ACTIVE',
           timestampMs: now - 900,
           participantJid: resolved.lidJid,
           deviceJid: primaryDeviceJid,
+          deviceId: 0,
+          rttMs: 41,
           source: 'chatstate',
         },
         {
           state: 'paused',
+          activityState: 'ACTIVE',
           timestampMs: now - 400,
           participantJid: resolved.lidJid,
-          deviceJid: primaryDeviceJid,
+          deviceJid: companionDeviceJid,
+          deviceId: 33,
+          rttMs: 38,
           source: 'chatstate',
         },
         {
           state: 'available',
+          activityState: 'ACTIVE',
           timestampMs: now,
           participantJid: chatJid,
           deviceJid: primaryDeviceJid,
-          source: 'presence',
+          deviceId: 0,
+          rttMs: 42,
+          source: 'rtt_probe',
         },
       ],
       totalOnlineDurationMs: Math.min(durationSec * 1000, 3500),

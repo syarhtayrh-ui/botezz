@@ -20,6 +20,11 @@ import {
 } from '../../function-lab';
 import { WhatsAppCapabilityAdapter } from '../../whatsapp/message-capabilities';
 import {
+  getActivePresenceTrackerRegistry,
+  renderRttSparkline,
+  TrackedPresenceRecord,
+} from '../../whatsapp/connection-manager';
+import {
   BotViewResponse,
   TelegramMediaAttachment,
 } from '../workflows/pairing-workflow';
@@ -2592,12 +2597,15 @@ export class ToolsHandler {
 
   public stopPresenceTrackingForAdmin(adminId: number): BotViewResponse {
     try {
+      const registry = getActivePresenceTrackerRegistry();
+      const stoppedReports = registry.stopAllForAdmin(adminId);
       const connected = this.sessionManager.listConnectedSessions(adminId);
-      let stopped = 0;
+      let driverStopped = 0;
       for (const sess of connected) {
         const driver = this.sessionManager.getDriver(sess.id, adminId);
-        stopped += driver.stopTrackingRecipientPresence?.() ?? 0;
+        driverStopped += driver.stopTrackingRecipientPresence?.() ?? 0;
       }
+      const stopped = Math.max(stoppedReports.length, driverStopped);
       return {
         text:
           `⏹️ *تم إيقاف جلسات رصد التواجد الحي بنجاح*\n` +
@@ -2610,6 +2618,43 @@ export class ToolsHandler {
         ],
         toastText: '⏹️ تم إيقاف رصد التواجد',
       };
+    } catch (err) {
+      const safeErr = toSafeArabicError(err);
+      return {
+        text: `⚠️ *تعذر إيقاف الرصد:*\n${safeErr.userMessage}`,
+        keyboard: [[{ text: '🔙 قائمة الأدوات', callbackData: 'menu:tools' }]],
+      };
+    }
+  }
+
+  public stopPresenceTrackerByWatchId(
+    adminId: number,
+    watchId: string
+  ): BotViewResponse {
+    try {
+      const registry = getActivePresenceTrackerRegistry();
+      const handle = registry.getByWatchId(watchId);
+      const report = registry.stopByWatchId(watchId);
+
+      const connected = this.sessionManager.listConnectedSessions(adminId);
+      for (const sess of connected) {
+        if (!handle || handle.sessionId === sess.id) {
+          const driver = this.sessionManager.getDriver(sess.id, adminId);
+          driver.stopTrackingRecipientPresence?.(handle?.targetPnJid);
+        }
+      }
+
+      if (report) {
+        return this.formatPresenceWatchView(
+          report.sessionId || connected[0]?.id || 'session',
+          report.chatJid,
+          report.targetDurationSeconds || 15,
+          report,
+          true
+        );
+      }
+
+      return this.stopPresenceTrackingForAdmin(adminId);
     } catch (err) {
       const safeErr = toSafeArabicError(err);
       return {
@@ -2710,11 +2755,349 @@ export class ToolsHandler {
     );
   }
 
+  private formatDurationBreakdownAr(ms?: number): string {
+    const totalSec = Math.max(0, Math.round((ms ?? 0) / 1000));
+    const mins = Math.floor(totalSec / 60);
+    const secs = totalSec % 60;
+    return mins > 0 ? `${mins}m ${secs}s` : `${secs}s`;
+  }
+
+  private formatTimestampMillis(tsMs: number): string {
+    const iso = new Date(tsMs).toISOString();
+    // HH:mm:ss.SSS
+    return iso.slice(11, 23);
+  }
+
+  public formatPresenceWatchView(
+    sessionId: string,
+    recipientFallback: string,
+    durationSeconds: number,
+    rec: TrackedPresenceRecord,
+    isFinal: boolean
+  ): BotViewResponse {
+    const formatStateAr = (s: string) => {
+      switch (s) {
+        case 'available':
+          return '🟢 متصل الآن (available)';
+        case 'composing':
+          return '⌨️ يكتب رسالة... (composing)';
+        case 'recording':
+          return '🎙️ يسجل صوتاً... (recording)';
+        case 'paused':
+          return '⏸️ متصل - توقف عن الكتابة (paused)';
+        default:
+          return '⚪ غير متصل (unavailable)';
+      }
+    };
+
+    const formatActivityClassificationHeadline = (
+      presenceState: string,
+      activityState?: string
+    ) => {
+      if (presenceState === 'composing') {
+        return '⌨️ COMPOSING... (🟢 ONLINE / SCREEN ON)';
+      }
+      if (presenceState === 'recording') {
+        return '🎙️ RECORDING AUDIO... (🟢 ONLINE / SCREEN ON)';
+      }
+      if (activityState === 'ACTIVE' || presenceState === 'available' || presenceState === 'paused') {
+        return '🟢 ONLINE (ACTIVE / SCREEN ON)';
+      }
+      if (activityState === 'OFFLINE') {
+        return '🔴 OFFLINE (DISCONNECTED / POWERED OFF)';
+      }
+      return '🟡 STANDBY / IDLE (BACKGROUND / SCREEN LOCKED)';
+    };
+
+    const formatDeviceBadge = (devOrJid?: string) => {
+      if (!devOrJid) return '📱 الهاتف الأساسي (:0)';
+      const userPart = devOrJid.split('@')[0] || '';
+      if (userPart.includes(':')) {
+        const devNum = Number(userPart.split(':')[1] || 0);
+        if (devNum === 0) return '📱 الهاتف الأساسي (:0)';
+        return `💻 جهاز مرافق/ويب (:${devNum})`;
+      }
+      return '📱 الهاتف الأساسي (:0)';
+    };
+
+    const formatSourceAr = (src?: string) => {
+      switch (src) {
+        case 'chatstate':
+          return '⚡ نبضة محادثة';
+        case 'message':
+          return '💬 رسالة حية';
+        case 'receipt':
+          return '✓✓ إيصال استلام';
+        case 'rtt_probe':
+          return '🛰️ مسبار RTT الصامت';
+        case 'usync_probe':
+          return '🛰️ مسبار USync';
+        default:
+          return '📡 حزمة تواجد';
+      }
+    };
+
+    const elapsedSec =
+      rec.elapsedSeconds !== undefined
+        ? Math.min(durationSeconds, Math.max(0, rec.elapsedSeconds))
+        : isFinal
+          ? durationSeconds
+          : 0;
+    const pct = Math.min(
+      100,
+      Math.round((elapsedSec / Math.max(1, durationSeconds)) * 100)
+    );
+    const filledBlocks = Math.min(10, Math.max(0, Math.round(pct / 10)));
+    const progressBar =
+      '🟩'.repeat(filledBlocks) + '⬜'.repeat(10 - filledBlocks);
+
+    const recentTransitions = rec.transitions.slice(-8);
+    const transitionsLines =
+      recentTransitions.length > 0
+        ? recentTransitions
+            .map((t, idx) => {
+              const rttTag =
+                typeof t.rttMs === 'number' ? ` | \`${t.rttMs}ms\`` : '';
+              const actTag = t.activityState ? ` [${t.activityState}]` : '';
+              return `${idx + 1}. \`${this.formatTimestampMillis(t.timestampMs)}\` — ${formatStateAr(t.state)}${actTag}${rttTag} | ${formatDeviceBadge(t.deviceJid || t.participantJid)} (${formatSourceAr(t.source)})`;
+            })
+            .join('\n')
+        : isFinal
+          ? '• لم ترد تغييرات حالة خلال نافذة الرصد (الهدف غير متصل حالياً أو يخفي حالة التواجد).'
+          : '• جاري الاستماع الحي لحزم التواجد وإرسال مسابير RTT الصامتة...';
+
+    const lastSeenText = rec.privacyLastSeenDenied
+      ? '🔴 محجوب صراحةً من إعدادات خصوصية الهدف (`last="deny"`)'
+      : rec.lastSeenTimestampSec && rec.lastSeenTimestampSec > 0
+        ? `\`${new Date(rec.lastSeenTimestampSec * 1000).toISOString()}\``
+        : 'محجوب أو غير معلن';
+
+    const lastRtt = rec.lastRttMs ?? rec.probeRttMs;
+    const movingAvgRtt = rec.movingAvgRttMs ?? lastRtt;
+    const medianRtt = rec.medianRttMs ?? lastRtt;
+    const dynThreshold = rec.dynamicThresholdMs ?? 800;
+    const jitter = rec.jitterMs ?? 0;
+    const probesSent = rec.probesSent ?? (lastRtt !== undefined ? 1 : 0);
+    const probesAcked = rec.probesAcked ?? (lastRtt !== undefined ? 1 : 0);
+    const probesTimedOut = rec.probesTimedOut ?? 0;
+    const deliveryRatePct =
+      rec.deliveryRatePct ??
+      (probesSent > 0 ? Math.round((probesAcked / probesSent) * 100) : 100);
+    const sparkline =
+      rec.sparkline ||
+      renderRttSparkline(
+        rec.rttHistory && rec.rttHistory.length > 0
+          ? rec.rttHistory
+          : lastRtt !== undefined
+            ? [lastRtt]
+            : []
+      );
+
+    const rttSection =
+      `📊 *قياسات القناة الجانبية (RTT Side-Channel Telemetry):*\n` +
+      `• Last RTT: \`${lastRtt !== undefined ? `${lastRtt} ms` : '—'}\` | Moving Avg (5): \`${movingAvgRtt !== undefined ? `${movingAvgRtt} ms` : '—'}\`\n` +
+      `• Median: \`${medianRtt !== undefined ? `${medianRtt} ms` : '—'}\` | Dynamic Threshold: \`${dynThreshold} ms\` | Jitter: \`±${jitter} ms\`\n` +
+      (rec.minRttMs !== undefined && rec.maxRttMs !== undefined
+        ? `• Min / Max RTT: \`${rec.minRttMs} ms\` / \`${rec.maxRttMs} ms\`\n`
+        : '') +
+      `• Probes: \`Sent: ${probesSent} | ACKed: ${probesAcked} | Timeouts: ${probesTimedOut} (Delivery Rate: ${deliveryRatePct}%)\`\n` +
+      `• Live ASCII Sparkline: \`${sparkline}\`\n`;
+
+    const linkedDevicesList = Array.isArray(rec.linkedDevices)
+      ? rec.linkedDevices
+      : Array.isArray(rec.detectedDevices)
+        ? rec.detectedDevices
+        : [];
+    const activeDevicesList = Array.isArray(rec.activeDevices)
+      ? rec.activeDevices
+      : Array.isArray(rec.respondingDevices)
+        ? rec.respondingDevices
+        : [];
+    const devicesLine =
+      linkedDevicesList.length > 0 || activeDevicesList.length > 0
+        ? `📱 *الأجهزة المكتشفة (${linkedDevicesList.length || 1}):* ${
+            linkedDevicesList.length > 0
+              ? linkedDevicesList.map((d) => formatDeviceBadge(d)).join(' ، ')
+              : formatDeviceBadge(rec.chatJid)
+          }\n` +
+          (activeDevicesList.length > 0
+            ? `🟢 *الأجهزة المستجيبة حياً:* ${activeDevicesList
+                .map((d) => formatDeviceBadge(d))
+                .join(' ، ')}\n`
+            : '')
+        : '';
+
+    const safePhoneDigits = (rec.chatJid || recipientFallback)
+      .split('@')[0]
+      .replace(/\D/g, '')
+      .slice(0, 18);
+    const targetPhoneDisplay =
+      rec.targetPhone || (safePhoneDigits ? `+${safePhoneDigits}` : rec.chatJid);
+
+    const activeTimeMs = rec.activeDurationMs ?? rec.totalOnlineDurationMs ?? 0;
+    const standbyTimeMs = rec.standbyDurationMs ?? 0;
+    const offlineTimeMs = rec.offlineDurationMs ?? 0;
+
+    const durationBreakdownLine =
+      `⏱️ *توزيع الفترات الزمنية (Duration Breakdown):*\n` +
+      `• Active Time: \`${this.formatDurationBreakdownAr(activeTimeMs)}\` (\`${(rec.totalOnlineDurationMs / 1000).toFixed(1)} ثانية\`) | Standby Time: \`${this.formatDurationBreakdownAr(standbyTimeMs)}\` | Offline Time: \`${this.formatDurationBreakdownAr(offlineTimeMs)}\`\n` +
+      `• Elapsed: ${progressBar} \`${elapsedSec}s / ${durationSeconds}s (${pct}%)\`${rec.stoppedEarly ? ' *(إيقاف مبكر يدوياً)*' : ''}\n`;
+
+    const finalKeyboard: InlineKeyboardRows = [];
+    if (safePhoneDigits) {
+      finalKeyboard.push(
+        [
+          {
+            text: `🔄 إعادة الرصد (${durationSeconds}ث)`,
+            callbackData: `tools:presence_run:${safePhoneDigits}:${durationSeconds}`,
+          },
+          {
+            text: '⏱️ رصد مطول (60ث)',
+            callbackData: `tools:presence_run:${safePhoneDigits}:60`,
+          },
+        ],
+        [
+          {
+            text: '⌨️ بث يكتب الآن...',
+            callbackData: `tools:presence_hb_q:composing:${safePhoneDigits}`,
+          },
+          {
+            text: '🎙️ بث يسجل صوتاً...',
+            callbackData: `tools:presence_hb_q:recording:${safePhoneDigits}`,
+          },
+        ],
+        [
+          {
+            text: '🔍 فحص الملف الشخصي الكامل',
+            callbackData: `tools:presence_prof:${safePhoneDigits}`,
+          },
+        ]
+      );
+    }
+    finalKeyboard.push([
+      {
+        text: '👁️ إعداد الرصد',
+        callbackData: 'tools:prompt_presence',
+      },
+      { text: '🔙 قائمة الأدوات', callbackData: 'menu:tools' },
+    ]);
+
+    const watchId = rec.watchId || 'active';
+    const stopCallbackData =
+      Buffer.byteLength(`presence:stop:${watchId}`, 'utf8') <= 64
+        ? `presence:stop:${watchId}`
+        : 'tools:presence_stop';
+
+    const liveKeyboard: InlineKeyboardRows = [
+      [
+        {
+          text: '🛑 إيقاف التتبع وإصدار التقرير (Stop Tracker)',
+          callbackData: stopCallbackData,
+        },
+      ],
+      [
+        {
+          text: '👁️ إعدادات الرادار',
+          callbackData: 'tools:prompt_presence',
+        },
+        { text: '🔙 قائمة الأدوات', callbackData: 'menu:tools' },
+      ],
+    ];
+
+    let mediaAttachments: TelegramMediaAttachment[] | undefined;
+    if (isFinal) {
+      const exportTimestamp = Date.now();
+      const exportFileName = `device_activity_${safePhoneDigits || 'target'}_${exportTimestamp}.json`;
+      const exportPayload = {
+        watchId: rec.watchId,
+        sessionId,
+        targetPhone: targetPhoneDisplay,
+        chatJid: rec.chatJid,
+        resolvedLid: rec.resolvedLid,
+        finalPresenceState: rec.currentState,
+        finalDeviceActivityState: rec.deviceActivityState || 'STANDBY',
+        privacyLastSeenDenied: Boolean(rec.privacyLastSeenDenied),
+        lastSeenTimestampSec: rec.lastSeenTimestampSec,
+        telemetrySummary: {
+          lastRttMs: lastRtt,
+          movingAvgRttMs: movingAvgRtt,
+          avgRttMs: rec.avgRttMs ?? movingAvgRtt,
+          medianRttMs: medianRtt,
+          minRttMs: rec.minRttMs,
+          maxRttMs: rec.maxRttMs,
+          dynamicThresholdMs: dynThreshold,
+          jitterMs: jitter,
+          probesSent,
+          probesAcked,
+          probesTimedOut,
+          deliveryRatePct,
+          sparkline,
+        },
+        durations: {
+          elapsedSeconds: elapsedSec,
+          targetDurationSeconds: durationSeconds,
+          totalOnlineDurationMs: rec.totalOnlineDurationMs,
+          activeDurationMs: activeTimeMs,
+          standbyDurationMs: standbyTimeMs,
+          offlineDurationMs: offlineTimeMs,
+          stoppedEarly: Boolean(rec.stoppedEarly),
+        },
+        devices: {
+          detectedDevices: linkedDevicesList,
+          respondingDevices: activeDevicesList,
+        },
+        rttSamples: rec.rttSamples || [],
+        transitions: rec.transitions || [],
+        exportedAtIso: new Date(exportTimestamp).toISOString(),
+      };
+      const jsonBuffer = Buffer.from(
+        JSON.stringify(exportPayload, null, 2),
+        'utf8'
+      );
+      mediaAttachments = [
+        {
+          filePath: path.join(os.tmpdir(), exportFileName),
+          fileName: exportFileName,
+          mimeType: 'application/json',
+          kind: 'document',
+          caption: `📎 التقرير الجنائي الكامل لنشاط الجهاز (RTT Side-Channel): ${targetPhoneDisplay}`,
+          buffer: jsonBuffer,
+        },
+      ];
+    }
+
+    return {
+      text:
+        `${isFinal ? '👁️ *تقرير رصد التواجد الحي — رادار نشاط الأجهزة (RTT Side-Channel + Presence)*' : '📡 *جاري الرصد الحي لتواجد الهدف — رادار نشاط الأجهزة (/presence)...*'}\n` +
+        `━━━━━━━━━━━━━━━━━━\n` +
+        `🆔 *الجلسة:* \`${sessionId}\` | *معرف الرصد:* \`${watchId}\`\n` +
+        `📞 *الهدف (Phone):* \`${targetPhoneDisplay}\`\n` +
+        `📱 *المستلم (PN JID):* \`${rec.chatJid}\`\n` +
+        (rec.resolvedLid
+          ? `🕵️ *الهوية المخفية المدمجة (LID):* \`${rec.resolvedLid}\`\n`
+          : '') +
+        `🎯 *تصنيف نشاط الجهاز (Activity State):* *${formatActivityClassificationHeadline(rec.currentState, rec.deviceActivityState)}*\n` +
+        `📡 *حالة التواجد (Native Presence):* ${formatStateAr(rec.currentState)}\n` +
+        `🕒 *آخر ظهور / الخصوصية:* ${lastSeenText}\n` +
+        devicesLine +
+        `\n` +
+        rttSection +
+        `\n` +
+        durationBreakdownLine +
+        `\n` +
+        `📜 *سجل التحولات الزمنية والمسابير (${rec.transitions.length}):*\n${transitionsLines}`,
+      keyboard: isFinal ? finalKeyboard : liveKeyboard,
+      ...(mediaAttachments ? { mediaAttachments } : {}),
+      ...(isFinal ? { toastText: '✅ اكتمل رصد التواجد اللحظي' } : {}),
+    };
+  }
+
   public async executePresenceTracking(
     adminId: number,
     rawInput: string,
     onProgressUpdate?: (view: BotViewResponse) => Promise<void>
   ): Promise<BotViewResponse> {
+    let coalesceTimer: ReturnType<typeof setTimeout> | undefined;
     try {
       const tokens = (rawInput || '').trim().split(/\s+/).filter(Boolean);
       if (tokens.length === 0) {
@@ -2743,225 +3126,68 @@ export class ToolsHandler {
       const { session, driver } =
         this.getPrimaryConnectedSessionAndDriver(adminId);
 
-      const formatStateAr = (s: string) => {
-        switch (s) {
-          case 'available':
-            return '🟢 متصل الآن (available)';
-          case 'composing':
-            return '⌨️ يكتب رسالة... (composing)';
-          case 'recording':
-            return '🎙️ يسجل صوتاً... (recording)';
-          case 'paused':
-            return '⏸️ متصل - توقف عن الكتابة (paused)';
-          default:
-            return '⚪ غير متصل (unavailable)';
-        }
-      };
-
-      const formatDeviceBadge = (devOrJid?: string) => {
-        if (!devOrJid) return '📱 الهاتف الأساسي';
-        const userPart = devOrJid.split('@')[0] || '';
-        if (userPart.includes(':')) {
-          const devNum = Number(userPart.split(':')[1] || 0);
-          if (devNum === 0) return '📱 الهاتف الأساسي (:0)';
-          return `💻 جهاز مرافق/ويب (:${devNum})`;
-        }
-        return '📱 الهاتف الأساسي (:0)';
-      };
-
-      const formatSourceAr = (src?: string) => {
-        switch (src) {
-          case 'chatstate':
-            return '⚡ نبضة محادثة';
-          case 'message':
-            return '💬 رسالة حية';
-          case 'receipt':
-            return '✓✓ إيصال قراءة/استلام';
-          case 'usync_probe':
-            return '🛰️ مسبار USync';
-          default:
-            return '📡 حزمة تواجد';
-        }
-      };
-
-      const renderLivePresenceView = (
-        rec: {
-          chatJid: string;
-          resolvedLid?: string;
-          currentState: string;
-          lastSeenTimestampSec?: number;
-          totalOnlineDurationMs: number;
-          probeRttMs?: number;
-          minRttMs?: number;
-          maxRttMs?: number;
-          linkedDevices?: string[];
-          activeDevices?: string[];
-          privacyLastSeenDenied?: boolean;
-          elapsedSeconds?: number;
-          targetDurationSeconds?: number;
-          lastActivitySource?: string;
-          transitions: Array<{
-            state: string;
-            timestampMs: number;
-            participantJid: string;
-            deviceJid?: string;
-            source?: string;
-          }>;
-        },
-        isFinal: boolean
-      ): BotViewResponse => {
-        const elapsedSec =
-          rec.elapsedSeconds !== undefined
-            ? Math.min(durationSeconds, Math.max(0, rec.elapsedSeconds))
-            : isFinal
-              ? durationSeconds
-              : 0;
-        const pct = Math.min(
-          100,
-          Math.round((elapsedSec / Math.max(1, durationSeconds)) * 100)
-        );
-        const filledBlocks = Math.min(10, Math.max(0, Math.round(pct / 10)));
-        const progressBar =
-          '🟩'.repeat(filledBlocks) + '⬜'.repeat(10 - filledBlocks);
-
-        const transitionsLines =
-          rec.transitions.length > 0
-            ? rec.transitions
-                .slice(-10)
-                .map(
-                  (t, idx) =>
-                    `${idx + 1}. \`${new Date(t.timestampMs).toISOString().slice(11, 19)}\` — ${formatStateAr(t.state)} | ${formatDeviceBadge(t.deviceJid || t.participantJid)} (${formatSourceAr(t.source)})`
-                )
-                .join('\n')
-            : isFinal
-              ? '• لم ترد تغييرات حالة خلال نافذة الرصد (الهدف غير متصل حالياً أو يخفي حالة التواجد).'
-              : '• جاري الاستماع الحي لحزم التواجد وفحص الأجهزة المرتبطة...';
-
-        const lastSeenText = rec.privacyLastSeenDenied
-          ? '🔴 محجوب صراحةً من إعدادات خصوصية الهدف (`last="deny"`)'
-          : rec.lastSeenTimestampSec && rec.lastSeenTimestampSec > 0
-            ? `\`${new Date(rec.lastSeenTimestampSec * 1000).toISOString()}\``
-            : 'محجوب أو غير معلن';
-
-        const rttLine =
-          rec.probeRttMs !== undefined
-            ? `⚡ *زمن استجابة المسبار (RTT):* \`${rec.probeRttMs} ms\`${
-                rec.minRttMs !== undefined && rec.maxRttMs !== undefined
-                  ? ` (أدنى: \`${rec.minRttMs}ms\` / أقصى: \`${rec.maxRttMs}ms\`)`
-                  : ''
-              }\n`
-            : '';
-
-        const linkedDevicesList = Array.isArray(rec.linkedDevices)
-          ? rec.linkedDevices
-          : [];
-        const activeDevicesList = Array.isArray(rec.activeDevices)
-          ? rec.activeDevices
-          : [];
-        const devicesLine =
-          linkedDevicesList.length > 0 || activeDevicesList.length > 0
-            ? `📱 *الأجهزة المرتبطة (${linkedDevicesList.length || 1}):* ${
-                linkedDevicesList.length > 0
-                  ? linkedDevicesList.map((d) => formatDeviceBadge(d)).join(' ، ')
-                  : formatDeviceBadge(rec.chatJid)
-              }\n` +
-              (activeDevicesList.length > 0
-                ? `🟢 *الأجهزة النشطة المرصودة:* ${activeDevicesList
-                    .map((d) => formatDeviceBadge(d))
-                    .join(' ، ')}\n`
-                : '')
-            : '';
-
-        const safePhoneDigits = (rec.chatJid || recipient)
-          .split('@')[0]
-          .replace(/\D/g, '')
-          .slice(0, 18);
-
-        const finalKeyboard: InlineKeyboardRows = [];
-        if (safePhoneDigits) {
-          finalKeyboard.push(
-            [
-              {
-                text: `🔄 إعادة الرصد (${durationSeconds}ث)`,
-                callbackData: `tools:presence_run:${safePhoneDigits}:${durationSeconds}`,
-              },
-              {
-                text: '⏱️ رصد مطول (60ث)',
-                callbackData: `tools:presence_run:${safePhoneDigits}:60`,
-              },
-            ],
-            [
-              {
-                text: '⌨️ بث يكتب الآن...',
-                callbackData: `tools:presence_hb_q:composing:${safePhoneDigits}`,
-              },
-              {
-                text: '🎙️ بث يسجل صوتاً...',
-                callbackData: `tools:presence_hb_q:recording:${safePhoneDigits}`,
-              },
-            ],
-            [
-              {
-                text: '🔍 فحص الملف الشخصي الكامل',
-                callbackData: `tools:presence_prof:${safePhoneDigits}`,
-              },
-            ]
-          );
-        }
-        finalKeyboard.push([
-          {
-            text: '👁️ إعداد الرصد',
-            callbackData: 'tools:prompt_presence',
-          },
-          { text: '🔙 قائمة الأدوات', callbackData: 'menu:tools' },
-        ]);
-
-        return {
-          text:
-            `${isFinal ? '👁️ *تقرير رصد التواجد الحي — رادار التتبع اللحظي المتقدم (/presence)*' : '📡 *جاري الرصد الحي لتواجد الهدف — رادار التتبع اللحظي (/presence)...*'}\n` +
-            `━━━━━━━━━━━━━━━━━━\n` +
-            `🆔 *الجلسة:* \`${session.id}\`\n` +
-            `📱 *المستلم (Chat JID):* \`${rec.chatJid}\`\n` +
-            (rec.resolvedLid
-              ? `🕵️ *الهوية المخفية المدمجة (LID):* \`${rec.resolvedLid}\`\n`
-              : '') +
-            `📡 *الحالة اللحظية:* ${formatStateAr(rec.currentState)}\n` +
-            `🕒 *آخر ظهور / الخصوصية:* ${lastSeenText}\n` +
-            rttLine +
-            devicesLine +
-            `⏳ *التقدم الزمني:* ${progressBar} \`${elapsedSec}/${durationSeconds}s (${pct}%)\`\n` +
-            `📊 *إجمالي زمن الاتصال النشط:* \`${(rec.totalOnlineDurationMs / 1000).toFixed(1)} ثانية\`\n\n` +
-            `📜 *سجل التحولات الزمنية والأجهزة (${rec.transitions.length}):*\n${transitionsLines}`,
-          keyboard: isFinal
-            ? finalKeyboard
-            : [
-                [
-                  {
-                    text: '⏹️ إيقاف الرصد الحي والاكتفاء بالتقرير الآن',
-                    callbackData: 'tools:presence_stop',
-                  },
-                ],
-                [
-                  {
-                    text: '👁️ إعدادات الرادار',
-                    callbackData: 'tools:prompt_presence',
-                  },
-                  { text: '🔙 قائمة الأدوات', callbackData: 'menu:tools' },
-                ],
-              ],
-          ...(isFinal ? { toastText: '✅ اكتمل رصد التواجد اللحظي' } : {}),
-        };
-      };
-
       let lastProgressSentAt = 0;
       let lastProgressText = '';
-      let lastProgressState = '';
+      let pendingCoalescedView: BotViewResponse | null = null;
+      let trackingCompleted = false;
+
+      const flushLiveView = (view: BotViewResponse) => {
+        if (!onProgressUpdate || trackingCompleted) return;
+        if (view.text === lastProgressText) return;
+        lastProgressText = view.text;
+        lastProgressSentAt = Date.now();
+        void onProgressUpdate(view).catch(() => undefined);
+      };
+
+      const scheduleCoalescedLiveUpdate = (liveRec: TrackedPresenceRecord) => {
+        if (!onProgressUpdate || trackingCompleted) return;
+        const view = this.formatPresenceWatchView(
+          session.id,
+          recipient,
+          durationSeconds,
+          liveRec,
+          false
+        );
+        if (view.text === lastProgressText) return;
+
+        const now = Date.now();
+        const elapsedSinceLast = now - lastProgressSentAt;
+        if (elapsedSinceLast >= 1500) {
+          if (coalesceTimer) {
+            clearTimeout(coalesceTimer);
+            coalesceTimer = undefined;
+          }
+          pendingCoalescedView = null;
+          flushLiveView(view);
+        } else {
+          pendingCoalescedView = view;
+          if (!coalesceTimer) {
+            const waitMs = Math.max(100, 1500 - elapsedSinceLast);
+            coalesceTimer = setTimeout(() => {
+              coalesceTimer = undefined;
+              if (pendingCoalescedView && !trackingCompleted) {
+                const nextView = pendingCoalescedView;
+                pendingCoalescedView = null;
+                flushLiveView(nextView);
+              }
+            }, waitMs);
+            if (typeof coalesceTimer.unref === 'function') {
+              coalesceTimer.unref();
+            }
+          }
+        }
+      };
 
       if (onProgressUpdate) {
-        const initialView = renderLivePresenceView(
+        const initialView = this.formatPresenceWatchView(
+          session.id,
+          recipient,
+          durationSeconds,
           {
             chatJid: recipient,
             currentState: 'unavailable',
+            deviceActivityState: 'STANDBY',
+            lastUpdatedMs: Date.now(),
             totalOnlineDurationMs: 0,
             elapsedSeconds: 0,
             targetDurationSeconds: durationSeconds,
@@ -2977,27 +3203,14 @@ export class ToolsHandler {
       const record = await driver.trackRecipientPresence({
         recipient,
         durationSeconds,
-        onUpdate: onProgressUpdate
-          ? (liveRec) => {
-              const now = Date.now();
-              const stateChanged = liveRec.currentState !== lastProgressState;
-              if (!stateChanged && now - lastProgressSentAt < 1500) {
-                return;
-              }
-              if (stateChanged && now - lastProgressSentAt < 650) {
-                return;
-              }
-              const liveView = renderLivePresenceView(liveRec, false);
-              if (liveView.text === lastProgressText) {
-                return;
-              }
-              lastProgressState = liveRec.currentState;
-              lastProgressText = liveView.text;
-              lastProgressSentAt = now;
-              void onProgressUpdate(liveView).catch(() => undefined);
-            }
-          : undefined,
+        onUpdate: onProgressUpdate ? scheduleCoalescedLiveUpdate : undefined,
       });
+
+      trackingCompleted = true;
+      if (coalesceTimer) {
+        clearTimeout(coalesceTimer);
+        coalesceTimer = undefined;
+      }
 
       this.auditRepo.record({
         actorTelegramId: adminId,
@@ -3006,14 +3219,28 @@ export class ToolsHandler {
         outcome: 'SUCCESS',
         metadata: {
           sessionId: session.id,
+          watchId: record.watchId,
           durationSeconds,
           transitionsCount: record.transitions.length,
           probeRttMs: record.probeRttMs,
+          deviceActivityState: record.deviceActivityState,
+          probesSent: record.probesSent,
+          probesAcked: record.probesAcked,
         },
       });
 
-      return renderLivePresenceView(record, true);
+      return this.formatPresenceWatchView(
+        session.id,
+        recipient,
+        durationSeconds,
+        record,
+        true
+      );
     } catch (err) {
+      if (coalesceTimer) {
+        clearTimeout(coalesceTimer);
+        coalesceTimer = undefined;
+      }
       const safeErr = toSafeArabicError(err);
       return {
         text: `⚠️ *تعذر تتبع حالة التواجد:*\n${safeErr.userMessage}`,
