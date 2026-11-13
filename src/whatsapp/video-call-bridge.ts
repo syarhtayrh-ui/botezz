@@ -1972,7 +1972,253 @@ export class RealVideoCallService extends EventEmitter {
             : 'silence'
           : stream.videoFilePath;
 
-      const sanitizedTargetJid = stream.recipientJid.replace(/:\d+@/, '@');
+      let sanitizedTargetJid = stream.recipientJid.replace(/:\d+@/, '@');
+
+      // Ensure rawSocket.getUSyncDevices has LID -> PN fallback and primary device `:0` guarantee
+      const sockWithUSync = rawSocket as {
+        __botezzVoipUSyncWrapped?: boolean;
+        getUSyncDevices?: (
+          jids: string[],
+          useCache?: boolean,
+          ignoreZeroDevices?: boolean
+        ) => Promise<
+          Array<{ user: string; device: number; server?: string; jid?: string }>
+        >;
+        assertSessions?: (jids: string[], force?: boolean) => Promise<boolean>;
+        signalRepository?: {
+          lidMapping?: {
+            getLIDForPN?: (pn: string) => Promise<string | null | undefined>;
+            getPNForLID?: (lid: string) => Promise<string | null | undefined>;
+          };
+          migrateSession?: (fromJid: string, toJid: string) => Promise<unknown>;
+        };
+      };
+
+      if (
+        typeof sockWithUSync.getUSyncDevices === 'function' &&
+        !sockWithUSync.__botezzVoipUSyncWrapped
+      ) {
+        sockWithUSync.__botezzVoipUSyncWrapped = true;
+        const origGetUSync = sockWithUSync.getUSyncDevices.bind(rawSocket);
+        sockWithUSync.getUSyncDevices = async (
+          jids: string[],
+          useCache = true,
+          ignoreZeroDevices = false
+        ) => {
+          const inputJids = Array.isArray(jids) ? jids.filter(Boolean) : [];
+          let items: Array<{
+            user: string;
+            device: number;
+            server?: string;
+            jid?: string;
+          }> = [];
+          try {
+            const res = await origGetUSync(
+              inputJids,
+              useCache,
+              ignoreZeroDevices
+            );
+            if (Array.isArray(res)) {
+              items = [...res];
+            }
+          } catch {
+            items = [];
+          }
+
+          const formatDeviceJid = (
+            u: string,
+            srv: string,
+            dev?: number
+          ): string => {
+            const cleanU = String(u || '').split(':')[0]?.split('_')[0] || '';
+            const cleanSrv = srv || 's.whatsapp.net';
+            const dNum =
+              typeof dev === 'number' && Number.isFinite(dev) && dev > 0
+                ? dev
+                : 0;
+            return dNum > 0 ? `${cleanU}:${dNum}@${cleanSrv}` : `${cleanU}@${cleanSrv}`;
+          };
+
+          for (const reqJid of inputJids) {
+            const atIdx = reqJid.indexOf('@');
+            const userPart =
+              atIdx >= 0 ? reqJid.slice(0, atIdx) : reqJid.replace(/\D/g, '');
+            const reqServer =
+              atIdx >= 0
+                ? reqJid.slice(atIdx + 1)
+                : reqJid.endsWith('@lid')
+                  ? 'lid'
+                  : 's.whatsapp.net';
+            const reqUser = userPart.split(':')[0]?.split('_')[0] || '';
+            if (!reqUser) continue;
+
+            let hasUser = items.some((it) => it?.user === reqUser);
+            if (
+              !hasUser &&
+              (reqServer === 'lid' || reqServer === 'hosted.lid') &&
+              typeof sockWithUSync.signalRepository?.lidMapping?.getPNForLID ===
+                'function'
+            ) {
+              const mappedPn = await sockWithUSync.signalRepository.lidMapping
+                .getPNForLID(`${reqUser}@${reqServer}`)
+                .catch(() => undefined);
+              if (mappedPn) {
+                const cleanPn = String(mappedPn).replace(/:\d+@/, '@');
+                const pnDevs = await origGetUSync(
+                  [cleanPn],
+                  false,
+                  ignoreZeroDevices
+                ).catch(() => []);
+                if (Array.isArray(pnDevs) && pnDevs.length > 0) {
+                  for (const pd of pnDevs) {
+                    const devNum =
+                      typeof pd?.device === 'number' &&
+                      Number.isFinite(pd.device)
+                        ? pd.device
+                        : 0;
+                    items.push({
+                      user: reqUser,
+                      server: reqServer,
+                      device: devNum,
+                      jid: formatDeviceJid(reqUser, reqServer, devNum),
+                    });
+                  }
+                  hasUser = true;
+                }
+                if (
+                  typeof sockWithUSync.signalRepository?.migrateSession ===
+                  'function'
+                ) {
+                  await sockWithUSync.signalRepository
+                    .migrateSession(cleanPn, `${reqUser}@${reqServer}`)
+                    .catch(() => undefined);
+                }
+              }
+            }
+
+            if (!hasUser && !ignoreZeroDevices) {
+              items.push({
+                user: reqUser,
+                server: reqServer,
+                device: 0,
+                jid: formatDeviceJid(reqUser, reqServer, 0),
+              });
+            }
+          }
+
+          const seen = new Set<string>();
+          const out: Array<{
+            user: string;
+            device: number;
+            server?: string;
+            jid: string;
+          }> = [];
+          for (const it of items) {
+            if (!it || !it.user) continue;
+            const srv =
+              it.server ||
+              (String(it.jid || '').endsWith('@lid')
+                ? 'lid'
+                : 's.whatsapp.net');
+            const devNum =
+              typeof it.device === 'number' && Number.isFinite(it.device)
+                ? it.device
+                : 0;
+            const canonical = formatDeviceJid(it.user, srv, devNum);
+            if (!canonical || seen.has(canonical)) continue;
+            seen.add(canonical);
+            out.push({
+              ...it,
+              user: it.user,
+              server: srv,
+              device: devNum,
+              jid: canonical,
+            });
+          }
+          return out;
+        };
+      }
+
+      const driverWithPrepare = ctx?.driver as
+        | (WhatsAppSessionDriver & {
+            preparePeerForVoipCall?: (targetInput: string) => Promise<{
+              dialTargetJid: string;
+              pnJid?: string;
+              lidJid?: string;
+              deviceJids: string[];
+            }>;
+          })
+        | undefined;
+
+      if (typeof driverWithPrepare?.preparePeerForVoipCall === 'function') {
+        const prepared = await driverWithPrepare
+          .preparePeerForVoipCall(sanitizedTargetJid)
+          .catch(() => undefined);
+        if (prepared?.dialTargetJid) {
+          sanitizedTargetJid = prepared.dialTargetJid;
+        }
+      } else {
+        try {
+          let pnJid = sanitizedTargetJid.endsWith('@s.whatsapp.net')
+            ? sanitizedTargetJid
+            : undefined;
+          let lidJid = sanitizedTargetJid.endsWith('@lid')
+            ? sanitizedTargetJid
+            : undefined;
+          if (
+            pnJid &&
+            !lidJid &&
+            typeof sockWithUSync.signalRepository?.lidMapping?.getLIDForPN ===
+              'function'
+          ) {
+            const resolvedLid =
+              await sockWithUSync.signalRepository.lidMapping
+                .getLIDForPN(pnJid)
+                .catch(() => undefined);
+            if (typeof resolvedLid === 'string' && resolvedLid.endsWith('@lid')) {
+              lidJid = resolvedLid.replace(/:\d+@/, '@');
+            }
+          } else if (
+            lidJid &&
+            !pnJid &&
+            typeof sockWithUSync.signalRepository?.lidMapping?.getPNForLID ===
+              'function'
+          ) {
+            const resolvedPn =
+              await sockWithUSync.signalRepository.lidMapping
+                .getPNForLID(lidJid)
+                .catch(() => undefined);
+            if (
+              typeof resolvedPn === 'string' &&
+              resolvedPn.endsWith('@s.whatsapp.net')
+            ) {
+              pnJid = resolvedPn.replace(/:\d+@/, '@');
+              sanitizedTargetJid = pnJid;
+            }
+          }
+          if (
+            pnJid &&
+            lidJid &&
+            typeof sockWithUSync.signalRepository?.migrateSession === 'function'
+          ) {
+            await sockWithUSync.signalRepository
+              .migrateSession(pnJid, lidJid)
+              .catch(() => undefined);
+          }
+          if (typeof sockWithUSync.assertSessions === 'function') {
+            const sessionTargets = [lidJid, pnJid].filter(
+              (j): j is string => Boolean(j)
+            );
+            if (sessionTargets.length > 0) {
+              await sockWithUSync
+                .assertSessions(sessionTargets, false)
+                .catch(() => false);
+            }
+          }
+        } catch {
+          // Non-fatal pre-call warmup fallback
+        }
+      }
 
       const callResult = await voip.call(
         sanitizedTargetJid,

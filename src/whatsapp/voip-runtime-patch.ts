@@ -2254,6 +2254,7 @@ export async function ensureHiroosyVoipRuntimePatched(): Promise<void> {
       }
 
       // Clean up calls when a `<reject>` stanza arrives (`P0-B` + `BZ-021`)
+      // and harden `syncDeviceList` + `ensureSessionsBatch` against empty `@lid` USync responses.
       const callManagerPath = path.join(
         pkgDir,
         'src/voip/call/WaCallManager.js'
@@ -2266,6 +2267,35 @@ export async function ensureHiroosyVoipRuntimePatched(): Promise<void> {
             prototype?: {
               __botezzCallManagerPatched?: boolean;
               calls?: Map<string, InstrumentedMediaSession>;
+              deps?: {
+                __botezzDepsHardened?: boolean;
+                signalDeviceSync?: {
+                  syncDeviceList?: (
+                    jids: string[]
+                  ) => Promise<Array<{ deviceJids: string[] }>>;
+                  queryLidsByPhoneJids?: (
+                    jids: string[]
+                  ) => Promise<Array<{ lidJid?: string }>>;
+                };
+                sessionResolver?: {
+                  ensureSessionsBatch?: (
+                    devices: string[]
+                  ) => Promise<Array<{ address: unknown; session: unknown }>>;
+                };
+                signalProtocol?: {
+                  encryptMessage?: (
+                    address: { user: string; server: string; device: number },
+                    plaintext: Uint8Array
+                  ) => Promise<{ type: string; ciphertext: Uint8Array }>;
+                };
+              };
+              startCall?: (options: {
+                peerJid: string;
+                isVideo?: boolean;
+                audioFile?: string;
+                videoConfig?: unknown;
+              }) => Promise<string>;
+              resolvePeerLid?: (peerJid: string) => Promise<string>;
               resolveSessionFromNode?: (
                 node: unknown
               ) => InstrumentedMediaSession | null;
@@ -2280,6 +2310,118 @@ export async function ensureHiroosyVoipRuntimePatched(): Promise<void> {
         const proto = mod?.WaCallManager?.prototype;
         if (proto && !proto.__botezzCallManagerPatched) {
           proto.__botezzCallManagerPatched = true;
+
+          const normalizeCallOfferDeviceJids = (
+            rawList: string[],
+            fallbackTargetJid: string
+          ): string[] => {
+            const toCanonicalDeviceJid = (input: string): string => {
+              const trimmed = String(input || '').trim();
+              if (!trimmed) return '';
+              const atIdx = trimmed.indexOf('@');
+              if (atIdx < 0) {
+                const digits = trimmed.replace(/\D/g, '');
+                return digits ? `${digits}@s.whatsapp.net` : '';
+              }
+              const userPart = trimmed.slice(0, atIdx);
+              const serverPart = trimmed.slice(atIdx + 1) || 's.whatsapp.net';
+              const [userRaw, devRaw] = userPart.split(':');
+              const cleanUser = (userRaw || '').split('_')[0] || '';
+              if (!cleanUser) return '';
+              const devNum =
+                devRaw !== undefined && devRaw !== '' ? Number(devRaw) : 0;
+              if (!Number.isFinite(devNum) || devNum <= 0) {
+                return `${cleanUser}@${serverPart}`;
+              }
+              return `${cleanUser}:${devNum}@${serverPart}`;
+            };
+
+            const seen = new Set<string>();
+            const deduped: string[] = [];
+            for (const item of rawList) {
+              const canonical = toCanonicalDeviceJid(item);
+              if (canonical && !seen.has(canonical)) {
+                seen.add(canonical);
+                deduped.push(canonical);
+              }
+            }
+            if (deduped.length === 0) {
+              const fallbackBare = toCanonicalDeviceJid(fallbackTargetJid);
+              if (fallbackBare) {
+                deduped.push(fallbackBare);
+              }
+            }
+            return deduped.slice(0, 5);
+          };
+
+          if (typeof proto.startCall === 'function') {
+            const origStartCall = proto.startCall;
+            proto.startCall = async function patchedStartCall(
+              this: NonNullable<typeof proto>,
+              options: {
+                peerJid: string;
+                isVideo?: boolean;
+                audioFile?: string;
+                videoConfig?: unknown;
+              }
+            ) {
+              if (this.deps && !this.deps.__botezzDepsHardened) {
+                this.deps.__botezzDepsHardened = true;
+
+                const syncObj = this.deps.signalDeviceSync;
+                if (syncObj && typeof syncObj.syncDeviceList === 'function') {
+                  const origSyncDeviceList = syncObj.syncDeviceList.bind(syncObj);
+                  syncObj.syncDeviceList = async (jids: string[]) => {
+                    let rawOut: Array<{ deviceJids: string[] }> = [];
+                    try {
+                      rawOut = await origSyncDeviceList(jids);
+                    } catch {
+                      rawOut = [];
+                    }
+                    return jids.map((jid, idx) => {
+                      const existing = Array.isArray(rawOut?.[idx]?.deviceJids)
+                        ? rawOut[idx]!.deviceJids
+                        : [];
+                      return {
+                        deviceJids: normalizeCallOfferDeviceJids(existing, jid),
+                      };
+                    });
+                  };
+                }
+
+                const resolverObj = this.deps.sessionResolver;
+                if (
+                  resolverObj &&
+                  typeof resolverObj.ensureSessionsBatch === 'function'
+                ) {
+                  const origEnsureBatch =
+                    resolverObj.ensureSessionsBatch.bind(resolverObj);
+                  resolverObj.ensureSessionsBatch = async (devices: string[]) => {
+                    if (Array.isArray(devices) && devices.length > 0) {
+                      const normalized = normalizeCallOfferDeviceJids(
+                        devices,
+                        devices[0]!
+                      );
+                      devices.splice(0, devices.length, ...normalized);
+                    }
+                    try {
+                      return await origEnsureBatch(devices);
+                    } catch (err) {
+                      if (Array.isArray(devices) && devices.length > 1) {
+                        const primaryOnly = [devices[0]!];
+                        devices.splice(0, devices.length, ...primaryOnly);
+                        return await origEnsureBatch(devices);
+                      }
+                      throw err;
+                    }
+                  };
+                }
+              }
+
+              return await origStartCall.call(this, options);
+            };
+          }
+
           proto.handleCallReject = async function patchedHandleCallReject(
             node: unknown
           ) {

@@ -259,14 +259,14 @@ test('1. validateRecipient & LID Resolution + sendAnonymousLidMessage across all
 
   assert.equal(fake.sentMessages.length, 1);
   assert.equal(fake.sentMessages[0].jid, '99887766554433@lid');
-  assert.equal(
+  const sentBody =
+    (fake.sentMessages[0].content as { text?: string })?.text ||
     (
       fake.sentMessages[0].content as {
         extendedTextMessage?: { text?: string };
       }
-    )?.extendedTextMessage?.text,
-    'رسالة سرية عبر بروتوكول LID'
-  );
+    )?.extendedTextMessage?.text;
+  assert.equal(sentBody, 'رسالة سرية عبر بروتوكول LID');
   assert.equal(fake.sentMessages[0].options?.addressingMode, 'lid');
   assert.deepEqual(
     fake.sentMessages[0].options?.additionalAttributes,
@@ -447,6 +447,48 @@ test('3. Full Profile Inspector (fetchFullProfileInfo): aggregates 7 sources and
     report.businessProfile?.businessHoursSummary?.[0]?.includes('09:00 - 17:00')
   );
 
+  // Also test official executeUSyncQuery single round-trip path directly
+  let executedUsyncCount = 0;
+  const fakeOfficialUsync = createFakeBaileysSocket({
+    executeUSyncQuery: async () => {
+      executedUsyncCount++;
+      return {
+        list: [
+          {
+            id: '966509998887@s.whatsapp.net',
+            contact: true,
+            lid: '55443322110099@lid',
+            status: {
+              status: 'حالة رسمية عبر USyncQuery',
+              setAt: new Date('2026-04-01T12:00:00.000Z'),
+            },
+            disappearing_mode: {
+              duration: 86400,
+              setAt: new Date('2026-04-01T08:00:00.000Z'),
+            },
+            devices: {
+              deviceList: [{ id: 0 }, { id: 14 }],
+            },
+          },
+        ],
+      };
+    },
+  });
+  const officialLookup = await driver.executeOfficialUSyncAccountLookup(
+    fakeOfficialUsync.sock,
+    '+966509998887'
+  );
+  assert.equal(executedUsyncCount, 1);
+  assert.equal(officialLookup.exists, true);
+  assert.equal(officialLookup.pnJid, '966509998887@s.whatsapp.net');
+  assert.equal(officialLookup.lidJid, '55443322110099@lid');
+  assert.equal(officialLookup.statusText, 'حالة رسمية عبر USyncQuery');
+  assert.equal(officialLookup.disappearingDuration, 86400);
+  assert.deepEqual(
+    officialLookup.devices.map((d) => d.id),
+    [0, 14]
+  );
+
   await driver.disconnect();
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
@@ -470,14 +512,17 @@ test('4. Short-Timer Self-Destruct Message (sendShortEphemeralMessage): sends ep
   assert.equal(ephSend.triggerMode, 'ON_SEND');
   assert.equal(fake.queriedNodes.length, 1);
   assert.equal(fake.queriedNodes[0].attrs.xmlns, 'w:g2');
-  assert.equal(fake.sentMessages.length, 1);
-  assert.equal(fake.sentMessages[0].jid, '966501234567@s.whatsapp.net');
-  assert.equal(fake.sentMessages[0].options?.ephemeralExpiration, 1);
+  assert.equal(fake.sentMessages.length, 2);
+  assert.deepEqual(fake.sentMessages[0].content, {
+    disappearingMessagesInChat: 1,
+  });
+  assert.equal(fake.sentMessages[1].jid, '966501234567@s.whatsapp.net');
+  assert.equal(fake.sentMessages[1].options?.ephemeralExpiration, 1);
 
   // Wait 1.15s for the auto-revoke timer to fire
   await new Promise((r) => setTimeout(r, 1150));
-  assert.equal(fake.sentMessages.length, 2);
-  const revokeCall = fake.sentMessages[1];
+  assert.equal(fake.sentMessages.length, 3);
+  const revokeCall = fake.sentMessages[2];
   assert.equal(revokeCall.jid, '966501234567@s.whatsapp.net');
   assert.deepEqual(revokeCall.content, {
     delete: {

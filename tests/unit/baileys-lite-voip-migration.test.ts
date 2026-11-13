@@ -33,6 +33,7 @@ import { RealVideoCallService } from '../../src/whatsapp/video-call-bridge';
 import {
   instrumentVideoEngineInstance,
   instrumentMediaSessionInstance,
+  ensureHiroosyVoipRuntimePatched,
 } from '../../src/whatsapp/voip-runtime-patch';
 import {
   MockWhatsAppSessionDriver,
@@ -1547,6 +1548,132 @@ describe('@hiroosy/baileys-lite & Real WhatsApp VoIP Video Call Suite', () => {
 
       appDb.close();
     });
+
+    it('resolves @lid device sessions (e.g. 36597986795687@lid) via PN fallback, migrates Signal sessions, and prevents "no device sessions to encrypt the call offer"', async () => {
+      await ensureHiroosyVoipRuntimePatched();
+
+      const targetPnJid = '967771234567@s.whatsapp.net';
+      const targetLidJid = '36597986795687@lid';
+      const migratedPairs: Array<{ fromJid: string; toJid: string }> = [];
+      const assertedSessionBatches: string[][] = [];
+      const usyncQueries: string[][] = [];
+
+      const rawSocket: Record<string, unknown> = {
+        ev: new EventEmitter(),
+        ws: { isOpen: true },
+        authState: {
+          creds: {
+            me: {
+              id: '966500000000:1@s.whatsapp.net',
+              lid: '11223344556677:1@lid',
+            },
+          },
+          keys: {
+            get: async () => ({}),
+            set: async () => undefined,
+          },
+        },
+        signalRepository: {
+          lidMapping: {
+            getLIDForPN: async (pn: string) =>
+              pn.startsWith('967771234567') ? targetLidJid : null,
+            getPNForLID: async (lid: string) =>
+              lid.startsWith('36597986795687') ? targetPnJid : null,
+            storeLIDPNMappings: async () => undefined,
+          },
+          migrateSession: async (fromJid: string, toJid: string) => {
+            migratedPairs.push({ fromJid, toJid });
+            return { migrated: 2, skipped: 0, total: 2 };
+          },
+          injectE2ESession: async () => undefined,
+          encryptMessage: async () => ({
+            type: 'pkmsg',
+            ciphertext: Buffer.from([1, 2, 3, 4]),
+          }),
+          decryptMessage: async () => Buffer.from([1, 2, 3, 4]),
+          jidToSignalProtocolAddress: (jid: string) => jid,
+        },
+        // Simulate WhatsApp USync server returning [] when queried directly with @lid after userDevicesCache expires,
+        // but returning the primary + companion device when queried with the counterpart @s.whatsapp.net PN JID:
+        getUSyncDevices: async (jids: string[]) => {
+          usyncQueries.push(jids);
+          if (jids.every((j) => j.endsWith('@lid'))) {
+            return [];
+          }
+          return [
+            { user: '967771234567', device: 0 },
+            { user: '967771234567', device: 33 },
+          ];
+        },
+        assertSessions: async (jids: string[]) => {
+          assertedSessionBatches.push(jids);
+          return true;
+        },
+      };
+
+      const service = new RealVideoCallService();
+      service.setCompatibilityOverride(
+        runBaileysCompatibilityProbe({ requireLiveSocket: false })
+      );
+      service.attachSession('sess_lid_voip_fix', rawSocket);
+
+      const harness = createRealisticHiroosyVoipMock();
+      const attachedMap = (
+        service as unknown as {
+          attachedSessions: Map<string, { voipInstance?: unknown }>;
+        }
+      ).attachedSessions;
+      attachedMap.get('sess_lid_voip_fix')!.voipInstance = harness.voipMock;
+
+      const stream = await service.startVideoCall({
+        sessionId: 'sess_lid_voip_fix',
+        socket: rawSocket,
+        recipientJid: targetPnJid,
+        videoFilePath: validLandscapeMp4,
+        allowedRootDirs: [tmpDir],
+      });
+
+      assert.ok(stream.voipCallInstance);
+
+      // Verify wrapped getUSyncDevices on rawSocket now resolves 36597986795687@lid via PN fallback
+      const wrappedGetUSyncDevices = rawSocket.getUSyncDevices as (
+        jids: string[],
+        useCache?: boolean,
+        ignoreZeroDevices?: boolean
+      ) => Promise<Array<{ user: string; device: number; jid?: string }>>;
+
+      const resolvedLidDevices = await wrappedGetUSyncDevices(
+        [targetLidJid],
+        true,
+        false
+      );
+      assert.ok(
+        resolvedLidDevices.length >= 2,
+        'Wrapped getUSyncDevices(["36597986795687@lid"]) must return primary + companion LID devices via PN fallback'
+      );
+      assert.ok(
+        resolvedLidDevices.some(
+          (d) => d.user === '36597986795687' && d.device === 0 && d.jid === '36597986795687@lid'
+        ),
+        'Primary LID device 0 (36597986795687@lid) must be present with .jid populated'
+      );
+      assert.ok(
+        resolvedLidDevices.some(
+          (d) => d.user === '36597986795687' && d.device === 33 && d.jid === '36597986795687:33@lid'
+        ),
+        'Companion LID device 33 (36597986795687:33@lid) must be mapped onto the LID user'
+      );
+      assert.ok(
+        migratedPairs.some(
+          (p) => p.fromJid === targetPnJid && p.toJid === targetLidJid
+        ),
+        'Signal session must be migrated from PN JID to LID JID'
+      );
+
+      await service.stopVideoCall('sess_lid_voip_fix', stream.callId);
+      service.detachSession('sess_lid_voip_fix');
+    });
   });
 });
+
 

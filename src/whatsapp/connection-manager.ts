@@ -7,6 +7,7 @@ import makeWASocket, {
   fetchLatestBaileysVersion,
   fetchLatestWaWebVersion,
   Browsers,
+  jidEncode,
   jidDecode,
   jidNormalizedUser,
   areJidsSameUser,
@@ -25,6 +26,9 @@ import makeWASocket, {
   S_WHATSAPP_NET,
   getBinaryNodeChild,
   getBinaryNodeChildren,
+  USyncQuery,
+  USyncUser,
+  type USyncQueryResultItem,
   toCompatibleWhatsAppSocket,
   CompatibleWhatsAppSocket,
 } from './baileys-compat';
@@ -1291,6 +1295,12 @@ export interface WhatsAppSessionDriver {
       | 'ON_WHATSAPP_USYNC'
       | 'GROUP_PARTICIPANT_CACHE';
   }>;
+  preparePeerForVoipCall?(targetInput: string): Promise<{
+    dialTargetJid: string;
+    pnJid?: string;
+    lidJid?: string;
+    deviceJids: string[];
+  }>;
   sendAnonymousLidMessage(params: {
     recipient: string;
     text: string;
@@ -1948,6 +1958,179 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
           });
           throw err;
         }
+      };
+    }
+
+    if (typeof sock.getUSyncDevices === 'function') {
+      const origGetUSyncDevices = sock.getUSyncDevices.bind(sock);
+      sock.getUSyncDevices = async (
+        jids: string[],
+        useCache = true,
+        ignoreZeroDevices = false
+      ) => {
+        const inputJids = Array.isArray(jids) ? jids.filter(Boolean) : [];
+        let rawResults: Array<{
+          user: string;
+          device: number;
+          server?: string;
+          jid?: string;
+        }> = [];
+        try {
+          const fetched = await origGetUSyncDevices(
+            inputJids,
+            useCache,
+            ignoreZeroDevices
+          );
+          if (Array.isArray(fetched)) {
+            rawResults = [...fetched];
+          }
+        } catch {
+          rawResults = [];
+        }
+
+        const normalizeResultJid = (
+          user: string,
+          server: string,
+          device?: number
+        ): string => {
+          const cleanUser = String(user || '').split(':')[0]?.split('_')[0] || '';
+          const cleanServer = server || 's.whatsapp.net';
+          const devNum =
+            typeof device === 'number' && Number.isFinite(device) && device > 0
+              ? device
+              : undefined;
+          return jidEncode(cleanUser, cleanServer, devNum);
+        };
+
+        for (const reqJid of inputJids) {
+          const decoded = jidDecode(reqJid);
+          const reqUser =
+            decoded?.user || reqJid.split('@')[0]?.split(':')[0] || '';
+          const reqServer =
+            decoded?.server ||
+            (reqJid.endsWith('@lid') ? 'lid' : 's.whatsapp.net');
+          if (!reqUser) continue;
+
+          if (typeof decoded?.device === 'number' && decoded.device >= 0) {
+            const explicitJid = normalizeResultJid(
+              reqUser,
+              reqServer,
+              decoded.device
+            );
+            if (!rawResults.some((r) => r.jid === explicitJid)) {
+              rawResults.push({
+                user: reqUser,
+                server: reqServer,
+                device: decoded.device,
+                jid: explicitJid,
+              });
+            }
+            continue;
+          }
+
+          let hasUserDevices = rawResults.some((r) => r?.user === reqUser);
+
+          // If `@lid` device discovery returned empty or missed `userDevicesCache`,
+          // resolve the counterpart `pnJid` (`@s.whatsapp.net`) and query USync via `pnJid`.
+          if (
+            !hasUserDevices &&
+            (reqServer === 'lid' || reqServer === 'hosted.lid')
+          ) {
+            const normLid = jidNormalizedUser(reqJid);
+            const mappedPn =
+              this.memoryStore.getPnForLid(normLid) ||
+              (await sock.signalRepository?.lidMapping
+                ?.getPNForLID?.(normLid)
+                .catch(() => undefined)) ||
+              undefined;
+            if (mappedPn) {
+              const normPn = jidNormalizedUser(mappedPn);
+              const pnUser = normPn.split('@')[0]?.split(':')[0] || '';
+              this.memoryStore.recordLidMapping(normLid, normPn);
+              const alreadyFetchedPnDevs = pnUser
+                ? rawResults.filter((r) => r?.user === pnUser)
+                : [];
+              const pnWasInInput = inputJids.some(
+                (j) => jidNormalizedUser(j) === normPn
+              );
+              const pnDevices =
+                alreadyFetchedPnDevs.length > 0
+                  ? alreadyFetchedPnDevs
+                  : await origGetUSyncDevices(
+                      [normPn],
+                      false,
+                      ignoreZeroDevices
+                    ).catch(() => []);
+              if (Array.isArray(pnDevices) && pnDevices.length > 0) {
+                for (const pd of pnDevices) {
+                  const devNum =
+                    typeof pd?.device === 'number' && Number.isFinite(pd.device)
+                      ? pd.device
+                      : 0;
+                  rawResults.push({
+                    user: reqUser,
+                    server: reqServer,
+                    device: devNum,
+                    jid: normalizeResultJid(reqUser, reqServer, devNum),
+                  });
+                }
+                hasUserDevices = true;
+              }
+              if (
+                !pnWasInInput &&
+                typeof sock.signalRepository?.migrateSession === 'function'
+              ) {
+                await sock.signalRepository
+                  .migrateSession(normPn, normLid)
+                  .catch(() => undefined);
+              }
+            }
+          }
+
+          // Guarantee primary phone device `:0` is present when `!ignoreZeroDevices`
+          if (!hasUserDevices && !ignoreZeroDevices) {
+            rawResults.push({
+              user: reqUser,
+              server: reqServer,
+              device: 0,
+              jid: normalizeResultJid(reqUser, reqServer, 0),
+            });
+          }
+        }
+
+        const deduped: Array<{
+          user: string;
+          device: number;
+          server?: string;
+          jid: string;
+        }> = [];
+        const seenJids = new Set<string>();
+        for (const item of rawResults) {
+          if (!item || !item.user) continue;
+          const itemDecoded = item.jid ? jidDecode(item.jid) : undefined;
+          const server =
+            item.server ||
+            itemDecoded?.server ||
+            (String(item.jid || '').endsWith('@lid')
+              ? 'lid'
+              : 's.whatsapp.net');
+          const devNum =
+            typeof item.device === 'number' && Number.isFinite(item.device)
+              ? item.device
+              : itemDecoded?.device ?? 0;
+          const canonicalJid = normalizeResultJid(item.user, server, devNum);
+          if (!canonicalJid || seenJids.has(canonicalJid)) continue;
+          seenJids.add(canonicalJid);
+          deduped.push({
+            ...item,
+            user: item.user,
+            server,
+            device: devNum,
+            jid: canonicalJid,
+          });
+        }
+
+        return deduped;
       };
     }
 
@@ -3476,14 +3659,301 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
   }
 
   /**
+   * Executes an official Baileys `USyncQuery` combining Contact, LID, Status, DisappearingMode,
+   * and Devices protocols in a single round-trip via `sock.executeUSyncQuery(usyncQuery)`,
+   * with safe fallbacks for mock/partial sockets.
+   */
+  public async executeOfficialUSyncAccountLookup(
+    sock: WASocket,
+    targetInput: string
+  ): Promise<{
+    exists: boolean;
+    pnJid: string;
+    lidJid?: string;
+    statusText?: string;
+    statusSetAt?: Date;
+    disappearingDuration?: number;
+    disappearingSetAt?: Date;
+    pictureId?: string;
+    devices: Array<{ id: number; keyIndex?: number; isHosted?: boolean }>;
+  }> {
+    let trimmed = String(targetInput || '').trim();
+    if (!trimmed.includes('@')) {
+      trimmed = trimmed.replace(/[\s\-()]+/g, '');
+    }
+
+    let isLid = trimmed.endsWith('@lid');
+    if (isLid) {
+      const userPart = trimmed.slice(0, -4).trim();
+      const digitsOnly = userPart.replace(/\D/g, '');
+      const looksLikePhoneWithFakeLid =
+        userPart.startsWith('+') ||
+        /^(?:9665\d{8}|9715\d{8}|965[569]\d{7}|974[3567]\d{7}|9733\d{7}|968[79]\d{7}|201\d{9}|9627\d{8}|9647\d{9}|9677\d{8})$/.test(
+          digitsOnly
+        );
+      if (looksLikePhoneWithFakeLid) {
+        trimmed = `+${digitsOnly}`;
+        isLid = false;
+      }
+    }
+
+    const cleanDigits = trimmed.split('@')[0].replace(/\D/g, '');
+    let pnJid = isLid ? '' : `${cleanDigits}@s.whatsapp.net`;
+    let lidJid = isLid ? jidNormalizedUser(trimmed) : undefined;
+
+    if (isLid && lidJid) {
+      const mappedPn =
+        this.memoryStore.getPnForLid(lidJid) ||
+        (await sock.signalRepository?.lidMapping
+          ?.getPNForLID?.(lidJid)
+          .catch(() => undefined)) ||
+        undefined;
+      if (mappedPn) {
+        pnJid = jidNormalizedUser(mappedPn);
+      }
+    }
+
+    let exists = false;
+    let statusText: string | undefined;
+    let statusSetAt: Date | undefined;
+    let disappearingDuration: number | undefined;
+    let disappearingSetAt: Date | undefined;
+    let pictureId: string | undefined;
+    let devices: Array<{ id: number; keyIndex?: number; isHosted?: boolean }> = [];
+
+    // 1. Primary path: Official Baileys USyncQuery combining all 5 protocols in 1 round-trip
+    if (typeof USyncQuery === 'function' && typeof USyncUser === 'function') {
+      const usyncQuery = new USyncQuery()
+        .withContext('interactive')
+        .withContactProtocol()
+        .withLIDProtocol()
+        .withStatusProtocol()
+        .withDisappearingModeProtocol()
+        .withDevicesProtocol();
+
+      const usyncUser = new USyncUser();
+      if (isLid && lidJid) {
+        usyncUser.withId(lidJid);
+      } else if (cleanDigits) {
+        usyncUser.withPhone(`+${cleanDigits}`).withId(pnJid);
+      }
+      usyncQuery.withUser(usyncUser);
+
+      if (typeof sock.executeUSyncQuery === 'function') {
+        try {
+          const res = await sock.executeUSyncQuery(usyncQuery);
+          const item: USyncQueryResultItem | undefined = res?.list?.[0];
+          if (item) {
+            if (item.id && item.id.endsWith('@s.whatsapp.net')) {
+              pnJid = jidNormalizedUser(item.id);
+            } else if (item.id && item.id.endsWith('@lid')) {
+              lidJid = jidNormalizedUser(item.id);
+            }
+
+            if (typeof item.contact === 'boolean') {
+              exists = item.contact;
+            } else if (item.contact && typeof item.contact === 'object') {
+              exists = item.contact.type !== 'out';
+            } else if (item.id) {
+              exists = true;
+            }
+
+            const parsedLid = this.extractLidString(item.lid);
+            if (parsedLid && parsedLid.endsWith('@lid')) {
+              lidJid = parsedLid;
+            }
+
+            if (
+              item.status &&
+              typeof item.status.status === 'string' &&
+              item.status.status.trim()
+            ) {
+              statusText = item.status.status.trim();
+            }
+            if (
+              item.status?.setAt instanceof Date &&
+              !Number.isNaN(item.status.setAt.getTime()) &&
+              item.status.setAt.getTime() > 0
+            ) {
+              statusSetAt = item.status.setAt;
+            }
+
+            if (
+              item.disappearing_mode &&
+              typeof item.disappearing_mode.duration === 'number'
+            ) {
+              disappearingDuration = item.disappearing_mode.duration;
+              if (
+                item.disappearing_mode.setAt instanceof Date &&
+                !Number.isNaN(item.disappearing_mode.setAt.getTime()) &&
+                item.disappearing_mode.setAt.getTime() > 0
+              ) {
+                disappearingSetAt = item.disappearing_mode.setAt;
+              }
+            }
+
+            if (Array.isArray(item.devices?.deviceList)) {
+              devices = item.devices!.deviceList.map((d) => ({
+                id: Number(d.id ?? 0),
+                keyIndex: d.keyIndex,
+                isHosted: d.isHosted,
+              }));
+            }
+          }
+        } catch {
+          // Fall through to individual Baileys socket methods below
+        }
+      }
+    }
+
+    // 2. Check signalRepository.lidMapping & memoryStore if LID is still unknown
+    if (!lidJid && pnJid) {
+      const repoLid = await sock.signalRepository?.lidMapping
+        ?.getLIDForPN?.(pnJid)
+        .catch(() => undefined);
+      const parsedRepoLid =
+        this.extractLidString(repoLid) || this.memoryStore.getLidForPn(pnJid);
+      if (parsedRepoLid && parsedRepoLid.endsWith('@lid')) {
+        lidJid = parsedRepoLid;
+      }
+    }
+
+    // 3. Fallback / Enrichment via sock.onWhatsApp, sock.getUSyncDevices, sock.fetchStatus, sock.fetchDisappearingDuration
+    if ((!lidJid || !exists) && typeof sock.onWhatsApp === 'function' && pnJid) {
+      try {
+        const waRes = await sock.onWhatsApp(pnJid);
+        const first = Array.isArray(waRes) ? waRes[0] : undefined;
+        if (first) {
+          exists = Boolean(first.exists);
+          if (first.jid) {
+            pnJid = jidNormalizedUser(first.jid);
+          }
+          const waLid = this.extractLidString(first.lid);
+          if (waLid && waLid.endsWith('@lid')) {
+            lidJid = waLid;
+          }
+        }
+      } catch {
+        // Ignore
+      }
+    }
+
+    if (
+      (devices.length === 0 || !lidJid) &&
+      typeof sock.getUSyncDevices === 'function' &&
+      (pnJid || lidJid)
+    ) {
+      try {
+        const devTarget = pnJid || lidJid!;
+        const rawDevs = await sock.getUSyncDevices([devTarget], false, false);
+        if (Array.isArray(rawDevs) && rawDevs.length > 0) {
+          exists = true;
+          if (devices.length === 0) {
+            const seen = new Set<number>();
+            for (const d of rawDevs) {
+              const id = Number(d?.device ?? 0);
+              if (Number.isFinite(id) && !seen.has(id)) {
+                seen.add(id);
+                devices.push({ id });
+              }
+            }
+          }
+        }
+        if (!lidJid && pnJid) {
+          const repoLid = await sock.signalRepository?.lidMapping
+            ?.getLIDForPN?.(pnJid)
+            .catch(() => undefined);
+          const parsedLid =
+            this.extractLidString(repoLid) || this.memoryStore.getLidForPn(pnJid);
+          if (parsedLid && parsedLid.endsWith('@lid')) {
+            lidJid = parsedLid;
+          }
+        }
+      } catch {
+        // Ignore
+      }
+    }
+
+    if (!statusText && typeof sock.fetchStatus === 'function' && (pnJid || lidJid)) {
+      try {
+        const stRes = await sock.fetchStatus(pnJid || lidJid!);
+        const first = Array.isArray(stRes) ? stRes[0] : stRes;
+        if (first && typeof first === 'object') {
+          const entryObj = first as Record<string, unknown>;
+          const nested = entryObj.status;
+          if (typeof nested === 'string' && nested.trim()) {
+            statusText = nested.trim();
+            const rawDate = entryObj.setAt;
+            if (rawDate) {
+              const d = new Date(rawDate as string | number | Date);
+              if (!Number.isNaN(d.getTime()) && d.getTime() > 0) {
+                statusSetAt = d;
+              }
+            }
+          } else if (nested && typeof nested === 'object') {
+            const inner = nested as Record<string, unknown>;
+            if (typeof inner.status === 'string' && inner.status.trim()) {
+              statusText = inner.status.trim();
+            }
+            const rawDate = inner.setAt ?? entryObj.setAt;
+            if (rawDate) {
+              const d = new Date(rawDate as string | number | Date);
+              if (!Number.isNaN(d.getTime()) && d.getTime() > 0) {
+                statusSetAt = d;
+              }
+            }
+          }
+        }
+      } catch {
+        // Ignore
+      }
+    }
+
+    if (
+      disappearingDuration === undefined &&
+      typeof sock.fetchDisappearingDuration === 'function' &&
+      (pnJid || lidJid)
+    ) {
+      try {
+        const dmRes = await sock.fetchDisappearingDuration(pnJid || lidJid!);
+        const dmItem = Array.isArray(dmRes) ? dmRes[0] : undefined;
+        if (typeof dmItem?.disappearing_mode?.duration === 'number') {
+          disappearingDuration = dmItem.disappearing_mode.duration;
+          if (
+            dmItem.disappearing_mode.setAt instanceof Date &&
+            !Number.isNaN(dmItem.disappearing_mode.setAt.getTime()) &&
+            dmItem.disappearing_mode.setAt.getTime() > 0
+          ) {
+            disappearingSetAt = dmItem.disappearing_mode.setAt;
+          }
+        }
+      } catch {
+        // Ignore
+      }
+    }
+
+    // 4. Persist LID <-> PN mapping in both memoryStore and Baileys' internal signalRepository.lidMapping
+    if (lidJid && pnJid) {
+      await this.persistLidPnMappingOnSocket(sock, lidJid, pnJid);
+    }
+
+    return {
+      exists,
+      pnJid: pnJid || lidJid || trimmed,
+      lidJid,
+      statusText,
+      statusSetAt,
+      disappearingDuration,
+      disappearingSetAt,
+      pictureId,
+      devices,
+    };
+  }
+
+  /**
    * Resolves the Privacy-Preserving Linked Identity (`@lid`) for a target phone number or JID
-   * across 6 protocol layers:
-   * 1. Direct `@lid` input
-   * 2. Local `signalRepository.lidMapping` & `SessionMemoryStore`
-   * 3. Live `sock.onWhatsApp(pnJid)` USync `<lid>` stanza query
-   * 4. `sock.getUSyncDevices([pnJid], false, false)` (which triggers `withLIDProtocol()` and populates `lidMapping`)
-   * 5. Direct USync `<iq xmlns="usync">` query with `<contact/>`, `<lid/>`, and `<devices version="2"/>`
-   * 6. Participating `groupMetadataCache` participant entries
+   * using official Baileys `USyncQuery` (`USyncLIDProtocol`), `signalRepository.lidMapping`,
+   * `SessionMemoryStore`, and participating `groupMetadataCache`.
    */
   public async resolveLidForRecipient(targetInput: string): Promise<{
     pnJid?: string;
@@ -3546,9 +4016,9 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
         'استخراج معرف @lid المباشر مخصص لجهات الاتصال الفردية (رقم دولي أو @lid).'
       );
     }
-    let pnJid = jidNormalizedUser(normalizedRecipient.jid);
+    const pnJid = jidNormalizedUser(normalizedRecipient.jid);
 
-    // 2. Check signalRepository.lidMapping & memoryStore
+    // 2. Fast-path: Check signalRepository.lidMapping & memoryStore
     try {
       const repoLid = await sock.signalRepository?.lidMapping?.getLIDForPN?.(pnJid);
       const parsedRepoLid = this.extractLidString(repoLid);
@@ -3573,52 +4043,22 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
       };
     }
 
-    // 3a. Query USync via sock.onWhatsApp(pnJid)
-    if (typeof sock.onWhatsApp === 'function') {
-      try {
-        const results = await sock.onWhatsApp(pnJid);
-        const entry = Array.isArray(results) ? results[0] : undefined;
-        if (entry?.jid) {
-          pnJid = jidNormalizedUser(entry.jid);
-        }
-        const usyncLid = this.extractLidString(entry?.lid);
-        if (usyncLid && usyncLid.endsWith('@lid')) {
-          await this.persistLidPnMappingOnSocket(sock, usyncLid, pnJid);
-          return {
-            pnJid,
-            lidJid: usyncLid,
-            source: 'ON_WHATSAPP_USYNC',
-          };
-        }
-      } catch {
-        // Fall through to getUSyncDevices & direct USync IQ
-      }
+    // 3a. Official Baileys USync lookup (USyncQuery + onWhatsApp + getUSyncDevices)
+    const usyncLookup = await this.executeOfficialUSyncAccountLookup(sock, pnJid);
+    if (usyncLookup.lidJid && usyncLookup.lidJid.endsWith('@lid')) {
+      await this.persistLidPnMappingOnSocket(
+        sock,
+        usyncLookup.lidJid,
+        usyncLookup.pnJid || pnJid
+      );
+      return {
+        pnJid: usyncLookup.pnJid || pnJid,
+        lidJid: usyncLookup.lidJid,
+        source: 'ON_WHATSAPP_USYNC',
+      };
     }
 
-    // 3b. Trigger sock.getUSyncDevices([pnJid], false, false) which executes USync withLIDProtocol()
-    // in @hiroosy/baileys-lite and populates signalRepository.lidMapping
-    if (typeof sock.getUSyncDevices === 'function') {
-      try {
-        await sock.getUSyncDevices([pnJid], false, false);
-        const repoLidAfterDevices =
-          await sock.signalRepository?.lidMapping?.getLIDForPN?.(pnJid);
-        const parsedAfterDevices =
-          this.extractLidString(repoLidAfterDevices) ||
-          this.memoryStore.getLidForPn(pnJid);
-        if (parsedAfterDevices && parsedAfterDevices.endsWith('@lid')) {
-          await this.persistLidPnMappingOnSocket(sock, parsedAfterDevices, pnJid);
-          return {
-            pnJid,
-            lidJid: parsedAfterDevices,
-            source: 'ON_WHATSAPP_USYNC',
-          };
-        }
-      } catch {
-        // Fall through to direct USync IQ
-      }
-    }
-
-    // 3c. Direct USync IQ query requesting <contact/>, <lid/>, and <devices version="2"/>
+    // 3b. Direct USync IQ query fallback when executeUSyncQuery is unavailable on mock sockets
     if (typeof sock.query === 'function') {
       try {
         const usyncNode: BinaryNode = {
@@ -3723,10 +4163,11 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
 
   /**
    * Sends a protocol-level LID-addressed message (`addressing_mode="lid"`) via `@hiroosy/baileys-lite`,
-   * migrating/asserting the E2E Signal session onto the target `@lid` JID and relaying with `userJid = selfLid`
-   * so the message stanza is strictly addressed from `@lid` to `@lid` without leaking PN identity.
+   * registering the LID<->PN mapping in `signalRepository.lidMapping`, migrating/asserting the E2E Signal
+   * session onto the target `@lid` JID (`migrateSession` + `assertSessions`), and delivering via
+   * `sock.sendMessage(lidJid, { text }, { addressingMode: 'lid', additionalAttributes: { addressing_mode: 'lid' } })`.
    * If the WhatsApp server does not expose a `@lid` for a valid phone number, safely falls back to delivering
-   * to `pnJid` (`@s.whatsapp.net`) with stripped `pushName` instead of failing or fabricating `<phone>@lid`.
+   * to `pnJid` (`@s.whatsapp.net`) with stripped `pushName`.
    */
   public async sendAnonymousLidMessage(params: {
     recipient: string;
@@ -3767,20 +4208,18 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
 
     if (trimmedRecipient.endsWith('@g.us')) {
       const groupCheck = validateRecipient(trimmedRecipient);
-      const waMsg = generateWAMessageFromContent(
+      const sent = await sock.sendMessage(
         groupCheck.jid,
-        { extendedTextMessage: { text: validText } },
-        { userJid: senderJid }
+        { text: validText },
+        {
+          addressingMode: 'lid',
+          additionalAttributes: { addressing_mode: 'lid' },
+        } as unknown as Record<string, unknown>
       );
-      const msgId = waMsg.key.id || `lid_grp_${Date.now()}`;
-      if (waMsg.message) {
-        this.memoryStore.cacheSentMessage(groupCheck.jid, msgId, waMsg.message);
+      const msgId = sent?.key?.id || `lid_grp_${Date.now()}`;
+      if (sent?.message) {
+        this.memoryStore.cacheSentMessage(groupCheck.jid, msgId, sent.message);
       }
-      await sock.relayMessage(groupCheck.jid, waMsg.message!, {
-        messageId: msgId,
-        addressingMode: 'lid',
-        additionalAttributes: { addressing_mode: 'lid' },
-      });
       await Promise.allSettled([this.credsSaveChain, this.flushAuthWrites()]);
       return {
         messageId: msgId,
@@ -3801,15 +4240,15 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
       lidJid = resolved.lidJid;
       source = resolved.source;
     } catch (err) {
-      // If the user passed a valid phone number / @s.whatsapp.net JID and the server did not expose a @lid,
-      // check if we can safely fall back to PN delivery with stripped pushName rather than failing outright
-      // when sock.sendMessage or relayMessage is available.
       const normalizedCheck = validateRecipient(
         trimmedRecipient.endsWith('@lid')
           ? `+${trimmedRecipient.slice(0, -4).replace(/\D/g, '')}`
           : trimmedRecipient
       );
-      if (normalizedCheck.jid.endsWith('@s.whatsapp.net') && typeof sock.onWhatsApp === 'function') {
+      if (
+        normalizedCheck.jid.endsWith('@s.whatsapp.net') &&
+        typeof sock.onWhatsApp === 'function'
+      ) {
         const waCheck = await sock.onWhatsApp(normalizedCheck.jid).catch(() => []);
         const waEntry = Array.isArray(waCheck) ? waCheck[0] : undefined;
         if (waEntry && waEntry.exists === false) {
@@ -3828,16 +4267,18 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
 
     const deliveryJid = lidJid!;
 
-    // Warm up USync devices & migrate/assert E2E Signal session onto the target identity
+    // 1. Register LID <-> PN mapping in Baileys' internal Signal repository
+    if (pnJid && usedLid) {
+      await this.persistLidPnMappingOnSocket(sock, deliveryJid, pnJid);
+    }
+
+    // 2. Official Baileys session migration from PN -> LID + assertSessions
     try {
       if (typeof sock.getUSyncDevices === 'function') {
         const jidsToFetch = Array.from(
           new Set([pnJid, deliveryJid].filter((j): j is string => Boolean(j)))
         );
         await sock.getUSyncDevices(jidsToFetch, false, false).catch(() => []);
-        if (usedLid) {
-          await sock.getUSyncDevices([deliveryJid], true, false).catch(() => []);
-        }
       }
       if (
         usedLid &&
@@ -3852,7 +4293,7 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
         await sock.assertSessions([deliveryJid], false).catch(() => false);
       }
     } catch {
-      // Best-effort session preparation before relayMessage
+      // Best-effort session preparation before sending
     }
 
     const previousName = sock.user?.name;
@@ -3862,17 +4303,42 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
 
     let msgId = `lid_msg_${Date.now()}`;
     try {
-      const waMsg = generateWAMessageFromContent(
-        deliveryJid,
-        { extendedTextMessage: { text: validText } },
-        { userJid: usedLid ? senderJid : sock.user?.id ? jidNormalizedUser(sock.user.id) : senderJid }
-      );
-      msgId = waMsg.key?.id || msgId;
-      if (waMsg.message) {
-        this.memoryStore.cacheSentMessage(deliveryJid, msgId, waMsg.message);
-      }
-
-      if (typeof sock.relayMessage === 'function') {
+      if (typeof sock.sendMessage === 'function') {
+        const sent = await sock.sendMessage(
+          deliveryJid,
+          { text: validText },
+          usedLid
+            ? ({
+                addressingMode: 'lid',
+                additionalAttributes: { addressing_mode: 'lid' },
+              } as unknown as Record<string, unknown>)
+            : undefined
+        );
+        if (sent?.key?.id) {
+          msgId = sent.key.id;
+        }
+        const messageToCache =
+          sent?.message ||
+          ({
+            extendedTextMessage: { text: validText },
+          } as unknown as proto.IMessage);
+        this.memoryStore.cacheSentMessage(deliveryJid, msgId, messageToCache);
+      } else {
+        const waMsg = generateWAMessageFromContent(
+          deliveryJid,
+          { extendedTextMessage: { text: validText } },
+          {
+            userJid: usedLid
+              ? senderJid
+              : sock.user?.id
+                ? jidNormalizedUser(sock.user.id)
+                : senderJid,
+          }
+        );
+        msgId = waMsg.key?.id || msgId;
+        if (waMsg.message) {
+          this.memoryStore.cacheSentMessage(deliveryJid, msgId, waMsg.message);
+        }
         await sock.relayMessage(
           deliveryJid,
           waMsg.message!,
@@ -3886,18 +4352,6 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
                 messageId: msgId,
               }
         );
-      } else {
-        const res = await sock.sendMessage(
-          deliveryJid,
-          { text: validText },
-          usedLid ? { addressingMode: 'lid' } : undefined
-        );
-        if (res?.key?.id) {
-          msgId = res.key.id;
-        }
-        if (res?.message) {
-          this.memoryStore.cacheSentMessage(deliveryJid, msgId, res.message);
-        }
       }
     } finally {
       if (sock.user) {
@@ -3940,9 +4394,10 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
             if (!d || typeof d !== 'object') continue;
             const user = String((d as { user?: string }).user || '').trim();
             const devId = Number((d as { device?: number }).device ?? 0);
-            const server = user.length >= 14 && !pnOrTargetJid.startsWith(user)
-              ? 'lid'
-              : 's.whatsapp.net';
+            const server =
+              user.length >= 14 && !pnOrTargetJid.startsWith(user)
+                ? 'lid'
+                : 's.whatsapp.net';
             if (user) {
               linkedDevices.push(`${user}:${devId}@${server}`);
             }
@@ -3958,8 +4413,10 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
 
   /**
    * Subscribes to and tracks real-time recipient presence (`available`, `unavailable`, `composing`, `recording`, `paused`)
-   * across both `@s.whatsapp.net` and `@lid` JIDs, combining raw WebSocket `<chatstate>`/`<presence>` stanzas,
-   * active USync device & RTT probing, cross-signal message/receipt activity inference, and auto-expiring stale composing states.
+   * across both `@s.whatsapp.net` and `@lid` JIDs using the official Baileys `makeInMemoryStore` pattern:
+   * 1. Resolves both `pnJid` and `lidJid` via `executeOfficialUSyncAccountLookup` / `resolveLidForRecipient` and links them in `memoryStore` BEFORE subscribing.
+   * 2. Registers `memoryStore.onPresenceChange` BEFORE calling `presenceSubscribe`.
+   * 3. Sends `await sock.sendPresenceUpdate('available')` and subscribes to both `pnJid` and `lidJid`.
    */
   public async trackRecipientPresence(params: {
     recipient: string;
@@ -3993,15 +4450,33 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
 
     const trackingStartedAtMs = Date.now();
     const resolveStartMs = Date.now();
-    const resolved = await this.resolveLidForRecipient(cleanRecipient).catch(
-      () => null
-    );
-    const initialResolveRttMs = resolved
+    const usyncLookup = await this.executeOfficialUSyncAccountLookup(
+      sock,
+      targetJid
+    ).catch(() => null);
+    let initialResolveRttMs = usyncLookup
       ? Math.max(1, Date.now() - resolveStartMs)
       : undefined;
-    if (resolved) {
-      pnJid = resolved.pnJid || pnJid;
-      lidJid = resolved.lidJid || lidJid;
+    if (usyncLookup) {
+      if (usyncLookup.pnJid && usyncLookup.pnJid.endsWith('@s.whatsapp.net')) {
+        pnJid = usyncLookup.pnJid;
+      }
+      if (usyncLookup.lidJid && usyncLookup.lidJid.endsWith('@lid')) {
+        lidJid = usyncLookup.lidJid;
+      }
+    }
+
+    if (!lidJid) {
+      const resolved = await this.resolveLidForRecipient(cleanRecipient).catch(
+        () => null
+      );
+      if (resolved) {
+        if (!initialResolveRttMs) {
+          initialResolveRttMs = Math.max(1, Date.now() - resolveStartMs);
+        }
+        pnJid = resolved.pnJid || pnJid;
+        lidJid = resolved.lidJid || lidJid;
+      }
     }
 
     if (pnJid && lidJid) {
@@ -4462,9 +4937,8 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
   }
 
   /**
-   * Deep OSINT Profile Inspector (`fetchFullProfileInfo`) combining comprehensive USync IQ (`<contact/>`,
-   * `<status/>`, `<picture/>`, `<lid/>`, `<devices version="2"/>`, `<disappearing_mode/>`, `<business/>`)
-   * with `onWhatsApp`, `fetchStatus`, `getBusinessProfile`, `getUSyncDevices`, HD `profilePictureUrl` + binary buffer,
+   * Deep OSINT Profile Inspector (`fetchFullProfileInfo`) powered by official Baileys `USyncQuery`
+   * (`executeOfficialUSyncAccountLookup`), `getBusinessProfile`, HD `profilePictureUrl` + binary buffer download,
    * `SessionMemoryStore` contacts/presence, and `groupFetchAllParticipating` shared groups.
    */
   public async fetchFullProfileInfo(
@@ -4484,362 +4958,175 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
       );
     }
 
-    let pnJid = validated.isLid ? '' : jidNormalizedUser(validated.jid);
-    let lidJid = validated.isLid ? jidNormalizedUser(validated.jid) : undefined;
-
-    if (validated.isLid && lidJid) {
-      const mappedPn =
-        this.memoryStore.getPnForLid(lidJid) ||
-        (await sock.signalRepository?.lidMapping
-          ?.getPNForLID?.(lidJid)
-          .catch(() => undefined)) ||
-        undefined;
-      if (mappedPn) {
-        pnJid = jidNormalizedUser(mappedPn);
-      }
-    }
-
+    // 1. Run official Baileys USync account lookup (Contact + LID + Status + DisappearingMode + Devices)
+    const usync = await this.executeOfficialUSyncAccountLookup(sock, recipient);
+    let pnJid = usync.pnJid || (validated.isLid ? '' : jidNormalizedUser(validated.jid));
+    let lidJid =
+      usync.lidJid || (validated.isLid ? jidNormalizedUser(validated.jid) : undefined);
     const targetQueryJid = pnJid || lidJid || validated.jid;
 
-    // Subscribe to presence early so the server pushes presence while other queries run
-    void sock.sendPresenceUpdate('available').catch(() => undefined);
+    // Subscribe to presence early so the server pushes presence while parallel queries run
+    void this.ensureSelfPresenceAvailable(sock, targetQueryJid);
     void sock.presenceSubscribe(targetQueryJid).catch(() => undefined);
+    if (lidJid && lidJid !== targetQueryJid) {
+      void sock.presenceSubscribe(lidJid).catch(() => undefined);
+    }
 
-    const [
-      usyncIqSettled,
-      onWaSettled,
-      statusSettled,
-      bizSettled,
-      devicesSettled,
-    ] = await Promise.allSettled([
-      // (0) Comprehensive USync IQ query (<contact/>, <status/>, <picture/>, <lid/>, <devices version="2"/>, <disappearing_mode/>, <business/>)
-      (async () => {
-        if (typeof sock.query !== 'function') return undefined;
-        const comprehensiveUsyncNode: BinaryNode = {
-          tag: 'iq',
-          attrs: {
-            to: S_WHATSAPP_NET,
-            type: 'get',
-            xmlns: 'usync',
-          },
-          content: [
-            {
-              tag: 'usync',
-              attrs: {
-                sid: `fullprof_${Date.now()}`,
-                mode: 'full',
-                last: 'true',
-                index: '0',
-                context: 'interactive',
-              },
-              content: [
-                {
-                  tag: 'query',
-                  attrs: {},
-                  content: [
-                    { tag: 'contact', attrs: {} },
-                    { tag: 'status', attrs: {} },
-                    { tag: 'picture', attrs: {} },
-                    { tag: 'lid', attrs: {} },
-                    { tag: 'devices', attrs: { version: '2' } },
-                    { tag: 'disappearing_mode', attrs: {} },
-                    {
-                      tag: 'business',
-                      attrs: {},
-                      content: [{ tag: 'verified_name', attrs: {} }],
-                    },
-                  ],
-                },
-                {
-                  tag: 'list',
-                  attrs: {},
-                  content: [{ tag: 'user', attrs: { jid: targetQueryJid } }],
-                },
-              ],
-            },
-          ],
-        };
-        return (await sock.query(comprehensiveUsyncNode, 10_000)) as
-          | BinaryNode
-          | undefined;
-      })(),
+    // 2. Run parallel queries for Business Profile, Profile Picture (HD + Preview + Binary Buffer), and Shared Groups
+    const profilePicture: WhatsAppFullProfileReport['profilePicture'] = {
+      status: 'NO_PICTURE',
+      statusReasonArabic: 'لا توجد صورة شخصية متاحة',
+      ...(usync.pictureId ? { pictureId: usync.pictureId } : {}),
+    };
 
-      // (A) Identity & LID via onWhatsApp
-      (async () => {
-        let exists = true;
-        if (typeof sock.onWhatsApp === 'function' && pnJid) {
-          const res = await sock.onWhatsApp(pnJid);
-          if (Array.isArray(res) && res.length > 0) {
-            exists = Boolean(res[0]?.exists);
-            if (res[0]?.jid) {
-              pnJid = jidNormalizedUser(res[0].jid);
-            }
-            const extractedLid = this.extractLidString(res[0]?.lid);
-            if (extractedLid) {
-              lidJid = extractedLid;
-              await this.persistLidPnMappingOnSocket(sock, extractedLid, pnJid);
-            }
-          } else {
-            exists = false;
-          }
-        }
-        if (!lidJid && pnJid) {
-          const repoLid = await sock.signalRepository?.lidMapping
-            ?.getLIDForPN?.(pnJid)
-            .catch(() => undefined);
-          lidJid =
-            this.extractLidString(repoLid) || this.memoryStore.getLidForPn(pnJid);
-        }
-        return { exists };
-      })(),
-
-      // (C) About / Status (`fetchStatus`)
-      (async () => {
-        if (typeof sock.fetchStatus !== 'function') return undefined;
-        return await sock.fetchStatus(targetQueryJid);
-      })(),
-
-      // (D) Business Profile (`getBusinessProfile`)
+    const [bizSettled] = await Promise.allSettled([
+      // (A) Business Profile (`getBusinessProfile`)
       (async () => {
         if (typeof sock.getBusinessProfile !== 'function') return undefined;
         return await sock.getBusinessProfile(targetQueryJid);
       })(),
 
-      // (E) Linked Companion Devices (`getUSyncDevices`)
+      // (B) Profile Picture with fallback & privacy/404 classification + binary download
       (async () => {
-        if (typeof sock.getUSyncDevices !== 'function') return [];
-        return await sock.getUSyncDevices([targetQueryJid], false, false);
-      })(),
-    ]);
-
-    let existsOnWhatsApp =
-      onWaSettled.status === 'fulfilled' ? onWaSettled.value.exists : true;
-
-    // Extract fields from comprehensive USync IQ response if present
-    let usyncStatusText: string | undefined;
-    let usyncStatusSetAt: string | undefined;
-    let pictureId: string | undefined;
-    let disappearingMode: WhatsAppFullProfileReport['disappearingMode'];
-    const usyncDeviceIds: number[] = [];
-
-    if (usyncIqSettled.status === 'fulfilled' && usyncIqSettled.value) {
-      const iqNode = usyncIqSettled.value;
-      const usyncNode = getBinaryNodeChild(iqNode, 'usync');
-      const listNode = getBinaryNodeChild(usyncNode, 'list');
-      const userNode = getBinaryNodeChild(listNode, 'user');
-      if (userNode) {
-        if (userNode.attrs?.jid && !pnJid && userNode.attrs.jid.endsWith('@s.whatsapp.net')) {
-          pnJid = jidNormalizedUser(userNode.attrs.jid);
-        }
-        const contactNode = getBinaryNodeChild(userNode, 'contact');
-        if (contactNode?.attrs?.type === 'out') {
-          existsOnWhatsApp = false;
-        } else if (contactNode?.attrs?.type === 'in') {
-          existsOnWhatsApp = true;
-        }
-        const lidNode = getBinaryNodeChild(userNode, 'lid');
-        const rawUsyncLid =
-          lidNode?.attrs?.val || lidNode?.attrs?.jid || lidNode?.attrs?.id;
-        const parsedUsyncLid = this.extractLidString(rawUsyncLid);
-        if (parsedUsyncLid && parsedUsyncLid.endsWith('@lid')) {
-          lidJid = parsedUsyncLid;
-          if (pnJid) {
-            await this.persistLidPnMappingOnSocket(sock, parsedUsyncLid, pnJid);
-          }
-        }
-
-        const statusNode = getBinaryNodeChild(userNode, 'status');
-        if (statusNode) {
-          const rawContent = statusNode.content;
-          const decodedText =
-            typeof rawContent === 'string'
-              ? rawContent
-              : Buffer.isBuffer(rawContent)
-                ? rawContent.toString('utf8')
-                : rawContent instanceof Uint8Array
-                  ? Buffer.from(rawContent).toString('utf8')
-                  : '';
-          if (decodedText.trim()) {
-            usyncStatusText = decodedText.trim();
-          }
-          const rawT = Number(statusNode.attrs?.t || 0);
-          if (Number.isFinite(rawT) && rawT > 0) {
-            usyncStatusSetAt = new Date(rawT * 1000).toISOString();
-          }
-        }
-
-        const pictureNode = getBinaryNodeChild(userNode, 'picture');
-        if (pictureNode?.attrs?.id) {
-          pictureId = String(pictureNode.attrs.id);
-        }
-
-        const dmNode = getBinaryNodeChild(userNode, 'disappearing_mode');
-        if (dmNode) {
-          const dur = Number(dmNode.attrs?.duration || 0);
-          const dmT = Number(dmNode.attrs?.t || 0);
-          if (Number.isFinite(dur) && dur >= 0 && dmNode.attrs?.duration !== undefined) {
-            disappearingMode = {
-              durationSeconds: dur,
-              ...(Number.isFinite(dmT) && dmT > 0
-                ? { setAtIso: new Date(dmT * 1000).toISOString() }
-                : {}),
+        if (typeof sock.profilePictureUrl !== 'function') return;
+        const classifyPicError = (err: unknown): {
+          status: 'PRIVACY_HIDDEN' | 'NO_PICTURE' | 'ERROR';
+          reason: string;
+        } => {
+          const msg = err instanceof Error ? err.message : String(err || '');
+          const statusCode = Number(
+            (err as { data?: number; output?: { statusCode?: number } })?.data ||
+              (err as { output?: { statusCode?: number } })?.output?.statusCode ||
+              0
+          );
+          if (
+            statusCode === 401 ||
+            statusCode === 403 ||
+            /not-authorized|401|403|forbidden/i.test(msg)
+          ) {
+            return {
+              status: 'PRIVACY_HIDDEN',
+              reason: 'محجوبة بإعدادات الخصوصية (جهات الاتصال فقط / لا أحد)',
             };
           }
-        }
-
-        const devicesNode = getBinaryNodeChild(userNode, 'devices');
-        const deviceListNode = getBinaryNodeChild(devicesNode, 'device-list');
-        for (const devNode of getBinaryNodeChildren(deviceListNode, 'device')) {
-          const devId = Number(devNode.attrs?.id ?? NaN);
-          if (Number.isFinite(devId) && devId >= 0) {
-            usyncDeviceIds.push(devId);
+          if (statusCode === 404 || /item-not-found|404/i.test(msg)) {
+            return {
+              status: 'NO_PICTURE',
+              reason: 'لا توجد صورة شخصية (أو محذوفة)',
+            };
           }
-        }
-      }
-    }
-
-    if (lidJid) {
-      void sock.presenceSubscribe(lidJid).catch(() => undefined);
-    }
-
-    // (B) Profile Picture with fallback & privacy/404 classification + binary download
-    const profilePicture: WhatsAppFullProfileReport['profilePicture'] = {
-      status: 'NO_PICTURE',
-      statusReasonArabic: 'لا توجد صورة شخصية متاحة',
-      ...(pictureId ? { pictureId } : {}),
-    };
-
-    if (typeof sock.profilePictureUrl === 'function') {
-      const classifyPicError = (err: unknown): {
-        status: 'PRIVACY_HIDDEN' | 'NO_PICTURE' | 'ERROR';
-        reason: string;
-      } => {
-        const msg = err instanceof Error ? err.message : String(err || '');
-        const statusCode = Number(
-          (err as { data?: number; output?: { statusCode?: number } })?.data ||
-            (err as { output?: { statusCode?: number } })?.output?.statusCode ||
-            0
-        );
-        if (
-          statusCode === 401 ||
-          statusCode === 403 ||
-          /not-authorized|401|403|forbidden/i.test(msg)
-        ) {
           return {
-            status: 'PRIVACY_HIDDEN',
-            reason: 'محجوبة بإعدادات الخصوصية (جهات الاتصال فقط / لا أحد)',
+            status: 'ERROR',
+            reason: 'تعذر جلب الصورة الشخصية من الخادم',
           };
-        }
-        if (statusCode === 404 || /item-not-found|404/i.test(msg)) {
-          return {
-            status: 'NO_PICTURE',
-            reason: 'لا توجد صورة شخصية (أو محذوفة)',
-          };
-        }
-        return {
-          status: 'ERROR',
-          reason: 'تعذر جلب الصورة الشخصية من الخادم',
         };
-      };
 
-      let hdUrl: string | undefined;
-      let previewUrl: string | undefined;
-      let lastPicError: unknown;
+        let hdUrl: string | undefined;
+        let previewUrl: string | undefined;
+        let lastPicError: unknown;
 
-      try {
-        hdUrl = await sock.profilePictureUrl(targetQueryJid, 'image', 10_000);
-      } catch (err) {
-        lastPicError = err;
-        if (lidJid && lidJid !== targetQueryJid) {
-          try {
-            hdUrl = await sock.profilePictureUrl(lidJid, 'image', 10_000);
-          } catch (lidErr) {
-            lastPicError = lidErr;
+        try {
+          hdUrl = await sock.profilePictureUrl(targetQueryJid, 'image', 10_000);
+        } catch (err) {
+          lastPicError = err;
+          if (lidJid && lidJid !== targetQueryJid) {
+            try {
+              hdUrl = await sock.profilePictureUrl(lidJid, 'image', 10_000);
+            } catch (lidErr) {
+              lastPicError = lidErr;
+            }
           }
         }
-      }
 
-      try {
-        previewUrl = await sock.profilePictureUrl(
-          lidJid && !hdUrl ? lidJid : targetQueryJid,
-          'preview',
-          8_000
-        );
-      } catch (err) {
-        if (!lastPicError) lastPicError = err;
-      }
+        try {
+          previewUrl = await sock.profilePictureUrl(
+            lidJid && !hdUrl ? lidJid : targetQueryJid,
+            'preview',
+            8_000
+          );
+        } catch (err) {
+          if (!lastPicError) lastPicError = err;
+        }
 
-      if (hdUrl || previewUrl) {
-        profilePicture.hdUrl = hdUrl;
-        profilePicture.previewUrl = previewUrl;
-        profilePicture.status = 'AVAILABLE';
-        profilePicture.statusReasonArabic = hdUrl
-          ? 'متاحة بدقة عالية (HD)'
-          : 'متاحة بدقة مصغرة (Preview)';
+        if (hdUrl || previewUrl) {
+          profilePicture.hdUrl = hdUrl;
+          profilePicture.previewUrl = previewUrl;
+          profilePicture.status = 'AVAILABLE';
+          profilePicture.statusReasonArabic = hdUrl
+            ? 'متاحة بدقة عالية (HD)'
+            : 'متاحة بدقة مصغرة (Preview)';
 
-        const downloadUrl = hdUrl || previewUrl;
-        if (downloadUrl) {
+          const downloadUrl = hdUrl || previewUrl;
+          if (downloadUrl) {
+            try {
+              const parsedUrl = new URL(downloadUrl);
+              if (
+                parsedUrl.protocol === 'https:' ||
+                parsedUrl.protocol === 'http:'
+              ) {
+                const res = await fetch(downloadUrl, {
+                  signal: AbortSignal.timeout(8_000),
+                });
+                if (res.ok) {
+                  const ab = await res.arrayBuffer();
+                  const buf = Buffer.from(ab);
+                  if (buf.length > 0) {
+                    profilePicture.imageBuffer = buf;
+                  }
+                }
+              }
+            } catch {
+              // Keep URL even if binary download fails
+            }
+          }
+        } else if (lastPicError) {
+          const classified = classifyPicError(lastPicError);
+          profilePicture.status = classified.status;
+          profilePicture.statusReasonArabic = classified.reason;
+        }
+      })(),
+
+      // (C) Populate groupMetadataCache once if empty
+      (async () => {
+        if (
+          this.groupMetadataCache.size === 0 &&
+          typeof sock.groupFetchAllParticipating === 'function'
+        ) {
           try {
-            const parsedUrl = new URL(downloadUrl);
-            if (
-              parsedUrl.protocol === 'https:' ||
-              parsedUrl.protocol === 'http:'
-            ) {
-              const res = await fetch(downloadUrl, {
-                signal: AbortSignal.timeout(8_000),
-              });
-              if (res.ok) {
-                const ab = await res.arrayBuffer();
-                const buf = Buffer.from(ab);
-                if (buf.length > 0) {
-                  profilePicture.imageBuffer = buf;
+            const allGroups = await sock.groupFetchAllParticipating();
+            if (allGroups && typeof allGroups === 'object') {
+              for (const [gJid, gMeta] of Object.entries(allGroups)) {
+                if (gMeta && typeof gMeta === 'object') {
+                  this.groupMetadataCache.set(gJid, gMeta as GroupMetadata);
                 }
               }
             }
           } catch {
-            // Keep URL even if binary download fails
+            // Ignore
           }
         }
-      } else if (lastPicError) {
-        const classified = classifyPicError(lastPicError);
-        profilePicture.status = classified.status;
-        profilePicture.statusReasonArabic = classified.reason;
-      }
-    }
+      })(),
+    ]);
 
-    // Parse Status (About) from fetchStatus or USync IQ
-    let statusText: string | undefined = usyncStatusText;
-    let statusSetAt: string | undefined = usyncStatusSetAt;
-    if (statusSettled.status === 'fulfilled' && statusSettled.value) {
-      const rawStatus = statusSettled.value as unknown;
-      const firstEntry = Array.isArray(rawStatus) ? rawStatus[0] : rawStatus;
-      if (firstEntry && typeof firstEntry === 'object') {
-        const entryObj = firstEntry as Record<string, unknown>;
-        const nestedStatus = entryObj.status;
-        if (typeof nestedStatus === 'string') {
-          statusText = nestedStatus.trim() || statusText;
-          const rawDate = entryObj.setAt;
-          if (rawDate) {
-            const d = new Date(rawDate as string | number | Date);
-            if (!Number.isNaN(d.getTime()) && d.getTime() > 0) {
-              statusSetAt = d.toISOString();
-            }
+    const statusText = usync.statusText;
+    const statusSetAt =
+      usync.statusSetAt &&
+      !Number.isNaN(usync.statusSetAt.getTime()) &&
+      usync.statusSetAt.getTime() > 0
+        ? usync.statusSetAt.toISOString()
+        : undefined;
+
+    const disappearingMode: WhatsAppFullProfileReport['disappearingMode'] =
+      typeof usync.disappearingDuration === 'number'
+        ? {
+            durationSeconds: usync.disappearingDuration,
+            ...(usync.disappearingSetAt &&
+            !Number.isNaN(usync.disappearingSetAt.getTime()) &&
+            usync.disappearingSetAt.getTime() > 0
+              ? { setAtIso: usync.disappearingSetAt.toISOString() }
+              : {}),
           }
-        } else if (nestedStatus && typeof nestedStatus === 'object') {
-          const inner = nestedStatus as Record<string, unknown>;
-          if (typeof inner.status === 'string' && inner.status.trim()) {
-            statusText = inner.status.trim();
-          }
-          const rawDate = inner.setAt ?? entryObj.setAt;
-          if (rawDate) {
-            const d = new Date(rawDate as string | number | Date);
-            if (!Number.isNaN(d.getTime()) && d.getTime() > 0) {
-              statusSetAt = d.toISOString();
-            }
-          }
-        }
-      }
-    }
+        : undefined;
 
     // Parse Business Profile
     let businessProfile: WhatsAppFullProfileReport['businessProfile'];
@@ -4896,29 +5183,19 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
       }
     }
 
-    // Parse Linked Devices (merging getUSyncDevices + USync IQ <devices>)
-    const rawDevices =
-      devicesSettled.status === 'fulfilled' && Array.isArray(devicesSettled.value)
-        ? devicesSettled.value
-        : [];
+    // Parse Linked Devices from USync lookup
     const primaryDevice: number[] = [];
     const companionDevices: number[] = [];
     const seenDevs = new Set<number>();
-    const recordDeviceNumber = (devNum: number) => {
-      if (seenDevs.has(devNum)) return;
+    for (const d of usync.devices) {
+      const devNum = typeof d?.id === 'number' ? d.id : 0;
+      if (seenDevs.has(devNum)) continue;
       seenDevs.add(devNum);
       if (devNum === 0) {
         primaryDevice.push(0);
       } else {
         companionDevices.push(devNum);
       }
-    };
-    for (const d of rawDevices) {
-      const devNum = typeof d?.device === 'number' ? d.device : 0;
-      recordDeviceNumber(devNum);
-    }
-    for (const devId of usyncDeviceIds) {
-      recordDeviceNumber(devId);
     }
     const deviceListFormatted = [
       ...primaryDevice.map((d) => `${d} (الهاتف الأساسي)`),
@@ -4955,7 +5232,6 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
         contactFromLid.verifiedName) ||
       undefined;
 
-    // Wait briefly (up to 150ms if not yet in store) for presence response
     let presenceRec =
       (pnJid ? this.memoryStore.presences.get(pnJid) : undefined) ||
       (lidJid ? this.memoryStore.presences.get(lidJid) : undefined);
@@ -4964,25 +5240,6 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
       presenceRec =
         (pnJid ? this.memoryStore.presences.get(pnJid) : undefined) ||
         (lidJid ? this.memoryStore.presences.get(lidJid) : undefined);
-    }
-
-    // Shared Groups from groupMetadataCache (populating once via groupFetchAllParticipating if empty)
-    if (
-      this.groupMetadataCache.size === 0 &&
-      typeof sock.groupFetchAllParticipating === 'function'
-    ) {
-      try {
-        const allGroups = await sock.groupFetchAllParticipating();
-        if (allGroups && typeof allGroups === 'object') {
-          for (const [gJid, gMeta] of Object.entries(allGroups)) {
-            if (gMeta && typeof gMeta === 'object') {
-              this.groupMetadataCache.set(gJid, gMeta as GroupMetadata);
-            }
-          }
-        }
-      } catch {
-        // Ignore
-      }
     }
 
     const sharedGroups: WhatsAppFullProfileReport['sharedGroups'] = [];
@@ -5018,15 +5275,14 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
     }
 
     const finalPnJid = pnJid || targetQueryJid;
-    const digitsOnly = (jidDecode(finalPnJid)?.user || finalPnJid.split('@')[0]).replace(
-      /\D/g,
-      ''
-    );
+    const digitsOnly = (
+      jidDecode(finalPnJid)?.user || finalPnJid.split('@')[0]
+    ).replace(/\D/g, '');
     const e164Phone = digitsOnly ? `+${digitsOnly}` : finalPnJid;
 
     return {
       queriedInput: recipient,
-      existsOnWhatsApp,
+      existsOnWhatsApp: usync.exists,
       pnJid: finalPnJid,
       e164Phone,
       lidJid,
@@ -5034,7 +5290,7 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
       verifiedName,
       statusText,
       statusSetAt,
-      ...(pictureId ? { pictureId } : {}),
+      ...(usync.pictureId ? { pictureId: usync.pictureId } : {}),
       profilePicture,
       ...(disappearingMode ? { disappearingMode } : {}),
       presence: {
@@ -5058,10 +5314,10 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
   }
 
   /**
-   * Sends a short-timer self-destructing message (`1` to `60` seconds) using a 3-layer hybrid mechanism:
-   * 1. Optional `<iq xmlns="w:g2" type="set"><ephemeral expiration="N" trigger="1"/></iq>` stanza (only for `@g.us` groups or when explicitly requested)
-   * 2. Protobuf `contextInfo.expiration = expirationSeconds` via `{ ephemeralExpiration: expirationSeconds }`
-   * 3. Deterministic auto-revoke timer (`REVOKE` protocolMessage) triggered `ON_SEND` or `ON_READ` (`messages.update` status 4/5 or `message-receipt.update`).
+   * Sends a short-timer self-destructing message (`1` to `60` seconds) using official Baileys patterns:
+   * 1. Step A: Optional `{ disappearingMessagesInChat: expSec }` protocol message (and `<iq xmlns="w:g2">` for groups/explicit IQ)
+   * 2. Step B: `sock.sendMessage(resolvedJid, { text, contextInfo: { expiration: expSec, ... } }, { ephemeralExpiration: expSec })`
+   * 3. Step C: Deterministic auto-revoke timer (`{ delete: exactSentKey }`) triggered `ON_SEND` or `ON_READ` (`messages.update` status >= 4 or `message-receipt.update`).
    */
   public async sendShortEphemeralMessage(params: {
     recipient: string;
@@ -5105,8 +5361,14 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
       ? await this.resolveDirectRecipientJid(sock, validated.jid)
       : jidNormalizedUser(validated.jid);
 
-    // Layer 1: Only send <iq xmlns="w:g2" type="set"><ephemeral .../></iq> for groups (@g.us)
-    // or when explicitly requested via setChatEphemeralIq: true (since w:g2 on 1:1 chats returns 400).
+    // Step A: Set chat disappearing timer when requested (official Baileys `{ disappearingMessagesInChat }` + group `<iq xmlns="w:g2">`)
+    if (params.setChatEphemeralIq === true) {
+      await sock
+        .sendMessage(resolvedJid, {
+          disappearingMessagesInChat: expSec,
+        } as AnyMessageContent)
+        .catch(() => undefined);
+    }
     const shouldSendGroupEphemeralIq =
       params.setChatEphemeralIq === true ||
       (params.setChatEphemeralIq !== false && resolvedJid.endsWith('@g.us'));
@@ -5132,8 +5394,7 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
         .catch(() => undefined);
     }
 
-    // Layer 2: Send message with native Protobuf contextInfo.expiration + disappearingMode + ephemeralExpiration
-    // so the recipient's WhatsApp client natively expires the message silently without a "This message was deleted" tombstone.
+    // Step B: Send message with official Baileys `{ ephemeralExpiration: expSec }` option + `contextInfo.expiration`
     const nowSec = Math.floor(Date.now() / 1000);
     const res = await sock.sendMessage(
       resolvedJid,
@@ -5163,9 +5424,7 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
       this.memoryStore.cacheSentMessage(resolvedJid, msgId, res.message);
     }
 
-    // Layer 3: Protocol Auto-Revoke Timer
-    // Only send `{ delete: exactSentKey }` (which produces "🚫 تم حذف هذه الرسالة" on recipient phones)
-    // when explicitly requested via `useRevokeDelete: true`, `setChatEphemeralIq: true`, or `triggerMode === 'ON_READ'`.
+    // Step C: Protocol Auto-Revoke Timer (`{ delete: exactSentKey }`)
     const shouldScheduleRevokeDelete = Boolean(
       params.useRevokeDelete ??
         (params.setChatEphemeralIq === true || triggerMode === 'ON_READ')
@@ -5230,6 +5489,171 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
       return await sock.query(node, timeoutMs);
     }
     return undefined;
+  }
+
+  /**
+   * Pre-warms USync device discovery, bidirectional `LID <-> PN` mapping, `'device-list'` storage,
+   * and E2E Signal sessions (`migrateSession` + `assertSessions`) before initiating an outbound VoIP call
+   * so `@hiroosy/baileys-lite/voip` never fails with `no device sessions to encrypt the call offer for <lid>@lid`.
+   */
+  public async preparePeerForVoipCall(targetInput: string): Promise<{
+    dialTargetJid: string;
+    pnJid?: string;
+    lidJid?: string;
+    deviceJids: string[];
+  }> {
+    const sock = this.ensureSocket();
+    const rawTrimmed = String(targetInput || '').trim();
+    const sanitizedInput = rawTrimmed.replace(/:\d+@/, '@');
+
+    let pnJid: string | undefined;
+    let lidJid: string | undefined;
+
+    if (sanitizedInput.endsWith('@lid')) {
+      lidJid = jidNormalizedUser(sanitizedInput);
+      const mappedPn =
+        this.memoryStore.getPnForLid(lidJid) ||
+        (await sock.signalRepository?.lidMapping
+          ?.getPNForLID?.(lidJid)
+          .catch(() => undefined)) ||
+        undefined;
+      if (mappedPn) {
+        pnJid = jidNormalizedUser(mappedPn);
+      }
+    } else {
+      const digits = sanitizedInput.split('@')[0]?.replace(/\D/g, '') || '';
+      if (digits) {
+        const candidatePn = `${digits}@s.whatsapp.net`;
+        pnJid = await this.resolveDirectRecipientJid(sock, candidatePn).catch(
+          () => candidatePn
+        );
+      }
+      if (pnJid) {
+        const mappedLid =
+          this.memoryStore.getLidForPn(pnJid) ||
+          this.extractLidString(
+            await sock.signalRepository?.lidMapping
+              ?.getLIDForPN?.(pnJid)
+              .catch(() => undefined)
+          );
+        if (mappedLid && mappedLid.endsWith('@lid')) {
+          lidJid = mappedLid;
+        }
+      }
+    }
+
+    if (!lidJid && pnJid) {
+      try {
+        const lookup = await this.executeOfficialUSyncAccountLookup(sock, pnJid);
+        if (lookup.pnJid && lookup.pnJid.endsWith('@s.whatsapp.net')) {
+          pnJid = jidNormalizedUser(lookup.pnJid);
+        }
+        if (lookup.lidJid && lookup.lidJid.endsWith('@lid')) {
+          lidJid = jidNormalizedUser(lookup.lidJid);
+        }
+      } catch {
+        // Non-fatal
+      }
+    }
+
+    if (lidJid && pnJid) {
+      await this.persistLidPnMappingOnSocket(sock, lidJid, pnJid);
+    }
+
+    const deviceNumbers = new Set<number>([0]);
+    if (typeof sock.getUSyncDevices === 'function') {
+      const fetchTargets = Array.from(
+        new Set([pnJid, lidJid].filter((j): j is string => Boolean(j)))
+      );
+      if (fetchTargets.length > 0) {
+        const fetched = await sock
+          .getUSyncDevices(fetchTargets, false, false)
+          .catch(() => []);
+        if (Array.isArray(fetched)) {
+          for (const d of fetched) {
+            if (typeof d?.device === 'number' && Number.isFinite(d.device) && d.device >= 0) {
+              deviceNumbers.add(d.device);
+            }
+          }
+        }
+      }
+    }
+
+    const pnUser = pnJid ? jidDecode(pnJid)?.user : undefined;
+    const lidUser = lidJid ? jidDecode(lidJid)?.user : undefined;
+    const deviceStrList = Array.from(deviceNumbers).map((n) => String(n));
+
+    if (sock.authState?.keys?.set && (pnUser || lidUser)) {
+      const deviceListUpdate: Record<string, string[]> = {};
+      if (pnUser) deviceListUpdate[pnUser] = deviceStrList;
+      if (lidUser) deviceListUpdate[lidUser] = deviceStrList;
+      await sock.authState.keys
+        .set({ 'device-list': deviceListUpdate } as never)
+        .catch(() => undefined);
+    }
+
+    if (
+      pnJid &&
+      lidJid &&
+      typeof sock.signalRepository?.migrateSession === 'function'
+    ) {
+      await sock.signalRepository
+        .migrateSession(pnJid, lidJid)
+        .catch(() => undefined);
+    }
+
+    const deviceJids: string[] = [];
+    for (const devNum of deviceNumbers) {
+      if (lidUser) {
+        deviceJids.push(
+          jidEncode(lidUser, 'lid', devNum > 0 ? devNum : undefined)
+        );
+      }
+      if (pnUser) {
+        deviceJids.push(
+          jidEncode(
+            pnUser,
+            's.whatsapp.net',
+            devNum > 0 ? devNum : undefined
+          )
+        );
+      }
+    }
+
+    if (typeof sock.assertSessions === 'function' && deviceJids.length > 0) {
+      const primaryTargets = lidUser
+        ? Array.from(deviceNumbers).map((d) =>
+            jidEncode(lidUser, 'lid', d > 0 ? d : undefined)
+          )
+        : deviceJids;
+      await sock.assertSessions(primaryTargets, false).catch(async () => {
+        if (pnUser) {
+          const pnTargets = Array.from(deviceNumbers).map((d) =>
+            jidEncode(pnUser, 's.whatsapp.net', d > 0 ? d : undefined)
+          );
+          await sock.assertSessions!(pnTargets, false).catch(() => false);
+          if (
+            pnJid &&
+            lidJid &&
+            typeof sock.signalRepository?.migrateSession === 'function'
+          ) {
+            await sock.signalRepository
+              .migrateSession(pnJid, lidJid)
+              .catch(() => undefined);
+          }
+        }
+        return false;
+      });
+    }
+
+    await Promise.allSettled([this.credsSaveChain, this.flushAuthWrites()]);
+
+    return {
+      dialTargetJid: pnJid || lidJid || sanitizedInput,
+      pnJid,
+      lidJid,
+      deviceJids,
+    };
   }
 
   public async forwardMessage(

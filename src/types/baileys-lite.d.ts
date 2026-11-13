@@ -220,7 +220,48 @@ declare module '@hiroosy/baileys-lite' {
     | { react: { text: string; key: WAMessageKey } }
     | { edit: WAMessageKey; text: string }
     | { delete: WAMessageKey }
+    | { disappearingMessagesInChat: boolean | number }
     | Record<string, unknown>;
+
+  export class USyncUser {
+    withId(id: string): this;
+    withPhone(phone: string): this;
+    withType(type: string): this;
+    withPersonaId(personaId: string): this;
+  }
+
+  export interface USyncQueryResultItem {
+    id: string;
+    lid?: string | { id?: string; lid?: string; val?: string };
+    contact?: boolean | { type?: string };
+    status?: { status?: string; setAt?: Date };
+    disappearing_mode?: { duration?: number; setAt?: Date };
+    devices?: {
+      deviceList?: Array<{ id: number; keyIndex?: number; isHosted?: boolean }>;
+      keyIndex?: {
+        timestamp?: number;
+        signedKeyIndex?: Uint8Array;
+        expectedTimestamp?: number;
+      };
+    };
+    [key: string]: unknown;
+  }
+
+  export class USyncQuery {
+    withMode(mode: 'query' | 'full' | 'delta'): this;
+    withContext(context: 'interactive' | 'background' | 'notification'): this;
+    withContactProtocol(): this;
+    withLIDProtocol(): this;
+    withStatusProtocol(): this;
+    withDisappearingModeProtocol(): this;
+    withDevicesProtocol(): this;
+    withDeviceProtocol(): this;
+    withBotProfileProtocol(): this;
+    withUser(user: USyncUser): this;
+    parseUSyncQueryResult?(
+      result: BinaryNode
+    ): { list: USyncQueryResultItem[]; sideList?: USyncQueryResultItem[] } | undefined;
+  }
 
   export interface WAMessageKey {
     remoteJid?: string | null;
@@ -446,6 +487,12 @@ declare module '@hiroosy/baileys-lite' {
       type: 'invite' | 'jid' | 'INVITE' | 'JID',
       key: string
     ): Promise<NewsletterMetadataResult | null>;
+    executeUSyncQuery?(
+      usyncQuery: USyncQuery
+    ): Promise<{ list: USyncQueryResultItem[]; sideList?: USyncQueryResultItem[] } | undefined>;
+    fetchDisappearingDuration?(
+      ...jids: string[]
+    ): Promise<Array<{ id: string; disappearing_mode?: { duration?: number; setAt?: Date } }> | undefined>;
     onWhatsApp?(...jids: string[]): Promise<Array<{ jid: string; exists: boolean; lid?: string }>>;
     getUSyncDevices?(
       jids: string[],

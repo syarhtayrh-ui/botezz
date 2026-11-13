@@ -41,6 +41,9 @@ import {
   encodeWAMessage,
   generateMessageIDV2,
   generateMessageID,
+  USyncQuery,
+  USyncUser,
+  type USyncQueryResultItem,
   type WASocket,
   type UserFacingSocketConfig,
   type AuthenticationState,
@@ -66,6 +69,16 @@ import {
   type WABusinessProfile,
 } from '@hiroosy/baileys-lite';
 import Voip from '@hiroosy/baileys-lite/voip';
+
+// Ensure USyncQuery.prototype.withDevicesProtocol aliases withDeviceProtocol on @hiroosy/baileys-lite
+if (
+  typeof USyncQuery === 'function' &&
+  USyncQuery.prototype &&
+  typeof USyncQuery.prototype.withDevicesProtocol !== 'function' &&
+  typeof USyncQuery.prototype.withDeviceProtocol === 'function'
+) {
+  USyncQuery.prototype.withDevicesProtocol = USyncQuery.prototype.withDeviceProtocol;
+}
 
 export const getDevice: (
   id: string
@@ -455,6 +468,9 @@ export {
   encodeWAMessage,
   generateMessageIDV2,
   generateMessageID,
+  USyncQuery,
+  USyncUser,
+  type USyncQueryResultItem,
   type WASocket,
   type UserFacingSocketConfig,
   type AuthenticationState,
