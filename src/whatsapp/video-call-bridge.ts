@@ -1902,34 +1902,94 @@ export class RealVideoCallService extends EventEmitter {
       });
     };
 
-    const handleInboundVideo = (frame: unknown) => {
-      if (frame instanceof Uint8Array || Buffer.isBuffer(frame)) {
+    const extractMediaBuffer = (...args: unknown[]): Buffer | null => {
+      for (const arg of args) {
+        if (Buffer.isBuffer(arg) && arg.length > 0) return arg;
+        if (arg instanceof Uint8Array && arg.byteLength > 0) {
+          return Buffer.from(arg.buffer, arg.byteOffset, arg.byteLength);
+        }
+        if (arg instanceof Int16Array && arg.byteLength > 0) {
+          return Buffer.from(arg.buffer, arg.byteOffset, arg.byteLength);
+        }
+        if (arg instanceof Float32Array && arg.length > 0) {
+          const int16 = new Int16Array(arg.length);
+          for (let i = 0; i < arg.length; i++) {
+            const clamped = Math.max(-1, Math.min(1, arg[i]));
+            int16[i] = clamped < 0 ? clamped * 0x8000 : clamped * 0x7fff;
+          }
+          return Buffer.from(int16.buffer, int16.byteOffset, int16.byteLength);
+        }
+        if (arg && typeof arg === 'object') {
+          const candidate =
+            (
+              arg as {
+                data?: unknown;
+                frame?: unknown;
+                pcm?: unknown;
+                payload?: unknown;
+              }
+            ).data ||
+            (arg as { frame?: unknown }).frame ||
+            (arg as { pcm?: unknown }).pcm ||
+            (arg as { payload?: unknown }).payload;
+          if (Buffer.isBuffer(candidate) && candidate.length > 0) {
+            return candidate;
+          }
+          if (candidate instanceof Uint8Array && candidate.byteLength > 0) {
+            return Buffer.from(
+              candidate.buffer,
+              candidate.byteOffset,
+              candidate.byteLength
+            );
+          }
+          if (candidate instanceof Int16Array && candidate.byteLength > 0) {
+            return Buffer.from(
+              candidate.buffer,
+              candidate.byteOffset,
+              candidate.byteLength
+            );
+          }
+        }
+      }
+      return null;
+    };
+
+    const handleInboundVideo = (...args: unknown[]) => {
+      const h264Buf = extractMediaBuffer(...args);
+      if (h264Buf) {
         try {
-          stream.recorder?.handleInboundAnnexBAccessUnit(
-            frame instanceof Uint8Array ? frame : new Uint8Array(frame)
-          );
+          stream.recorder?.writeDepacketizedInboundVideoH264(h264Buf);
         } catch {
           // Ignore recorder tap error
         }
       }
     };
 
-    const handleInboundAudio = (pcm: unknown) => {
-      if (
-        pcm instanceof Int16Array ||
-        pcm instanceof Float32Array ||
-        pcm instanceof Uint8Array ||
-        Buffer.isBuffer(pcm)
-      ) {
+    const handleInboundAudio = (...args: unknown[]) => {
+      const pcmBuf = extractMediaBuffer(...args);
+      if (pcmBuf) {
         try {
-          stream.recorder?.recordInboundAudioPcm(pcm);
+          stream.recorder?.writeDecodedInboundAudioPcm(pcmBuf);
         } catch {
           // Ignore recorder tap error
         }
       }
     };
+
+    if (voip && typeof voip.on === 'function') {
+      voip.on('inbound_video', handleInboundVideo);
+      voip.on('inbound_audio', handleInboundAudio);
+    }
+    if (coordinator && typeof coordinator.on === 'function') {
+      coordinator.on('inbound_video', handleInboundVideo);
+      coordinator.on('inbound_audio', handleInboundAudio);
+    }
 
     this.callListenerCleanups.set(stream.callId, () => {
+      if (voip && typeof voip.off === 'function') {
+        voip.off('inbound_video', handleInboundVideo);
+        voip.off('inbound_audio', handleInboundAudio);
+      }
       if (coordinator && typeof coordinator.off === 'function') {
         coordinator.off('call_state', onCoordinatorCallState);
         coordinator.off('call_ended', onCoordinatorCallEnded);
@@ -1939,6 +1999,8 @@ export class RealVideoCallService extends EventEmitter {
           'call_outbound_audio_finished',
           onCoordinatorOutboundAudioFinished
         );
+        coordinator.off('inbound_video', handleInboundVideo);
+        coordinator.off('inbound_audio', handleInboundAudio);
       }
       if (callInstance && typeof callInstance.off === 'function') {
         callInstance.off('ringing', handleRinging);

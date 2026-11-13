@@ -7,8 +7,8 @@ import { createLogger } from '../../logging/logger';
 const log = createLogger('auth-middleware');
 
 const OWNER_ONLY_PATTERNS = [
-  /^(?:text|message):\/(?:addpremium|addprem|delpremium|delprem|addgcpremium|delgcpremium|listprem|addgb|delgb|listgb|setcooldown|admin|settings|controls|cekall|resetsession|delpair|settfmax|settfdelay|settfscope|nettraffic|netinspect)\b/i,
-  /^callback:(?:menu:admin|menu:settings|menu:subscriptions|menu:audit:|menu:network|net:|tools:cekall|tools:tf_|sub:|settings:)/i,
+  /^(?:text|message):\/(?:addpremium|addprem|delpremium|delprem|addgcpremium|delgcpremium|listprem|addgb|delgb|listgb|setcooldown|admin|settings|controls|cekall|resetsession|delpair|settfmax|settfdelay|settfscope|nettraffic|netinspect|secanalyzer|secupload)\b/i,
+  /^callback:(?:menu:admin|menu:settings|menu:subscriptions|menu:audit:|menu:network|menu:sec_analyzer|net:|sec:|tools:cekall|tools:tf_|sub:|settings:)/i,
 ];
 
 export function isOwnerOnlyAction(actionDescription: string): boolean {

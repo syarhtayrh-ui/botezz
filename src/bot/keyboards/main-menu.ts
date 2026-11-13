@@ -78,6 +78,7 @@ export function buildMainMenuKeyboard(
   if (isAdmin) {
     rows.push([
       { text: '🌐 حركة مرور الشبكة والطلبات', callbackData: 'menu:network' },
+      { text: '🛡️ المحلل الأمني والجنائي', callbackData: 'menu:sec_analyzer' },
     ]);
     rows.push([
       { text: '⭐ الاشتراكات (Premium)', callbackData: 'menu:subscriptions:page:1' },

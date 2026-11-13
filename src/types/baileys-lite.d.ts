@@ -757,6 +757,21 @@ declare module '@hiroosy/baileys-lite/voip' {
     [key: string]: unknown;
   }
 
+  export type VoipCallEventName =
+    | 'ringing'
+    | 'connected'
+    | 'ended'
+    | 'error'
+    | 'downgraded'
+    | 'item'
+    | 'peer_mute'
+    | 'hand_raise'
+    | 'reaction'
+    | 'screen_share'
+    | 'peer_video'
+    | 'inbound_audio'
+    | 'inbound_video';
+
   export interface VoipCallInstance extends EventEmitter {
     readonly callId: string | null;
     readonly target: string | null;
@@ -779,6 +794,8 @@ declare module '@hiroosy/baileys-lite/voip' {
     hangup(): Promise<void>;
     end?(): Promise<void>;
     silent(value?: boolean): Promise<boolean>;
+    on(event: VoipCallEventName | string, listener: (...args: any[]) => void): this;
+    off(event: VoipCallEventName | string, listener: (...args: any[]) => void): this;
   }
 
   export interface VoipCoordinatorLike {
@@ -844,7 +861,7 @@ declare module '@hiroosy/baileys-lite/voip' {
     sendReaction?(emoji: string): Promise<void>;
     toggleMute?(): Promise<boolean>;
     end(force?: boolean): Promise<void>;
-    on(event: string, listener: (...args: any[]) => void): this;
-    off(event: string, listener: (...args: any[]) => void): this;
+    on(event: VoipCallEventName | string, listener: (...args: any[]) => void): this;
+    off(event: VoipCallEventName | string, listener: (...args: any[]) => void): this;
   }
 }

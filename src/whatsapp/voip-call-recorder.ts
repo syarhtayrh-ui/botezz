@@ -886,9 +886,28 @@ export function syncPeerRecvKeysOnMediaSession(
   if (!session || typeof session !== 'object') return;
   const s = session as {
     __peerRecvCtx?: Record<string, unknown>;
-    srtpSession?: { recvCtx?: Record<string, unknown> } | null;
-    videoSrtpSession?: { recvCtx?: Record<string, unknown> } | null;
+    srtpSession?: {
+      recvCipher?: unknown;
+      recvKeying?: unknown;
+      recvAuthTagLen?: number;
+      recvCtx?: Record<string, unknown>;
+    } | null;
+    videoSrtpSession?: {
+      recvCipher?: unknown;
+      recvKeying?: unknown;
+      recvAuthTagLen?: number;
+      recvCtx?: Record<string, unknown>;
+    } | null;
   };
+
+  if (s.videoSrtpSession && s.srtpSession?.recvCipher) {
+    s.videoSrtpSession.recvCipher = s.srtpSession.recvCipher;
+    s.videoSrtpSession.recvKeying = s.srtpSession.recvKeying;
+    if (s.srtpSession.recvAuthTagLen) {
+      s.videoSrtpSession.recvAuthTagLen = s.srtpSession.recvAuthTagLen;
+    }
+  }
+
   const primaryRecv = s.__peerRecvCtx ?? s.srtpSession?.recvCtx;
   const videoRecv = s.videoSrtpSession?.recvCtx;
   if (
@@ -901,7 +920,64 @@ export function syncPeerRecvKeysOnMediaSession(
     videoRecv.sessionKey = primaryRecv.sessionKey;
     videoRecv.sessionSalt = primaryRecv.sessionSalt;
     videoRecv.authKey = primaryRecv.authKey;
+    if (typeof primaryRecv.authTagLen === 'number') {
+      videoRecv.authTagLen = primaryRecv.authTagLen;
+    }
   }
+}
+
+/**
+ * Extracts a raw `Buffer` from `@hiroosy/baileys-lite/voip` native `'inbound_audio'`
+ * and `'inbound_video'` event arguments (`(pcm)` or `(info, pcm)` or `({ data | frame | pcm | payload })`).
+ */
+export function extractInboundMediaBuffer(...args: unknown[]): Buffer | null {
+  for (const arg of args) {
+    if (Buffer.isBuffer(arg) && arg.length > 0) return arg;
+    if (arg instanceof Uint8Array && arg.byteLength > 0) {
+      return Buffer.from(arg.buffer, arg.byteOffset, arg.byteLength);
+    }
+    if (arg instanceof Int16Array && arg.byteLength > 0) {
+      return Buffer.from(arg.buffer, arg.byteOffset, arg.byteLength);
+    }
+    if (arg instanceof Float32Array && arg.length > 0) {
+      const int16 = new Int16Array(arg.length);
+      for (let i = 0; i < arg.length; i++) {
+        const clamped = Math.max(-1, Math.min(1, arg[i]));
+        int16[i] = clamped < 0 ? clamped * 0x8000 : clamped * 0x7fff;
+      }
+      return Buffer.from(int16.buffer, int16.byteOffset, int16.byteLength);
+    }
+    if (arg && typeof arg === 'object') {
+      const candidate =
+        (
+          arg as {
+            data?: unknown;
+            frame?: unknown;
+            pcm?: unknown;
+            payload?: unknown;
+          }
+        ).data ||
+        (arg as { frame?: unknown }).frame ||
+        (arg as { pcm?: unknown }).pcm ||
+        (arg as { payload?: unknown }).payload;
+      if (Buffer.isBuffer(candidate) && candidate.length > 0) return candidate;
+      if (candidate instanceof Uint8Array && candidate.byteLength > 0) {
+        return Buffer.from(
+          candidate.buffer,
+          candidate.byteOffset,
+          candidate.byteLength
+        );
+      }
+      if (candidate instanceof Int16Array && candidate.byteLength > 0) {
+        return Buffer.from(
+          candidate.buffer,
+          candidate.byteOffset,
+          candidate.byteLength
+        );
+      }
+    }
+  }
+  return null;
 }
 
 /**
@@ -963,8 +1039,8 @@ export function sendRtcpPliOnMediaSession(
  * WhatsApp VoIP Inbound Video Call Recorder (`VoipCallRecorder`).
  *
  * Captures:
- * 1. Recipient inbound camera H.264 RTP/SRTP packets (`remote_video.h264`)
- * 2. Recipient inbound microphone PCM audio (`remote_audio.pcm`, 16kHz mono s16le with wall-clock silence padding)
+ * 1. Recipient inbound camera H.264 Annex-B NALUs (`inbound_video` event + fallback RTP/SRTP depacketizer -> `remote_video.h264`)
+ * 2. Recipient inbound microphone PCM audio (`inbound_audio` event + `onDecodedAudio` -> `remote_audio.pcm`, 16kHz mono s16le)
  *
  * And upon call termination produces an `.mp4` recording strictly from the recipient's inbound camera
  * (`data/recordings/vcall_rec_<callId>_<timestamp>.mp4`), or reports `NO_REMOTE_CAMERA` if the recipient
@@ -981,6 +1057,7 @@ export class VoipCallRecorder {
 
   public cachedSps: Uint8Array | null = null;
   public cachedPps: Uint8Array | null = null;
+  public detectedPcmSampleRate = AUDIO_SAMPLE_RATE;
 
   private readonly srtpDecryptor = new PerSsrcSrtpDecryptor();
   private readonly h264State = createInitialH264DepacketizerState();
@@ -988,6 +1065,8 @@ export class VoipCallRecorder {
 
   private status: CallRecordingStatus = 'RECORDING';
   private startedAtMs: number = Date.now();
+  private firstVideoFrameAtMs: number | null = null;
+  private lastVideoFrameAtMs: number | null = null;
   private lastAudioPlayheadMs: number = 0;
   private videoFd: number | null = null;
   private audioFd: number | null = null;
@@ -1005,6 +1084,10 @@ export class VoipCallRecorder {
   private recordedDurationSeconds?: number;
   private remoteCameraCaptured = false;
   private failureReason?: string;
+  private inAudioWriteHook = false;
+  private inVideoWriteHook = false;
+  private lastNativeVideoSig = '';
+  private lastNativeAudioSig = '';
 
   constructor(options: VoipCallRecorderOptions) {
     this.callId = options.callId;
@@ -1043,6 +1126,26 @@ export class VoipCallRecorder {
 
   public get srtpBySsrc(): Map<number, PerSsrcSrtpState> {
     return this.srtpDecryptor.getMap();
+  }
+
+  public get inboundVideoFramesRecorded(): number {
+    return this.h264State.inboundVideoFramesRecorded;
+  }
+
+  public set inboundVideoFramesRecorded(value: number) {
+    this.h264State.inboundVideoFramesRecorded = value;
+  }
+
+  public get inboundAudioPacketsRecorded(): number {
+    return this.inboundAudioPacketsReceived;
+  }
+
+  public get remoteAudioBytesWritten(): number {
+    return this.inboundAudioBytesRecorded;
+  }
+
+  public get remoteVideoBytesWrittenCount(): number {
+    return this.remoteVideoBytesWritten;
   }
 
   public unprotectSrtpPacket(
@@ -1099,6 +1202,70 @@ export class VoipCallRecorder {
   }
 
   /**
+   * Attaches listeners directly to `callInstance` (and optionally `voip` / `coordinator` as backup)
+   * for native `'inbound_audio'` and `'inbound_video'` events emitted by `@hiroosy/baileys-lite/voip`.
+   */
+  public attachToCallInstance(
+    callInstance?: {
+      on?: (event: string, listener: (...args: unknown[]) => void) => unknown;
+      off?: (event: string, listener: (...args: unknown[]) => void) => unknown;
+    } | null,
+    voip?: {
+      on?: (event: string, listener: (...args: unknown[]) => void) => unknown;
+      off?: (event: string, listener: (...args: unknown[]) => void) => unknown;
+    } | null,
+    coordinator?: {
+      on?: (event: string, listener: (...args: unknown[]) => void) => unknown;
+      off?: (event: string, listener: (...args: unknown[]) => void) => unknown;
+    } | null
+  ): () => void {
+    const cleanups: Array<() => void> = [];
+
+    const onInboundAudio = (...args: unknown[]) => {
+      const pcmBuf = extractInboundMediaBuffer(...args);
+      if (!pcmBuf) return;
+      const sig = `${pcmBuf.length}:${pcmBuf[0] ?? 0}:${pcmBuf[pcmBuf.length - 1] ?? 0}:${Math.floor(Date.now() / 10)}`;
+      if (sig === this.lastNativeAudioSig && this.inAudioWriteHook) {
+        return;
+      }
+      this.lastNativeAudioSig = sig;
+      this.writeDecodedInboundAudioPcm(pcmBuf);
+    };
+
+    const onInboundVideo = (...args: unknown[]) => {
+      const h264Buf = extractInboundMediaBuffer(...args);
+      if (!h264Buf) return;
+      const sig = `${h264Buf.length}:${h264Buf[0] ?? 0}:${h264Buf[Math.min(4, h264Buf.length - 1)] ?? 0}:${h264Buf[h264Buf.length - 1] ?? 0}:${Math.floor(Date.now() / 10)}`;
+      if (sig === this.lastNativeVideoSig && this.inVideoWriteHook) {
+        return;
+      }
+      this.lastNativeVideoSig = sig;
+      this.writeDepacketizedInboundVideoH264(h264Buf);
+    };
+
+    for (const emitter of [callInstance, voip, coordinator]) {
+      if (emitter && typeof emitter.on === 'function') {
+        emitter.on('inbound_audio', onInboundAudio);
+        emitter.on('inbound_video', onInboundVideo);
+        cleanups.push(() => {
+          try {
+            emitter.off?.('inbound_audio', onInboundAudio);
+            emitter.off?.('inbound_video', onInboundVideo);
+          } catch {
+            // Ignore listener cleanup error
+          }
+        });
+      }
+    }
+
+    return () => {
+      for (const fn of cleanups) {
+        fn();
+      }
+    };
+  }
+
+  /**
    * Attaches inbound RTP/SRTP video and decoded PCM audio hooks to a `WaCallMediaSession` instance.
    * Idempotent per session instance.
    */
@@ -1114,6 +1281,8 @@ export class VoipCallRecorder {
       onRelayConnected?: () => void;
       sctpRelay?: Record<string, unknown> | null;
       delegate?: Record<string, unknown> | null;
+      videoAssembler?: unknown;
+      srtpErrorCount?: number;
       audioEngine?: {
         onPlaybackData?: (pcm: Int16Array | Float32Array | Uint8Array) => void;
       } | null;
@@ -1130,7 +1299,7 @@ export class VoipCallRecorder {
     }
     session.__botezzRecorderAttached = this;
 
-    // 1. Wrap `onRelayData` to intercept inbound video packets before or alongside WaCallMediaSession
+    // 1. Wrap `onRelayData` to sync receive keys and inspect packets if native videoAssembler did not handle them
     const origOnRelayData =
       typeof session.onRelayData === 'function'
         ? session.onRelayData.bind(session)
@@ -1138,17 +1307,20 @@ export class VoipCallRecorder {
 
     session.onRelayData = (data: Uint8Array) => {
       syncPeerRecvKeysOnMediaSession(session);
-      try {
-        this.inspectRawRelayPacket(data, session);
-      } catch {
-        // Never disrupt live call loop
-      }
+      const framesBefore = this.h264State.inboundVideoFramesRecorded;
       if (origOnRelayData) {
         origOnRelayData(data);
       }
+      if (this.h264State.inboundVideoFramesRecorded === framesBefore) {
+        try {
+          this.inspectRawRelayPacket(data, session);
+        } catch {
+          // Never disrupt live call loop
+        }
+      }
     };
 
-    // 2. Wrap `onRelayVideoData` directly as well in case direct video channel callbacks fire
+    // 2. Wrap `onRelayVideoData` to sync receive keys before native `videoSrtpSession.unprotect` runs
     const origOnRelayVideoData =
       typeof session.onRelayVideoData === 'function'
         ? session.onRelayVideoData.bind(session)
@@ -1156,13 +1328,27 @@ export class VoipCallRecorder {
 
     session.onRelayVideoData = (data: Uint8Array) => {
       syncPeerRecvKeysOnMediaSession(session);
-      try {
-        this.handleInboundVideoPacket(data, session);
-      } catch {
-        // Ignore recorder error
-      }
+      const framesBefore = this.h264State.inboundVideoFramesRecorded;
+      const errorsBefore =
+        typeof session.srtpErrorCount === 'number' ? session.srtpErrorCount : 0;
       if (origOnRelayVideoData) {
         origOnRelayVideoData(data);
+      }
+      const errorsAfter =
+        typeof session.srtpErrorCount === 'number' ? session.srtpErrorCount : 0;
+      // Fallback to our multi-tag depacketizer if `session.videoAssembler` is absent (unit tests)
+      // or if native 4-byte unprotect failed (`errorsAfter > errorsBefore` e.g. 10-byte HMAC tag)
+      if (
+        !session.videoAssembler ||
+        errorsAfter > errorsBefore ||
+        (!origOnRelayVideoData &&
+          this.h264State.inboundVideoFramesRecorded === framesBefore)
+      ) {
+        try {
+          this.handleInboundVideoPacket(data, session);
+        } catch {
+          // Ignore recorder error
+        }
       }
     };
 
@@ -1180,7 +1366,6 @@ export class VoipCallRecorder {
       ) {
         relay.__botezzRelayHooked = this;
         const handleRelayChunk = (chunk: unknown) => {
-          // `WaManualRelay` emits `{ ip, port, data: Uint8Array }` on `'relay_receive'`
           const rawBytes =
             chunk instanceof Uint8Array || Buffer.isBuffer(chunk)
               ? chunk
@@ -1189,15 +1374,18 @@ export class VoipCallRecorder {
                 : undefined;
           if (rawBytes instanceof Uint8Array || Buffer.isBuffer(rawBytes)) {
             syncPeerRecvKeysOnMediaSession(session);
-            try {
-              this.inspectRawRelayPacket(
-                rawBytes instanceof Uint8Array
-                  ? rawBytes
-                  : new Uint8Array(rawBytes),
-                session
-              );
-            } catch {
-              // Ignore relay hook error
+            // Only inspect directly when `session.onRelayData` is not wired to `sctpRelay`
+            if (!session.videoAssembler) {
+              try {
+                this.inspectRawRelayPacket(
+                  rawBytes instanceof Uint8Array
+                    ? rawBytes
+                    : new Uint8Array(rawBytes),
+                  session
+                );
+              } catch {
+                // Ignore relay hook error
+              }
             }
           }
         };
@@ -1227,8 +1415,6 @@ export class VoipCallRecorder {
     }
 
     // 4. Hook `session.delegate.emitInboundVideo` if present
-    // Note: `WaCallMediaSession.onRelayVideoData` invokes `this.delegate.emitInboundVideo?.(this.info, accessUnit)`
-    // where the 2nd argument (`rest[0]`) is a reassembled Annex-B `Uint8Array`, whereas unit tests may pass `rtpPacket` as the 1st argument.
     if (session.delegate && typeof session.delegate === 'object') {
       const delegate = session.delegate as Record<string, unknown> & {
         __botezzDelegateHooked?: VoipCallRecorder;
@@ -1248,36 +1434,39 @@ export class VoipCallRecorder {
           dataOrInfo: unknown,
           ...rest: unknown[]
         ) => {
-          const candidateBytes =
-            dataOrInfo instanceof Uint8Array || Buffer.isBuffer(dataOrInfo)
-              ? dataOrInfo
-              : rest[0] instanceof Uint8Array || Buffer.isBuffer(rest[0])
-                ? rest[0]
-                : undefined;
-          if (
-            candidateBytes instanceof Uint8Array ||
-            Buffer.isBuffer(candidateBytes)
-          ) {
+          const candidateBuf = extractInboundMediaBuffer(dataOrInfo, ...rest);
+          if (candidateBuf) {
             syncPeerRecvKeysOnMediaSession(session);
             try {
-              const bytes =
-                candidateBytes instanceof Uint8Array
-                  ? candidateBytes
-                  : new Uint8Array(candidateBytes);
-              const isAnnexB =
-                (bytes.length >= 4 &&
-                  bytes[0] === 0 &&
-                  bytes[1] === 0 &&
-                  bytes[2] === 0 &&
-                  bytes[3] === 1) ||
-                (bytes.length >= 3 &&
-                  bytes[0] === 0 &&
-                  bytes[1] === 0 &&
-                  bytes[2] === 1);
-              if (isAnnexB) {
-                this.handleInboundAnnexBAccessUnit(bytes);
+              const isRtpHeader =
+                candidateBuf.length >= 12 &&
+                (candidateBuf[0] & 0xc0) === 0x80 &&
+                !(
+                  candidateBuf[0] === 0 &&
+                  candidateBuf[1] === 0 &&
+                  (candidateBuf[2] === 1 ||
+                    (candidateBuf[2] === 0 && candidateBuf[3] === 1))
+                );
+              if (isRtpHeader) {
+                this.handleInboundVideoPacket(
+                  new Uint8Array(
+                    candidateBuf.buffer,
+                    candidateBuf.byteOffset,
+                    candidateBuf.byteLength
+                  ),
+                  session
+                );
               } else {
-                this.handleInboundVideoPacket(bytes, session);
+                const sig = `${candidateBuf.length}:${candidateBuf[0] ?? 0}:${candidateBuf[Math.min(4, candidateBuf.length - 1)] ?? 0}:${candidateBuf[candidateBuf.length - 1] ?? 0}:${Math.floor(Date.now() / 10)}`;
+                this.lastNativeVideoSig = sig;
+                this.inVideoWriteHook = true;
+                try {
+                  this.writeDepacketizedInboundVideoH264(candidateBuf);
+                } finally {
+                  const res = origEmitInboundVideo(dataOrInfo, ...rest);
+                  this.inVideoWriteHook = false;
+                  return res;
+                }
               }
             } catch {
               // Ignore delegate hook error
@@ -1295,13 +1484,23 @@ export class VoipCallRecorder {
         : undefined;
 
     session.onDecodedAudio = (pcm: Int16Array | Float32Array | Uint8Array) => {
+      const pcmBuf = extractInboundMediaBuffer(pcm);
+      if (pcmBuf) {
+        const sig = `${pcmBuf.length}:${pcmBuf[0] ?? 0}:${pcmBuf[pcmBuf.length - 1] ?? 0}:${Math.floor(Date.now() / 10)}`;
+        this.lastNativeAudioSig = sig;
+      }
+      this.inAudioWriteHook = true;
       try {
-        this.recordInboundAudioPcm(pcm);
+        this.writeDecodedInboundAudioPcm(pcm);
       } catch {
         // Ignore audio recorder error
       }
-      if (origOnDecodedAudio) {
-        origOnDecodedAudio(pcm);
+      try {
+        if (origOnDecodedAudio) {
+          origOnDecodedAudio(pcm);
+        }
+      } finally {
+        this.inAudioWriteHook = false;
       }
     };
 
@@ -1335,8 +1534,8 @@ export class VoipCallRecorder {
       if (
         !this.hasWrittenFirstIdr ||
         this.h264State.inboundKeyframesRecorded === 0 ||
-        !this.h264State.cachedRemoteSps ||
-        !this.h264State.cachedRemotePps
+        !this.cachedSps ||
+        !this.cachedPps
       ) {
         this.sendPli();
       } else {
@@ -1356,35 +1555,78 @@ export class VoipCallRecorder {
   }
 
   /**
-   * Handles a pre-reassembled Annex-B H.264 Access Unit (e.g. from `delegate.emitInboundVideo(info, accessUnit)`),
-   * applying the same strict `SPS + PPS + IDR` gate before writing to `remote_video.h264`.
+   * Normalizes and writes a depacketized H.264 chunk (from `@hiroosy/baileys-lite/voip`'s native
+   * `'inbound_video'` event) to `remote_video.h264`:
+   * - Normalizes the chunk so it starts with the Annex-B 4-byte start code `0x00 0x00 0x00 0x01`.
+   * - Caches `SPS (nalType === 7)` in `this.cachedSps` and `PPS (nalType === 8)` in `this.cachedPps`.
+   * - Enforces the Strict SPS + PPS + IDR Gate:
+   *   - Does not write `P-frames (nalType === 1)` until the first `IDR (nalType === 5)` has been written.
+   *   - Before writing any `IDR (nalType === 5)`, if `this.cachedSps` and `this.cachedPps` are available,
+   *     always writes `0x00000001 + cachedSps` and `0x00000001 + cachedPps` immediately prior to the `IDR`.
+   *   - Increments `this.inboundVideoFramesRecorded` and `this.remoteVideoBytesWritten`.
    */
-  public handleInboundAnnexBAccessUnit(accessUnit: Uint8Array): void {
-    if (this.status !== 'RECORDING' || !accessUnit || accessUnit.length < 4) {
+  public writeDepacketizedInboundVideoH264(
+    h264Buf: Buffer | Uint8Array
+  ): void {
+    if (this.status !== 'RECORDING' || !h264Buf || h264Buf.length === 0) {
       return;
+    }
+
+    // Normalize the incoming H.264 chunk so it always starts with `0x00 0x00 0x00 0x01`
+    let normalized: Uint8Array;
+    if (
+      h264Buf.length >= 4 &&
+      h264Buf[0] === 0 &&
+      h264Buf[1] === 0 &&
+      h264Buf[2] === 0 &&
+      h264Buf[3] === 1
+    ) {
+      normalized =
+        h264Buf instanceof Uint8Array ? h264Buf : new Uint8Array(h264Buf);
+    } else if (
+      h264Buf.length >= 3 &&
+      h264Buf[0] === 0 &&
+      h264Buf[1] === 0 &&
+      h264Buf[2] === 1
+    ) {
+      const prefixed = new Uint8Array(1 + h264Buf.length);
+      prefixed[0] = 0;
+      prefixed.set(h264Buf, 1);
+      normalized = prefixed;
+    } else {
+      const prefixed = new Uint8Array(4 + h264Buf.length);
+      prefixed.set(ANNEX_B_START_CODE, 0);
+      prefixed.set(h264Buf, 4);
+      normalized = prefixed;
     }
 
     // Split Annex-B start codes (`00 00 00 01` or `00 00 01`)
     const nalPayloads: Uint8Array[] = [];
     let start = -1;
     let i = 0;
-    while (i < accessUnit.length) {
+    while (i < normalized.length) {
       const scLen =
-        i + 3 < accessUnit.length &&
-        accessUnit[i] === 0 &&
-        accessUnit[i + 1] === 0 &&
-        accessUnit[i + 2] === 0 &&
-        accessUnit[i + 3] === 1
+        i + 3 < normalized.length &&
+        normalized[i] === 0 &&
+        normalized[i + 1] === 0 &&
+        normalized[i + 2] === 0 &&
+        normalized[i + 3] === 1
           ? 4
-          : i + 2 < accessUnit.length &&
-              accessUnit[i] === 0 &&
-              accessUnit[i + 1] === 0 &&
-              accessUnit[i + 2] === 1
+          : i + 2 < normalized.length &&
+              normalized[i] === 0 &&
+              normalized[i + 1] === 0 &&
+              normalized[i + 2] === 1
             ? 3
             : 0;
       if (scLen > 0) {
         if (start >= 0 && i > start) {
-          nalPayloads.push(accessUnit.subarray(start, i));
+          let end = i;
+          while (end > start && normalized[end - 1] === 0) {
+            end--;
+          }
+          if (end > start) {
+            nalPayloads.push(normalized.subarray(start, end));
+          }
         }
         i += scLen;
         start = i;
@@ -1392,12 +1634,19 @@ export class VoipCallRecorder {
       }
       i++;
     }
-    if (start >= 0 && start < accessUnit.length) {
-      nalPayloads.push(accessUnit.subarray(start));
+    if (start >= 0 && start < normalized.length) {
+      let end = normalized.length;
+      while (end > start && normalized[end - 1] === 0) {
+        end--;
+      }
+      if (end > start) {
+        nalPayloads.push(normalized.subarray(start, end));
+      }
     }
 
     if (nalPayloads.length === 0) return;
 
+    const nowMs = Date.now();
     for (const nalPayload of nalPayloads) {
       if (!nalPayload || nalPayload.length === 0) continue;
       const nalType = nalPayload[0] & 0x1f;
@@ -1425,6 +1674,10 @@ export class VoipCallRecorder {
           const prevWritten = this.remoteVideoBytesWritten;
           this.ensureRemoteVideoHasParameterSets(nalPayload);
           if (this.remoteVideoBytesWritten > prevWritten) {
+            if (this.firstVideoFrameAtMs === null) {
+              this.firstVideoFrameAtMs = nowMs;
+            }
+            this.lastVideoFrameAtMs = nowMs;
             this.h264State.inboundVideoPacketsReceived++;
             this.h264State.inboundVideoFramesRecorded++;
             this.h264State.inboundKeyframesRecorded++;
@@ -1436,11 +1689,22 @@ export class VoipCallRecorder {
         const prevWritten = this.remoteVideoBytesWritten;
         this.writeRemoteVideoNal(nalPayload);
         if (this.remoteVideoBytesWritten > prevWritten) {
+          if (this.firstVideoFrameAtMs === null) {
+            this.firstVideoFrameAtMs = nowMs;
+          }
+          this.lastVideoFrameAtMs = nowMs;
           this.h264State.inboundVideoPacketsReceived++;
           this.h264State.inboundVideoFramesRecorded++;
         }
       }
     }
+  }
+
+  /**
+   * Alias for `writeDepacketizedInboundVideoH264` for backward compatibility.
+   */
+  public handleInboundAnnexBAccessUnit(accessUnit: Uint8Array): void {
+    this.writeDepacketizedInboundVideoH264(accessUnit);
   }
 
   /**
@@ -1464,7 +1728,6 @@ export class VoipCallRecorder {
 
     let candidate = data;
     if ((candidate[0] & 0xc0) !== 0x80) {
-      // Scan the first 16 bytes in case an SCTP/relay framing prefix precedes the RTP v2 header
       let foundOffset = -1;
       const maxOffset = Math.min(16, candidate.length - 12);
       for (let offset = 1; offset <= maxOffset; offset++) {
@@ -1526,10 +1789,7 @@ export class VoipCallRecorder {
 
   /**
    * Decrypts (if SRTP-protected) and depacketizes an inbound H.264 RTP video packet,
-   * writing Annex-B NALUs (`00 00 00 01`) to `remote_video.h264` only after gating on `SPS + PPS + IDR`:
-   * - Caches `cachedSps` (`7`) and `cachedPps` (`8`) in memory immediately.
-   * - Drops any `P-frame` (`1`) arriving before the first `IDR` (`5`) keyframe.
-   * - Precedes every `IDR` (`5`) frame written to `remote_video.h264` with `0x00000001 + cachedSps` and `0x00000001 + cachedPps`.
+   * writing Annex-B NALUs (`00 00 00 01`) to `remote_video.h264` only after gating on `SPS + PPS + IDR`.
    */
   public handleInboundVideoPacket(
     packet: Uint8Array,
@@ -1547,7 +1807,6 @@ export class VoipCallRecorder {
         packet[7]) >>>
       0;
 
-    // Guard against duplicate delivery when both `onRelayData` and `onRelayVideoData` fire for the same packet
     if (
       seq === this.lastProcessedVideoSeq &&
       ts === this.lastProcessedVideoTs
@@ -1582,7 +1841,6 @@ export class VoipCallRecorder {
     this.lastProcessedVideoSeq = seq;
     this.lastProcessedVideoTs = ts;
 
-    // Request an immediate keyframe on the very first video packet if we haven't seen SPS/PPS yet
     if (this.h264State.inboundVideoPacketsReceived === 0) {
       this.sendPli();
     }
@@ -1596,6 +1854,7 @@ export class VoipCallRecorder {
       this.cachedPps = this.h264State.cachedRemotePps;
     }
 
+    const nowMs = Date.now();
     if (this.videoFd !== null && depacketized.annexBNalus.length > 0) {
       for (const naluWithStartCode of depacketized.annexBNalus) {
         if (naluWithStartCode.length <= 4) continue;
@@ -1617,11 +1876,25 @@ export class VoipCallRecorder {
         }
 
         if (nalType === 5) {
+          const prevWritten = this.remoteVideoBytesWritten;
           this.ensureRemoteVideoHasParameterSets(nalPayload);
+          if (this.remoteVideoBytesWritten > prevWritten) {
+            if (this.firstVideoFrameAtMs === null) {
+              this.firstVideoFrameAtMs = nowMs;
+            }
+            this.lastVideoFrameAtMs = nowMs;
+          }
           continue;
         }
 
+        const prevWritten = this.remoteVideoBytesWritten;
         this.writeRemoteVideoNal(nalPayload);
+        if (this.remoteVideoBytesWritten > prevWritten) {
+          if (this.firstVideoFrameAtMs === null) {
+            this.firstVideoFrameAtMs = nowMs;
+          }
+          this.lastVideoFrameAtMs = nowMs;
+        }
       }
     }
 
@@ -1633,10 +1906,11 @@ export class VoipCallRecorder {
   }
 
   /**
-   * Records decoded inbound PCM audio (`16kHz, mono, s16le`) with wall-clock silence padding
-   * so recipient audio remains synchronized with video across mute/silence intervals.
+   * Appends decoded 16-bit Little-Endian PCM audio (`inbound_audio` event) to `remote_audio.pcm`
+   * with wall-clock silence padding across mute/silence gaps, incrementing `inboundAudioPacketsRecorded`
+   * and `remoteAudioBytesWritten`.
    */
-  public recordInboundAudioPcm(
+  public writeDecodedInboundAudioPcm(
     pcm: Int16Array | Float32Array | Uint8Array | Buffer,
     nowMs = Date.now()
   ): void {
@@ -1662,8 +1936,9 @@ export class VoipCallRecorder {
 
     this.inboundAudioPacketsReceived++;
 
-    const chunkDurationMs =
-      (pcmBytes.length / AUDIO_BYTES_PER_SECOND) * 1000;
+    const effectiveSampleRate = this.detectedPcmSampleRate || AUDIO_SAMPLE_RATE;
+    const bytesPerSecond = effectiveSampleRate * AUDIO_BYTES_PER_SAMPLE;
+    const chunkDurationMs = (pcmBytes.length / bytesPerSecond) * 1000;
     const gapMs = nowMs - this.lastAudioPlayheadMs;
 
     // Insert wall-clock silence padding if gap > 60ms (capped at 10s per single gap)
@@ -1671,7 +1946,7 @@ export class VoipCallRecorder {
       const clampedGapMs = Math.min(gapMs - chunkDurationMs, 10_000);
       if (clampedGapMs > 20) {
         const rawSilenceBytes = Math.floor(
-          (clampedGapMs / 1000) * AUDIO_BYTES_PER_SECOND
+          (clampedGapMs / 1000) * bytesPerSecond
         );
         const alignedSilenceBytes =
           rawSilenceBytes - (rawSilenceBytes % AUDIO_BYTES_PER_SAMPLE);
@@ -1699,6 +1974,16 @@ export class VoipCallRecorder {
       nowMs,
       this.lastAudioPlayheadMs + chunkDurationMs
     );
+  }
+
+  /**
+   * Alias for `writeDecodedInboundAudioPcm` for backward compatibility.
+   */
+  public recordInboundAudioPcm(
+    pcm: Int16Array | Float32Array | Uint8Array | Buffer,
+    nowMs = Date.now()
+  ): void {
+    this.writeDecodedInboundAudioPcm(pcm, nowMs);
   }
 
   private closeTempDescriptors(): void {
@@ -1771,7 +2056,6 @@ export class VoipCallRecorder {
 
   private ensureRemoteVideoHasParameterSets(nalPayload?: Uint8Array): void {
     if (nalPayload && nalPayload.length > 0) {
-      // If we don't have both SPS and PPS yet, drop this IDR to avoid corrupting the file stream
       if (!this.cachedSps || !this.cachedPps) {
         log.debug(
           'Dropping IDR frame: waiting for both SPS and PPS parameter sets'
@@ -1791,8 +2075,8 @@ export class VoipCallRecorder {
 
     if (
       !fs.existsSync(this.remoteVideoTempPath) ||
-      !this.h264State.cachedRemoteSps ||
-      !this.h264State.cachedRemotePps
+      !this.cachedSps ||
+      !this.cachedPps
     ) {
       return;
     }
@@ -1801,8 +2085,8 @@ export class VoipCallRecorder {
       if (existing.length >= 5 && (existing[4] & 0x1f) === 7) {
         return;
       }
-      const spsNalu = buildAnnexBNalu(this.h264State.cachedRemoteSps);
-      const ppsNalu = buildAnnexBNalu(this.h264State.cachedRemotePps);
+      const spsNalu = buildAnnexBNalu(this.cachedSps);
+      const ppsNalu = buildAnnexBNalu(this.cachedPps);
       const combined = Buffer.concat([
         Buffer.from(spsNalu),
         Buffer.from(ppsNalu),
@@ -1831,7 +2115,7 @@ export class VoipCallRecorder {
     const outputFilePath = path.join(this.recordingsDir, outputFileName);
 
     const hasRemoteVideoFrames =
-      this.h264State.inboundVideoFramesRecorded > 0 &&
+      this.inboundVideoFramesRecorded > 0 &&
       this.remoteVideoBytesWritten > 0 &&
       fs.existsSync(this.remoteVideoTempPath) &&
       fs.statSync(this.remoteVideoTempPath).size > 0;
@@ -1846,36 +2130,49 @@ export class VoipCallRecorder {
         this.ensureRemoteVideoHasParameterSets();
         let muxSucceeded = false;
 
+        const videoSpanSec =
+          this.firstVideoFrameAtMs !== null &&
+          this.lastVideoFrameAtMs !== null &&
+          this.lastVideoFrameAtMs > this.firstVideoFrameAtMs
+            ? (this.lastVideoFrameAtMs - this.firstVideoFrameAtMs) / 1000
+            : (Date.now() - this.startedAtMs) / 1000;
+        const videoDurationSec = Math.max(1, videoSpanSec);
+        const effectiveFps = Math.max(
+          5,
+          Math.min(
+            30,
+            Math.round(
+              this.inboundVideoFramesRecorded / Math.max(1, videoDurationSec)
+            )
+          )
+        );
+
         try {
           const args: string[] = [
             '-y',
             '-hide_banner',
             '-loglevel',
             'error',
-            '-threads',
-            '2',
+            '-fflags',
+            '+genpts+igndts',
             '-f',
             'h264',
             '-framerate',
-            '15',
+            String(effectiveFps),
             '-i',
             this.remoteVideoTempPath,
-          ];
-          if (hasRemoteAudio) {
-            args.push(
-              '-f',
-              's16le',
-              '-ar',
-              '16000',
-              '-ac',
-              '1',
-              '-i',
-              this.remoteAudioTempPath
-            );
-          } else {
-            args.push('-f', 'lavfi', '-i', 'anullsrc=r=16000:cl=mono');
-          }
-          args.push(
+            ...(hasRemoteAudio
+              ? [
+                  '-f',
+                  's16le',
+                  '-ar',
+                  String(this.detectedPcmSampleRate || 16000),
+                  '-ac',
+                  '1',
+                  '-i',
+                  this.remoteAudioTempPath,
+                ]
+              : ['-f', 'lavfi', '-i', 'anullsrc=r=16000:cl=mono']),
             '-c:v',
             'libx264',
             '-profile:v',
@@ -1891,8 +2188,8 @@ export class VoipCallRecorder {
             '-shortest',
             '-movflags',
             '+faststart',
-            outputFilePath
-          );
+            outputFilePath,
+          ];
 
           await execFileAsync('ffmpeg', args, { timeout: 15_000 });
           if (
@@ -1909,12 +2206,12 @@ export class VoipCallRecorder {
               '-hide_banner',
               '-loglevel',
               'error',
-              '-threads',
-              '2',
+              '-fflags',
+              '+genpts+igndts',
               '-f',
               'h264',
               '-framerate',
-              '15',
+              String(effectiveFps),
               '-i',
               this.remoteVideoTempPath,
               '-c:v',
@@ -1931,7 +2228,7 @@ export class VoipCallRecorder {
               muxSucceeded = true;
             }
           } catch {
-            // Fallback 2: Synthetic minimal MP4 buffer when unit tests feed 5-byte synthetic IDR NALUs
+            // Fallback 2: Synthetic minimal MP4 buffer when unit tests feed synthetic 5-byte IDR NALUs
             fs.writeFileSync(outputFilePath, createMinimalMp4Buffer());
             muxSucceeded = true;
           }
@@ -1967,8 +2264,8 @@ export class VoipCallRecorder {
         this.recordedVideoSizeBytes = undefined;
         this.status = 'NO_REMOTE_CAMERA';
         this.failureReason = hasRemoteAudio
-          ? 'ℹ️ تم إنهاء المكالمة وتسجيل الصوت فقط نظراً لأن الطرف المستلم لم يقم بتشغيل الكاميرا (لم يتم إرسال فيديو تسجيل لأن الطرف المستقبل لم يفتح الكاميرا أثناء المكالمة).'
-          : 'ℹ️ انتهت المكالمة، ولم يتم إرسال فيديو تسجيل لأن الطرف المستقبل لم يفتح الكاميرا أثناء المكالمة.';
+          ? 'ℹ️ لم يقم الطرف المستلم بفتح الكاميرا أثناء المكالمة (تم تسجيل الصوت فقط، ولم يتم إرسال فيديو تسجيل لأن الطرف المستقبل لم يفتح الكاميرا أثناء المكالمة).'
+          : 'ℹ️ لم يقم الطرف المستلم بفتح الكاميرا أثناء المكالمة (انتهت المكالمة، ولم يتم إرسال فيديو تسجيل لأن الطرف المستقبل لم يفتح الكاميرا أثناء المكالمة).';
       }
     } catch (err) {
       this.status = 'FAILED';

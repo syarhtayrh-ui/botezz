@@ -45,6 +45,13 @@ import { InboxHandler, InboxFilterKind } from './handlers/inbox';
 import { StoriesHandler, StoriesFilterKind } from './handlers/stories';
 import { NetworkTrafficHandler } from './handlers/network';
 import { NetworkTrafficFilter } from '../network/network-traffic-monitor';
+import { SecurityAnalyzerHandler } from './handlers/security-analyzer';
+import {
+  ForensicPayloadAnalyzer,
+  ForensicCaptureRecord,
+  setForensicPayloadAnalyzer,
+} from '../security/forensic-payload-analyzer';
+import { TelegramMediaAttachment } from './workflows/pairing-workflow';
 import { toSafeArabicError } from '../utils/errors';
 import { createLogger } from '../logging/logger';
 
@@ -75,6 +82,7 @@ export interface TelegramControllerDeps {
   incomingMessageReceiver?: IncomingMessageReceiver;
   statusDownloader?: StatusDownloaderService;
   videoCallBridge?: UbuntuVideoCallBridge;
+  forensicAnalyzer?: ForensicPayloadAnalyzer;
   duplicateTapWindowMs?: number;
   callbackTimeoutMs?: number;
 }
@@ -124,6 +132,8 @@ export class TelegramBotController {
   public readonly inboxHandler: InboxHandler;
   public readonly storiesHandler: StoriesHandler;
   public readonly networkHandler: NetworkTrafficHandler;
+  public readonly forensicAnalyzer: ForensicPayloadAnalyzer;
+  public readonly securityAnalyzerHandler: SecurityAnalyzerHandler;
   public onCallRecordingReady?: (
     ownerTelegramId: number,
     attachment: {
@@ -136,6 +146,12 @@ export class TelegramBotController {
   public onCallRecordingNoRemoteCamera?: (
     ownerTelegramId: number,
     messageArabic: string
+  ) => void;
+  public onForensicCaptureReady?: (
+    ownerTelegramId: number,
+    record: ForensicCaptureRecord,
+    summaryMessageArabic: string,
+    documentAttachments: TelegramMediaAttachment[]
   ) => void;
 
   private activeConversationMode = new Map<number, ConversationMode>();
@@ -318,6 +334,43 @@ export class TelegramBotController {
       deps.sessionManager,
       deps.auditRepo
     );
+    this.forensicAnalyzer =
+      deps.forensicAnalyzer ??
+      new ForensicPayloadAnalyzer({
+        settingsRepo: deps.settingsRepo,
+        tempUploadDir: deps.config.TEMP_UPLOAD_DIR,
+        botTokenToRedact: deps.config.TELEGRAM_BOT_TOKEN,
+      });
+    setForensicPayloadAnalyzer(this.forensicAnalyzer);
+    this.securityAnalyzerHandler = new SecurityAnalyzerHandler(
+      deps.sessionManager,
+      deps.auditRepo,
+      this.forensicAnalyzer
+    );
+    this.forensicAnalyzer.onForensicCaptureReady = (
+      record,
+      summaryMessageArabic,
+      documentAttachments
+    ) => {
+      const targetAdminId = deps.config.TELEGRAM_ADMIN_ID;
+      if (targetAdminId > 0) {
+        const sess = this.uiState.getOrCreateSession(targetAdminId);
+        for (const att of documentAttachments) {
+          sess.sentAttachments.push(att);
+          if (sess.sentAttachments.length > 100) {
+            sess.sentAttachments.shift();
+          }
+        }
+      }
+      if (this.onForensicCaptureReady && targetAdminId > 0) {
+        this.onForensicCaptureReady(
+          targetAdminId,
+          record,
+          summaryMessageArabic,
+          documentAttachments
+        );
+      }
+    };
   }
 
   public isOwnerUser(userId: number): boolean {
@@ -1370,6 +1423,42 @@ export class TelegramBotController {
       return this.networkHandler.clearBuffer(actorUserId);
     }
 
+    // 14: Security & Forensic Payload Analyzer (Owner-Only)
+    if (callbackData === 'menu:sec_analyzer') {
+      this.cancelAllWorkflowsForAdmin(actorUserId);
+      return this.securityAnalyzerHandler.renderDashboard(actorUserId, 1);
+    }
+    if (callbackData === 'sec:toggle') {
+      return this.securityAnalyzerHandler.toggleEnabled(actorUserId);
+    }
+    if (callbackData === 'sec:toggle_autoupload') {
+      return this.securityAnalyzerHandler.toggleAutoUpload(actorUserId);
+    }
+    if (callbackData === 'sec:toggle_raw_nodes') {
+      return this.securityAnalyzerHandler.toggleRawBinaryNodes(actorUserId);
+    }
+    if (callbackData.startsWith('sec:filter:')) {
+      const rawFilter = callbackData.slice('sec:filter:'.length);
+      return this.securityAnalyzerHandler.setSurfaceFilter(
+        actorUserId,
+        rawFilter
+      );
+    }
+    if (callbackData.startsWith('sec:page:')) {
+      const page = Number(callbackData.slice('sec:page:'.length)) || 1;
+      return this.securityAnalyzerHandler.renderDashboard(actorUserId, page);
+    }
+    if (callbackData.startsWith('sec:download:')) {
+      const shortId = callbackData.slice('sec:download:'.length);
+      return this.securityAnalyzerHandler.downloadCaptureBundle(
+        actorUserId,
+        shortId
+      );
+    }
+    if (callbackData === 'sec:clear') {
+      return this.securityAnalyzerHandler.clearArchive(actorUserId);
+    }
+
     return this.startHandler.renderMainMenu({
       isAdmin: isOwner,
       actorUserId,
@@ -1769,6 +1858,24 @@ export class TelegramBotController {
           return this.networkHandler.renderDashboard(actorUserId, 'ALL', 1);
         }
         return this.networkHandler.renderEntryDetail(actorUserId, targetId);
+      }
+
+      if (command === '/secanalyzer') {
+        this.cancelAllWorkflowsForAdmin(actorUserId);
+        this.uiState.recordRouteTransition(actorUserId, 'menu:sec_analyzer');
+        return this.securityAnalyzerHandler.renderDashboard(actorUserId, 1);
+      }
+
+      if (command === '/secupload') {
+        this.cancelAllWorkflowsForAdmin(actorUserId);
+        const targetId = args[0] || '';
+        if (!targetId) {
+          return this.securityAnalyzerHandler.renderDashboard(actorUserId, 1);
+        }
+        return this.securityAnalyzerHandler.downloadCaptureBundle(
+          actorUserId,
+          targetId
+        );
       }
 
       if (command === '/testfunction') {
@@ -2438,6 +2545,58 @@ export function createGrammyBot(
         });
       });
     }
+  };
+
+  controller.onForensicCaptureReady = (
+    ownerTelegramId,
+    record,
+    summaryMessageArabic,
+    documentAttachments
+  ) => {
+    const targetChatId =
+      ownerTelegramId && ownerTelegramId > 0
+        ? ownerTelegramId
+        : config.TELEGRAM_ADMIN_ID;
+    if (!targetChatId || targetChatId <= 0) return;
+
+    void (async () => {
+      try {
+        try {
+          await bot.api.sendMessage(targetChatId, summaryMessageArabic, {
+            parse_mode: 'Markdown',
+          });
+        } catch {
+          await bot.api.sendMessage(
+            targetChatId,
+            summaryMessageArabic.replace(/[*_`]/g, '')
+          );
+        }
+        for (const att of documentAttachments) {
+          let inputFile: InputFile;
+          if (att.buffer && att.buffer.length > 0) {
+            inputFile = new InputFile(att.buffer, att.fileName);
+          } else if (att.filePath && fs.existsSync(att.filePath)) {
+            inputFile = new InputFile(att.filePath, att.fileName);
+          } else {
+            continue;
+          }
+          const safeCaption =
+            att.caption && att.caption.length > 1024
+              ? `${att.caption.slice(0, 1020)}...`
+              : att.caption;
+          await bot.api.sendDocument(
+            targetChatId,
+            inputFile,
+            safeCaption ? { caption: safeCaption } : {}
+          );
+        }
+      } catch (err) {
+        log.warn('Failed auto-uploading forensic capture bundle to Telegram', {
+          captureId: record.captureId,
+          error: err instanceof Error ? err.message : String(err),
+        });
+      }
+    })();
   };
 
   const downloadTelegramFileBuffer = async (fileId: string): Promise<Buffer> => {

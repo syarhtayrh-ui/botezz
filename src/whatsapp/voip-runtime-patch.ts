@@ -1196,6 +1196,68 @@ function syncSessionVideoSsrcWithDeviceJid(
   }
 }
 
+export function syncReceiveOnlySrtpOnMediaSession(
+  mediaSession: InstrumentedMediaSession | null | undefined
+): void {
+  if (!mediaSession || typeof mediaSession !== 'object') {
+    return;
+  }
+  const s = mediaSession as InstrumentedMediaSession & {
+    srtpSession?: {
+      recvCipher?: unknown;
+      recvKeying?: unknown;
+      recvAuthTagLen?: number;
+      recvCtx?: {
+        sessionKey?: Uint8Array;
+        sessionSalt?: Uint8Array;
+        authKey?: Uint8Array;
+        authTagLen?: number;
+      };
+    } | null;
+    videoSrtpSession?: {
+      recvCipher?: unknown;
+      recvKeying?: unknown;
+      recvAuthTagLen?: number;
+      recvCtx?: {
+        sessionKey?: Uint8Array;
+        sessionSalt?: Uint8Array;
+        authKey?: Uint8Array;
+        authTagLen?: number;
+      };
+    } | null;
+  };
+
+  if (s.videoSrtpSession && s.srtpSession?.recvCipher) {
+    s.videoSrtpSession.recvCipher = s.srtpSession.recvCipher;
+    s.videoSrtpSession.recvKeying = s.srtpSession.recvKeying;
+    if (s.srtpSession.recvAuthTagLen) {
+      s.videoSrtpSession.recvAuthTagLen = s.srtpSession.recvAuthTagLen;
+    }
+  }
+
+  const recv = s.srtpSession?.recvCtx;
+  if (recv?.sessionKey instanceof Uint8Array) {
+    mediaSession.__peerRecvCtx = {
+      sessionKey: recv.sessionKey,
+      sessionSalt: recv.sessionSalt,
+      authKey: recv.authKey,
+      authTagLen: recv.authTagLen ?? 4,
+    };
+    if (
+      s.videoSrtpSession?.recvCtx &&
+      recv.sessionSalt instanceof Uint8Array &&
+      recv.authKey instanceof Uint8Array
+    ) {
+      s.videoSrtpSession.recvCtx.sessionKey = recv.sessionKey;
+      s.videoSrtpSession.recvCtx.sessionSalt = recv.sessionSalt;
+      s.videoSrtpSession.recvCtx.authKey = recv.authKey;
+      if (recv.authTagLen) {
+        s.videoSrtpSession.recvCtx.authTagLen = recv.authTagLen;
+      }
+    }
+  }
+}
+
 export function instrumentMediaSessionInstance(
   rawSession: WaCallMediaSessionLike | null | undefined
 ): InstrumentedMediaSession | undefined {
@@ -1205,26 +1267,19 @@ export function instrumentMediaSessionInstance(
   const session = rawSession as InstrumentedMediaSession;
 
   // For real `@hiroosy/baileys-lite` `WaCallMediaSession` instances, NEVER monkey-patch or override
-  // outbound audio/video engines (`WaVideoEngine`, `WaAudioEngine`, `sendCapturedVideoAU`, `videoSrtpSession`).
-  // Attach ONLY a 100% passive, read-only inbound tap (`__peerRecvCtx`) for `VoipCallRecorder`.
+  // outbound audio/video engines (`WaVideoEngine`, `WaAudioEngine`, `sendCapturedVideoAU`, `videoSrtpSession.sendCipher`).
+  // Attach ONLY a non-destructive receive-side cipher sync (`recvCipher`/`recvKeying`/`recvCtx`) for inbound media.
   const isNativeWaCallMediaSession =
     (session as { constructor?: { name?: string } }).constructor?.name ===
     'WaCallMediaSession';
   if (isNativeWaCallMediaSession) {
+    syncReceiveOnlySrtpOnMediaSession(session);
     if (Object.prototype.hasOwnProperty.call(session, '__botezzInstrumented')) {
       return session;
     }
     session.__botezzInstrumented = true;
     const nativeWithAccept = session as InstrumentedMediaSession & {
       handleCallAccept?: (...args: unknown[]) => Promise<unknown>;
-      srtpSession?: {
-        recvCtx?: {
-          sessionKey?: Uint8Array;
-          sessionSalt?: Uint8Array;
-          authKey?: Uint8Array;
-          authTagLen?: number;
-        };
-      } | null;
     };
     if (typeof nativeWithAccept.handleCallAccept === 'function') {
       const origAccept = nativeWithAccept.handleCallAccept;
@@ -1234,17 +1289,9 @@ export function instrumentMediaSessionInstance(
       ) {
         const res = await origAccept.apply(this, args);
         try {
-          const recv = this.srtpSession?.recvCtx;
-          if (recv?.sessionKey instanceof Uint8Array) {
-            this.__peerRecvCtx = {
-              sessionKey: recv.sessionKey,
-              sessionSalt: recv.sessionSalt,
-              authKey: recv.authKey,
-              authTagLen: recv.authTagLen ?? 4,
-            };
-          }
+          syncReceiveOnlySrtpOnMediaSession(this);
         } catch {
-          // Passive read-only tap must never throw
+          // Passive receive-side sync must never throw
         }
         return res;
       };
@@ -1607,6 +1654,7 @@ export function instrumentMediaSessionInstance(
         }
       }
 
+      syncReceiveOnlySrtpOnMediaSession(this);
       const videoSessionObj = this.videoSrtpSession as
         | {
             sendCtx?: {
@@ -2236,17 +2284,9 @@ export async function ensureHiroosyVoipRuntimePatched(): Promise<void> {
             ) {
               const res = await origHandleCallAccept.apply(this, args);
               try {
-                const recv = this.srtpSession?.recvCtx;
-                if (recv?.sessionKey instanceof Uint8Array) {
-                  this.__peerRecvCtx = {
-                    sessionKey: recv.sessionKey,
-                    sessionSalt: recv.sessionSalt,
-                    authKey: recv.authKey,
-                    authTagLen: recv.authTagLen ?? 4,
-                  };
-                }
+                syncReceiveOnlySrtpOnMediaSession(this);
               } catch {
-                // Passive read-only tap must never throw
+                // Passive receive-side sync must never throw
               }
               return res;
             };

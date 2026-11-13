@@ -135,7 +135,10 @@ export function isNavigableRoute(callbackData: string): boolean {
     callbackData === 'menu:network' ||
     callbackData.startsWith('net:list:') ||
     callbackData.startsWith('net:view:') ||
-    callbackData === 'net:ping'
+    callbackData === 'net:ping' ||
+    callbackData === 'menu:sec_analyzer' ||
+    callbackData.startsWith('sec:page:') ||
+    callbackData.startsWith('sec:download:')
   );
 }
 

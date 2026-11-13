@@ -739,9 +739,9 @@ describe('Two-Way VoIP Video Call Recording (VoipCallRecorder)', () => {
       accessUnitsSent: number;
       videoPath: string | null;
       waitingForKeyFrame: boolean;
-      proc?: unknown;
+      proc?: import('node:child_process').ChildProcess | null;
       lastGeneratedFfmpegArgs?: string[];
-      start: (onAccessUnit?: (au: Uint8Array) => void) => unknown;
+      start: (...args: unknown[]) => unknown;
       stop?: () => void;
     } = {
       sourceKind: 'blank' as const,
@@ -756,11 +756,11 @@ describe('Two-Way VoIP Video Call Recording (VoipCallRecorder)', () => {
       videoPath: null,
       waitingForKeyFrame: true,
       // Simulate real WaVideoEngine.prototype.start which checks `if (this.running) return;`
-      start(onAccessUnit?: (au: Uint8Array) => void) {
+      start(onAccessUnit?: unknown) {
         if (this.running) return null;
-        if (onAccessUnit) {
+        if (typeof onAccessUnit === 'function') {
           (this as { onAccessUnit?: (au: Uint8Array) => void }).onAccessUnit =
-            onAccessUnit;
+            onAccessUnit as (au: Uint8Array) => void;
         }
         return (this as { spawnFfmpeg?: () => unknown }).spawnFfmpeg?.();
       },
@@ -914,10 +914,11 @@ describe('Two-Way VoIP Video Call Recording (VoipCallRecorder)', () => {
     }
   });
 
-  it('preserves native WaCallMediaSession outbound methods untouched while passively tapping __peerRecvCtx for VoipCallRecorder', async () => {
+  it('preserves native WaCallMediaSession outbound methods untouched while passively tapping __peerRecvCtx and syncing receive-only SRTP onto videoSrtpSession', async () => {
     const {
       ensureHiroosyVoipRuntimePatched,
       instrumentMediaSessionInstance,
+      syncReceiveOnlySrtpOnMediaSession,
     } = await import('../../src/whatsapp/voip-runtime-patch');
     await ensureHiroosyVoipRuntimePatched();
 
@@ -933,16 +934,41 @@ describe('Two-Way VoIP Video Call Recording (VoipCallRecorder)', () => {
     const peerRecvKey = crypto.randomBytes(16);
     const peerRecvSalt = crypto.randomBytes(14);
     const peerAuthKey = crypto.randomBytes(20);
+    const ourVideoSendKey = crypto.randomBytes(16);
+    const ourVideoSendSalt = crypto.randomBytes(14);
+    const ourVideoSendAuth = crypto.randomBytes(20);
 
     class WaCallMediaSession {
       sendCapturedVideoAU = nativeSendCapturedVideoAU;
       sendCapturedAudio = nativeSendCapturedAudio;
       startMediaFlow = nativeStartMediaFlow;
       srtpSession = {
+        recvCipher: { kind: 'peer_recv_cipher' },
+        recvKeying: { masterKey: new Uint8Array(peerRecvKey) },
+        recvAuthTagLen: 10,
         recvCtx: {
           sessionKey: new Uint8Array(peerRecvKey),
           sessionSalt: new Uint8Array(peerRecvSalt),
           authKey: new Uint8Array(peerAuthKey),
+          authTagLen: 10,
+        },
+      };
+      videoSrtpSession = {
+        sendCipher: { kind: 'our_send_cipher' },
+        sendKeying: { masterKey: new Uint8Array(ourVideoSendKey) },
+        sendCtx: {
+          sessionKey: new Uint8Array(ourVideoSendKey),
+          sessionSalt: new Uint8Array(ourVideoSendSalt),
+          authKey: new Uint8Array(ourVideoSendAuth),
+          authTagLen: 10,
+        },
+        recvCipher: { kind: 'stale_recv_cipher' },
+        recvKeying: null as unknown,
+        recvAuthTagLen: 4,
+        recvCtx: {
+          sessionKey: new Uint8Array(16),
+          sessionSalt: new Uint8Array(14),
+          authKey: new Uint8Array(20),
           authTagLen: 4,
         },
       };
@@ -980,6 +1006,115 @@ describe('Two-Way VoIP Video Call Recording (VoipCallRecorder)', () => {
         .__peerRecvCtx?.sessionKey instanceof Uint8Array,
       'Passive accept tap must expose __peerRecvCtx for VoipCallRecorder'
     );
+
+    // Verify receive-only SRTP synchronization onto videoSrtpSession without touching sendCtx/sendCipher
+    syncReceiveOnlySrtpOnMediaSession(session as unknown as Record<string, unknown>);
+    assert.deepEqual(session.videoSrtpSession.recvCipher, { kind: 'peer_recv_cipher' });
+    assert.equal(session.videoSrtpSession.recvAuthTagLen, 10);
+    assert.deepEqual(
+      Buffer.from(session.videoSrtpSession.recvCtx.sessionKey),
+      peerRecvKey
+    );
+    assert.deepEqual(session.videoSrtpSession.sendCipher, { kind: 'our_send_cipher' });
+    assert.deepEqual(
+      Buffer.from(session.videoSrtpSession.sendCtx.sessionKey),
+      ourVideoSendKey,
+      'videoSrtpSession.sendCtx must never be overwritten by peer receive keys'
+    );
+  });
+
+  it('wires writeDepacketizedInboundVideoH264 and writeDecodedInboundAudioPcm via inbound_video and inbound_audio events with SPS+PPS+IDR gating and dynamic FPS muxing', async () => {
+    const { EventEmitter } = await import('node:events');
+    const tmpDir = fs.mkdtempSync(
+      path.join(os.tmpdir(), 'botezz-native-inbound-events-')
+    );
+    try {
+      const recorder = new VoipCallRecorder({
+        callId: 'vcall_native_events_1',
+        sessionId: 'sess_native_1',
+        recipientJid: '966501234567@s.whatsapp.net',
+        outboundVideoPath: path.join(tmpDir, 'unused_local.mp4'),
+        recordingsDir: tmpDir,
+        isMockMode: false,
+      });
+
+      const fakeCallInstance = new EventEmitter();
+      const fakeVoip = new EventEmitter();
+      const cleanup = recorder.attachToCallInstance(fakeCallInstance, fakeVoip);
+
+      // 1. P-frame (NAL type 1) BEFORE first IDR must be dropped
+      fakeCallInstance.emit(
+        'inbound_video',
+        { callId: 'vcall_native_events_1' },
+        Buffer.from([0x00, 0x00, 0x00, 0x01, 0x41, 0x9a, 0x24, 0x6c])
+      );
+      assert.equal(
+        recorder.inboundVideoFramesRecorded,
+        0,
+        'P-frame before first IDR must be dropped'
+      );
+
+      // 2. Emit SPS (7) without start code and PPS (8) with 3-byte start code, followed by IDR (5)
+      fakeCallInstance.emit(
+        'inbound_video',
+        { callId: 'vcall_native_events_1' },
+        Buffer.from([0x67, 0x42, 0xc0, 0x1f, 0xda, 0x02, 0x80, 0x2d])
+      );
+      fakeCallInstance.emit(
+        'inbound_video',
+        { callId: 'vcall_native_events_1' },
+        Buffer.from([0x00, 0x00, 0x01, 0x68, 0xce, 0x3c, 0x80])
+      );
+      fakeCallInstance.emit(
+        'inbound_video',
+        { callId: 'vcall_native_events_1' },
+        Buffer.from([0x00, 0x00, 0x00, 0x01, 0x65, 0x88, 0x84, 0x21, 0xa0])
+      );
+      assert.equal(recorder.inboundVideoFramesRecorded, 1);
+
+      // 3. Emit subsequent P-frames via backup voip emitter and direct method
+      fakeVoip.emit(
+        'inbound_video',
+        Buffer.from([0x00, 0x00, 0x00, 0x01, 0x41, 0x9a, 0x24, 0x6c])
+      );
+      recorder.writeDepacketizedInboundVideoH264(
+        Buffer.from([0x00, 0x00, 0x00, 0x01, 0x41, 0x9b, 0x25, 0x6d])
+      );
+      assert.equal(recorder.inboundVideoFramesRecorded, 3);
+
+      // 4. Emit inbound_audio 16-bit LE PCM samples
+      const pcmChunk = Buffer.alloc(640, 0x12);
+      fakeCallInstance.emit(
+        'inbound_audio',
+        { callId: 'vcall_native_events_1' },
+        pcmChunk
+      );
+      assert.equal(recorder.inboundAudioPacketsRecorded, 1);
+      assert.equal(recorder.remoteAudioBytesWritten, 640);
+
+      cleanup();
+
+      // Verify Annex-B start codes + SPS + PPS precede IDR in remote_video.h264
+      const rawH264 = fs.readFileSync(recorder.remoteVideoTempPath);
+      const expectedPrefix = Buffer.from([
+        0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0xc0, 0x1f, 0xda, 0x02, 0x80, 0x2d,
+        0x00, 0x00, 0x00, 0x01, 0x68, 0xce, 0x3c, 0x80,
+        0x00, 0x00, 0x00, 0x01, 0x65, 0x88, 0x84, 0x21, 0xa0,
+      ]);
+      assert.deepEqual(
+        rawH264.subarray(0, expectedPrefix.length),
+        expectedPrefix,
+        'remote_video.h264 must start with 4-byte Annex-B SPS + PPS immediately before IDR'
+      );
+
+      const summary = await recorder.finalizeRecording();
+      assert.equal(summary.recordingStatus, 'READY');
+      assert.equal(summary.remoteCameraCaptured, true);
+      assert.ok(summary.recordedVideoPath && fs.existsSync(summary.recordedVideoPath));
+      assert.ok((summary.recordedVideoSizeBytes ?? 0) > 128);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
   });
 });
 

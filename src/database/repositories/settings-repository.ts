@@ -51,10 +51,40 @@ export const DEFAULT_TEST_FUNCTION_CONFIG: TestFunctionConfig = {
   smartWrap: true,
 };
 
+export type PersistedAnalyzerSurfaceFilter =
+  | 'ALL'
+  | 'PRIVATE_CHAT'
+  | 'GROUP'
+  | 'STATUS_STORY'
+  | 'NEWSLETTER'
+  | 'PROTOCOL_STANZA'
+  | 'ANOMALIES_ONLY';
+
+export interface PersistedSecurityAnalyzerConfig {
+  enabled: boolean;
+  targetSessionIds: 'ALL' | string[];
+  surfaceFilter: PersistedAnalyzerSurfaceFilter;
+  autoUploadToTelegram: boolean;
+  captureRawBinaryStanzas: boolean;
+  captureMediaBuffers: boolean;
+  maxMediaCaptureBytes: number;
+}
+
+export const DEFAULT_SECURITY_ANALYZER_CONFIG: PersistedSecurityAnalyzerConfig = {
+  enabled: false,
+  targetSessionIds: 'ALL',
+  surfaceFilter: 'ALL',
+  autoUploadToTelegram: true,
+  captureRawBinaryStanzas: false,
+  captureMediaBuffers: true,
+  maxMediaCaptureBytes: 25 * 1024 * 1024,
+};
+
 const PREMIUM_SUBSCRIPTIONS_KEY = 'nebula_premium_subscriptions_json';
 const CLAIM_GROUPS_KEY = 'nebula_claim_groups_json';
 const COMMAND_COOLDOWN_KEY = 'command_cooldown_seconds';
 const TEST_FUNCTION_CONFIG_KEY = 'nebula_testfunction_config_json';
+const SECURITY_ANALYZER_CONFIG_KEY = 'security_analyzer_config_json';
 
 export class SettingsRepository {
   private readonly userCooldownTimestamps = new Map<number, number>();
@@ -400,5 +430,77 @@ export class SettingsRepository {
     }
     this.saveClaimGroups(filtered);
     return true;
+  }
+
+  // =========================================================================
+  // Security & Forensic Payload Analyzer Configuration (Persistent SQLite)
+  // =========================================================================
+
+  public getSecurityAnalyzerConfig(): PersistedSecurityAnalyzerConfig {
+    const raw = this.get(SECURITY_ANALYZER_CONFIG_KEY);
+    if (!raw) {
+      return { ...DEFAULT_SECURITY_ANALYZER_CONFIG };
+    }
+    try {
+      const parsed = JSON.parse(raw) as Partial<PersistedSecurityAnalyzerConfig>;
+      const validFilters: PersistedAnalyzerSurfaceFilter[] = [
+        'ALL',
+        'PRIVATE_CHAT',
+        'GROUP',
+        'STATUS_STORY',
+        'NEWSLETTER',
+        'PROTOCOL_STANZA',
+        'ANOMALIES_ONLY',
+      ];
+      return {
+        enabled:
+          typeof parsed.enabled === 'boolean'
+            ? parsed.enabled
+            : DEFAULT_SECURITY_ANALYZER_CONFIG.enabled,
+        targetSessionIds:
+          parsed.targetSessionIds === 'ALL'
+            ? 'ALL'
+            : Array.isArray(parsed.targetSessionIds)
+              ? parsed.targetSessionIds.filter((s): s is string => typeof s === 'string')
+              : DEFAULT_SECURITY_ANALYZER_CONFIG.targetSessionIds,
+        surfaceFilter:
+          typeof parsed.surfaceFilter === 'string' &&
+          validFilters.includes(parsed.surfaceFilter as PersistedAnalyzerSurfaceFilter)
+            ? (parsed.surfaceFilter as PersistedAnalyzerSurfaceFilter)
+            : DEFAULT_SECURITY_ANALYZER_CONFIG.surfaceFilter,
+        autoUploadToTelegram:
+          typeof parsed.autoUploadToTelegram === 'boolean'
+            ? parsed.autoUploadToTelegram
+            : DEFAULT_SECURITY_ANALYZER_CONFIG.autoUploadToTelegram,
+        captureRawBinaryStanzas:
+          typeof parsed.captureRawBinaryStanzas === 'boolean'
+            ? parsed.captureRawBinaryStanzas
+            : DEFAULT_SECURITY_ANALYZER_CONFIG.captureRawBinaryStanzas,
+        captureMediaBuffers:
+          typeof parsed.captureMediaBuffers === 'boolean'
+            ? parsed.captureMediaBuffers
+            : DEFAULT_SECURITY_ANALYZER_CONFIG.captureMediaBuffers,
+        maxMediaCaptureBytes:
+          typeof parsed.maxMediaCaptureBytes === 'number' &&
+          Number.isFinite(parsed.maxMediaCaptureBytes) &&
+          parsed.maxMediaCaptureBytes > 0
+            ? Math.floor(parsed.maxMediaCaptureBytes)
+            : DEFAULT_SECURITY_ANALYZER_CONFIG.maxMediaCaptureBytes,
+      };
+    } catch {
+      return { ...DEFAULT_SECURITY_ANALYZER_CONFIG };
+    }
+  }
+
+  public updateSecurityAnalyzerConfig(
+    partial: Partial<PersistedSecurityAnalyzerConfig>
+  ): PersistedSecurityAnalyzerConfig {
+    const current = this.getSecurityAnalyzerConfig();
+    const next: PersistedSecurityAnalyzerConfig = {
+      ...current,
+      ...partial,
+    };
+    this.set(SECURITY_ANALYZER_CONFIG_KEY, JSON.stringify(next));
+    return next;
   }
 }
