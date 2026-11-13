@@ -71,11 +71,36 @@ import {
   classifyDeviceActivityState,
   renderRttSparkline,
 } from './device-activity-tracker';
+import {
+  WhatsAppIdentityService,
+  PrivacyTokenManager,
+  LidResolutionResult,
+  LidResolutionSource,
+  PrivacyTokenRecord,
+  ReachoutDiagnostic,
+  ReachoutFailureReason,
+  WhatsAppUsernameState,
+  UsernameRecommendationResult,
+  SendLidAddressedParams,
+  SendLidAddressedResult,
+  emitIdentityTelemetry,
+} from './identity-privacy-service';
+import type { ReachoutTimelockInfo } from './baileys-compat';
 
 export type {
   PresenceWatchReport,
   RttProbeSample,
   DeviceActivityState,
+  LidResolutionResult,
+  LidResolutionSource,
+  PrivacyTokenRecord,
+  ReachoutDiagnostic,
+  ReachoutFailureReason,
+  WhatsAppUsernameState,
+  UsernameRecommendationResult,
+  SendLidAddressedParams,
+  SendLidAddressedResult,
+  ReachoutTimelockInfo,
 };
 export {
   DeviceActivityTracker,
@@ -86,6 +111,9 @@ export {
   computeRttTelemetryStats,
   classifyDeviceActivityState,
   renderRttSparkline,
+  WhatsAppIdentityService,
+  PrivacyTokenManager,
+  emitIdentityTelemetry,
 };
 import {
   WhatsAppConnectionError,
@@ -1388,6 +1416,40 @@ export interface WhatsAppSessionDriver {
     resolutionSource: string;
     usedLid?: boolean;
   }>;
+  getIdentityService?(): WhatsAppIdentityService;
+  resolveIdentity?(
+    targetInput: string,
+    options?: { usernameKey?: string }
+  ): Promise<LidResolutionResult | null>;
+  sendLidAddressedMessage?(
+    params: SendLidAddressedParams
+  ): Promise<SendLidAddressedResult>;
+  getPrivacyTokenInfo?(targetJid: string): Promise<PrivacyTokenRecord | null>;
+  ensurePrivacyToken?(
+    targetJid: string,
+    forceRefresh?: boolean
+  ): Promise<{ record: PrivacyTokenRecord | null; refreshed: boolean }>;
+  getReachoutStatus?(): Promise<ReachoutTimelockInfo>;
+  checkUsername?(
+    handle: string,
+    pin?: string
+  ): Promise<WhatsAppUsernameState>;
+  setUsername?(handle: string): Promise<WhatsAppUsernameState>;
+  deleteUsername?(): Promise<WhatsAppUsernameState>;
+  setUsernamePin?(pin: string): Promise<WhatsAppUsernameState>;
+  recommendUsername?(seed?: string): Promise<UsernameRecommendationResult>;
+  getSelfUsernameState?(): Promise<WhatsAppUsernameState>;
+  deliverRelayPayload?(params: {
+    targetJid: string;
+    preferLid?: boolean;
+    content: AnyMessageContent;
+    quotedMessageId?: string;
+    customPushName?: string;
+  }): Promise<{
+    messageId: string;
+    deliveredToJid: string;
+    addressingMode: 'lid' | 'pn';
+  }>;
   trackRecipientPresence(params: {
     recipient: string;
     durationSeconds: number;
@@ -1801,6 +1863,7 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
   private readonly activePresenceTrackersByKey = new Map<string, Set<() => void>>();
   private readonly activePresenceHeartbeatsByKey = new Map<string, Set<() => void>>();
   public messageSender?: MessageSender;
+  public readonly identityService: WhatsAppIdentityService;
 
   constructor(
     public readonly sessionId: string,
@@ -1811,6 +1874,16 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
       optionsOrSender instanceof MessageSender
         ? optionsOrSender
         : optionsOrSender?.messageSender;
+    this.identityService = new WhatsAppIdentityService({
+      sessionId: this.sessionId,
+      getSocket: () => this.sock,
+      memoryStore: this.memoryStore,
+      groupMetadataCache: this.groupMetadataCache,
+    });
+  }
+
+  public getIdentityService(): WhatsAppIdentityService {
+    return this.identityService;
   }
 
   private lastActiveIncomingStanza: BinaryNode | undefined;
@@ -2286,6 +2359,14 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
                 evt === 'CB:iq' ||
                 evt === 'CB:notification'
               ) {
+                if (evt === 'CB:iq' && bNode.attrs?.xmlns === 'privacy') {
+                  void this.identityService.privacyTokens
+                    .captureIncomingPrivacyToken({
+                      iqNode: bNode,
+                      fallbackJid: bNode.attrs?.from,
+                    })
+                    .catch(() => undefined);
+                }
                 void this.forensicAnalyzer
                   .captureIncomingPayload({
                     sessionId: this.sessionId,
@@ -2294,6 +2375,17 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
                     sock,
                   })
                   .catch(() => undefined);
+              } else if (evt === 'CB:ack' && bNode.attrs?.error === '463') {
+                emitIdentityTelemetry({
+                  sessionId: this.sessionId,
+                  event: 'MESSAGE_463',
+                  targetJid: bNode.attrs?.from,
+                  outcome: 'ERROR',
+                  metadata: {
+                    msgId: bNode.attrs?.id,
+                    error: '463',
+                  },
+                });
               }
 
               // Intercept raw <chatstate> and <presence> stanzas before baileys-lite
@@ -2628,7 +2720,12 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
     };
 
     const connectionListener = (update: Partial<ConnectionState>) => {
-      const { connection, lastDisconnect, qr, isNewLogin } = update;
+      const { connection, lastDisconnect, qr, isNewLogin, reachoutTimeLock } = update;
+      if (reachoutTimeLock) {
+        this.identityService.privacyTokens.handleReachoutTimelockUpdate(
+          reachoutTimeLock
+        );
+      }
 
       // 1. Companion registration handshake ready (`CB:iq,type:set,pair-device` emitted `qr`):
       // At this point `validateConnection()` and `noise.finishInit()` are 100% complete,
@@ -4586,6 +4683,134 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
       resolvedPn: pnJid,
       resolutionSource: source,
       usedLid,
+    };
+  }
+
+  public async resolveIdentity(
+    targetInput: string,
+    options?: { usernameKey?: string }
+  ): Promise<LidResolutionResult | null> {
+    this.ensureSocket();
+    return this.identityService.resolveIdentity(targetInput, options);
+  }
+
+  public async sendLidAddressedMessage(
+    params: SendLidAddressedParams
+  ): Promise<SendLidAddressedResult> {
+    this.ensureSocket();
+    const res = await this.identityService.sendLidAddressedMessage(params);
+    await Promise.allSettled([this.credsSaveChain, this.flushAuthWrites()]);
+    return res;
+  }
+
+  public async getPrivacyTokenInfo(
+    targetJid: string
+  ): Promise<PrivacyTokenRecord | null> {
+    this.ensureSocket();
+    return this.identityService.privacyTokens.getValidPrivacyToken(targetJid);
+  }
+
+  public async ensurePrivacyToken(
+    targetJid: string,
+    forceRefresh = false
+  ): Promise<{ record: PrivacyTokenRecord | null; refreshed: boolean }> {
+    this.ensureSocket();
+    const res = await this.identityService.privacyTokens.ensurePrivacyToken(
+      targetJid,
+      { forceRefresh }
+    );
+    await Promise.allSettled([this.credsSaveChain, this.flushAuthWrites()]);
+    return res;
+  }
+
+  public async getReachoutStatus(): Promise<ReachoutTimelockInfo> {
+    const sock = this.ensureSocket();
+    if (typeof sock.fetchAccountReachoutTimelock === 'function') {
+      const live = await sock.fetchAccountReachoutTimelock().catch(() => null);
+      if (live) {
+        this.identityService.privacyTokens.handleReachoutTimelockUpdate(live);
+        return live;
+      }
+    }
+    return this.identityService.privacyTokens.getReachoutTimeLock();
+  }
+
+  public async checkUsername(
+    handle: string,
+    pin?: string
+  ): Promise<WhatsAppUsernameState> {
+    return this.identityService.checkUsername(handle, pin);
+  }
+
+  public async setUsername(handle: string): Promise<WhatsAppUsernameState> {
+    return this.identityService.setUsername(handle);
+  }
+
+  public async deleteUsername(): Promise<WhatsAppUsernameState> {
+    return this.identityService.deleteUsername();
+  }
+
+  public async setUsernamePin(pin: string): Promise<WhatsAppUsernameState> {
+    return this.identityService.setUsernamePin(pin);
+  }
+
+  public async recommendUsername(
+    seed?: string
+  ): Promise<UsernameRecommendationResult> {
+    return this.identityService.recommendUsername(seed);
+  }
+
+  public async getSelfUsernameState(): Promise<WhatsAppUsernameState> {
+    return this.identityService.getSelfUsernameState();
+  }
+
+  public async deliverRelayPayload(params: {
+    targetJid: string;
+    preferLid?: boolean;
+    content: AnyMessageContent;
+    quotedMessageId?: string;
+    customPushName?: string;
+  }): Promise<{
+    messageId: string;
+    deliveredToJid: string;
+    addressingMode: 'lid' | 'pn';
+  }> {
+    this.ensureSocket();
+    if (this.connectionState !== 'CONNECTED' || !this.wsOpen) {
+      throw new WhatsAppConnectionError(
+        'الجلسة غير متصلة حالياً لتمرير رسالة Menfess.'
+      );
+    }
+    let quotedObj: { key: WAMessageKey; message?: Record<string, unknown> } | undefined;
+    if (params.quotedMessageId) {
+      const cached = await this.memoryStore.getMessage({
+        remoteJid: params.targetJid,
+        id: params.quotedMessageId,
+      });
+      quotedObj = {
+        key: {
+          remoteJid: params.targetJid,
+          id: params.quotedMessageId,
+          fromMe: false,
+        },
+        message: cached || undefined,
+      };
+    }
+
+    const res = await this.identityService.sendLidAddressedMessage({
+      target: params.targetJid,
+      content: params.content,
+      preferLid: params.preferLid,
+      quoted: quotedObj,
+      customPushName: params.customPushName,
+      ensurePrivacyToken: true,
+    });
+
+    await Promise.allSettled([this.credsSaveChain, this.flushAuthWrites()]);
+    return {
+      messageId: res.messageId,
+      deliveredToJid: res.targetJid,
+      addressingMode: res.addressingMode,
     };
   }
 
@@ -6625,6 +6850,256 @@ export class MockWhatsAppSessionDriver implements WhatsAppSessionDriver {
       pnJid: validated.jid,
       lidJid: `${lidDigits}@lid`,
       source: 'ON_WHATSAPP_USYNC',
+    };
+  }
+
+  public async resolveIdentity(
+    targetInput: string
+  ): Promise<LidResolutionResult | null> {
+    if (!this.connected || !this.registered) {
+      throw new WhatsAppConnectionError('الجلسة غير متصلة حالياً.');
+    }
+    const raw = String(targetInput || '').trim();
+    if (!raw) return null;
+    if (raw.startsWith('@')) {
+      const handle = raw.slice(1).toLowerCase();
+      const mapped = this.mockUsernameDirectory.get(handle);
+      if (!mapped) return null;
+      return {
+        pnJid: mapped.pnJid,
+        lidJid: mapped.lidJid,
+        phoneNumber: mapped.pnJid ? `+${mapped.pnJid.split('@')[0]}` : undefined,
+        username: handle,
+        source: 'usync',
+      };
+    }
+    if (raw.endsWith('@lid')) {
+      const validated = validateRecipient(raw);
+      return {
+        lidJid: validated.jid,
+        source: 'direct',
+      };
+    }
+    const res = await this.resolveLidForRecipient(raw);
+    return {
+      pnJid: res.pnJid,
+      lidJid: res.lidJid,
+      phoneNumber: res.pnJid ? `+${res.pnJid.split('@')[0]}` : undefined,
+      source: 'usync',
+    };
+  }
+
+  public async sendLidAddressedMessage(
+    params: SendLidAddressedParams
+  ): Promise<SendLidAddressedResult> {
+    const text =
+      typeof params.content === 'string'
+        ? params.content
+        : typeof (params.content as { text?: unknown }).text === 'string'
+          ? String((params.content as { text?: string }).text)
+          : '[media]';
+    const legacy = await this.sendAnonymousLidMessage({
+      recipient: params.target,
+      text,
+      customPushName: params.customPushName,
+    });
+    const usingLid = legacy.targetLid.endsWith('@lid');
+    return {
+      messageId: legacy.messageId,
+      targetJid: legacy.targetLid,
+      pnJid: legacy.resolvedPn,
+      lidJid: usingLid ? legacy.targetLid : undefined,
+      addressingMode: usingLid ? 'lid' : 'pn',
+      resolutionSource: 'usync',
+      tcTokenAttached: Boolean(this.mockPrivacyTokens.get(legacy.targetLid)),
+    };
+  }
+
+  public async deliverRelayPayload(params: {
+    targetJid: string;
+    preferLid?: boolean;
+    content: AnyMessageContent;
+    quotedMessageId?: string;
+    customPushName?: string;
+  }): Promise<{
+    messageId: string;
+    deliveredToJid: string;
+    addressingMode: 'lid' | 'pn';
+  }> {
+    if (!this.connected || !this.registered) {
+      throw new WhatsAppConnectionError('الجلسة غير متصلة حالياً.');
+    }
+    const messageId = `sim_relay_${this.sessionId}_${Date.now()}_${Math.random()
+      .toString(36)
+      .slice(2, 6)}`;
+    this.sentMessagesCount++;
+    this.sentAnonymousLidMessages.push({
+      recipient: params.targetJid,
+      targetLid: params.targetJid,
+      text: JSON.stringify(params.content).slice(0, 200),
+      messageId,
+    });
+    return {
+      messageId,
+      deliveredToJid: params.targetJid,
+      addressingMode: params.targetJid.endsWith('@lid') ? 'lid' : 'pn',
+    };
+  }
+
+  private readonly mockPrivacyTokens = new Map<string, PrivacyTokenRecord>();
+  private mockSelfUsername?: string;
+  private mockSelfUsernamePin?: string;
+  private readonly mockUsernameDirectory = new Map<
+    string,
+    { pnJid?: string; lidJid: string; pin?: string }
+  >();
+  public mockReachoutTimelock: ReachoutTimelockInfo = { isActive: false };
+
+  public async getPrivacyTokenInfo(
+    targetJid: string
+  ): Promise<PrivacyTokenRecord | null> {
+    return this.mockPrivacyTokens.get(targetJid) || null;
+  }
+
+  public async ensurePrivacyToken(
+    targetJid: string,
+    forceRefresh = false
+  ): Promise<{ record: PrivacyTokenRecord | null; refreshed: boolean }> {
+    const existing = this.mockPrivacyTokens.get(targetJid);
+    if (existing && !existing.expired && !forceRefresh) {
+      return { record: existing, refreshed: false };
+    }
+    const nowSec = Math.floor(Date.now() / 1000);
+    const rec: PrivacyTokenRecord = {
+      storageJid: targetJid,
+      hasToken: true,
+      timestampSec: nowSec,
+      senderTimestampSec: nowSec,
+      expired: false,
+      source: 'outgoing_issue',
+      updatedAtIso: new Date().toISOString(),
+    };
+    this.mockPrivacyTokens.set(targetJid, rec);
+    return { record: rec, refreshed: true };
+  }
+
+  public async getReachoutStatus(): Promise<ReachoutTimelockInfo> {
+    return { ...this.mockReachoutTimelock };
+  }
+
+  public async checkUsername(
+    handle: string,
+    pin?: string
+  ): Promise<WhatsAppUsernameState> {
+    const clean = handle.trim().replace(/^@/, '');
+    const found = this.mockUsernameDirectory.get(clean.toLowerCase());
+    if (!found) {
+      return {
+        username: clean,
+        available: true,
+        supported: true,
+        status: 'available',
+        reasonArabic: `اسم المستخدم (@${clean}) متاح للاستخدام (محاكاة).`,
+        source: 'socket_iq',
+      };
+    }
+    if (found.pin && found.pin !== pin) {
+      return {
+        username: clean,
+        available: false,
+        supported: true,
+        status: 'key-required',
+        reasonArabic: `اسم المستخدم (@${clean}) محمي برمز PIN.`,
+        source: 'socket_iq',
+      };
+    }
+    return {
+      username: clean,
+      available: false,
+      jid: found.pnJid || found.lidJid,
+      lidJid: found.lidJid,
+      supported: true,
+      status: 'taken',
+      reasonArabic: `اسم المستخدم (@${clean}) مستخدم بالفعل.`,
+      source: 'socket_iq',
+    };
+  }
+
+  public async setUsername(handle: string): Promise<WhatsAppUsernameState> {
+    const clean = handle.trim().replace(/^@/, '');
+    if (this.mockSelfUsername) {
+      this.mockUsernameDirectory.delete(this.mockSelfUsername.toLowerCase());
+    }
+    this.mockSelfUsername = clean;
+    this.mockUsernameDirectory.set(clean.toLowerCase(), {
+      pnJid: this.currentJid,
+      lidJid: `1000${this.currentJid.split('@')[0].slice(-10).padStart(10, '0')}@lid`,
+      pin: this.mockSelfUsernamePin,
+    });
+    return {
+      username: clean,
+      jid: this.currentJid,
+      supported: true,
+      status: 'ok',
+      reasonArabic: `تم تعيين اسم المستخدم (@${clean}) بنجاح (محاكاة).`,
+      source: 'socket_iq',
+    };
+  }
+
+  public async deleteUsername(): Promise<WhatsAppUsernameState> {
+    if (this.mockSelfUsername) {
+      this.mockUsernameDirectory.delete(this.mockSelfUsername.toLowerCase());
+      this.mockSelfUsername = undefined;
+    }
+    return {
+      supported: true,
+      status: 'ok',
+      reasonArabic: 'تم حذف اسم المستخدم المرتبط بالجلسة (محاكاة).',
+      source: 'socket_iq',
+    };
+  }
+
+  public async setUsernamePin(pin: string): Promise<WhatsAppUsernameState> {
+    this.mockSelfUsernamePin = pin;
+    if (this.mockSelfUsername) {
+      const entry = this.mockUsernameDirectory.get(
+        this.mockSelfUsername.toLowerCase()
+      );
+      if (entry) entry.pin = pin;
+    }
+    return {
+      username: this.mockSelfUsername,
+      supported: true,
+      status: 'ok',
+      reasonArabic: 'تم تحديث رمز الحماية PIN لاسم المستخدم (محاكاة).',
+      source: 'socket_iq',
+    };
+  }
+
+  public async recommendUsername(
+    seed = 'botezz_user'
+  ): Promise<UsernameRecommendationResult> {
+    const clean = seed.replace(/[^a-zA-Z0-9._]/g, '') || 'botezz_user';
+    const candidates = [clean, `${clean}_01`, `${clean}.official`].map((u) => ({
+      username: u,
+      available: !this.mockUsernameDirectory.has(u.toLowerCase()),
+      status: (this.mockUsernameDirectory.has(u.toLowerCase())
+        ? 'taken'
+        : 'available') as WhatsAppUsernameState['status'],
+    }));
+    return { seed: clean, supported: true, candidates };
+  }
+
+  public async getSelfUsernameState(): Promise<WhatsAppUsernameState> {
+    return {
+      username: this.mockSelfUsername,
+      jid: this.currentJid,
+      supported: true,
+      status: this.mockSelfUsername ? 'ok' : 'not-found',
+      reasonArabic: this.mockSelfUsername
+        ? `اسم المستخدم الحالي: @${this.mockSelfUsername}`
+        : 'لا يوجد اسم مستخدم مضبوط حالياً.',
+      source: 'creds',
     };
   }
 

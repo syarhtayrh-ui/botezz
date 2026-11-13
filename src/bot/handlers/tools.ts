@@ -25,6 +25,11 @@ import {
   TrackedPresenceRecord,
 } from '../../whatsapp/connection-manager';
 import {
+  AnonymousSessionEngine,
+  AnonymousMediaKind,
+} from '../../whatsapp/anonymous-session-engine';
+import { maskPhoneForMenfess } from '../../security/redaction';
+import {
   BotViewResponse,
   TelegramMediaAttachment,
 } from '../workflows/pairing-workflow';
@@ -58,6 +63,11 @@ export type ToolsInputStep =
   | 'AWAITING_UPLOADED_FUNCTION_NAME'
   | 'AWAITING_RUN_SAVED_FUNCTION_PARAMS'
   | 'AWAITING_ANON_LID_INPUT'
+  | 'AWAITING_LID_RESOLVE_INPUT'
+  | 'AWAITING_USERNAME_INPUT'
+  | 'AWAITING_MENFESS_START_INPUT'
+  | 'AWAITING_MENFESS_RELAY_INPUT'
+  | 'AWAITING_MENFESS_STOP_INPUT'
   | 'AWAITING_PRESENCE_TRACK_INPUT'
   | 'AWAITING_PRESENCE_HEARTBEAT_INPUT'
   | 'AWAITING_FULL_PROFILE_INPUT'
@@ -94,6 +104,11 @@ export class ToolsHandler {
   >();
   private readonly presenceTrackDurationByAdmin = new Map<number, number>();
   private readonly lastTrackedRecipientByAdmin = new Map<number, string>();
+  private readonly activeAnonSessionByAdmin = new Map<number, string>();
+  private readonly usernameModeByAdmin = new Map<
+    number,
+    'check' | 'set' | 'pin' | 'recommend'
+  >();
   public readonly functionLabRepo: FunctionLabRepository;
   public readonly functionRegistry: FunctionRegistry;
   public readonly functionValidator: FunctionValidator;
@@ -102,6 +117,7 @@ export class ToolsHandler {
   public readonly sessionResolver: SessionResolver;
   public readonly diagnosticLogger: DiagnosticLogger;
   public readonly capabilityAdapter: WhatsAppCapabilityAdapter;
+  public readonly anonymousEngine: AnonymousSessionEngine;
 
   constructor(
     private readonly sessionManager: SessionManager,
@@ -122,6 +138,7 @@ export class ToolsHandler {
       this.diagnosticLogger,
       this.functionLabRepo
     );
+    this.anonymousEngine = this.sessionManager.getAnonymousSessionEngine();
   }
 
   public getStep(adminId: number): ToolsInputStep {
@@ -361,28 +378,48 @@ export class ToolsHandler {
           callbackData: 'tools:prompt_anon_lid',
         },
         {
-          text: '👁️ تتبع التواجد والنبض (/presence)',
-          callbackData: 'tools:prompt_presence',
+          text: '🎭 جلسات التواصل المجهول (/anonstart)',
+          callbackData: 'tools:menfess_list',
         },
       ],
       [
+        {
+          text: '🧬 كاشف الهوية PN↔LID (/lid)',
+          callbackData: 'tools:prompt_lid_lookup',
+        },
+        {
+          text: '📛 إدارة اسم المستخدم (/username)',
+          callbackData: 'tools:prompt_username_mgr',
+        },
+      ],
+      [
+        {
+          text: '👁️ تتبع التواجد والنبض (/presence)',
+          callbackData: 'tools:prompt_presence',
+        },
         {
           text: '🔍 فحص الملف الشخصي الكامل (/fullprofile)',
           callbackData: 'tools:prompt_full_profile',
         },
+      ],
+      [
         {
           text: '⏱️ رسالة تدمير ذاتي قصير (/ephemeral)',
           callbackData: 'tools:prompt_short_ephemeral',
         },
-      ],
-      [
         {
           text: '📡 فحص قناة واتساب (/cekidch)',
           callbackData: 'tools:prompt_channel',
         },
+      ],
+      [
         {
           text: '📱 فحص مقابس الإرسال (/ceksender)',
           callbackData: 'tools:ceksender',
+        },
+        {
+          text: '🛡️ قيود Reachout & TC-Token',
+          callbackData: 'tools:reachout_status',
         },
       ],
       isAdmin
@@ -448,7 +485,12 @@ export class ToolsHandler {
       text:
         `🛠️ *الأدوات والفحص المتقدم (Tools & Diagnostics)*\n\n` +
         `اختر الأداة المطلوبة من الأزرار التفاعلية أدناه أو استخدم الأوامر السريعة مباشرة:\n` +
-        `• \`/anonmsg <phone|lid> <text>\` — إرسال رسالة بهوية مخفية عبر بروتوكول \`@lid\` (\`addressing_mode="lid"\`)\n` +
+        `• \`/lid <phone|lid|@username>\` — كاشف الهوية الثنائية PN↔LID وفحص TC-Token\n` +
+        `• \`/username <check|set|delete|pin|recommend|status>\` — إدارة اسم المستخدم الرسمي لواتساب\n` +
+        `• \`/anonstart <sender> <receiver> [alias]\` — إنشاء جلسة تواصل مجهول ثنائية الاتجاه (Menfess)\n` +
+        `• \`/anonmsg <phone|lid|anon_id> <text>\` — إرسال عبر الهوية المخفية \`@lid\` أو جلسة Menfess نشطة\n` +
+        `• \`/anonstop [anon_id]\` — إغلاق جلسة تواصل مجهول نشطة\n` +
+        `• \`/reachout [target]\` — تشخيص قيود التواصل (Error 463 & Reachout Timelock)\n` +
         `• \`/presence <track|composing|recording> <phone> [sec]\` — رصد التواجد الحي أو بث النبض المستمر\n` +
         `• \`/fullprofile <phone|lid>\` — فحص استقصائي شامل للملف الشخصي والأجهزة المرافقة والأعمال\n` +
         `• \`/ephemeral <phone> <seconds 1-60> <text>\` — رسالة تدمير ذاتي قصير (ثوانٍ) مع حذف بروتوكولي تلقائي\n` +
@@ -879,6 +921,46 @@ export class ToolsHandler {
     if (step === 'AWAITING_ANON_LID_INPUT') {
       this.cancel(adminId);
       return this.executeAnonymousLidMessage(adminId, rawText);
+    }
+    if (step === 'AWAITING_LID_RESOLVE_INPUT') {
+      this.cancel(adminId);
+      return this.executeLidResolveCommand(adminId, rawText);
+    }
+    if (step === 'AWAITING_USERNAME_INPUT') {
+      this.cancel(adminId);
+      const mode = this.usernameModeByAdmin.get(adminId);
+      this.usernameModeByAdmin.delete(adminId);
+      const trimmed = rawText.trim();
+      const firstWord = trimmed.split(/\s+/)[0]?.toLowerCase() || '';
+      const hasExplicitVerb = [
+        'check',
+        'set',
+        'delete',
+        'remove',
+        'pin',
+        'recommend',
+        'status',
+      ].includes(firstWord);
+      const finalArgs =
+        !hasExplicitVerb && mode ? `${mode} ${trimmed}` : trimmed;
+      return this.executeUsernameCommand(adminId, finalArgs);
+    }
+    if (step === 'AWAITING_MENFESS_START_INPUT') {
+      this.cancel(adminId);
+      return this.executeAnonStartCommand(adminId, rawText);
+    }
+    if (step === 'AWAITING_MENFESS_RELAY_INPUT') {
+      this.cancel(adminId);
+      const activeId = this.activeAnonSessionByAdmin.get(adminId);
+      const trimmed = rawText.trim();
+      if (activeId && !/^anon_[a-f0-9]+\b/i.test(trimmed)) {
+        return this.executeMenfessRelay(adminId, activeId, trimmed);
+      }
+      return this.executeAnonymousLidMessage(adminId, trimmed);
+    }
+    if (step === 'AWAITING_MENFESS_STOP_INPUT') {
+      this.cancel(adminId);
+      return this.executeAnonStopCommand(adminId, rawText);
     }
     if (step === 'AWAITING_PRESENCE_TRACK_INPUT') {
       this.cancel(adminId);
@@ -2350,13 +2432,24 @@ export class ToolsHandler {
     rawInput: string
   ): Promise<BotViewResponse> {
     try {
+      const trimmed = (rawInput || '').trim();
+      const menfessMatch = trimmed.match(/^(anon_[a-f0-9]{6,16})\s+([\s\S]+)$/i);
+      if (menfessMatch && menfessMatch[1] && menfessMatch[2]) {
+        return this.executeMenfessRelay(
+          adminId,
+          menfessMatch[1].toLowerCase(),
+          menfessMatch[2].trim()
+        );
+      }
+
       const parsed = this.parseRecipientAndBodyInput(rawInput);
       if (!parsed) {
         return {
           text:
             `⚠️ *صيغة الأمر غير مكتملة (/anonmsg)*\n\n` +
-            `يرجى إدخال رقم المستلم (أو معرف \`@lid\`) متبوعاً بنص الرسالة:\n` +
+            `يرجى إدخال رقم المستلم (أو معرف \`@lid\` أو \`anon_xxxx\`) متبوعاً بنص الرسالة:\n` +
             `• \`/anonmsg +966501234567 نص الرسالة هنا\`\n` +
+            `• \`/anonmsg anon_1a2b3c4d رسالة عبر جلسة Menfess\`\n` +
             `• أو بفاصل: \`+966 50 123 4567 | نص الرسالة هنا\``,
           keyboard: [
             [
@@ -2364,8 +2457,12 @@ export class ToolsHandler {
                 text: '🕵️ إعادة الإدخال',
                 callbackData: 'tools:prompt_anon_lid',
               },
-              { text: '🔙 قائمة الأدوات', callbackData: 'menu:tools' },
+              {
+                text: '🎭 جلسات Menfess',
+                callbackData: 'tools:menfess_list',
+              },
             ],
+            [{ text: '🔙 قائمة الأدوات', callbackData: 'menu:tools' }],
           ],
         };
       }
@@ -3806,5 +3903,927 @@ export class ToolsHandler {
         ],
       };
     }
+  }
+
+  // ============================================================================
+  // Feature A: Native PN <-> LID Resolution & TC-Token / Reachout 463 (/lid, /reachout)
+  // ============================================================================
+
+  public promptLidResolve(adminId: number): BotViewResponse {
+    this.inputStates.set(adminId, 'AWAITING_LID_RESOLVE_INPUT');
+    return {
+      text:
+        `${renderBreadcrumb(['الرئيسية', 'الأدوات', 'كاشف الهوية PN↔LID'])}\n` +
+        `🧬 *كاشف الهوية الثنائية ورموز الخصوصية (PN ↔ LID & TC-Token — /lid)*\n` +
+        `━━━━━━━━━━━━━━━━━━\n` +
+        `يكشف هذا المحرك الهوية المقنّعة (\`@lid\`) ورقم الهاتف (\`@s.whatsapp.net\`) واسم المستخدم (\`@username\`) عبر USync وسجلات Signal الحية، مع فحص حالة \`TC-Token\` وقيود التواصل \`463 / Reachout Timelock\`.\n\n` +
+        `📌 *أرسل الآن:*\n` +
+        `• رقم هاتف دولي: \`+967771234567\`\n` +
+        `• معرف مقنّع: \`144109809438738@lid\`\n` +
+        `• اسم مستخدم: \`@username\` (أو \`@username pin:1234\`)`,
+      keyboard: [
+        [
+          {
+            text: '🛡️ فحص قيود Reachout 463',
+            callbackData: 'tools:reachout_status',
+          },
+        ],
+        buildBackCancelRow('menu:tools'),
+      ],
+      toastText: '🧬 أدخل الرقم أو @lid أو @username',
+      route: 'tools:prompt_lid_lookup',
+    };
+  }
+
+  public async executeLidResolveCommand(
+    adminId: number,
+    rawInput: string
+  ): Promise<BotViewResponse> {
+    try {
+      const trimmed = (rawInput || '').trim();
+      if (!trimmed) {
+        return this.promptLidResolve(adminId);
+      }
+
+      if (/^(?:diag|reachout|timelock)$/i.test(trimmed)) {
+        return this.executeReachoutDiagnostic(adminId);
+      }
+
+      const { session, driver } =
+        this.getPrimaryConnectedSessionAndDriver(adminId);
+
+      // Optional inline pin / key: `@user pin:1234`
+      const pinMatch = trimmed.match(/\bpin:([A-Za-z0-9_-]{4,64})\b/i);
+      const targetOnly = trimmed
+        .replace(/\bpin:[A-Za-z0-9_-]{4,64}\b/gi, '')
+        .trim();
+
+      const resolved =
+        typeof driver.resolveIdentity === 'function'
+          ? await driver.resolveIdentity(targetOnly, {
+              usernameKey: pinMatch?.[1],
+            })
+          : null;
+
+      if (!resolved) {
+        return {
+          text:
+            `ℹ️ *لم يتم العثور على سجل هوية مطابق في واتساب*\n` +
+            `━━━━━━━━━━━━━━━━━━\n` +
+            `🔎 *المدخل:* \`${escapeMarkdown(targetOnly)}\`\n` +
+            `🆔 *الجلسة:* \`${session.id}\`\n\n` +
+            `قد يكون الرقم غير مسجل في واتساب أو محمياً بمفتاح Username PIN.`,
+          keyboard: [
+            [
+              {
+                text: '🔍 فحص هدف آخر',
+                callbackData: 'tools:prompt_lid_lookup',
+              },
+              { text: '🔙 قائمة الأدوات', callbackData: 'menu:tools' },
+            ],
+          ],
+          toastText: 'ℹ️ لم يتم العثور على هوية مطابقة',
+        };
+      }
+
+      const tokenTarget = resolved.lidJid || resolved.pnJid;
+      const tcInfo =
+        tokenTarget && typeof driver.getPrivacyTokenInfo === 'function'
+          ? await driver.getPrivacyTokenInfo(tokenTarget)
+          : null;
+      const reachout =
+        typeof driver.getReachoutStatus === 'function'
+          ? await driver.getReachoutStatus()
+          : null;
+
+      this.auditRepo.record({
+        actorTelegramId: adminId,
+        action: 'TOOL_IDENTITY_RESOLVE',
+        targetId: resolved.lidJid || resolved.pnJid || targetOnly,
+        outcome: 'SUCCESS',
+        metadata: {
+          sessionId: session.id,
+          source: resolved.source,
+          hasLid: Boolean(resolved.lidJid),
+          hasPn: Boolean(resolved.pnJid),
+          hasUsername: Boolean(resolved.username),
+        },
+      });
+
+      const tcSummary = tcInfo
+        ? tcInfo.hasToken
+          ? tcInfo.expired
+            ? `⚠️ منتهي الصلاحية (${tcInfo.source})`
+            : `✅ متوفر وصالح (${tcInfo.source})`
+          : '⚠️ غير مخزن بعد'
+        : '—';
+
+      return {
+        text:
+          `🧬 *نتيجة كشف الهوية الثنائية ورموز الخصوصية (/lid)*\n` +
+          `━━━━━━━━━━━━━━━━━━\n` +
+          `🆔 *الجلسة الفاحصة:* \`${session.id}\`\n` +
+          `🔎 *الهدف:* \`${escapeMarkdown(targetOnly)}\`\n` +
+          `📡 *مصدر المطابقة:* \`${resolved.source}\`\n` +
+          `📱 *رقم الهاتف (E.164):* \`${resolved.phoneNumber || 'مخفي / غير متاح'}\`\n` +
+          `🔗 *معرف الشبكة (PN JID):* \`${resolved.pnJid || 'غير متاح'}\`\n` +
+          `🕵️ *الهوية المقنّعة (LID JID):* \`${resolved.lidJid || 'غير متاح'}\`\n` +
+          `📛 *اسم المستخدم (@username):* \`${resolved.username ? '@' + resolved.username : 'غير مضبوط / محجوب'}\`\n` +
+          `🛡️ *رمز الخصوصية (TC-Token):* ${tcSummary}\n` +
+          (reachout
+            ? `🔒 *حالة قيد Reachout 463:* ${
+                reachout.isActive
+                  ? `⛔ مقيد حتى \`${reachout.timeEnforcementEnds || '—'}\``
+                  : '🟢 غير مقيد'
+              }\n`
+            : ''),
+        keyboard: [
+          [
+            {
+              text: '🧬 فحص هوية أخرى',
+              callbackData: 'tools:prompt_lid_lookup',
+            },
+            {
+              text: '🛡️ فحص قيود 463',
+              callbackData: 'tools:reachout_status',
+            },
+          ],
+          [{ text: '🔙 قائمة الأدوات', callbackData: 'menu:tools' }],
+        ],
+        toastText: '✅ تم استخراج الهوية الثنائية بنجاح',
+      };
+    } catch (err) {
+      const safeErr = toSafeArabicError(err);
+      return {
+        text: `⚠️ *تعذر استخراج الهوية الثنائية:*\n${safeErr.userMessage}`,
+        keyboard: [
+          [
+            { text: '🔄 إعادة المحاولة', callbackData: 'tools:prompt_lid_lookup' },
+            { text: '🔙 قائمة الأدوات', callbackData: 'menu:tools' },
+          ],
+        ],
+      };
+    }
+  }
+
+  public async executeReachoutDiagnostic(
+    adminId: number,
+    targetInput?: string
+  ): Promise<BotViewResponse> {
+    try {
+      const { session, driver } =
+        this.getPrimaryConnectedSessionAndDriver(adminId);
+
+      const reachout =
+        typeof driver.getReachoutStatus === 'function'
+          ? await driver.getReachoutStatus()
+          : { isActive: false };
+
+      let tokenBlock = '';
+      if (targetInput?.trim() && typeof driver.getPrivacyTokenInfo === 'function') {
+        const cleanTarget = targetInput.trim();
+        const info = await driver.getPrivacyTokenInfo(cleanTarget);
+        const refreshed =
+          (!info || !info.hasToken || info.expired) &&
+          typeof driver.ensurePrivacyToken === 'function'
+            ? await driver.ensurePrivacyToken(cleanTarget, false)
+            : null;
+        const effective = refreshed?.record || info;
+        tokenBlock =
+          `\n🎟️ *فحص TC-Token للهدف:* \`${escapeMarkdown(cleanTarget)}\`\n` +
+          `• *متوفر:* ${effective?.hasToken ? 'نعم ✅' : 'لا ⚠️'}\n` +
+          `• *منتهي الصلاحية:* ${effective?.expired ? 'نعم ⚠️' : 'لا ✅'}\n` +
+          `• *المصدر:* \`${effective?.source || 'none'}\`\n` +
+          (refreshed
+            ? `• *تم طلب الإصدار النشط:* ${refreshed.refreshed ? 'نعم ✅' : 'لا ℹ️'}\n`
+            : '');
+      }
+
+      return {
+        text:
+          `🛡️ *تشخيص قيود التواصل ورموز الخصوصية (Error 463 / TC-Token)*\n` +
+          `━━━━━━━━━━━━━━━━━━\n` +
+          `🆔 *الجلسة:* \`${session.id}\`\n` +
+          `🔒 *حالة قيد الحساب (Reachout Timelock):* ${
+            reachout.isActive ? '⛔ مقيد حالياً (Active)' : '🟢 سليم — لا توجد قيود نشطة'
+          }\n` +
+          (reachout.timeEnforcementEnds
+            ? `⏳ *انتهاء القيد:* \`${reachout.timeEnforcementEnds}\`\n`
+            : '') +
+          (reachout.enforcementType
+            ? `📋 *نوع التقييد:* \`${reachout.enforcementType}\`\n`
+            : '') +
+          tokenBlock +
+          `\n💡 _ملاحظة: عند حدوث Error 463 بسبب فقدان TC-Token، يحاول النظام إصدار/تحديث الرمز وإعادة الإرسال مرة واحدة فقط، ويتوقف تلقائياً إذا كان Reachout Timelock نشطاً لحماية الحساب._`,
+        keyboard: [
+          [
+            { text: '🔄 تحديث الفحص', callbackData: 'tools:reachout_status' },
+            { text: '🧬 فحص هوية /lid', callbackData: 'tools:prompt_lid_lookup' },
+          ],
+          [{ text: '🔙 قائمة الأدوات', callbackData: 'menu:tools' }],
+        ],
+        toastText: reachout.isActive
+          ? '⛔ يوجد قيد Reachout نشط'
+          : '🟢 الحساب سليم بدون قيود 463',
+        route: 'tools:reachout_status',
+      };
+    } catch (err) {
+      const safeErr = toSafeArabicError(err);
+      return {
+        text: `⚠️ *تعذر فحص حالة Reachout / TC-Token:*\n${safeErr.userMessage}`,
+        keyboard: [[{ text: '🔙 قائمة الأدوات', callbackData: 'menu:tools' }]],
+      };
+    }
+  }
+
+  // ============================================================================
+  // Feature B: WhatsApp Username Management (/username)
+  // ============================================================================
+
+  public async renderUsernameManager(
+    adminId: number,
+    notice?: string
+  ): Promise<BotViewResponse> {
+    let statusLine = 'ℹ️ يرجى ربط/توصيل جلسة واتساب لعرض الحالة الحية.';
+    try {
+      const { session, driver } =
+        this.getPrimaryConnectedSessionAndDriver(adminId);
+      if (typeof driver.getSelfUsernameState === 'function') {
+        const selfState = await driver.getSelfUsernameState();
+        statusLine =
+          `🆔 *الجلسة:* \`${session.id}\`\n` +
+          `📛 *اسم المستخدم الحالي:* ${
+            selfState.username ? `\`@${selfState.username}\`` : 'غير مضبوط'
+          }\n` +
+          `ℹ️ *التفاصيل:* ${selfState.reasonArabic}`;
+      }
+    } catch {
+      // Keep non-fatal fallback text
+    }
+
+    return {
+      text:
+        `${renderBreadcrumb(['الرئيسية', 'الأدوات', 'إدارة اسم المستخدم'])}\n` +
+        (notice ? `${notice}\n━━━━━━━━━━━━━━━━━━\n` : '') +
+        `📛 *إدارة اسم مستخدم واتساب (@username — /username)*\n` +
+        `━━━━━━━━━━━━━━━━━━\n` +
+        `${statusLine}\n\n` +
+        `📌 *الأوامر المباشرة المدعومة:*\n` +
+        `• \`/username check <@name> [pin]\` — فحص التوفر أو الحاجة لرمز PIN\n` +
+        `• \`/username set <@name>\` — تعيين اسم المستخدم لحساب الجلسة\n` +
+        `• \`/username pin <digits>\` — تعيين مفتاح حماية (Username PIN)\n` +
+        `• \`/username recommend [seed]\` — فحص واقتراح أسماء متاحة\n` +
+        `• \`/username delete\` — حذف اسم المستخدم الحالي`,
+      keyboard: [
+        [
+          {
+            text: '🔍 فحص توفر اسم',
+            callbackData: 'tools:uname_mode:check',
+          },
+          {
+            text: '✏️ تعيين اسم مستخدم',
+            callbackData: 'tools:uname_mode:set',
+          },
+        ],
+        [
+          {
+            text: '🔐 تعيين PIN حماية',
+            callbackData: 'tools:uname_mode:pin',
+          },
+          {
+            text: '💡 اقتراح أسماء متاحة',
+            callbackData: 'tools:uname_mode:recommend',
+          },
+        ],
+        [
+          {
+            text: '🗑️ حذف اسمي الحالي',
+            callbackData: 'tools:uname_delete',
+          },
+          {
+            text: '🔄 تحديث الحالة',
+            callbackData: 'tools:prompt_username_mgr',
+          },
+        ],
+        buildBackCancelRow('menu:tools'),
+      ],
+      toastText: '📛 لوحة إدارة اسم المستخدم',
+      route: 'tools:prompt_username_mgr',
+    };
+  }
+
+  public promptUsernameMode(
+    adminId: number,
+    mode: 'check' | 'set' | 'pin' | 'recommend'
+  ): BotViewResponse {
+    this.usernameModeByAdmin.set(adminId, mode);
+    this.inputStates.set(adminId, 'AWAITING_USERNAME_INPUT');
+    const prompts: Record<typeof mode, string> = {
+      check: '🔍 أرسل اسم المستخدم المراد فحص توفره (مثال: `@myhandle` أو `myhandle pin1234`):',
+      set: '✏️ أرسل اسم المستخدم الجديد لتعيينه لحسابك (3 إلى 30 حرفاً/رقماً/نقطة/`_`):',
+      pin: '🔐 أرسل رمز PIN الحماية الجديد (4 إلى 8 أرقام) — لن يتم عرض أو تسجيل الرمز في السجلات:',
+      recommend: '💡 أرسل كلمة أساسية لاقتراح أسماء متاحة حولها (مثال: `botezz`):',
+    };
+    return {
+      text:
+        `${renderBreadcrumb(['الرئيسية', 'الأدوات', 'اسم المستخدم', mode])}\n` +
+        `${prompts[mode]}`,
+      keyboard: [buildBackCancelRow('tools:prompt_username_mgr')],
+      toastText: `أدخل قيمة (${mode})`,
+      route: `tools:uname_mode:${mode}`,
+    };
+  }
+
+  public async executeUsernameCommand(
+    adminId: number,
+    rawArgs: string
+  ): Promise<BotViewResponse> {
+    try {
+      const trimmed = (rawArgs || '').trim();
+      if (!trimmed || /^status$/i.test(trimmed)) {
+        return this.renderUsernameManager(adminId);
+      }
+
+      const { session, driver } =
+        this.getPrimaryConnectedSessionAndDriver(adminId);
+      const tokens = trimmed.split(/\s+/).filter(Boolean);
+      const sub = (tokens[0] || '').toLowerCase();
+      const rest = tokens.slice(1);
+
+      if (sub === 'check' || (!['set', 'delete', 'remove', 'pin', 'recommend'].includes(sub) && tokens.length >= 1)) {
+        const handle = sub === 'check' ? rest[0] || '' : tokens[0] || '';
+        const pin = sub === 'check' ? rest[1] : tokens[1];
+        if (!handle) {
+          return this.promptUsernameMode(adminId, 'check');
+        }
+        const res = await driver.checkUsername!(handle, pin);
+        this.auditRepo.record({
+          actorTelegramId: adminId,
+          action: 'TOOL_USERNAME_CHECK',
+          targetId: res.username || handle,
+          outcome: res.supported ? 'SUCCESS' : 'FAILURE',
+          metadata: { sessionId: session.id, status: res.status, available: res.available },
+        });
+        return this.renderUsernameManager(
+          adminId,
+          `🔍 *نتيجة فحص الاسم (\`${escapeMarkdown(res.username || handle)}\`):*\n` +
+            `• *الحالة:* \`${res.status}\`\n` +
+            `• *متاح:* ${res.available === true ? 'نعم ✅' : res.available === false ? 'لا ❌' : '—'}\n` +
+            (res.lidJid ? `• *LID المطابق:* \`${res.lidJid}\`\n` : '') +
+            `• *التفاصيل:* ${res.reasonArabic}`
+        );
+      }
+
+      if (sub === 'set') {
+        const handle = rest[0] || '';
+        if (!handle) {
+          return this.promptUsernameMode(adminId, 'set');
+        }
+        const res = await driver.setUsername!(handle);
+        this.auditRepo.record({
+          actorTelegramId: adminId,
+          action: 'TOOL_USERNAME_SET',
+          targetId: res.username || handle,
+          outcome: res.status === 'ok' ? 'SUCCESS' : 'FAILURE',
+          metadata: { sessionId: session.id, status: res.status },
+        });
+        return this.renderUsernameManager(
+          adminId,
+          `${res.status === 'ok' ? '✅' : '⚠️'} *تعيين اسم المستخدم:* ${res.reasonArabic}`
+        );
+      }
+
+      if (sub === 'delete' || sub === 'remove') {
+        const res = await driver.deleteUsername!();
+        this.auditRepo.record({
+          actorTelegramId: adminId,
+          action: 'TOOL_USERNAME_DELETE',
+          targetId: session.id,
+          outcome: res.status === 'ok' ? 'SUCCESS' : 'FAILURE',
+          metadata: { sessionId: session.id, status: res.status },
+        });
+        return this.renderUsernameManager(
+          adminId,
+          `${res.status === 'ok' ? '✅' : '⚠️'} *حذف اسم المستخدم:* ${res.reasonArabic}`
+        );
+      }
+
+      if (sub === 'pin') {
+        const pinVal = rest[0] || '';
+        if (!pinVal) {
+          return this.promptUsernameMode(adminId, 'pin');
+        }
+        const res = await driver.setUsernamePin!(pinVal);
+        // NEVER include raw PIN value in audit metadata or UI!
+        this.auditRepo.record({
+          actorTelegramId: adminId,
+          action: 'TOOL_USERNAME_PIN_SET',
+          targetId: session.id,
+          outcome: res.status === 'ok' ? 'SUCCESS' : 'FAILURE',
+          metadata: { sessionId: session.id, status: res.status, redacted: true },
+        });
+        return this.renderUsernameManager(
+          adminId,
+          `${res.status === 'ok' ? '🔐✅' : '⚠️'} *إعداد Username PIN:* ${res.reasonArabic}`
+        );
+      }
+
+      if (sub === 'recommend') {
+        const seed = rest[0] || 'botezz';
+        const rec = await driver.recommendUsername!(seed);
+        const list = rec.candidates
+          .map(
+            (c) =>
+              `• \`@${c.username}\` — ${
+                c.available ? '✅ متاح' : `❌ غير متاح (\`${c.status}\`)`
+              }`
+          )
+          .join('\n');
+        return this.renderUsernameManager(
+          adminId,
+          `💡 *اقتراحات أسماء المستخدم حول (\`${escapeMarkdown(rec.seed)}\`):*\n${list}`
+        );
+      }
+
+      return this.renderUsernameManager(adminId);
+    } catch (err) {
+      const safeErr = toSafeArabicError(err);
+      return this.renderUsernameManager(
+        adminId,
+        `⚠️ *تعذر تنفيذ أمر اسم المستخدم:* ${safeErr.userMessage}`
+      );
+    }
+  }
+
+  // ============================================================================
+  // Feature C: Menfess / Anonymous Brokered Relay Sessions (/anonstart, /anonstop, /anonmsg)
+  // ============================================================================
+
+  public promptMenfessStart(adminId: number): BotViewResponse {
+    this.inputStates.set(adminId, 'AWAITING_MENFESS_START_INPUT');
+    return {
+      text:
+        `${renderBreadcrumb(['الرئيسية', 'الأدوات', 'إنشاء جلسة تواصل مجهول'])}\n` +
+        `🎭 *إنشاء جلسة تواصل مجهول ثنائية الاتجاه (Menfess Relay — /anonstart)*\n` +
+        `━━━━━━━━━━━━━━━━━━\n` +
+        `يعمل البوت كوسيط آمن يعزل الطرفين تماماً (\`Sender A ⇄ Botezz Broker ⇄ Receiver B\`) دون تسريب رقم أو JID أي طرف للطرف الآخر، مع دعم الرد التلقائي وتمرير الوسائط.\n\n` +
+        `📌 *أرسل بيانات الجلسة الآن بصيغة:*\n` +
+        `\`<sender_phone|lid> <receiver_phone|lid> [alias] [--nomask]\`\n` +
+        `• مثال 1: \`+967771112233 +966501234567 SecretFriend\`\n` +
+        `• مثال 2: \`+967771112233 | +966501234567 | Anonymous Sender\``,
+      keyboard: [
+        [
+          {
+            text: '📋 عرض الجلسات النشطة',
+            callbackData: 'tools:menfess_list',
+          },
+        ],
+        buildBackCancelRow('menu:tools'),
+      ],
+      toastText: '🎭 أدخل المرسل والمستلم والاسم المستعار الاختياري',
+      route: 'tools:prompt_menfess_start',
+    };
+  }
+
+  public promptMenfessRelayMessage(
+    adminId: number,
+    anonSessionId: string
+  ): BotViewResponse {
+    this.activeAnonSessionByAdmin.set(adminId, anonSessionId);
+    this.inputStates.set(adminId, 'AWAITING_MENFESS_RELAY_INPUT');
+    return {
+      text:
+        `${renderBreadcrumb(['الرئيسية', 'الأدوات', 'Menfess', anonSessionId])}\n` +
+        `✉️ *إرسال رسالة أو وسائط عبر جلسة التواصل المجهول (\`${anonSessionId}\`)*\n` +
+        `━━━━━━━━━━━━━━━━━━\n` +
+        `أرسل الآن **النص** مباشرة، أو ارفع **صورة / فيديو / مقطع صوتي / بصمة صوتية / مستند / ملصق** ليتم تمريره فوراً إلى المستلم عبر البوت الوسيط دون كشف هوية المرسل.`,
+      keyboard: [
+        [
+          {
+            text: '🛑 إغلاق هذه الجلسة',
+            callbackData: `tools:menfess_stop:${anonSessionId}`,
+          },
+          {
+            text: '📋 كل الجلسات',
+            callbackData: 'tools:menfess_list',
+          },
+        ],
+        buildBackCancelRow('tools:menfess_list'),
+      ],
+      toastText: `✉️ الجلسة ${anonSessionId} جاهزة للإرسال`,
+      route: `tools:menfess_relay:${anonSessionId}`,
+    };
+  }
+
+  public renderMenfessSessionsMenu(
+    adminId: number,
+    notice?: string
+  ): BotViewResponse {
+    const ownerFilter = this.sessionManager.isOwner(adminId) ? undefined : adminId;
+    const sessions = this.anonymousEngine.listAnonymousSessions({
+      ownerTelegramId: ownerFilter,
+      includeClosed: false,
+    });
+
+    const lines =
+      sessions.length > 0
+        ? sessions.slice(0, 10).map((s, idx) => {
+            const label = this.anonymousEngine.formatPresentationLabel(s);
+            return (
+              `${idx + 1}. \`${s.id}\` — الجلسة الوسيطة: \`${s.sessionId}\`\n` +
+              `   👤 المرسل المعروض: *${escapeMarkdown(label)}* | 🎯 إلى: \`${maskPhoneForMenfess(s.receiverJid)}\`\n` +
+              `   📨 مرسل: *${s.messagesRelayedCount}* | ↩️ ردود: *${s.repliesRelayedCount}*`
+            );
+          })
+        : ['ℹ️ *لا توجد جلسات تواصل مجهول نشطة حالياً.*'];
+
+    const rows: InlineKeyboardRows = [];
+    for (const s of sessions.slice(0, 6)) {
+      rows.push([
+        {
+          text: `✉️ إرسال (${s.id})`,
+          callbackData: `tools:menfess_relay:${s.id}`,
+        },
+        {
+          text: `🛑 إغلاق (${s.id})`,
+          callbackData: `tools:menfess_stop:${s.id}`,
+        },
+      ]);
+    }
+
+    rows.push([
+      {
+        text: '➕ إنشاء جلسة مجهولة (/anonstart)',
+        callbackData: 'tools:prompt_menfess_start',
+      },
+      {
+        text: '🔄 تحديث القائمة',
+        callbackData: 'tools:menfess_list',
+      },
+    ]);
+    rows.push(
+      buildAppNavigationRow({
+        backCallback: 'menu:tools',
+        refreshCallback: 'tools:menfess_list',
+      })
+    );
+
+    return {
+      text:
+        `${renderBreadcrumb(['الرئيسية', 'الأدوات', 'جلسات Menfess'])}\n` +
+        (notice ? `${notice}\n━━━━━━━━━━━━━━━━━━\n` : '') +
+        `🎭 *إدارة جلسات التواصل المجهول (Menfess Anonymous Relay)*\n` +
+        `━━━━━━━━━━━━━━━━━━\n` +
+        lines.join('\n\n'),
+      keyboard: rows,
+      toastText: `🎭 جلسات Menfess النشطة (${sessions.length})`,
+      route: 'tools:menfess_list',
+    };
+  }
+
+  public async executeAnonStartCommand(
+    adminId: number,
+    rawArgs: string
+  ): Promise<BotViewResponse> {
+    try {
+      const trimmed = (rawArgs || '').trim();
+      if (!trimmed) {
+        return this.promptMenfessStart(adminId);
+      }
+
+      const hasNoMask = /(?:^|\s)--nomask(?:\s|$)/i.test(trimmed);
+      const cleaned = trimmed.replace(/(?:^|\s)--nomask(?:\s|$)/gi, ' ').trim();
+
+      let senderInput = '';
+      let receiverInput = '';
+      let senderAlias: string | undefined;
+
+      if (cleaned.includes('|')) {
+        const pipeParts = cleaned
+          .split('|')
+          .map((p) => p.trim())
+          .filter(Boolean);
+        senderInput = pipeParts[0] || '';
+        receiverInput = pipeParts[1] || '';
+        senderAlias = pipeParts[2] || undefined;
+      } else {
+        const tokens = cleaned.split(/\s+/).filter(Boolean);
+        senderInput = tokens[0] || '';
+        receiverInput = tokens[1] || '';
+        senderAlias = tokens.length > 2 ? tokens.slice(2).join(' ') : undefined;
+      }
+
+      if (!senderInput || !receiverInput) {
+        return {
+          text:
+            `⚠️ *صيغة /anonstart غير مكتملة*\n` +
+            `الصيغة: \`/anonstart <sender_phone|lid> <receiver_phone|lid> [alias]\``,
+          keyboard: [
+            [{ text: '🎭 إعادة الإدخال', callbackData: 'tools:prompt_menfess_start' }],
+            [{ text: '🔙 قائمة الأدوات', callbackData: 'menu:tools' }],
+          ],
+        };
+      }
+
+      const { session, driver } =
+        this.getPrimaryConnectedSessionAndDriver(adminId);
+
+      const anonSess = await this.anonymousEngine.createAnonymousSession({
+        sessionId: session.id,
+        ownerTelegramId: adminId,
+        senderInput,
+        receiverInput,
+        senderAlias,
+        maskPhonePresentation: !hasNoMask,
+        preferLidDelivery: true,
+        identityService: driver.getIdentityService?.(),
+      });
+
+      this.activeAnonSessionByAdmin.set(adminId, anonSess.id);
+
+      this.auditRepo.record({
+        actorTelegramId: adminId,
+        action: 'TOOL_ANON_SESSION_CREATED',
+        targetId: anonSess.id,
+        outcome: 'SUCCESS',
+        metadata: {
+          sessionId: session.id,
+          maskPhonePresentation: anonSess.maskPhonePresentation,
+          preferLidDelivery: anonSess.preferLidDelivery,
+        },
+      });
+
+      const presentation = this.anonymousEngine.formatPresentationLabel(anonSess);
+      const safeSendCb = `tools:menfess_relay:${anonSess.id}`;
+      const safeStopCb = `tools:menfess_stop:${anonSess.id}`;
+
+      return {
+        text:
+          `✅ *تم إنشاء جلسة التواصل المجهول (Menfess Relay) بنجاح!*\n` +
+          `━━━━━━━━━━━━━━━━━━\n` +
+          `🆔 *معرف الجلسة المجهولة:* \`${anonSess.id}\`\n` +
+          `📡 *جلسة واتساب الوسيطة:* \`${anonSess.sessionId}\`\n` +
+          `👤 *الهوية الظاهرة للمستلم:* \`${escapeMarkdown(presentation)}\`\n` +
+          `🛡️ *عزل الرقم:* رقم المرسل الحقيقي معزول ومخفي تماماً عن المستلم\n` +
+          `⏳ *صلاحية الجلسة:* 24 ساعة (تقبل الرد التلقائي عند الاقتباس Reply)\n\n` +
+          `📌 *لإرسال رسالة فوراً:*\n` +
+          `\`/anonmsg ${anonSess.id} نص رسالتك المجهولة\``,
+        keyboard: [
+          [
+            { text: '✉️ إرسال رسالة الآن', callbackData: safeSendCb },
+            { text: '🛑 إغلاق الجلسة', callbackData: safeStopCb },
+          ],
+          [{ text: '📋 قائمة جلسات Menfess', callbackData: 'tools:menfess_list' }],
+        ],
+        toastText: `✅ تم إنشاء الجلسة ${anonSess.id}`,
+      };
+    } catch (err) {
+      const safeErr = toSafeArabicError(err);
+      return {
+        text: `⚠️ *تعذر إنشاء جلسة التواصل المجهول:*\n${safeErr.userMessage}`,
+        keyboard: [
+          [{ text: '🔄 إعادة المحاولة', callbackData: 'tools:prompt_menfess_start' }],
+          [{ text: '🔙 قائمة الأدوات', callbackData: 'menu:tools' }],
+        ],
+      };
+    }
+  }
+
+  public async executeMenfessRelay(
+    adminId: number,
+    anonSessionId: string,
+    text: string
+  ): Promise<BotViewResponse> {
+    try {
+      const { session, driver } =
+        this.getPrimaryConnectedSessionAndDriver(adminId);
+      if (typeof driver.deliverRelayPayload !== 'function') {
+        throw new WhatsAppConnectionError(
+          'محرك التوصيل الوسيط (deliverRelayPayload) غير متاح على الجلسة الحالية.'
+        );
+      }
+
+      const result = await this.anonymousEngine.relayAnonymousMessage({
+        sessionId: session.id,
+        anonSessionId,
+        text,
+        deliver: async (req) => {
+          const res = await driver.deliverRelayPayload!({
+            targetJid: req.targetJid,
+            preferLid: req.preferLid,
+            content: req.content,
+            quotedMessageId: req.quotedMessageId,
+            customPushName: req.customPushName,
+          });
+          return {
+            messageId: res.messageId,
+            deliveredToJid: res.deliveredToJid,
+            addressingMode: res.addressingMode,
+          };
+        },
+      });
+
+      this.activeAnonSessionByAdmin.set(adminId, result.anonSession.id);
+
+      return {
+        text:
+          `✅ *تم تمرير الرسالة المجهولة عبر الوسيط بنجاح!*\n` +
+          `━━━━━━━━━━━━━━━━━━\n` +
+          `🎭 *جلسة Menfess:* \`${result.anonSession.id}\`\n` +
+          `👤 *الهوية الظاهرة للمستلم:* \`${escapeMarkdown(result.presentationLabel)}\`\n` +
+          `🎯 *مسار التسليم:* \`${result.deliveredToJid}\`\n` +
+          `📨 *معرف الرسالة:* \`${result.messageId}\`\n\n` +
+          `↩️ _أي رد يرسله المستلم باقتباس هذه الرسالة سيعود تلقائياً للطرف الأول عبر البوت._`,
+        keyboard: [
+          [
+            {
+              text: '✉️ إرسال رسالة أخرى',
+              callbackData: `tools:menfess_relay:${result.anonSession.id}`,
+            },
+            {
+              text: '🛑 إغلاق الجلسة',
+              callbackData: `tools:menfess_stop:${result.anonSession.id}`,
+            },
+          ],
+          [{ text: '📋 كل جلسات Menfess', callbackData: 'tools:menfess_list' }],
+        ],
+        toastText: `✅ تم التسليم عبر ${result.anonSession.id}`,
+      };
+    } catch (err) {
+      const safeErr = toSafeArabicError(err);
+      return {
+        text: `⚠️ *تعذر تمرير الرسالة المجهولة:*\n${safeErr.userMessage}`,
+        keyboard: [
+          [{ text: '📋 قائمة الجلسات', callbackData: 'tools:menfess_list' }],
+          [{ text: '🔙 قائمة الأدوات', callbackData: 'menu:tools' }],
+        ],
+      };
+    }
+  }
+
+  public async handleMenfessMediaUpload(
+    adminId: number,
+    upload: {
+      originalFilename: string;
+      mimeType: string;
+      contentBuffer: Buffer;
+      caption?: string;
+    },
+    explicitAnonId?: string
+  ): Promise<BotViewResponse> {
+    try {
+      const caption = (upload.caption || '').trim();
+      const capAnonMatch = caption.match(/^(?:\/anonmsg\s+)?#?(anon_[a-f0-9]{6,16})\b/i);
+      const targetAnonId =
+        explicitAnonId ||
+        capAnonMatch?.[1]?.toLowerCase() ||
+        this.activeAnonSessionByAdmin.get(adminId);
+
+      if (!targetAnonId) {
+        return this.renderMenfessSessionsMenu(
+          adminId,
+          '⚠️ الرجاء اختيار جلسة Menfess أو إرفاق معرفها في الشرح (مثل `anon_1a2b3c4d`).'
+        );
+      }
+
+      const cleanCaption = caption
+        .replace(/^(?:\/anonmsg\s+)?#?anon_[a-f0-9]{6,16}\s*/i, '')
+        .trim();
+
+      const mime = (upload.mimeType || '').toLowerCase();
+      const lowerName = (upload.originalFilename || '').toLowerCase();
+      let mediaKind: Exclude<AnonymousMediaKind, 'text'> = 'document';
+      let ptt = false;
+      if (mime.includes('webp') || lowerName.endsWith('.webp')) {
+        mediaKind = 'sticker';
+      } else if (mime.startsWith('image/')) {
+        mediaKind = 'image';
+      } else if (mime.startsWith('video/')) {
+        mediaKind = 'video';
+      } else if (mime.includes('ogg') || lowerName.startsWith('voice_')) {
+        mediaKind = 'ptt';
+        ptt = true;
+      } else if (mime.startsWith('audio/')) {
+        mediaKind = 'audio';
+      }
+
+      const { session, driver } =
+        this.getPrimaryConnectedSessionAndDriver(adminId);
+      if (typeof driver.deliverRelayPayload !== 'function') {
+        throw new WhatsAppConnectionError(
+          'محرك التوصيل الوسيط غير متاح على الجلسة الحالية.'
+        );
+      }
+
+      const res = await this.anonymousEngine.relayAnonymousMedia({
+        sessionId: session.id,
+        anonSessionId: targetAnonId,
+        mediaKind,
+        buffer: upload.contentBuffer,
+        mimeType: upload.mimeType,
+        fileName: upload.originalFilename,
+        caption: cleanCaption || undefined,
+        ptt,
+        deliver: async (req) => {
+          const d = await driver.deliverRelayPayload!({
+            targetJid: req.targetJid,
+            preferLid: req.preferLid,
+            content: req.content,
+            quotedMessageId: req.quotedMessageId,
+            customPushName: req.customPushName,
+          });
+          return {
+            messageId: d.messageId,
+            deliveredToJid: d.deliveredToJid,
+            addressingMode: d.addressingMode,
+          };
+        },
+      });
+
+      this.cancel(adminId);
+      return {
+        text:
+          `✅ *تم تمرير الوسائط المجهولة بنجاح!*\n` +
+          `━━━━━━━━━━━━━━━━━━\n` +
+          `🎭 *جلسة Menfess:* \`${res.anonSession.id}\`\n` +
+          `📦 *نوع الوسائط:* \`${res.mediaKind}\`\n` +
+          `👤 *الهوية الظاهرة:* \`${escapeMarkdown(res.presentationLabel)}\`\n` +
+          `📨 *معرف الرسالة:* \`${res.messageId}\``,
+        keyboard: [
+          [
+            {
+              text: '✉️ إرسال رسالة أخرى',
+              callbackData: `tools:menfess_relay:${res.anonSession.id}`,
+            },
+            {
+              text: '🛑 إغلاق الجلسة',
+              callbackData: `tools:menfess_stop:${res.anonSession.id}`,
+            },
+          ],
+          [{ text: '📋 كل الجلسات', callbackData: 'tools:menfess_list' }],
+        ],
+        toastText: `✅ تم إرسال ${res.mediaKind} بسرية`,
+      };
+    } catch (err) {
+      this.cancel(adminId);
+      const safeErr = toSafeArabicError(err);
+      return this.renderMenfessSessionsMenu(
+        adminId,
+        `⚠️ *تعذر تمرير الوسائط المجهولة:* ${safeErr.userMessage}`
+      );
+    }
+  }
+
+  public async executeAnonStopCommand(
+    adminId: number,
+    rawAnonId?: string
+  ): Promise<BotViewResponse> {
+    const targetId =
+      (rawAnonId || '').trim().toLowerCase() ||
+      this.activeAnonSessionByAdmin.get(adminId) ||
+      '';
+    if (!targetId) {
+      this.inputStates.set(adminId, 'AWAITING_MENFESS_STOP_INPUT');
+      return {
+        text: `🛑 *إغلاق جلسة تواصل مجهول (/anonstop)*\nأرسل معرف الجلسة المراد إغلاقها (مثال: \`anon_1a2b3c4d\`):`,
+        keyboard: [
+          [{ text: '📋 عرض الجلسات', callbackData: 'tools:menfess_list' }],
+          buildBackCancelRow('menu:tools'),
+        ],
+      };
+    }
+
+    const ownerFilter = this.sessionManager.isOwner(adminId) ? undefined : adminId;
+    const all = this.anonymousEngine.listAnonymousSessions({
+      ownerTelegramId: ownerFilter,
+      includeClosed: true,
+    });
+    const matched = all.find((s) => s.id.toLowerCase() === targetId);
+    if (!matched) {
+      return this.renderMenfessSessionsMenu(
+        adminId,
+        `ℹ️ الجلسة المجهولة \`${escapeMarkdown(targetId)}\` غير موجودة أو غير مصرح بالوصول إليها.`
+      );
+    }
+
+    const closed = this.anonymousEngine.closeAnonymousSession({
+      sessionId: matched.sessionId,
+      anonSessionId: matched.id,
+    });
+    if (this.activeAnonSessionByAdmin.get(adminId) === matched.id) {
+      this.activeAnonSessionByAdmin.delete(adminId);
+    }
+    this.auditRepo.record({
+      actorTelegramId: adminId,
+      action: 'TOOL_ANON_SESSION_CLOSED',
+      targetId: matched.id,
+      outcome: closed ? 'SUCCESS' : 'FAILURE',
+      metadata: { sessionId: matched.sessionId },
+    });
+
+    return this.renderMenfessSessionsMenu(
+      adminId,
+      `🛑 *تم إغلاق جلسة التواصل المجهول (\`${matched.id}\`) بنجاح.*`
+    );
   }
 }

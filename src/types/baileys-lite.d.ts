@@ -75,6 +75,12 @@ declare module '@hiroosy/baileys-lite' {
     verification?: string;
   }
 
+  export interface ReachoutTimelockInfo {
+    isActive: boolean;
+    timeEnforcementEnds?: Date;
+    enforcementType?: string;
+  }
+
   export interface ConnectionState {
     connection: 'open' | 'connecting' | 'close';
     lastDisconnect?: {
@@ -90,7 +96,7 @@ declare module '@hiroosy/baileys-lite' {
     qr?: string;
     receivedPendingNotifications?: boolean;
     isOnline?: boolean;
-    reachoutTimeLock?: unknown;
+    reachoutTimeLock?: ReachoutTimelockInfo;
   }
 
   export interface AuthenticationCreds {
@@ -111,6 +117,12 @@ declare module '@hiroosy/baileys-lite' {
     [key: string]: unknown;
   }
 
+  export interface TcTokenEntry {
+    token?: Buffer | Uint8Array;
+    timestamp?: string | number;
+    senderTimestamp?: number;
+  }
+
   export type SignalDataTypeMap = {
     'pre-key': unknown;
     session: unknown;
@@ -120,7 +132,7 @@ declare module '@hiroosy/baileys-lite' {
     'app-state-sync-version': unknown;
     'lid-mapping': unknown;
     'device-list': unknown;
-    tctoken: unknown;
+    tctoken: TcTokenEntry;
     [key: string]: unknown;
   };
 
@@ -135,6 +147,8 @@ declare module '@hiroosy/baileys-lite' {
       };
     }): Promise<void>;
     clear?(): Promise<void>;
+    isInTransaction?(): boolean;
+    transaction?<T>(work: () => Promise<T>, key?: string): Promise<T>;
   }
 
   export interface AuthenticationState {
@@ -225,7 +239,10 @@ declare module '@hiroosy/baileys-lite' {
 
   export class USyncUser {
     withId(id: string): this;
+    withLid(lid: string): this;
     withPhone(phone: string): this;
+    withUsername(username: string): this;
+    withUsernameKey(usernameKey: string): this;
     withType(type: string): this;
     withPersonaId(personaId: string): this;
   }
@@ -233,6 +250,7 @@ declare module '@hiroosy/baileys-lite' {
   export interface USyncQueryResultItem {
     id: string;
     lid?: string | { id?: string; lid?: string; val?: string };
+    username?: string;
     contact?: boolean | { type?: string };
     status?: { status?: string; setAt?: Date };
     disappearing_mode?: { duration?: number; setAt?: Date };
@@ -252,6 +270,7 @@ declare module '@hiroosy/baileys-lite' {
     withContext(context: 'interactive' | 'background' | 'notification'): this;
     withContactProtocol(): this;
     withLIDProtocol(): this;
+    withUsernameProtocol(): this;
     withStatusProtocol(): this;
     withDisappearingModeProtocol(): this;
     withDevicesProtocol(): this;
@@ -433,6 +452,7 @@ declare module '@hiroosy/baileys-lite' {
       id: string;
       lid?: string;
       name?: string;
+      username?: string;
     };
     authState: AuthenticationState;
     signalRepository?: SignalRepository;
@@ -521,6 +541,23 @@ declare module '@hiroosy/baileys-lite' {
       filePath: string,
       opts: { mediaType: string; fileEncSha256B64: string; timeoutMs?: number }
     ) => Promise<{ mediaUrl: string; directPath: string; handle?: string }>;
+    serverProps?: {
+      privacyTokenOn1to1?: boolean;
+      profilePicPrivacyToken?: boolean;
+      lidTrustedTokenIssueToLid?: boolean;
+      [key: string]: unknown;
+    };
+    resolveUsername?(
+      handle: string,
+      usernameKey?: string
+    ): Promise<
+      | { status: 'ok'; jid: string }
+      | { status: 'key-required' }
+      | { status: 'not-found' }
+    >;
+    issuePrivacyTokens?(jids: string[], timestamp?: number): Promise<BinaryNode>;
+    fetchAccountReachoutTimelock?(): Promise<ReachoutTimelockInfo>;
+    fetchNewChatMessageCap?(): Promise<Record<string, unknown> | undefined>;
     generateMessageTag?(): string;
     end(error?: Error): Promise<void> | void;
     logout(msg?: string): Promise<void>;
@@ -703,6 +740,43 @@ declare module '@hiroosy/baileys-lite' {
     useCache?: boolean,
     ignoreZeroDevices?: boolean
   ): Promise<Array<{ user: string; device: number; jid?: string }>>;
+
+  export const NACK_REASONS: {
+    SenderReachoutTimelocked: number;
+    [key: string]: number;
+  };
+
+  export const SERVER_ERROR_CODES: {
+    MessageAccountRestriction: string;
+    SmaxInvalid: string;
+    [key: string]: string;
+  };
+
+  export function isTcTokenExpired(timestamp: string | number | null | undefined): boolean;
+  export function shouldSendNewTcToken(senderTimestamp?: number): boolean;
+  export function resolveTcTokenJid(
+    jid: string,
+    getLIDForPN: (pn: string) => Promise<string | undefined>
+  ): Promise<string>;
+  export function resolveIssuanceJid(
+    jid: string,
+    issueToLid: boolean | undefined,
+    getLIDForPN: (pn: string) => Promise<string | undefined>,
+    getPNForLID?: (lid: string) => Promise<string | undefined>
+  ): Promise<string>;
+  export function buildTcTokenFromJid(params: {
+    authState: AuthenticationState;
+    jid: string;
+    baseContent?: BinaryNode[];
+    getLIDForPN: (pn: string) => Promise<string | undefined>;
+  }): Promise<BinaryNode[] | undefined>;
+  export function storeTcTokensFromIqResult(params: {
+    result: BinaryNode;
+    fallbackJid?: string;
+    keys: SignalKeyStore;
+    getLIDForPN: (pn: string) => Promise<string | undefined>;
+    onNewJidStored?: (jid: string) => void;
+  }): Promise<void>;
 
   export function makeWASocket(config: UserFacingSocketConfig): WASocket;
   export default makeWASocket;

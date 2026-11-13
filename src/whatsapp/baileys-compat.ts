@@ -43,6 +43,14 @@ import {
   generateMessageID,
   USyncQuery,
   USyncUser,
+  isTcTokenExpired,
+  shouldSendNewTcToken,
+  resolveTcTokenJid,
+  resolveIssuanceJid,
+  buildTcTokenFromJid,
+  storeTcTokensFromIqResult,
+  NACK_REASONS,
+  SERVER_ERROR_CODES,
   type USyncQueryResultItem,
   type WASocket,
   type UserFacingSocketConfig,
@@ -53,6 +61,8 @@ import {
   type SignalRepository,
   type BaileysEventEmitter,
   type ConnectionState,
+  type ReachoutTimelockInfo,
+  type TcTokenEntry,
   type GroupMetadata,
   type GroupParticipant,
   type ParticipantAction,
@@ -69,6 +79,27 @@ import {
   type WABusinessProfile,
 } from '@hiroosy/baileys-lite';
 import Voip from '@hiroosy/baileys-lite/voip';
+
+export const USERNAME_MIN_LENGTH = 4;
+export const USERNAME_MAX_LENGTH = 30;
+const USERNAME_PATTERN = /^[a-zA-Z][a-zA-Z0-9._]*$/;
+
+export function normalizeUsername(input: string): string {
+  if (typeof input !== 'string') return '';
+  return input.trim().replace(/^@/, '');
+}
+
+export function isValidUsername(input: string): boolean {
+  const handle = normalizeUsername(input);
+  if (handle.length < USERNAME_MIN_LENGTH || handle.length > USERNAME_MAX_LENGTH) {
+    return false;
+  }
+  return USERNAME_PATTERN.test(handle);
+}
+
+export function isValidUsernameKey(key: string): boolean {
+  return typeof key === 'string' && /^\d{4}$/.test(key);
+}
 
 // Ensure USyncQuery.prototype.withDevicesProtocol aliases withDeviceProtocol on @hiroosy/baileys-lite
 if (
@@ -470,6 +501,14 @@ export {
   generateMessageID,
   USyncQuery,
   USyncUser,
+  isTcTokenExpired,
+  shouldSendNewTcToken,
+  resolveTcTokenJid,
+  resolveIssuanceJid,
+  buildTcTokenFromJid,
+  storeTcTokensFromIqResult,
+  NACK_REASONS,
+  SERVER_ERROR_CODES,
   type USyncQueryResultItem,
   type WASocket,
   type UserFacingSocketConfig,
@@ -480,6 +519,8 @@ export {
   type SignalRepository,
   type BaileysEventEmitter,
   type ConnectionState,
+  type ReachoutTimelockInfo,
+  type TcTokenEntry,
   type GroupMetadata,
   type GroupParticipant,
   type ParticipantAction,

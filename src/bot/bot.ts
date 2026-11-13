@@ -1291,6 +1291,55 @@ export class TelegramBotController {
       this.activeConversationMode.set(actorUserId, 'TOOLS');
       return this.toolsHandler.promptAnonymousLidMessage(actorUserId);
     }
+    if (callbackData === 'tools:prompt_lid_lookup') {
+      this.cancelAllWorkflowsForAdmin(actorUserId);
+      this.activeConversationMode.set(actorUserId, 'TOOLS');
+      return this.toolsHandler.promptLidResolve(actorUserId);
+    }
+    if (callbackData === 'tools:reachout_status') {
+      this.cancelAllWorkflowsForAdmin(actorUserId);
+      return this.toolsHandler.executeReachoutDiagnostic(actorUserId);
+    }
+    if (callbackData === 'tools:prompt_username_mgr') {
+      this.cancelAllWorkflowsForAdmin(actorUserId);
+      return this.toolsHandler.renderUsernameManager(actorUserId);
+    }
+    if (callbackData.startsWith('tools:uname_mode:')) {
+      const modeRaw = callbackData
+        .slice('tools:uname_mode:'.length)
+        .toLowerCase();
+      const validMode: 'check' | 'set' | 'pin' | 'recommend' =
+        modeRaw === 'set' || modeRaw === 'pin' || modeRaw === 'recommend'
+          ? modeRaw
+          : 'check';
+      this.cancelAllWorkflowsForAdmin(actorUserId);
+      this.activeConversationMode.set(actorUserId, 'TOOLS');
+      return this.toolsHandler.promptUsernameMode(actorUserId, validMode);
+    }
+    if (callbackData === 'tools:uname_delete') {
+      this.cancelAllWorkflowsForAdmin(actorUserId);
+      return this.toolsHandler.executeUsernameCommand(actorUserId, 'delete');
+    }
+    if (callbackData === 'tools:prompt_menfess_start') {
+      this.cancelAllWorkflowsForAdmin(actorUserId);
+      this.activeConversationMode.set(actorUserId, 'TOOLS');
+      return this.toolsHandler.promptMenfessStart(actorUserId);
+    }
+    if (callbackData === 'tools:menfess_list') {
+      this.cancelAllWorkflowsForAdmin(actorUserId);
+      return this.toolsHandler.renderMenfessSessionsMenu(actorUserId);
+    }
+    if (callbackData.startsWith('tools:menfess_relay:')) {
+      const anonId = callbackData.slice('tools:menfess_relay:'.length).trim();
+      this.cancelAllWorkflowsForAdmin(actorUserId);
+      this.activeConversationMode.set(actorUserId, 'TOOLS');
+      return this.toolsHandler.promptMenfessRelayMessage(actorUserId, anonId);
+    }
+    if (callbackData.startsWith('tools:menfess_stop:')) {
+      const anonId = callbackData.slice('tools:menfess_stop:'.length).trim();
+      this.cancelAllWorkflowsForAdmin(actorUserId);
+      return this.toolsHandler.executeAnonStopCommand(actorUserId, anonId);
+    }
     if (callbackData === 'tools:prompt_presence') {
       this.cancelAllWorkflowsForAdmin(actorUserId);
       this.activeConversationMode.set(actorUserId, 'TOOLS');
@@ -1541,6 +1590,12 @@ export class TelegramBotController {
 
     let view: BotViewResponse;
 
+    const isMenfessCaption =
+      /^(?:\/anonmsg\s+)?#?anon_[a-f0-9]{6,16}\b/i.test(caption);
+    const isAwaitingMenfessMedia =
+      mode === 'TOOLS' &&
+      this.toolsHandler.getStep(actorUserId) === 'AWAITING_MENFESS_RELAY_INPUT';
+
     if (
       (mode === 'TOOLS' && isCodeExtension) ||
       (isFunctionLabCaption && isCodeExtension)
@@ -1552,6 +1607,12 @@ export class TelegramBotController {
         caption: upload.caption,
       });
       this.activeConversationMode.set(actorUserId, 'TOOLS');
+    } else if (isAwaitingMenfessMedia || isMenfessCaption) {
+      view = await this.toolsHandler.handleMenfessMediaUpload(
+        actorUserId,
+        upload
+      );
+      this.activeConversationMode.set(actorUserId, 'NONE');
     } else if (mode === 'VIDEO_CALL') {
       view = await this.videoCallWorkflow.handleVideoUpload(actorUserId, upload);
       const nextStep = this.videoCallWorkflow.getState(actorUserId)?.step;
@@ -1813,6 +1874,44 @@ export class TelegramBotController {
           return this.toolsHandler.promptAnonymousLidMessage(actorUserId);
         }
         return this.toolsHandler.executeAnonymousLidMessage(actorUserId, rawArgs);
+      }
+
+      if (command === '/lid') {
+        const rawArgs = trimmed.replace(/^\/\S+\s*/, '');
+        if (!rawArgs) {
+          this.cancelAllWorkflowsForAdmin(actorUserId);
+          this.activeConversationMode.set(actorUserId, 'TOOLS');
+          return this.toolsHandler.promptLidResolve(actorUserId);
+        }
+        return this.toolsHandler.executeLidResolveCommand(actorUserId, rawArgs);
+      }
+
+      if (command === '/reachout' || command === '/tctoken') {
+        const rawArgs = trimmed.replace(/^\/\S+\s*/, '');
+        return this.toolsHandler.executeReachoutDiagnostic(
+          actorUserId,
+          rawArgs || undefined
+        );
+      }
+
+      if (command === '/username') {
+        const rawArgs = trimmed.replace(/^\/\S+\s*/, '');
+        return this.toolsHandler.executeUsernameCommand(actorUserId, rawArgs);
+      }
+
+      if (command === '/anonstart') {
+        const rawArgs = trimmed.replace(/^\/\S+\s*/, '');
+        if (!rawArgs) {
+          this.cancelAllWorkflowsForAdmin(actorUserId);
+          this.activeConversationMode.set(actorUserId, 'TOOLS');
+          return this.toolsHandler.promptMenfessStart(actorUserId);
+        }
+        return this.toolsHandler.executeAnonStartCommand(actorUserId, rawArgs);
+      }
+
+      if (command === '/anonstop') {
+        const rawArgs = trimmed.replace(/^\/\S+\s*/, '');
+        return this.toolsHandler.executeAnonStopCommand(actorUserId, rawArgs);
       }
 
       if (command === '/presence') {
@@ -2470,16 +2569,49 @@ export function createGrammyBot(
     ) {
       return;
     }
-    const inputFile = new InputFile(attachment.filePath, attachment.fileName);
-    const captionOpts = attachment.caption ? { caption: attachment.caption } : {};
-    if (attachment.kind === 'photo') {
-      await bot.api.sendPhoto(targetChatId, inputFile, captionOpts);
-    } else if (attachment.kind === 'video') {
-      await bot.api.sendVideo(targetChatId, inputFile, captionOpts);
-    } else if (attachment.kind === 'audio') {
-      await bot.api.sendAudio(targetChatId, inputFile, captionOpts);
-    } else {
-      await bot.api.sendDocument(targetChatId, inputFile, captionOpts);
+    const rawCaption = attachment.caption ? String(attachment.caption) : '';
+    const trimmedCaption =
+      rawCaption.length > 1024
+        ? `${rawCaption.slice(0, 1020)}...`
+        : rawCaption;
+    const sendWithFallback = async (usePlainCaption: boolean): Promise<void> => {
+      if (!fs.existsSync(attachment.filePath)) {
+        return;
+      }
+      const inputFile = new InputFile(attachment.filePath, attachment.fileName);
+      const effectiveCaption = usePlainCaption
+        ? trimmedCaption.replace(/[*_`]/g, '')
+        : trimmedCaption;
+      const captionOpts = effectiveCaption
+        ? {
+            caption: effectiveCaption,
+            ...(usePlainCaption ? {} : { parse_mode: 'Markdown' as const }),
+          }
+        : {};
+      if (attachment.kind === 'photo') {
+        await bot.api.sendPhoto(targetChatId, inputFile, captionOpts);
+      } else if (attachment.kind === 'video') {
+        try {
+          await bot.api.sendVideo(targetChatId, inputFile, captionOpts);
+        } catch {
+          const docFile = new InputFile(attachment.filePath, attachment.fileName);
+          await bot.api.sendDocument(targetChatId, docFile, captionOpts);
+        }
+      } else if (attachment.kind === 'audio') {
+        await bot.api.sendAudio(targetChatId, inputFile, captionOpts);
+      } else {
+        await bot.api.sendDocument(targetChatId, inputFile, captionOpts);
+      }
+    };
+
+    try {
+      await sendWithFallback(false);
+    } catch {
+      await sendWithFallback(true);
+    }
+    if (rawCaption.length > 1024) {
+      const remainder = rawCaption.slice(0, 4096).replace(/[*_`]/g, '');
+      await bot.api.sendMessage(targetChatId, remainder).catch(() => undefined);
     }
     onForwarded();
   };

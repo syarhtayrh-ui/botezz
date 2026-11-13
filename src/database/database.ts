@@ -229,6 +229,46 @@ export class AppDatabase {
         "ALTER TABLE captured_statuses ADD COLUMN archive_format TEXT NOT NULL DEFAULT 'direct'"
       );
     }
+
+    this.sqlite.exec(`
+      CREATE TABLE IF NOT EXISTS anonymous_relay_sessions (
+        id TEXT PRIMARY KEY,
+        session_id TEXT NOT NULL,
+        owner_telegram_id INTEGER NOT NULL DEFAULT 0,
+        sender_jid TEXT NOT NULL,
+        sender_lid_jid TEXT,
+        receiver_jid TEXT NOT NULL,
+        receiver_lid_jid TEXT,
+        sender_alias TEXT NOT NULL DEFAULT 'Anonymous Sender',
+        mask_phone_presentation INTEGER NOT NULL DEFAULT 1,
+        prefer_lid_delivery INTEGER NOT NULL DEFAULT 1,
+        created_at INTEGER NOT NULL,
+        last_activity_at INTEGER NOT NULL,
+        expires_at INTEGER NOT NULL,
+        messages_relayed_count INTEGER NOT NULL DEFAULT 0,
+        replies_relayed_count INTEGER NOT NULL DEFAULT 0,
+        state TEXT NOT NULL DEFAULT 'active'
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_anon_relay_sessions_session_state
+        ON anonymous_relay_sessions(session_id, state);
+      CREATE INDEX IF NOT EXISTS idx_anon_relay_sessions_sender
+        ON anonymous_relay_sessions(session_id, sender_jid, state);
+      CREATE INDEX IF NOT EXISTS idx_anon_relay_sessions_receiver
+        ON anonymous_relay_sessions(session_id, receiver_jid, state);
+
+      CREATE TABLE IF NOT EXISTS anonymous_relay_messages (
+        relayed_wa_message_id TEXT PRIMARY KEY,
+        anon_session_id TEXT NOT NULL,
+        session_id TEXT NOT NULL,
+        direction TEXT NOT NULL,
+        media_kind TEXT NOT NULL DEFAULT 'text',
+        created_at INTEGER NOT NULL
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_anon_relay_messages_anon_session
+        ON anonymous_relay_messages(anon_session_id);
+    `);
   }
 
   private ensureMultiTenantColumns(): void {

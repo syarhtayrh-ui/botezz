@@ -138,7 +138,15 @@ export function isNavigableRoute(callbackData: string): boolean {
     callbackData === 'net:ping' ||
     callbackData === 'menu:sec_analyzer' ||
     callbackData.startsWith('sec:page:') ||
-    callbackData.startsWith('sec:download:')
+    callbackData.startsWith('sec:download:') ||
+    callbackData === 'tools:prompt_anon_lid' ||
+    callbackData === 'tools:prompt_lid_lookup' ||
+    callbackData === 'tools:reachout_status' ||
+    callbackData === 'tools:prompt_username_mgr' ||
+    callbackData.startsWith('tools:uname_mode:') ||
+    callbackData === 'tools:prompt_menfess_start' ||
+    callbackData === 'tools:menfess_list' ||
+    callbackData.startsWith('tools:menfess_relay:')
   );
 }
 

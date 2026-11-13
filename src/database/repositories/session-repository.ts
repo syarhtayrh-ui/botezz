@@ -43,6 +43,10 @@ export interface SessionRecord {
 export class SessionRepository {
   constructor(private readonly db: AppDatabase) {}
 
+  public getDatabase(): AppDatabase {
+    return this.db;
+  }
+
   public create(params: {
     id: string;
     label: string;

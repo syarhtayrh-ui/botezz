@@ -6,6 +6,13 @@
 
 const SENSITIVE_KEY_PATTERNS = [
   /token/i,
+  /tctoken/i,
+  /tc[_-]?token/i,
+  /cstoken/i,
+  /cs[_-]?token/i,
+  /username[_-]?pin/i,
+  /username[_-]?key/i,
+  /^pin$/i,
   /secret/i,
   /password/i,
   /pairing[_-]?code/i,
@@ -22,6 +29,8 @@ const SENSITIVE_KEY_PATTERNS = [
 
 const TELEGRAM_BOT_TOKEN_REGEX = /\b\d{8,12}:[A-Za-z0-9_-]{30,45}\b/g;
 const PAIRING_CODE_FORMAT_REGEX = /\b[A-Z0-9]{4}-[A-Z0-9]{4}\b/g;
+const PRIVACY_TOKEN_INLINE_REGEX =
+  /\b(tctoken|tc_token|cstoken|cs_token|usernamePin|username_pin|usernameKey|username_key)\s*[:=]\s*["']?([^"'\s,;}\]]+)["']?/gi;
 
 /**
  * Masks a phone number so only country prefix and last 4 digits are visible.
@@ -43,13 +52,46 @@ export function maskPhoneNumber(phone: string | null | undefined): string {
 }
 
 /**
+ * Masks a phone number or JID for Menfess / Anonymous Session presentation.
+ * Example: "967771234535@s.whatsapp.net" -> "+967•••••••35"
+ */
+export function maskPhoneForMenfess(phoneOrJid: string | null | undefined): string {
+  if (!phoneOrJid) return 'Anonymous Sender';
+  const rawUser = String(phoneOrJid).split('@')[0].split(':')[0];
+  const digits = rawUser.replace(/\D/g, '');
+  if (digits.length < 6) {
+    return 'Anonymous Sender';
+  }
+  const prefix = digits.slice(0, 3);
+  const suffix = digits.slice(-2);
+  const dotsCount = Math.max(5, digits.length - 5);
+  return `+${prefix}${'•'.repeat(dotsCount)}${suffix}`;
+}
+
+/**
+ * Masks a WhatsApp JID (`@s.whatsapp.net` or `@lid`) for safe diagnostics and telemetry.
+ */
+export function maskJidForDiagnostics(jid: string | null | undefined): string {
+  if (!jid) return 'unknown';
+  const trimmed = String(jid).trim();
+  const atIdx = trimmed.indexOf('@');
+  const userPart = (atIdx >= 0 ? trimmed.slice(0, atIdx) : trimmed).split(':')[0];
+  const domainPart = atIdx >= 0 ? trimmed.slice(atIdx) : '';
+  if (userPart.length <= 5) {
+    return `***${domainPart}`;
+  }
+  return `${userPart.slice(0, 3)}••••${userPart.slice(-2)}${domainPart}`;
+}
+
+/**
  * Redacts sensitive patterns from arbitrary text strings.
  */
 export function redactText(input: string): string {
   if (!input) return input;
   return input
     .replace(TELEGRAM_BOT_TOKEN_REGEX, '[REDACTED_TELEGRAM_TOKEN]')
-    .replace(PAIRING_CODE_FORMAT_REGEX, '[REDACTED_PAIRING_CODE]');
+    .replace(PAIRING_CODE_FORMAT_REGEX, '[REDACTED_PAIRING_CODE]')
+    .replace(PRIVACY_TOKEN_INLINE_REGEX, '$1=[REDACTED]');
 }
 
 export { redactText as redactString };

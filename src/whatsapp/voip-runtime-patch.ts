@@ -1223,6 +1223,11 @@ export function syncReceiveOnlySrtpOnMediaSession(
         sessionSalt?: Uint8Array;
         authKey?: Uint8Array;
         authTagLen?: number;
+        initialized?: boolean;
+        roc?: number;
+        lastSeq?: number;
+        highestIndex?: bigint;
+        replayMask?: bigint;
       };
     } | null;
   };
@@ -1248,11 +1253,24 @@ export function syncReceiveOnlySrtpOnMediaSession(
       recv.sessionSalt instanceof Uint8Array &&
       recv.authKey instanceof Uint8Array
     ) {
-      s.videoSrtpSession.recvCtx.sessionKey = recv.sessionKey;
-      s.videoSrtpSession.recvCtx.sessionSalt = recv.sessionSalt;
-      s.videoSrtpSession.recvCtx.authKey = recv.authKey;
+      const targetRecv = s.videoSrtpSession.recvCtx;
+      const keyChanged =
+        !(targetRecv.sessionKey instanceof Uint8Array) ||
+        targetRecv.sessionKey.length !== recv.sessionKey.length ||
+        !targetRecv.sessionKey.every((b, idx) => b === recv.sessionKey![idx]);
+
+      targetRecv.sessionKey = recv.sessionKey;
+      targetRecv.sessionSalt = recv.sessionSalt;
+      targetRecv.authKey = recv.authKey;
       if (recv.authTagLen) {
-        s.videoSrtpSession.recvCtx.authTagLen = recv.authTagLen;
+        targetRecv.authTagLen = recv.authTagLen;
+      }
+      if (keyChanged) {
+        targetRecv.initialized = false;
+        targetRecv.roc = 0;
+        targetRecv.lastSeq = 0;
+        targetRecv.highestIndex = BigInt(0);
+        targetRecv.replayMask = BigInt(0);
       }
     }
   }
@@ -1268,30 +1286,69 @@ export function instrumentMediaSessionInstance(
 
   // For real `@hiroosy/baileys-lite` `WaCallMediaSession` instances, NEVER monkey-patch or override
   // outbound audio/video engines (`WaVideoEngine`, `WaAudioEngine`, `sendCapturedVideoAU`, `videoSrtpSession.sendCipher`).
-  // Attach ONLY a non-destructive receive-side cipher sync (`recvCipher`/`recvKeying`/`recvCtx`) for inbound media.
+  // Attach ONLY non-destructive receive-side cipher sync (`recvCipher`/`recvKeying`/`recvCtx`) and videoSsrc sync after call ack/accept.
   const isNativeWaCallMediaSession =
     (session as { constructor?: { name?: string } }).constructor?.name ===
     'WaCallMediaSession';
   if (isNativeWaCallMediaSession) {
     syncReceiveOnlySrtpOnMediaSession(session);
+    syncSessionVideoSsrcWithDeviceJid(session);
     if (Object.prototype.hasOwnProperty.call(session, '__botezzInstrumented')) {
       return session;
     }
     session.__botezzInstrumented = true;
-    const nativeWithAccept = session as InstrumentedMediaSession & {
+    const nativeWithTaps = session as InstrumentedMediaSession & {
       handleCallAccept?: (...args: unknown[]) => Promise<unknown>;
+      connectRelays?: (...args: unknown[]) => Promise<unknown>;
     };
-    if (typeof nativeWithAccept.handleCallAccept === 'function') {
-      const origAccept = nativeWithAccept.handleCallAccept;
-      nativeWithAccept.handleCallAccept = async function passiveAcceptTap(
-        this: typeof nativeWithAccept,
+    if (typeof nativeWithTaps.handleCallAccept === 'function') {
+      const origAccept = nativeWithTaps.handleCallAccept;
+      nativeWithTaps.handleCallAccept = async function passiveAcceptTap(
+        this: typeof nativeWithTaps,
         ...args: unknown[]
       ) {
         const res = await origAccept.apply(this, args);
         try {
           syncReceiveOnlySrtpOnMediaSession(this);
+          syncSessionVideoSsrcWithDeviceJid(this);
         } catch {
           // Passive receive-side sync must never throw
+        }
+        return res;
+      };
+    }
+    if (typeof nativeWithTaps.handleCallAck === 'function') {
+      const origAck = nativeWithTaps.handleCallAck;
+      nativeWithTaps.handleCallAck = async function passiveAckTap(
+        this: typeof nativeWithTaps,
+        node: unknown
+      ): Promise<void> {
+        await origAck.call(this, node);
+        try {
+          syncSessionVideoSsrcWithDeviceJid(this);
+          syncReceiveOnlySrtpOnMediaSession(this);
+        } catch {
+          // Passive ack sync must never throw
+        }
+      };
+    }
+    if (typeof nativeWithTaps.connectRelays === 'function') {
+      const origRelays = nativeWithTaps.connectRelays;
+      nativeWithTaps.connectRelays = async function passiveRelaysTap(
+        this: typeof nativeWithTaps,
+        ...args: unknown[]
+      ) {
+        try {
+          syncSessionVideoSsrcWithDeviceJid(this);
+        } catch {
+          // Non-fatal
+        }
+        const res = await origRelays.apply(this, args);
+        try {
+          syncSessionVideoSsrcWithDeviceJid(this);
+          syncReceiveOnlySrtpOnMediaSession(this);
+        } catch {
+          // Non-fatal
         }
         return res;
       };
@@ -2270,26 +2327,40 @@ export async function ensureHiroosyVoipRuntimePatched(): Promise<void> {
           };
         };
         const sessionProto = mod?.WaCallMediaSession?.prototype;
-        if (
-          sessionProto &&
-          !sessionProto.__botezzPassiveTapApplied &&
-          typeof sessionProto.handleCallAccept === 'function'
-        ) {
+        if (sessionProto && !sessionProto.__botezzPassiveTapApplied) {
           sessionProto.__botezzPassiveTapApplied = true;
-          const origHandleCallAccept = sessionProto.handleCallAccept;
-          sessionProto.handleCallAccept =
-            async function passiveHandleCallAcceptTap(
+          if (typeof sessionProto.handleCallAccept === 'function') {
+            const origHandleCallAccept = sessionProto.handleCallAccept;
+            sessionProto.handleCallAccept =
+              async function passiveHandleCallAcceptTap(
+                this: NonNullable<typeof sessionProto>,
+                ...args: unknown[]
+              ) {
+                const res = await origHandleCallAccept.apply(this, args);
+                try {
+                  syncReceiveOnlySrtpOnMediaSession(this);
+                  syncSessionVideoSsrcWithDeviceJid(this);
+                } catch {
+                  // Passive receive-side sync must never throw
+                }
+                return res;
+              };
+          }
+          if (typeof sessionProto.handleCallAck === 'function') {
+            const origHandleCallAck = sessionProto.handleCallAck;
+            sessionProto.handleCallAck = async function passiveHandleCallAckTap(
               this: NonNullable<typeof sessionProto>,
-              ...args: unknown[]
-            ) {
-              const res = await origHandleCallAccept.apply(this, args);
+              node: unknown
+            ): Promise<void> {
+              await origHandleCallAck.call(this, node);
               try {
+                syncSessionVideoSsrcWithDeviceJid(this);
                 syncReceiveOnlySrtpOnMediaSession(this);
               } catch {
-                // Passive receive-side sync must never throw
+                // Passive ack sync must never throw
               }
-              return res;
             };
+          }
         }
       }
 

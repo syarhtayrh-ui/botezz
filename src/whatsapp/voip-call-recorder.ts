@@ -286,7 +286,7 @@ export class PerSsrcSrtpDecryptor {
       headerSize += 4 + extLen * 4;
     }
 
-    if (rtpPart.length < headerSize) {
+    if (rtpPart.length <= headerSize) {
       return null;
     }
 
@@ -324,9 +324,30 @@ export class PerSsrcSrtpDecryptor {
       state.lastSeq = seq;
     }
 
-    const plainRtp = new Uint8Array(headerSize + decryptedPayload.length);
+    const hasPadding = (rtpPart[0] & 0x20) !== 0;
+    let cleanPayload: Uint8Array = decryptedPayload;
+    let strippedPadding = false;
+    if (hasPadding && decryptedPayload.length > 0) {
+      const padLen = decryptedPayload[decryptedPayload.length - 1];
+      if (padLen > 0 && padLen <= decryptedPayload.length) {
+        cleanPayload = decryptedPayload.subarray(
+          0,
+          decryptedPayload.length - padLen
+        );
+        strippedPadding = true;
+      }
+    }
+
+    if (cleanPayload.length === 0) {
+      return null;
+    }
+
+    const plainRtp = new Uint8Array(headerSize + cleanPayload.length);
     plainRtp.set(rtpPart.subarray(0, headerSize), 0);
-    plainRtp.set(decryptedPayload, headerSize);
+    if (strippedPadding) {
+      plainRtp[0] = plainRtp[0] & ~0x20;
+    }
+    plainRtp.set(cleanPayload, headerSize);
     return plainRtp;
   }
 
@@ -917,11 +938,24 @@ export function syncPeerRecvKeysOnMediaSession(
     primaryRecv.sessionSalt instanceof Uint8Array &&
     primaryRecv.authKey instanceof Uint8Array
   ) {
+    const keyChanged =
+      !(videoRecv.sessionKey instanceof Uint8Array) ||
+      videoRecv.sessionKey.length !== primaryRecv.sessionKey.length ||
+      !videoRecv.sessionKey.every(
+        (b, idx) => b === (primaryRecv.sessionKey as Uint8Array)[idx]
+      );
     videoRecv.sessionKey = primaryRecv.sessionKey;
     videoRecv.sessionSalt = primaryRecv.sessionSalt;
     videoRecv.authKey = primaryRecv.authKey;
     if (typeof primaryRecv.authTagLen === 'number') {
       videoRecv.authTagLen = primaryRecv.authTagLen;
+    }
+    if (keyChanged) {
+      videoRecv.initialized = false;
+      videoRecv.roc = 0;
+      videoRecv.lastSeq = 0;
+      videoRecv.highestIndex = BigInt(0);
+      videoRecv.replayMask = BigInt(0);
     }
   }
 }
@@ -1221,29 +1255,40 @@ export class VoipCallRecorder {
   ): () => void {
     const cleanups: Array<() => void> = [];
 
+    let inCallAudioDispatch = false;
+    let inCallVideoDispatch = false;
+
     const onInboundAudio = (...args: unknown[]) => {
-      const pcmBuf = extractInboundMediaBuffer(...args);
-      if (!pcmBuf) return;
-      const sig = `${pcmBuf.length}:${pcmBuf[0] ?? 0}:${pcmBuf[pcmBuf.length - 1] ?? 0}:${Math.floor(Date.now() / 10)}`;
-      if (sig === this.lastNativeAudioSig && this.inAudioWriteHook) {
+      if (this.inAudioWriteHook || inCallAudioDispatch) {
         return;
       }
-      this.lastNativeAudioSig = sig;
-      this.writeDecodedInboundAudioPcm(pcmBuf);
+      const pcmBuf = extractInboundMediaBuffer(...args);
+      if (!pcmBuf) return;
+      inCallAudioDispatch = true;
+      try {
+        this.lastNativeAudioSig = `${pcmBuf.length}:${pcmBuf[0] ?? 0}:${pcmBuf[pcmBuf.length - 1] ?? 0}:${Math.floor(Date.now() / 10)}`;
+        this.writeDecodedInboundAudioPcm(pcmBuf);
+      } finally {
+        inCallAudioDispatch = false;
+      }
     };
 
     const onInboundVideo = (...args: unknown[]) => {
-      const h264Buf = extractInboundMediaBuffer(...args);
-      if (!h264Buf) return;
-      const sig = `${h264Buf.length}:${h264Buf[0] ?? 0}:${h264Buf[Math.min(4, h264Buf.length - 1)] ?? 0}:${h264Buf[h264Buf.length - 1] ?? 0}:${Math.floor(Date.now() / 10)}`;
-      if (sig === this.lastNativeVideoSig && this.inVideoWriteHook) {
+      if (this.inVideoWriteHook || inCallVideoDispatch) {
         return;
       }
-      this.lastNativeVideoSig = sig;
-      this.writeDepacketizedInboundVideoH264(h264Buf);
+      const h264Buf = extractInboundMediaBuffer(...args);
+      if (!h264Buf) return;
+      inCallVideoDispatch = true;
+      try {
+        this.lastNativeVideoSig = `${h264Buf.length}:${h264Buf[0] ?? 0}:${h264Buf[Math.min(4, h264Buf.length - 1)] ?? 0}:${h264Buf[h264Buf.length - 1] ?? 0}:${Math.floor(Date.now() / 10)}`;
+        this.writeDepacketizedInboundVideoH264(h264Buf);
+      } finally {
+        inCallVideoDispatch = false;
+      }
     };
 
-    for (const emitter of [callInstance, voip, coordinator]) {
+    for (const emitter of [callInstance, voip]) {
       if (emitter && typeof emitter.on === 'function') {
         emitter.on('inbound_audio', onInboundAudio);
         emitter.on('inbound_video', onInboundVideo);
@@ -1256,6 +1301,18 @@ export class VoipCallRecorder {
           }
         });
       }
+    }
+    if (coordinator && typeof coordinator.on === 'function') {
+      coordinator.on('call_inbound_audio', onInboundAudio);
+      coordinator.on('call_inbound_video', onInboundVideo);
+      cleanups.push(() => {
+        try {
+          coordinator.off?.('call_inbound_audio', onInboundAudio);
+          coordinator.off?.('call_inbound_video', onInboundVideo);
+        } catch {
+          // Ignore listener cleanup error
+        }
+      });
     }
 
     return () => {
@@ -1855,6 +1912,8 @@ export class VoipCallRecorder {
     }
 
     const nowMs = Date.now();
+    let droppedPreIdrFrames = 0;
+    let droppedUnwrittenKeyframes = 0;
     if (this.videoFd !== null && depacketized.annexBNalus.length > 0) {
       for (const naluWithStartCode of depacketized.annexBNalus) {
         if (naluWithStartCode.length <= 4) continue;
@@ -1872,6 +1931,7 @@ export class VoipCallRecorder {
 
         // Strict SPS/PPS/IDR gate: never write P-frames (NALU 1) before the first IDR (NALU 5)
         if (nalType === 1 && !this.hasWrittenFirstIdr) {
+          droppedPreIdrFrames++;
           continue;
         }
 
@@ -1883,6 +1943,9 @@ export class VoipCallRecorder {
               this.firstVideoFrameAtMs = nowMs;
             }
             this.lastVideoFrameAtMs = nowMs;
+          } else {
+            droppedPreIdrFrames++;
+            droppedUnwrittenKeyframes++;
           }
           continue;
         }
@@ -1894,8 +1957,22 @@ export class VoipCallRecorder {
             this.firstVideoFrameAtMs = nowMs;
           }
           this.lastVideoFrameAtMs = nowMs;
+        } else if (nalType === 1) {
+          droppedPreIdrFrames++;
         }
       }
+    }
+    if (droppedPreIdrFrames > 0) {
+      this.h264State.inboundVideoFramesRecorded = Math.max(
+        0,
+        this.h264State.inboundVideoFramesRecorded - droppedPreIdrFrames
+      );
+    }
+    if (droppedUnwrittenKeyframes > 0) {
+      this.h264State.inboundKeyframesRecorded = Math.max(
+        0,
+        this.h264State.inboundKeyframesRecorded - droppedUnwrittenKeyframes
+      );
     }
 
     if (depacketized.sequenceGap) {
@@ -2115,6 +2192,7 @@ export class VoipCallRecorder {
     const outputFilePath = path.join(this.recordingsDir, outputFileName);
 
     const hasRemoteVideoFrames =
+      this.hasWrittenFirstIdr &&
       this.inboundVideoFramesRecorded > 0 &&
       this.remoteVideoBytesWritten > 0 &&
       fs.existsSync(this.remoteVideoTempPath) &&

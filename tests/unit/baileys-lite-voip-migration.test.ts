@@ -1673,7 +1673,137 @@ describe('@hiroosy/baileys-lite & Real WhatsApp VoIP Video Call Suite', () => {
       await service.stopVideoCall('sess_lid_voip_fix', stream.callId);
       service.detachSession('sess_lid_voip_fix');
     });
+
+    it('awaits finalizeStreamRecording BEFORE emitting call:ended and resets videoSrtpSession.recvCtx replay/ROC when peer keys change', async () => {
+      const { syncReceiveOnlySrtpOnMediaSession } = await import(
+        '../../src/whatsapp/voip-runtime-patch'
+      );
+
+      // 1. Verify replay/ROC state resets on peer key switch without touching sendCtx
+      const randBytes = (len: number) =>
+        crypto.getRandomValues(new Uint8Array(len));
+      const initialLocalKey = randBytes(16);
+      const newPeerKey = randBytes(16);
+      const sendKey = randBytes(16);
+      const fakeNativeSession: Record<string, unknown> = {
+        srtpSession: {
+          recvCtx: {
+            sessionKey: newPeerKey,
+            sessionSalt: randBytes(14),
+            authKey: randBytes(20),
+            authTagLen: 10,
+          },
+        },
+        videoSrtpSession: {
+          sendCtx: {
+            sessionKey: sendKey,
+            sessionSalt: randBytes(14),
+            authKey: randBytes(20),
+            authTagLen: 4,
+          },
+          recvCtx: {
+            sessionKey: initialLocalKey,
+            sessionSalt: randBytes(14),
+            authKey: randBytes(20),
+            authTagLen: 4,
+            initialized: true,
+            roc: 5,
+            lastSeq: 900,
+            highestIndex: BigInt(900),
+            replayMask: BigInt(0xff),
+          },
+        },
+      };
+
+      syncReceiveOnlySrtpOnMediaSession(fakeNativeSession);
+      const videoSrtp = fakeNativeSession.videoSrtpSession as {
+        sendCtx: { sessionKey: Uint8Array };
+        recvCtx: {
+          sessionKey: Uint8Array;
+          initialized: boolean;
+          roc: number;
+          lastSeq: number;
+          highestIndex: bigint;
+          replayMask: bigint;
+        };
+      };
+      assert.deepEqual(videoSrtp.sendCtx.sessionKey, sendKey);
+      assert.deepEqual(videoSrtp.recvCtx.sessionKey, newPeerKey);
+      assert.equal(videoSrtp.recvCtx.initialized, false);
+      assert.equal(videoSrtp.recvCtx.roc, 0);
+      assert.equal(videoSrtp.recvCtx.lastSeq, 0);
+      assert.equal(videoSrtp.recvCtx.highestIndex, BigInt(0));
+      assert.equal(videoSrtp.recvCtx.replayMask, BigInt(0));
+
+      // 2. Verify RealVideoCallService awaits finalizeStreamRecording BEFORE emitting call:ended
+      const service = new RealVideoCallService();
+      service.setCompatibilityOverride(
+        runBaileysCompatibilityProbe({ requireLiveSocket: false })
+      );
+
+      const rawSocket = {
+        authState: { creds: { me: { id: '966500000000@s.whatsapp.net' } } },
+        ev: new EventEmitter(),
+        ws: { send: async () => undefined },
+      };
+      service.attachSession('sess_finalize_order', rawSocket);
+
+      const harness = createRealisticHiroosyVoipMock();
+      const attachedMap = (
+        service as unknown as {
+          attachedSessions: Map<string, { voipInstance?: unknown }>;
+        }
+      ).attachedSessions;
+      attachedMap.get('sess_finalize_order')!.voipInstance = harness.voipMock;
+
+      const eventOrder: string[] = [];
+      service.on('call:recording-ready', () => {
+        eventOrder.push('recording-ready');
+      });
+      service.on('call:recording-no-remote-camera', () => {
+        eventOrder.push('recording-no-remote-camera');
+      });
+
+      const endedPromise = new Promise<{
+        state: string;
+        recordingStatus?: string;
+      }>((resolve) => {
+        service.once('call:ended', (payload: { callId: string; state: string }) => {
+          eventOrder.push('call:ended');
+          const status = service.getCallStatus(payload.callId);
+          resolve({
+            state: payload.state,
+            recordingStatus: status?.recordingStatus,
+          });
+        });
+      });
+
+      const stream = await service.startVideoCall({
+        sessionId: 'sess_finalize_order',
+        socket: rawSocket,
+        recipientJid: '966501234567@s.whatsapp.net',
+        videoFilePath: validLandscapeMp4,
+        allowedRootDirs: [tmpDir],
+        recordCall: true,
+      });
+
+      const callInst = harness.createdCallInstances[0]!;
+      callInst.emit('ended', 'completed');
+
+      const endedResult = await endedPromise;
+      assert.equal(endedResult.state, 'ENDED');
+      assert.equal(endedResult.recordingStatus, 'NO_REMOTE_CAMERA');
+      assert.deepEqual(
+        eventOrder,
+        ['recording-no-remote-camera', 'call:ended'],
+        'Recording finalization MUST complete and emit recording event BEFORE call:ended fires'
+      );
+      assert.equal(stream.recordingStatus, 'NO_REMOTE_CAMERA');
+
+      service.detachSession('sess_finalize_order');
+    });
   });
 });
+
 
 

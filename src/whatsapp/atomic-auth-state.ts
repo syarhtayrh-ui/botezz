@@ -275,6 +275,27 @@ export async function createAtomicMultiFileAuthState(
     }
   }
 
+  let inTransactionDepth = 0;
+  const txQueues = new Map<string, { runExclusive<T>(fn: () => Promise<T>): Promise<T> }>();
+  const getTxLock = (key = '__default_tx__') => {
+    let lock = txQueues.get(key);
+    if (!lock) {
+      let queue: Promise<void> = Promise.resolve();
+      lock = {
+        runExclusive<T>(fn: () => Promise<T>): Promise<T> {
+          const next = queue.then(fn, fn);
+          queue = next.then(
+            () => undefined,
+            () => undefined
+          );
+          return next;
+        },
+      };
+      txQueues.set(key, lock);
+    }
+    return lock;
+  };
+
   return {
     recoveredFromBackup,
     state: {
@@ -311,6 +332,21 @@ export async function createAtomicMultiFileAuthState(
             }
           }
           await Promise.all(tasks);
+        },
+        isInTransaction: () => inTransactionDepth > 0,
+        transaction: async <T>(
+          work: () => Promise<T>,
+          key = '__default_tx__'
+        ): Promise<T> => {
+          const txLock = getTxLock(key);
+          return txLock.runExclusive(async () => {
+            inTransactionDepth++;
+            try {
+              return await work();
+            } finally {
+              inTransactionDepth = Math.max(0, inTransactionDepth - 1);
+            }
+          });
         },
       },
     },

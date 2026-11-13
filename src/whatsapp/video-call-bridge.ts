@@ -163,6 +163,8 @@ export interface ActiveVideoCallStream {
   recordingDeliveredToTelegram?: boolean;
   recorder?: VoipCallRecorder;
   __recordingReadyEmitted?: boolean;
+  __endedEventEmitted?: boolean;
+  __terminalizePromise?: Promise<void>;
   startedAt: string;
   connectedAt?: string;
   endedAt?: string;
@@ -258,6 +260,23 @@ export class RealVideoCallService extends EventEmitter {
       stream.recordedVideoSizeBytes = summary.recordedVideoSizeBytes;
       stream.recordedDurationSeconds = summary.recordedDurationSeconds;
     }
+  }
+
+  private emitCallEndedSafely(
+    stream: ActiveVideoCallStream,
+    payload: {
+      callId: string;
+      voipCallId?: string;
+      sessionId: string;
+      state: RealCallState;
+      reason: string;
+    }
+  ): void {
+    if (stream.__endedEventEmitted) {
+      return;
+    }
+    stream.__endedEventEmitted = true;
+    this.emit('call:ended', payload);
   }
 
   private async finalizeStreamRecording(
@@ -528,6 +547,21 @@ export class RealVideoCallService extends EventEmitter {
       ctx.activeCallInstances.clear();
     }
 
+    if (
+      !isFullVoipDispose &&
+      voipInstance instanceof Voip &&
+      typeof voipInstance.end === 'function' &&
+      !this.getActiveStreamForSession(sessionId)
+    ) {
+      // Clear lingering entries from Voip.#calls so consecutive calls never hit "Maximum concurrent calls reached (1)"
+      // while leaving coordinator listeners intact for session reuse.
+      try {
+        await Promise.resolve(voipInstance.end(true)).catch(() => undefined);
+      } catch {
+        // Ignore end(true) error
+      }
+    }
+
     if (isFullVoipDispose) {
       // 3. Force-clear Voip.#calls via end(true)
       if (voipInstance && typeof voipInstance.end === 'function') {
@@ -609,14 +643,17 @@ export class RealVideoCallService extends EventEmitter {
             this.transitionCallState(stream, 'MEDIA_STOPPED');
           }
           this.transitionCallState(stream, 'ENDED', 'session_detached');
-          this.emit('call:ended', {
+        }
+        this.archiveCompletedStream(stream);
+        stream.__terminalizePromise = (async () => {
+          await this.finalizeStreamRecording(stream);
+          this.emitCallEndedSafely(stream, {
             callId: stream.callId,
             sessionId,
             state: 'ENDED',
             reason: 'session_detached',
           });
-        }
-        this.archiveCompletedStream(stream);
+        })();
       }
     }
 
@@ -1067,11 +1104,12 @@ export class RealVideoCallService extends EventEmitter {
     } catch (err) {
       this.clearCallTimers(callId);
       await this.teardownSessionVoipInstance(req.sessionId, streamRecord);
+      await this.finalizeStreamRecording(streamRecord);
       const reason = err instanceof Error ? err.message : String(err);
       if (!this.isTerminalState(streamRecord.callState)) {
         this.transitionCallState(streamRecord, 'FAILED', reason);
         streamRecord.detailsArabic = `❌ فشل بدء المكالمة عبر VoIP: ${reason}`;
-        this.emit('call:ended', {
+        this.emitCallEndedSafely(streamRecord, {
           callId,
           sessionId: req.sessionId,
           state: 'FAILED',
@@ -1541,15 +1579,18 @@ export class RealVideoCallService extends EventEmitter {
           error: mediaErr,
           reason,
         });
-        this.emit('call:ended', {
-          callId: stream.callId,
-          voipCallId: stream.voipCallId,
-          sessionId: stream.sessionId,
-          state: 'FAILED',
-          reason,
-        });
 
-        void hangupActiveCallSafely();
+        stream.__terminalizePromise = (async () => {
+          await hangupActiveCallSafely();
+          await this.finalizeStreamRecording(stream);
+          this.emitCallEndedSafely(stream, {
+            callId: stream.callId,
+            voipCallId: stream.voipCallId,
+            sessionId: stream.sessionId,
+            state: 'FAILED',
+            reason,
+          });
+        })();
       }, mediaStartTimeoutMs);
 
       if (typeof mediaTimeout.unref === 'function') {
@@ -1731,14 +1772,16 @@ export class RealVideoCallService extends EventEmitter {
         stream.detailsArabic = `🛑 انتهت المكالمة المرئية (${reason}).`;
       }
 
-      this.emit('call:ended', {
-        callId: stream.callId,
-        sessionId: stream.sessionId,
-        state: stream.callState,
-        reason,
-      });
-      void this.finalizeStreamRecording(stream);
-      void this.teardownSessionVoipInstance(stream.sessionId, stream);
+      stream.__terminalizePromise = (async () => {
+        await this.teardownSessionVoipInstance(stream.sessionId, stream);
+        await this.finalizeStreamRecording(stream);
+        this.emitCallEndedSafely(stream, {
+          callId: stream.callId,
+          sessionId: stream.sessionId,
+          state: stream.callState,
+          reason,
+        });
+      })();
     };
 
     const handleError = (errInput: unknown) => {
@@ -1770,14 +1813,17 @@ export class RealVideoCallService extends EventEmitter {
         error: err,
         classification,
       });
-      this.emit('call:ended', {
-        callId: stream.callId,
-        sessionId: stream.sessionId,
-        state: 'FAILED',
-        reason: classification.summary,
-      });
-      void this.finalizeStreamRecording(stream);
-      void hangupActiveCallSafely();
+      const hangupPromise = hangupActiveCallSafely();
+      stream.__terminalizePromise = (async () => {
+        await hangupPromise;
+        await this.finalizeStreamRecording(stream);
+        this.emitCallEndedSafely(stream, {
+          callId: stream.callId,
+          sessionId: stream.sessionId,
+          state: 'FAILED',
+          reason: classification.summary,
+        });
+      })();
     };
 
     // Official WaVoipCoordinator listeners (`call_state`, `call_ended`, `call_error`, `call_video_state`, `call_outbound_audio_finished`)
@@ -1902,93 +1948,16 @@ export class RealVideoCallService extends EventEmitter {
       });
     };
 
-    const extractMediaBuffer = (...args: unknown[]): Buffer | null => {
-      for (const arg of args) {
-        if (Buffer.isBuffer(arg) && arg.length > 0) return arg;
-        if (arg instanceof Uint8Array && arg.byteLength > 0) {
-          return Buffer.from(arg.buffer, arg.byteOffset, arg.byteLength);
-        }
-        if (arg instanceof Int16Array && arg.byteLength > 0) {
-          return Buffer.from(arg.buffer, arg.byteOffset, arg.byteLength);
-        }
-        if (arg instanceof Float32Array && arg.length > 0) {
-          const int16 = new Int16Array(arg.length);
-          for (let i = 0; i < arg.length; i++) {
-            const clamped = Math.max(-1, Math.min(1, arg[i]));
-            int16[i] = clamped < 0 ? clamped * 0x8000 : clamped * 0x7fff;
-          }
-          return Buffer.from(int16.buffer, int16.byteOffset, int16.byteLength);
-        }
-        if (arg && typeof arg === 'object') {
-          const candidate =
-            (
-              arg as {
-                data?: unknown;
-                frame?: unknown;
-                pcm?: unknown;
-                payload?: unknown;
-              }
-            ).data ||
-            (arg as { frame?: unknown }).frame ||
-            (arg as { pcm?: unknown }).pcm ||
-            (arg as { payload?: unknown }).payload;
-          if (Buffer.isBuffer(candidate) && candidate.length > 0) {
-            return candidate;
-          }
-          if (candidate instanceof Uint8Array && candidate.byteLength > 0) {
-            return Buffer.from(
-              candidate.buffer,
-              candidate.byteOffset,
-              candidate.byteLength
-            );
-          }
-          if (candidate instanceof Int16Array && candidate.byteLength > 0) {
-            return Buffer.from(
-              candidate.buffer,
-              candidate.byteOffset,
-              candidate.byteLength
-            );
-          }
-        }
-      }
-      return null;
-    };
-
-    const handleInboundVideo = (...args: unknown[]) => {
-      const h264Buf = extractMediaBuffer(...args);
-      if (h264Buf) {
-        try {
-          stream.recorder?.writeDepacketizedInboundVideoH264(h264Buf);
-        } catch {
-          // Ignore recorder tap error
-        }
-      }
-    };
-
-    const handleInboundAudio = (...args: unknown[]) => {
-      const pcmBuf = extractMediaBuffer(...args);
-      if (pcmBuf) {
-        try {
-          stream.recorder?.writeDecodedInboundAudioPcm(pcmBuf);
-        } catch {
-          // Ignore recorder tap error
-        }
-      }
-    };
-
-    if (voip && typeof voip.on === 'function') {
-      voip.on('inbound_video', handleInboundVideo);
-      voip.on('inbound_audio', handleInboundAudio);
-    }
-    if (coordinator && typeof coordinator.on === 'function') {
-      coordinator.on('inbound_video', handleInboundVideo);
-      coordinator.on('inbound_audio', handleInboundAudio);
-    }
+    let detachRecorderFromCall: (() => void) | undefined;
 
     this.callListenerCleanups.set(stream.callId, () => {
-      if (voip && typeof voip.off === 'function') {
-        voip.off('inbound_video', handleInboundVideo);
-        voip.off('inbound_audio', handleInboundAudio);
+      if (detachRecorderFromCall) {
+        try {
+          detachRecorderFromCall();
+        } catch {
+          // Ignore recorder listener cleanup error
+        }
+        detachRecorderFromCall = undefined;
       }
       if (coordinator && typeof coordinator.off === 'function') {
         coordinator.off('call_state', onCoordinatorCallState);
@@ -1999,16 +1968,12 @@ export class RealVideoCallService extends EventEmitter {
           'call_outbound_audio_finished',
           onCoordinatorOutboundAudioFinished
         );
-        coordinator.off('inbound_video', handleInboundVideo);
-        coordinator.off('inbound_audio', handleInboundAudio);
       }
       if (callInstance && typeof callInstance.off === 'function') {
         callInstance.off('ringing', handleRinging);
         callInstance.off('connected', handleConnected);
         callInstance.off('item', handleItem);
         callInstance.off('downgraded', handleDowngraded);
-        callInstance.off('inbound_video', handleInboundVideo);
-        callInstance.off('inbound_audio', handleInboundAudio);
         callInstance.off('ended', handleEnded);
         callInstance.off('error', handleError);
         callInstance.off('media_outbound_started', onExplicitOutboundMedia);
@@ -2216,7 +2181,13 @@ export class RealVideoCallService extends EventEmitter {
         const prepared = await driverWithPrepare
           .preparePeerForVoipCall(sanitizedTargetJid)
           .catch(() => undefined);
-        if (prepared?.dialTargetJid) {
+        // `Voip.call()` strips all non-digits to build the phone number JID; NEVER replace a valid PN with @lid digits!
+        if (prepared?.pnJid) {
+          sanitizedTargetJid = prepared.pnJid.replace(/:\d+@/, '@');
+        } else if (
+          prepared?.dialTargetJid &&
+          !prepared.dialTargetJid.endsWith('@lid')
+        ) {
           sanitizedTargetJid = prepared.dialTargetJid;
         }
       } else {
@@ -2282,6 +2253,19 @@ export class RealVideoCallService extends EventEmitter {
         }
       }
 
+      // Ensure no stale entry remains in Voip.#calls when placing a new call on a reused Voip instance
+      if (voip instanceof Voip && typeof voip.end === 'function') {
+        const otherActive = Array.from(this.activeStreams.values()).some(
+          (s) =>
+            s.sessionId === stream.sessionId &&
+            s.callId !== stream.callId &&
+            !this.isTerminalState(s.callState)
+        );
+        if (!otherActive) {
+          await Promise.resolve(voip.end(true)).catch(() => undefined);
+        }
+      }
+
       const callResult = await voip.call(
         sanitizedTargetJid,
         mediaPayload as never,
@@ -2301,12 +2285,17 @@ export class RealVideoCallService extends EventEmitter {
         callInstance.on('connected', handleConnected);
         callInstance.on('item', handleItem);
         callInstance.on('downgraded', handleDowngraded);
-        callInstance.on('inbound_video', handleInboundVideo);
-        callInstance.on('inbound_audio', handleInboundAudio);
         callInstance.on('ended', handleEnded);
         callInstance.on('error', handleError);
         callInstance.on('media_outbound_started', onExplicitOutboundMedia);
       }
+    }
+    if (stream.recorder) {
+      detachRecorderFromCall = stream.recorder.attachToCallInstance(
+        callInstance,
+        voip,
+        null
+      );
     }
 
     const voipCallId =
@@ -2393,11 +2382,12 @@ export class RealVideoCallService extends EventEmitter {
     } catch (err) {
       this.clearCallTimers(stream.callId);
       await this.teardownSessionVoipInstance(stream.sessionId, stream);
+      await this.finalizeStreamRecording(stream);
       const classification = classifyEngineeringFailure(err);
       if (!this.isTerminalState(stream.callState)) {
         this.transitionCallState(stream, 'FAILED', classification.summary);
         stream.detailsArabic = `❌ فشل بدء المكالمة عبر VoIP: ${classification.reasonArabic}`;
-        this.emit('call:ended', {
+        this.emitCallEndedSafely(stream, {
           callId: stream.callId,
           sessionId: stream.sessionId,
           state: 'FAILED',
@@ -2619,12 +2609,15 @@ export class RealVideoCallService extends EventEmitter {
           sessionId,
           reason,
         });
-        this.emit('call:ended', {
-          callId: stream.callId,
-          sessionId,
-          state: 'FAILED',
-          reason,
-        });
+        stream.__terminalizePromise = (async () => {
+          await this.finalizeStreamRecording(stream);
+          this.emitCallEndedSafely(stream, {
+            callId: stream.callId,
+            sessionId,
+            state: 'FAILED',
+            reason,
+          });
+        })();
       }
     }
   }
@@ -2717,6 +2710,11 @@ export class RealVideoCallService extends EventEmitter {
       // Ignore simulated termination error
     }
 
+    // Await any in-progress async terminalization (teardown + recording finalization) BEFORE cleanup/emit
+    if (stream.__terminalizePromise) {
+      await stream.__terminalizePromise.catch(() => undefined);
+    }
+
     // Finalize two-way call recording BEFORE optionally deleting the source video file
     await this.finalizeStreamRecording(stream);
 
@@ -2753,13 +2751,19 @@ export class RealVideoCallService extends EventEmitter {
       }
       this.transitionCallState(stream, 'ENDED', reason);
       stream.detailsArabic = `🛑 تم إنهاء المكالمة المرئية (${reason}).`;
-      this.emit('call:ended', {
+      this.emitCallEndedSafely(stream, {
         callId: stream.callId,
         sessionId: stream.sessionId,
         state: 'ENDED',
         reason,
       });
     } else {
+      this.emitCallEndedSafely(stream, {
+        callId: stream.callId,
+        sessionId: stream.sessionId,
+        state: stream.callState,
+        reason,
+      });
       this.archiveCompletedStream(stream);
     }
 

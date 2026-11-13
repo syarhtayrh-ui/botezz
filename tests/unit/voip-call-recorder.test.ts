@@ -1116,5 +1116,195 @@ describe('Two-Way VoIP Video Call Recording (VoipCallRecorder)', () => {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
   });
+
+  it('decrypts 10-byte SRTP video packets carrying RTP Header Extension (X=1, 0xBEDE) + RTP Padding (P=1) and strips padding without leaking into remote_video.h264', async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'botezz-srtp-ext-pad-'));
+    try {
+      const recorder = new VoipCallRecorder({
+        callId: 'vcall_srtp_ext_pad',
+        sessionId: 'sess_ext_pad',
+        recipientJid: '966501234567@s.whatsapp.net',
+        outboundVideoPath: path.join(tmpDir, 'unused_outbound.mp4'),
+        recordingsDir: tmpDir,
+        isMockMode: false,
+      });
+
+      const peerKeys10: SrtpKeyMaterial = {
+        sessionKey: crypto.randomBytes(16),
+        sessionSalt: crypto.randomBytes(14),
+        authKey: crypto.randomBytes(20),
+        authTagLen: 10,
+      };
+      const fakeSession: Record<string, unknown> = {
+        srtpSession: { recvCtx: peerKeys10 },
+        videoSrtpSession: { recvCtx: peerKeys10 },
+      };
+
+      const sps = new Uint8Array([0x67, 0x42, 0xc0, 0x1f, 0xda, 0x02, 0x80, 0x2d]);
+      const pps = new Uint8Array([0x68, 0xce, 0x3c, 0x80]);
+      const stapPayload = new Uint8Array(1 + 2 + sps.length + 2 + pps.length);
+      stapPayload[0] = 24;
+      stapPayload[1] = 0;
+      stapPayload[2] = sps.length;
+      stapPayload.set(sps, 3);
+      const ppsOff = 3 + sps.length;
+      stapPayload[ppsOff] = 0;
+      stapPayload[ppsOff + 1] = pps.length;
+      stapPayload.set(pps, ppsOff + 2);
+
+      // Packet 1: STAP-A(SPS+PPS) with CVO 0xBEDE extension AND 4 bytes of encrypted RTP padding
+      const encStap = protectRtpForTest(
+        buildRawRtpPacket({
+          payloadType: 96,
+          seq: 101,
+          timestamp: 9000,
+          ssrc: 0x778899aa,
+          payload: stapPayload,
+          extension: new Uint8Array([0x10, 0x00, 0x00, 0x00]),
+          paddingLen: 4,
+        }),
+        peerKeys10
+      );
+
+      // Packet 2: FU-A IDR fragment start + end with 0xBEDE extension AND 3 bytes of encrypted RTP padding
+      const idrFull = new Uint8Array([0x65, 0x88, 0x84, 0x21, 0xa0, 0xbb, 0xcc]);
+      const fua1 = new Uint8Array([0x7c, 0x85, ...idrFull.subarray(1, 4)]);
+      const fua2 = new Uint8Array([0x7c, 0x45, ...idrFull.subarray(4)]);
+
+      const encFua1 = protectRtpForTest(
+        buildRawRtpPacket({
+          payloadType: 96,
+          seq: 102,
+          timestamp: 9000,
+          ssrc: 0x778899aa,
+          payload: fua1,
+          extension: new Uint8Array([0x21, 0x01, 0x00, 0x00]),
+          paddingLen: 2,
+        }),
+        peerKeys10
+      );
+      const encFua2 = protectRtpForTest(
+        buildRawRtpPacket({
+          payloadType: 96,
+          seq: 103,
+          timestamp: 9000,
+          ssrc: 0x778899aa,
+          marker: true,
+          payload: fua2,
+          extension: new Uint8Array([0x21, 0x01, 0x00, 0x00]),
+          paddingLen: 3,
+        }),
+        peerKeys10
+      );
+
+      const dec1 = recorder.handleInboundVideoPacket(encStap, fakeSession);
+      assert.ok(dec1);
+      assert.deepEqual(dec1.nalTypes, [7, 8]);
+
+      recorder.handleInboundVideoPacket(encFua1, fakeSession);
+      const dec3 = recorder.handleInboundVideoPacket(encFua2, fakeSession);
+      assert.ok(dec3);
+      assert.deepEqual(dec3.nalTypes, [5]);
+
+      const rawH264 = fs.readFileSync(recorder.remoteVideoTempPath);
+      const expectedExact = Buffer.concat([
+        Buffer.from([0x00, 0x00, 0x00, 0x01]),
+        Buffer.from(sps),
+        Buffer.from([0x00, 0x00, 0x00, 0x01]),
+        Buffer.from(pps),
+        Buffer.from([0x00, 0x00, 0x00, 0x01]),
+        Buffer.from(idrFull),
+      ]);
+      assert.deepEqual(
+        rawH264,
+        expectedExact,
+        'Encrypted RTP padding bytes must never leak into remote_video.h264'
+      );
+
+      recorder.recordInboundAudioPcm(new Int16Array(320).fill(512), Date.now());
+      const summary = await recorder.finalizeRecording();
+      assert.equal(summary.recordingStatus, 'READY');
+      assert.equal(summary.inboundVideoFramesRecorded, 1);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('deduplicates synchronous delegate.emitInboundVideo/onDecodedAudio and inbound_video/inbound_audio events so frames and PCM chunks are never written twice', async () => {
+    const { EventEmitter } = await import('node:events');
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'botezz-dedup-'));
+    try {
+      const recorder = new VoipCallRecorder({
+        callId: 'vcall_dedup_1',
+        sessionId: 'sess_dedup_1',
+        recipientJid: '966501234567@s.whatsapp.net',
+        outboundVideoPath: path.join(tmpDir, 'unused.mp4'),
+        recordingsDir: tmpDir,
+        isMockMode: false,
+      });
+
+      const fakeCallInstance = new EventEmitter();
+      const fakeVoip = new EventEmitter();
+      const fakeCoordinator = new EventEmitter();
+
+      const fakeSession: Record<string, unknown> = {
+        delegate: {
+          emitInboundVideo(info: unknown, au: Uint8Array) {
+            // Replicate WaCallManager -> coordinator -> VoipCall synchronous forwarding
+            fakeCoordinator.emit('call_inbound_video', info, au);
+            fakeCallInstance.emit('inbound_video', au);
+            fakeVoip.emit('inbound_video', au);
+          },
+        },
+        onDecodedAudio(pcm: Int16Array | Float32Array) {
+          fakeCoordinator.emit('call_inbound_audio', { callId: 'vcall_dedup_1' }, pcm);
+          fakeCallInstance.emit('inbound_audio', pcm);
+          fakeVoip.emit('inbound_audio', pcm);
+        },
+      };
+
+      recorder.attachToMediaSession(fakeSession);
+      const cleanup = recorder.attachToCallInstance(
+        fakeCallInstance,
+        fakeVoip,
+        fakeCoordinator
+      );
+
+      // Emit a single Access Unit (SPS + PPS + IDR) via delegate.emitInboundVideo
+      const au = Buffer.from([
+        0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0xc0, 0x1f, 0xda, 0x02, 0x80, 0x2d,
+        0x00, 0x00, 0x00, 0x01, 0x68, 0xce, 0x3c, 0x80,
+        0x00, 0x00, 0x00, 0x01, 0x65, 0x88, 0x84, 0x21, 0xa0,
+      ]);
+      (
+        fakeSession.delegate as {
+          emitInboundVideo: (info: unknown, au: Uint8Array) => void;
+        }
+      ).emitInboundVideo({ callId: 'vcall_dedup_1' }, au);
+
+      // Emit a single decoded audio frame via onDecodedAudio
+      const pcm = new Int16Array(320).fill(777);
+      (
+        fakeSession.onDecodedAudio as (pcm: Int16Array) => void
+      )(pcm);
+
+      assert.equal(
+        recorder.inboundVideoFramesRecorded,
+        1,
+        'Single video frame forwarded across delegate + coordinator + callInstance + voip must be recorded exactly once'
+      );
+      assert.equal(
+        recorder.inboundAudioPacketsRecorded,
+        1,
+        'Single audio chunk forwarded across onDecodedAudio + coordinator + callInstance + voip must be recorded exactly once'
+      );
+      assert.equal(recorder.remoteAudioBytesWritten, 640);
+
+      cleanup();
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
 });
+
 

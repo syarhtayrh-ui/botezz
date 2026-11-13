@@ -27,6 +27,7 @@ import {
 import { redactText, maskPhoneNumber } from '../security/redaction';
 import { calculateBackoffDelay } from '../utils/retry';
 import { createLogger } from '../logging/logger';
+import { AnonymousSessionEngine } from './anonymous-session-engine';
 
 const log = createLogger('session-manager');
 
@@ -100,6 +101,7 @@ export class SessionManager {
     NonNullable<ConnectionEventCallbacks['onIncomingMessage']>
   >();
   private isShuttingDown = false;
+  private anonymousSessionEngine: AnonymousSessionEngine;
 
   constructor(
     private readonly sessionRepo: SessionRepository,
@@ -116,6 +118,17 @@ export class SessionManager {
     this.defaultAutoCompleteInMock = options?.defaultAutoCompleteInMock ?? true;
     this.configuredAdminId = options?.configuredAdminId ?? 0;
     this.onDisconnectAlert = options?.onDisconnectAlert;
+    this.anonymousSessionEngine = new AnonymousSessionEngine(
+      this.sessionRepo.getDatabase()
+    );
+  }
+
+  public setAnonymousSessionEngine(engine: AnonymousSessionEngine): void {
+    this.anonymousSessionEngine = engine;
+  }
+
+  public getAnonymousSessionEngine(): AnonymousSessionEngine {
+    return this.anonymousSessionEngine;
   }
 
   private runSessionExclusive<T>(
@@ -184,6 +197,127 @@ export class SessionManager {
     };
   }
 
+  private extractRelayCandidateFields(rawMessage: Record<string, unknown>): {
+    fromMe: boolean;
+    fromJid: string;
+    senderLidJid?: string;
+    text: string;
+    quotedMessageId?: string;
+  } {
+    const key = (rawMessage.key || {}) as {
+      fromMe?: boolean;
+      remoteJid?: string;
+      remoteJidAlt?: string;
+      participant?: string;
+      participantAlt?: string;
+    };
+    const fromMe = Boolean(key.fromMe);
+    const fromJid = String(
+      key.participant || key.remoteJid || key.remoteJidAlt || ''
+    ).trim();
+    const lidCandidate = [
+      key.participant,
+      key.participantAlt,
+      key.remoteJid,
+      key.remoteJidAlt,
+    ].find((j) => typeof j === 'string' && j.endsWith('@lid'));
+
+    let msg = rawMessage.message as Record<string, unknown> | undefined;
+    if (msg?.ephemeralMessage && typeof msg.ephemeralMessage === 'object') {
+      msg = (msg.ephemeralMessage as { message?: Record<string, unknown> })
+        .message;
+    } else if (
+      msg?.viewOnceMessage &&
+      typeof msg.viewOnceMessage === 'object'
+    ) {
+      msg = (msg.viewOnceMessage as { message?: Record<string, unknown> })
+        .message;
+    } else if (
+      msg?.viewOnceMessageV2 &&
+      typeof msg.viewOnceMessageV2 === 'object'
+    ) {
+      msg = (msg.viewOnceMessageV2 as { message?: Record<string, unknown> })
+        .message;
+    }
+
+    let text = '';
+    let quotedMessageId: string | undefined;
+    if (msg && typeof msg === 'object') {
+      if (typeof msg.conversation === 'string') {
+        text = msg.conversation;
+      } else if (
+        msg.extendedTextMessage &&
+        typeof msg.extendedTextMessage === 'object'
+      ) {
+        const ext = msg.extendedTextMessage as {
+          text?: string;
+          contextInfo?: { stanzaId?: string };
+        };
+        text = typeof ext.text === 'string' ? ext.text : '';
+        quotedMessageId = ext.contextInfo?.stanzaId;
+      } else {
+        const mediaObj =
+          (msg.imageMessage as Record<string, unknown> | undefined) ||
+          (msg.videoMessage as Record<string, unknown> | undefined) ||
+          (msg.documentMessage as Record<string, unknown> | undefined);
+        if (mediaObj) {
+          text = typeof mediaObj.caption === 'string' ? mediaObj.caption : '';
+          const ci = mediaObj.contextInfo as { stanzaId?: string } | undefined;
+          quotedMessageId = ci?.stanzaId;
+        }
+      }
+      if (!quotedMessageId) {
+        const ci = msg.messageContextInfo as { stanzaId?: string } | undefined;
+        quotedMessageId = ci?.stanzaId;
+      }
+    }
+
+    return {
+      fromMe,
+      fromJid,
+      senderLidJid: lidCandidate,
+      text: text.trim(),
+      quotedMessageId,
+    };
+  }
+
+  private async handleAnonymousIncomingRelay(
+    params: Parameters<NonNullable<ConnectionEventCallbacks['onIncomingMessage']>>[0]
+  ): Promise<void> {
+    if (this.isShuttingDown) return;
+    const candidate = this.extractRelayCandidateFields(params.rawMessage);
+    if (candidate.fromMe || !candidate.fromJid || !candidate.text) {
+      return;
+    }
+    const driver = this.drivers.get(params.sessionId);
+    if (!driver || typeof driver.deliverRelayPayload !== 'function') {
+      return;
+    }
+
+    await this.anonymousSessionEngine.handleIncomingRelayCandidate({
+      sessionId: params.sessionId,
+      fromJid: candidate.fromJid,
+      senderLidJid: candidate.senderLidJid,
+      text: candidate.text,
+      quotedMessageId: candidate.quotedMessageId,
+      fromMe: candidate.fromMe,
+      deliver: async (req) => {
+        const res = await driver.deliverRelayPayload!({
+          targetJid: req.targetJid,
+          preferLid: req.preferLid,
+          content: req.content,
+          quotedMessageId: req.quotedMessageId,
+          customPushName: req.customPushName,
+        });
+        return {
+          messageId: res.messageId,
+          deliveredToJid: res.deliveredToJid,
+          addressingMode: res.addressingMode,
+        };
+      },
+    });
+  }
+
   private dispatchIncomingMessage(
     params: Parameters<NonNullable<ConnectionEventCallbacks['onIncomingMessage']>>[0]
   ): void {
@@ -197,6 +331,13 @@ export class SessionManager {
         });
       }
     }
+
+    void this.handleAnonymousIncomingRelay(params).catch((err) => {
+      log.warn('Error dispatching incoming message to AnonymousSessionEngine', {
+        sessionId: params.sessionId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    });
   }
 
   private nextGeneration(sessionId: string): number {
