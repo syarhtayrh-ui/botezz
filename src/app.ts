@@ -1,4 +1,5 @@
-import { validateEnv } from './config/env';
+import path from 'node:path';
+import { validateEnv, loadDotEnvIntoProcessEnv } from './config/env';
 import { AppDatabase } from './database/database';
 import { SessionRepository } from './database/repositories/session-repository';
 import { TaskRepository } from './database/repositories/task-repository';
@@ -48,11 +49,13 @@ export async function assertSupportedNodeSqliteRuntime(
  */
 export async function startStandaloneBotApplication(): Promise<void> {
   await assertSupportedNodeSqliteRuntime();
+  const envLoadResult = loadDotEnvIntoProcessEnv();
   const config = validateEnv(process.env);
   const shutdownManager = new ShutdownManager();
 
   log.info('Starting WhatsApp Multi-Session Management System (@hiroosy/baileys-lite)...', {
     nodeEnv: config.NODE_ENV,
+    envLoadedFrom: envLoadResult.loadedFrom || 'process.env',
     maxConcurrentTasks: config.MAX_CONCURRENT_TASKS,
   });
 
@@ -170,7 +173,7 @@ export async function startStandaloneBotApplication(): Promise<void> {
 if (
   typeof process !== 'undefined' &&
   process.argv[1] &&
-  process.argv[1].endsWith('src/app.ts')
+  path.resolve(process.argv[1]).endsWith(path.join('src', 'app.ts'))
 ) {
   startStandaloneBotApplication().catch((err) => {
     log.error('Fatal startup error', {

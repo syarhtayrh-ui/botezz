@@ -54,7 +54,13 @@ next-env.d.ts
 /data/tmp/
 /data/temp_uploads/
 /data/downloads/
+/data/recordings/
+/data/forensics/
 !/data/.gitkeep
+
+# PM2 runtime config
+ecosystem.config.js
+ecosystem.config.cjs
 
 # Playwright verification artifacts
 .playwright-cli/

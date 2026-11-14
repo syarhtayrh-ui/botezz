@@ -3,7 +3,11 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { validateEnv } from '../../src/config/env';
+import {
+  validateEnv,
+  parseDotEnvContent,
+  loadDotEnvIntoProcessEnv,
+} from '../../src/config/env';
 import {
   maskPhoneNumber,
   redactText,
@@ -74,6 +78,43 @@ test('Startup configuration validation succeeds with valid env and fails fast on
       }),
     /Startup Configuration Validation Failed/
   );
+});
+
+test('Automatic .env parser and loader handles quotes, export prefixes, CRLF, and comments', () => {
+  const rawDotEnv =
+    '\uFEFF# Comment line\r\n' +
+    'export TELEGRAM_BOT_TOKEN="999888777:AAH_quoted_token_value"\r\n' +
+    "TELEGRAM_ADMIN_ID='123456789'\r\n" +
+    'MAX_CONCURRENT_TASKS=5 # inline comment\r\n';
+  const parsed = parseDotEnvContent(rawDotEnv);
+  assert.equal(parsed.TELEGRAM_BOT_TOKEN, '999888777:AAH_quoted_token_value');
+  assert.equal(parsed.TELEGRAM_ADMIN_ID, '123456789');
+  assert.equal(parsed.MAX_CONCURRENT_TASKS, '5');
+
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'botezz-dotenv-'));
+  const envFile = path.join(tmpDir, '.env');
+  fs.writeFileSync(envFile, rawDotEnv, 'utf8');
+  try {
+    const prevToken = process.env.TELEGRAM_BOT_TOKEN;
+    const prevAdmin = process.env.TELEGRAM_ADMIN_ID;
+    delete process.env.TELEGRAM_BOT_TOKEN;
+    delete process.env.TELEGRAM_ADMIN_ID;
+
+    const loadRes = loadDotEnvIntoProcessEnv(envFile, true);
+    assert.equal(loadRes.loadedFrom, envFile);
+    assert.equal(
+      process.env.TELEGRAM_BOT_TOKEN,
+      '999888777:AAH_quoted_token_value'
+    );
+    assert.equal(process.env.TELEGRAM_ADMIN_ID, '123456789');
+
+    if (prevToken === undefined) delete process.env.TELEGRAM_BOT_TOKEN;
+    else process.env.TELEGRAM_BOT_TOKEN = prevToken;
+    if (prevAdmin === undefined) delete process.env.TELEGRAM_ADMIN_ID;
+    else process.env.TELEGRAM_ADMIN_ID = prevAdmin;
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
 });
 
 test('Unauthorized Telegram users are strictly rejected', () => {

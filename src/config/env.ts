@@ -1,4 +1,105 @@
+import fs from 'node:fs';
+import path from 'node:path';
 import { z } from 'zod';
+
+/**
+ * Parses standard `.env` file content into key-value pairs.
+ * Supports:
+ * - UTF-8 BOM and CRLF (`\r\n`) line endings
+ * - `export KEY=VALUE` prefix
+ * - Single-quoted (`'...'`) and double-quoted (`"..."`) values
+ * - Unquoted inline comments (`KEY=value # comment`)
+ */
+export function parseDotEnvContent(content: string): Record<string, string> {
+  const result: Record<string, string> = {};
+  const normalized = content.replace(/^\uFEFF/, '');
+  const lines = normalized.split(/\r?\n/);
+
+  for (const rawLine of lines) {
+    const trimmed = rawLine.trim();
+    if (!trimmed || trimmed.startsWith('#')) {
+      continue;
+    }
+
+    const withoutExport = trimmed.startsWith('export ')
+      ? trimmed.slice(7).trim()
+      : trimmed;
+    const eqIndex = withoutExport.indexOf('=');
+    if (eqIndex <= 0) {
+      continue;
+    }
+
+    const key = withoutExport.slice(0, eqIndex).trim();
+    if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(key)) {
+      continue;
+    }
+
+    let rawValue = withoutExport.slice(eqIndex + 1).trim();
+    if (
+      (rawValue.startsWith('"') && rawValue.endsWith('"') && rawValue.length >= 2) ||
+      (rawValue.startsWith("'") && rawValue.endsWith("'") && rawValue.length >= 2)
+    ) {
+      rawValue = rawValue.slice(1, -1);
+    } else {
+      const commentIdx = rawValue.indexOf(' #');
+      if (commentIdx !== -1) {
+        rawValue = rawValue.slice(0, commentIdx).trim();
+      }
+    }
+
+    result[key] = rawValue;
+  }
+
+  return result;
+}
+
+/**
+ * Automatically loads `.env` from disk into `process.env` so standalone scripts
+ * (`npm run bot:start`, `tsx src/app.ts`, PM2, systemd) always receive `.env` variables.
+ */
+export function loadDotEnvIntoProcessEnv(
+  customEnvPath?: string,
+  overrideExisting = false
+): { loadedFrom?: string; loadedKeys: string[] } {
+  const candidatePaths = [
+    customEnvPath,
+    process.env.ENV_FILE_PATH,
+    path.resolve(process.cwd(), '.env'),
+    path.resolve(__dirname, '../../.env'),
+  ].filter((p): p is string => Boolean(p && p.trim().length > 0));
+
+  for (const filePath of candidatePaths) {
+    try {
+      if (!fs.existsSync(filePath) || !fs.statSync(filePath).isFile()) {
+        continue;
+      }
+      const rawContent = fs.readFileSync(filePath, 'utf8');
+      const parsed = parseDotEnvContent(rawContent);
+      const loadedKeys: string[] = [];
+
+      for (const [key, value] of Object.entries(parsed)) {
+        if (value === '') {
+          continue;
+        }
+        const currentVal = process.env[key];
+        if (
+          overrideExisting ||
+          currentVal === undefined ||
+          currentVal.trim() === ''
+        ) {
+          process.env[key] = value;
+          loadedKeys.push(key);
+        }
+      }
+
+      return { loadedFrom: filePath, loadedKeys };
+    } catch {
+      // Ignore unreadable candidate path and try next
+    }
+  }
+
+  return { loadedKeys: [] };
+}
 
 const envSchema = z.object({
   NODE_ENV: z.enum(['development', 'production', 'test']).default('development'),
@@ -47,9 +148,15 @@ export type AppConfig = z.infer<typeof envSchema>;
 
 /**
  * Strictly validates environment variables at startup.
+ * Automatically loads `.env` from disk when validating `process.env`.
  * Fails fast with a clear, actionable diagnostic message if required variables are missing or malformed.
  */
-export function validateEnv(rawEnv: Record<string, string | undefined> = process.env): AppConfig {
+export function validateEnv(
+  rawEnv: Record<string, string | undefined> = process.env
+): AppConfig {
+  if (rawEnv === process.env) {
+    loadDotEnvIntoProcessEnv();
+  }
   const parsed = envSchema.safeParse(rawEnv);
   if (!parsed.success) {
     const issues = parsed.error.issues
@@ -73,6 +180,9 @@ export function loadRuntimeConfig(
   isLiveConfigured: boolean;
   validationIssues: string[];
 } {
+  if (rawEnv === process.env) {
+    loadDotEnvIntoProcessEnv();
+  }
   const strictResult = envSchema.safeParse(rawEnv);
   if (strictResult.success) {
     return {
