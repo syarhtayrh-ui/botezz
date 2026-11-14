@@ -15,6 +15,21 @@ export type UiDeliveryMode =
   | 'NEW_MESSAGE'
   | 'DUPLICATE_BLOCKED';
 
+export type ActiveInputOwner =
+  | 'NONE'
+  | 'PAIRING'
+  | 'SEND_TEXT'
+  | 'SEND_MEDIA'
+  | 'VIDEO_CALL'
+  | 'GROUP'
+  | 'TOOLS'
+  | 'INBOX'
+  | 'STORIES'
+  | 'SETTINGS'
+  | 'SUBSCRIPTIONS';
+
+export type ActiveWorkflowOwner = ActiveInputOwner;
+
 export interface UiSessionStats {
   sentCount: number;
   editedTextCount: number;
@@ -28,6 +43,11 @@ export interface UserUiSessionState {
   userId: number;
   chatId?: number;
   activeMessageId?: number;
+  pinnedMessageId?: number;
+  lastSeenChatMessageId?: number;
+  panelBuriedByNewMessages?: boolean;
+  activeInputOwner: ActiveInputOwner;
+  activeInputUpdatedAtMs: number;
   lastText?: string;
   lastKeyboardJson?: string;
   currentRoute: string;
@@ -39,8 +59,14 @@ export interface UserUiSessionState {
   stats: UiSessionStats;
 }
 
+export type BotUiStateSession = UserUiSessionState;
+
 export interface TelegramMessageTransport {
-  sendNewMessage(
+  sendNewMessage?(
+    text: string,
+    keyboard: InlineKeyboardRows
+  ): Promise<{ messageId: number }>;
+  sendMessage?(
     text: string,
     keyboard: InlineKeyboardRows
   ): Promise<{ messageId: number }>;
@@ -53,11 +79,39 @@ export interface TelegramMessageTransport {
     messageId: number,
     keyboard: InlineKeyboardRows
   ): Promise<void>;
-  sendMediaAttachment?(attachment: TelegramMediaAttachment): Promise<void>;
+  sendMediaAttachment?(
+    attachment: TelegramMediaAttachment
+  ): Promise<void | { messageId?: number }>;
   answerCallbackQuery?(options?: {
     text?: string;
     showAlert?: boolean;
   }): Promise<void>;
+  deleteMessage?(messageId: number): Promise<void>;
+  pinMessage?(messageId: number): Promise<void>;
+  unpinMessage?(messageId: number): Promise<void>;
+}
+
+export type UiDeliveryTransport = TelegramMessageTransport;
+
+const WORKFLOW_OWNER_BANNER_ARABIC: Record<ActiveInputOwner, string> = {
+  NONE: 'القائمة الرئيسية (لا توجد عملية معلقة)',
+  PAIRING: '📲 ربط جلسة واتساب جديدة (بانتظار إدخال رقم الهاتف)',
+  SEND_TEXT: '✉️ إرسال رسالة نصية عبر واتساب',
+  SEND_MEDIA: '📎 إرسال وسائط / ملفات عبر واتساب',
+  VIDEO_CALL: '📹 إعداد وبث مكالمة فيديو VoIP',
+  GROUP: '👥 إدارة المجموعات والانضمام الجماعي',
+  TOOLS: '🛠️ أداة واتساب تفاعلية قيد الإدخال',
+  INBOX: '📥 إعادة توجيه / الرد من صندوق الوارد',
+  STORIES: '⭕ إدارة وتحميل حالات واتساب',
+  SETTINGS: '⚙️ تحديث إعدادات النظام والأمان',
+  SUBSCRIPTIONS: '⭐ إدارة الاشتراكات ومجموعات التفعيل',
+};
+
+export function formatActiveInputOwnerArabic(owner: ActiveInputOwner): string {
+  return (
+    WORKFLOW_OWNER_BANNER_ARABIC[owner] ||
+    WORKFLOW_OWNER_BANNER_ARABIC.NONE
+  );
 }
 
 /**
@@ -153,9 +207,10 @@ export function isNavigableRoute(callbackData: string): boolean {
 /**
  * Stateful UI and Single-Message Navigation Manager.
  * Ensures the Telegram bot behaves like a modern single-message interactive application:
- * - Edits existing messages in-place via editMessageText or editMessageReplyMarkup
- * - Absorbs "message is not modified" gracefully
- * - Falls back to sending a new message only when no active message exists or edit fails
+ * - Edits existing messages in-place via editMessageText or editMessageReplyMarkup when not buried
+ * - Re-anchors the Control Panel to the bottom of the chat, deletes the old buried panel,
+ *   and pins the new Control Panel whenever user input, media, or background notifications bury it
+ * - Tracks single exclusive ActiveInputOwner to prevent multi-map workflow collisions
  * - Tracks Back / Home / Refresh navigation stack per user
  * - Prevents duplicate operations on repeated button taps
  */
@@ -178,6 +233,8 @@ export class BotUiStateManager {
     if (!sess) {
       sess = {
         userId,
+        activeInputOwner: 'NONE',
+        activeInputUpdatedAtMs: Date.now(),
         currentRoute: 'menu:main',
         history: [],
         sentAttachments: [],
@@ -195,6 +252,66 @@ export class BotUiStateManager {
       this.sessions.set(userId, sess);
     }
     return sess;
+  }
+
+  public getState(userId: number): UserUiSessionState {
+    return this.getOrCreateSession(userId);
+  }
+
+  public getActiveMessageId(userId: number): number | undefined {
+    return this.getOrCreateSession(userId).activeMessageId;
+  }
+
+  /**
+   * Returns the single exclusive active input workflow owner for the user.
+   */
+  public getActiveInputOwner(userId: number): ActiveInputOwner {
+    return this.getOrCreateSession(userId).activeInputOwner;
+  }
+
+  /**
+   * Updates the single exclusive active input workflow owner for the user.
+   */
+  public setActiveInputOwner(userId: number, owner: ActiveInputOwner): void {
+    const sess = this.getOrCreateSession(userId);
+    sess.activeInputOwner = owner;
+    sess.activeInputUpdatedAtMs = Date.now();
+  }
+
+  /**
+   * Records a new message ID observed in the chat (e.g., user text/media input or
+   * background notification) so `deliverView` knows if the Control Panel was buried.
+   */
+  public recordChatActivityMessageId(userId: number, messageId: number): void {
+    if (!Number.isFinite(messageId) || messageId <= 0) return;
+    const sess = this.getOrCreateSession(userId);
+    if (
+      sess.lastSeenChatMessageId === undefined ||
+      messageId > sess.lastSeenChatMessageId
+    ) {
+      sess.lastSeenChatMessageId = messageId;
+    }
+    if (
+      sess.activeMessageId !== undefined &&
+      messageId > sess.activeMessageId
+    ) {
+      sess.panelBuriedByNewMessages = true;
+    }
+  }
+
+  /**
+   * Explicitly marks the current Control Panel message as buried below newer chat
+   * messages (e.g., after sending a background notification or media upload).
+   */
+  public markPanelBuried(userId: number): void {
+    const sess = this.getOrCreateSession(userId);
+    sess.panelBuriedByNewMessages = true;
+    if (sess.activeMessageId !== undefined) {
+      sess.lastSeenChatMessageId = Math.max(
+        sess.lastSeenChatMessageId ?? 0,
+        sess.activeMessageId + 1
+      );
+    }
   }
 
   public setActiveMessage(
@@ -257,6 +374,8 @@ export class BotUiStateManager {
     const sess = this.getOrCreateSession(userId);
     sess.history = [];
     sess.currentRoute = 'menu:main';
+    sess.activeInputOwner = 'NONE';
+    sess.activeInputUpdatedAtMs = Date.now();
   }
 
   /**
@@ -299,11 +418,29 @@ export class BotUiStateManager {
     sess.stats.callbackAnsweredCount += 1;
   }
 
+  private async invokeTransportSendNew(
+    transport: TelegramMessageTransport | undefined,
+    text: string,
+    keyboard: InlineKeyboardRows
+  ): Promise<{ messageId: number }> {
+    if (transport?.sendNewMessage) {
+      return transport.sendNewMessage(text, keyboard);
+    }
+    if (transport?.sendMessage) {
+      return transport.sendMessage(text, keyboard);
+    }
+    this.nextSimulatedMessageId += 1;
+    return { messageId: this.nextSimulatedMessageId };
+  }
+
   /**
-   * Delivers a BotViewResponse over a Telegram transport (or simulated transport)
-   * by editing the active menu message in-place whenever possible.
-   * When mediaAttachments are present on a real transport, sends attachments first
-   * and then anchors the interactive control panel at the bottom of the chat.
+   * Delivers a BotViewResponse over a Telegram transport (or simulated transport):
+   * - Pure inline button clicks (`preferEdit && !isPanelBuried && !shouldReanchorBelowMedia`)
+   *   edit the existing Control Panel message in-place and ensure it is pinned.
+   * - When the Control Panel is buried below user messages, media attachments, or background
+   *   notifications (`isPanelBuried || !preferEdit || shouldReanchorBelowMedia`), sends a brand-new
+   *   Control Panel message at the bottom of the chat, deletes the old buried panel message,
+   *   and silently pins the new Control Panel message.
    */
   public async deliverView(params: {
     userId: number;
@@ -314,23 +451,60 @@ export class BotUiStateManager {
   }): Promise<BotViewResponse> {
     const { userId, view, pendingWorkflow, preferEdit, transport } = params;
     const sess = this.getOrCreateSession(userId);
-    const nextKeyboardJson = JSON.stringify(view.keyboard);
+
+    // Ensure a 1-tap escape button (`workflow:cancel`) is present whenever an input workflow is active
+    const effectiveKeyboard: InlineKeyboardRows = view.keyboard
+      ? view.keyboard.map((row) => [...row])
+      : [];
+    if (sess.activeInputOwner !== 'NONE' || pendingWorkflow !== 'NONE') {
+      const hasCancelButton = effectiveKeyboard
+        .flat()
+        .some(
+          (btn) =>
+            btn.callbackData === 'workflow:cancel' ||
+            btn.callbackData === 'nav:home' ||
+            btn.callbackData === 'menu:main'
+        );
+      if (!hasCancelButton) {
+        effectiveKeyboard.push([
+          {
+            text: '❌ إلغاء العملية والعودة للرئيسية',
+            callbackData: 'workflow:cancel',
+          },
+        ]);
+      }
+    }
+
+    const effectiveView: BotViewResponse = {
+      ...view,
+      keyboard: effectiveKeyboard,
+    };
+
+    const nextKeyboardJson = JSON.stringify(effectiveKeyboard);
     const hasAttachments =
-      Array.isArray(view.mediaAttachments) && view.mediaAttachments.length > 0;
+      Array.isArray(effectiveView.mediaAttachments) &&
+      effectiveView.mediaAttachments.length > 0;
     const shouldReanchorBelowMedia =
       hasAttachments && Boolean(transport?.sendMediaAttachment);
 
     let deliveryMode: UiDeliveryMode = 'NEW_MESSAGE';
 
-    if (hasAttachments && view.mediaAttachments) {
-      for (const att of view.mediaAttachments) {
+    if (hasAttachments && effectiveView.mediaAttachments) {
+      for (const att of effectiveView.mediaAttachments) {
         sess.sentAttachments.push(att);
         if (sess.sentAttachments.length > 100) {
           sess.sentAttachments.shift();
         }
         if (transport?.sendMediaAttachment) {
           try {
-            await transport.sendMediaAttachment(att);
+            const mediaRes = await transport.sendMediaAttachment(att);
+            if (
+              mediaRes &&
+              typeof mediaRes === 'object' &&
+              typeof mediaRes.messageId === 'number'
+            ) {
+              this.recordChatActivityMessageId(userId, mediaRes.messageId);
+            }
           } catch (attErr) {
             log.warn('Failed sending media attachment to Telegram', {
               userId,
@@ -343,21 +517,29 @@ export class BotUiStateManager {
       }
     }
 
+    const isPanelBuried =
+      sess.panelBuriedByNewMessages === true ||
+      (sess.activeMessageId !== undefined &&
+        sess.lastSeenChatMessageId !== undefined &&
+        sess.lastSeenChatMessageId > sess.activeMessageId);
+
     if (
       preferEdit &&
       sess.activeMessageId !== undefined &&
-      !shouldReanchorBelowMedia
+      !shouldReanchorBelowMedia &&
+      !isPanelBuried
     ) {
-      const sameText = sess.lastText === view.text;
+      const targetMsgId = sess.activeMessageId;
+      const sameText = sess.lastText === effectiveView.text;
       const sameKeyboard = sess.lastKeyboardJson === nextKeyboardJson;
 
       if (sameText && sameKeyboard) {
         if (transport) {
           try {
             await transport.editMessageText(
-              sess.activeMessageId,
-              view.text,
-              view.keyboard
+              targetMsgId,
+              effectiveView.text,
+              effectiveKeyboard
             );
           } catch (err) {
             if (!isMessageNotModifiedError(err)) {
@@ -371,8 +553,8 @@ export class BotUiStateManager {
         try {
           if (transport) {
             await transport.editMessageReplyMarkup(
-              sess.activeMessageId,
-              view.keyboard
+              targetMsgId,
+              effectiveKeyboard
             );
           }
           sess.lastKeyboardJson = nextKeyboardJson;
@@ -385,7 +567,7 @@ export class BotUiStateManager {
           } else {
             deliveryMode = await this.fallbackEditOrSend(
               sess,
-              view,
+              effectiveView,
               nextKeyboardJson,
               transport
             );
@@ -394,28 +576,54 @@ export class BotUiStateManager {
       } else {
         deliveryMode = await this.fallbackEditOrSend(
           sess,
-          view,
+          effectiveView,
           nextKeyboardJson,
           transport
         );
       }
-    } else {
-      if (transport) {
-        const sent = await transport.sendNewMessage(view.text, view.keyboard);
-        sess.activeMessageId = sent.messageId;
-      } else {
-        this.nextSimulatedMessageId += 1;
-        sess.activeMessageId = this.nextSimulatedMessageId;
+
+      if (
+        sess.activeMessageId !== undefined &&
+        sess.pinnedMessageId !== sess.activeMessageId &&
+        transport?.pinMessage
+      ) {
+        await transport.pinMessage(sess.activeMessageId).catch(() => undefined);
+        sess.pinnedMessageId = sess.activeMessageId;
       }
-      sess.lastText = view.text;
+    } else {
+      const oldMessageId = sess.activeMessageId;
+      const sent = await this.invokeTransportSendNew(
+        transport,
+        effectiveView.text,
+        effectiveKeyboard
+      );
+      sess.activeMessageId = sent.messageId;
+      sess.lastText = effectiveView.text;
       sess.lastKeyboardJson = nextKeyboardJson;
       sess.stats.sentCount += 1;
+      sess.panelBuriedByNewMessages = false;
+      sess.lastSeenChatMessageId = Math.max(
+        sess.lastSeenChatMessageId ?? 0,
+        sent.messageId
+      );
+
+      if (
+        oldMessageId !== undefined &&
+        oldMessageId !== sent.messageId &&
+        transport?.deleteMessage
+      ) {
+        await transport.deleteMessage(oldMessageId).catch(() => undefined);
+      }
+      if (transport?.pinMessage) {
+        await transport.pinMessage(sent.messageId).catch(() => undefined);
+        sess.pinnedMessageId = sent.messageId;
+      }
       deliveryMode = 'NEW_MESSAGE';
     }
 
     const enriched: BotViewResponse = {
-      ...view,
-      route: view.route || sess.currentRoute,
+      ...effectiveView,
+      route: effectiveView.route || sess.currentRoute,
       uiMeta: {
         deliveryMode,
         activeMessageId: sess.activeMessageId!,
@@ -469,23 +677,40 @@ export class BotUiStateManager {
       }
     }
 
-    if (transport) {
-      const sent = await transport.sendNewMessage(view.text, view.keyboard);
-      sess.activeMessageId = sent.messageId;
-    } else {
-      this.nextSimulatedMessageId += 1;
-      sess.activeMessageId = this.nextSimulatedMessageId;
-    }
+    const oldMessageId = sess.activeMessageId;
+    const sent = await this.invokeTransportSendNew(
+      transport,
+      view.text,
+      view.keyboard
+    );
+    sess.activeMessageId = sent.messageId;
     sess.lastText = view.text;
     sess.lastKeyboardJson = nextKeyboardJson;
     sess.stats.sentCount += 1;
+    sess.panelBuriedByNewMessages = false;
+    sess.lastSeenChatMessageId = Math.max(
+      sess.lastSeenChatMessageId ?? 0,
+      sent.messageId
+    );
+    if (
+      oldMessageId !== undefined &&
+      oldMessageId !== sent.messageId &&
+      transport?.deleteMessage
+    ) {
+      await transport.deleteMessage(oldMessageId).catch(() => undefined);
+    }
+    if (transport?.pinMessage) {
+      await transport.pinMessage(sent.messageId).catch(() => undefined);
+      sess.pinnedMessageId = sent.messageId;
+    }
     return 'NEW_MESSAGE';
   }
 }
 
 /**
  * Wraps a grammY Context into a TelegramMessageTransport so callback queries
- * and text workflows edit the active menu message in-place.
+ * edit the active menu message in-place and buried panels re-anchor at the bottom
+ * of the chat, deleting the old panel and pinning the new one.
  */
 export function createGrammyTransport(
   ctx: {
@@ -513,6 +738,16 @@ export function createGrammyTransport(
         messageId: number,
         other?: Record<string, unknown>
       ) => Promise<unknown>;
+      deleteMessage?: (chatId: number, messageId: number) => Promise<unknown>;
+      pinChatMessage?: (
+        chatId: number,
+        messageId: number,
+        other?: Record<string, unknown>
+      ) => Promise<unknown>;
+      unpinChatMessage?: (
+        chatId: number,
+        messageId?: number
+      ) => Promise<unknown>;
     };
   },
   uiState: BotUiStateManager,
@@ -524,24 +759,32 @@ export function createGrammyTransport(
     uiState.setActiveMessage(userId, callbackMsgId, chatId);
   }
 
-  return {
-    sendNewMessage: async (text, keyboard) => {
-      try {
-        const sent = await ctx.reply(text, {
-          parse_mode: 'Markdown',
+  const sendNewMessageImpl = async (
+    text: string,
+    keyboard: InlineKeyboardRows
+  ): Promise<{ messageId: number }> => {
+    try {
+      const sent = await ctx.reply(text, {
+        parse_mode: 'Markdown',
+        reply_markup: toGrammyInlineKeyboard(keyboard),
+      });
+      uiState.recordChatActivityMessageId(userId, sent.message_id);
+      return { messageId: sent.message_id };
+    } catch (err) {
+      if (isMarkdownEntityError(err)) {
+        const sent = await ctx.reply(stripMarkdown(text), {
           reply_markup: toGrammyInlineKeyboard(keyboard),
         });
+        uiState.recordChatActivityMessageId(userId, sent.message_id);
         return { messageId: sent.message_id };
-      } catch (err) {
-        if (isMarkdownEntityError(err)) {
-          const sent = await ctx.reply(stripMarkdown(text), {
-            reply_markup: toGrammyInlineKeyboard(keyboard),
-          });
-          return { messageId: sent.message_id };
-        }
-        throw err;
       }
-    },
+      throw err;
+    }
+  };
+
+  return {
+    sendNewMessage: sendNewMessageImpl,
+    sendMessage: sendNewMessageImpl,
     editMessageText: async (messageId, text, keyboard) => {
       const editFn = async (parseMode?: 'Markdown') => {
         const opts = {
@@ -620,6 +863,25 @@ export function createGrammyTransport(
         show_alert: options?.showAlert,
       });
     },
+    deleteMessage: async (messageId: number) => {
+      if (ctx.api?.deleteMessage && chatId !== undefined) {
+        await ctx.api.deleteMessage(chatId, messageId).catch(() => undefined);
+      }
+    },
+    pinMessage: async (messageId: number) => {
+      if (ctx.api?.pinChatMessage && chatId !== undefined) {
+        await ctx.api
+          .pinChatMessage(chatId, messageId, { disable_notification: true })
+          .catch(() => undefined);
+      }
+    },
+    unpinMessage: async (messageId: number) => {
+      if (ctx.api?.unpinChatMessage && chatId !== undefined) {
+        await ctx.api
+          .unpinChatMessage(chatId, messageId)
+          .catch(() => undefined);
+      }
+    },
     sendMediaAttachment: async (attachment) => {
       let inputFile: InputFile;
       if (attachment.buffer && attachment.buffer.length > 0) {
@@ -638,11 +900,12 @@ export function createGrammyTransport(
           ? `${attachment.caption.slice(0, 1020)}...`
           : attachment.caption;
       const captionOpts = safeCaption ? { caption: safeCaption } : {};
+      let sentMedia: unknown;
       if (
         attachment.kind === 'photo' &&
         typeof anyCtx.replyWithPhoto === 'function'
       ) {
-        await (
+        sentMedia = await (
           anyCtx.replyWithPhoto as (
             f: InputFile,
             o?: Record<string, unknown>
@@ -652,7 +915,7 @@ export function createGrammyTransport(
         attachment.kind === 'video' &&
         typeof anyCtx.replyWithVideo === 'function'
       ) {
-        await (
+        sentMedia = await (
           anyCtx.replyWithVideo as (
             f: InputFile,
             o?: Record<string, unknown>
@@ -662,19 +925,30 @@ export function createGrammyTransport(
         attachment.kind === 'audio' &&
         typeof anyCtx.replyWithAudio === 'function'
       ) {
-        await (
+        sentMedia = await (
           anyCtx.replyWithAudio as (
             f: InputFile,
             o?: Record<string, unknown>
           ) => Promise<unknown>
         )(inputFile, captionOpts);
       } else if (typeof anyCtx.replyWithDocument === 'function') {
-        await (
+        sentMedia = await (
           anyCtx.replyWithDocument as (
             f: InputFile,
             o?: Record<string, unknown>
           ) => Promise<unknown>
         )(inputFile, captionOpts);
+      }
+      const sentId =
+        sentMedia &&
+        typeof sentMedia === 'object' &&
+        'message_id' in sentMedia &&
+        typeof (sentMedia as { message_id?: unknown }).message_id === 'number'
+          ? (sentMedia as { message_id: number }).message_id
+          : undefined;
+      if (sentId !== undefined) {
+        uiState.recordChatActivityMessageId(userId, sentId);
+        return { messageId: sentId };
       }
     },
   };

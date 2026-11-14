@@ -28,6 +28,10 @@ export class StoriesHandler {
     return this.filterByAdmin.get(adminId) || 'ALL';
   }
 
+  public cancel(adminId: number): void {
+    this.filterByAdmin.delete(adminId);
+  }
+
   public setFilter(adminId: number, filter: StoriesFilterKind): BotViewResponse {
     this.filterByAdmin.set(adminId, filter);
     return this.renderStoriesMenu(adminId, 1);

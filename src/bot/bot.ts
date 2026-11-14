@@ -5,7 +5,11 @@ import {
   verifyTelegramAdmin,
   createGrammyAuthorizationMiddleware,
 } from './middleware/authorization';
-import { buildBackCancelRow, buildAppNavigationRow } from './keyboards/main-menu';
+import {
+  buildBackCancelRow,
+  buildAppNavigationRow,
+  toGrammyInlineKeyboard,
+} from './keyboards/main-menu';
 import { formatSessionStatusArabic } from './keyboards/session-menu';
 import { PairingWorkflow, BotViewResponse } from './workflows/pairing-workflow';
 import { MessageWorkflow } from './workflows/message-workflow';
@@ -22,9 +26,11 @@ import { TasksHandler } from './handlers/tasks';
 import { SettingsHandler } from './handlers/settings';
 import { ToolsHandler, DEFAULT_SAMPLE_TEST_FUNCTION } from './handlers/tools';
 import {
+  ActiveInputOwner,
   BotUiStateManager,
   TelegramMessageTransport,
   createGrammyTransport,
+  formatActiveInputOwnerArabic,
   isNavigableRoute,
 } from './ui-state';
 import { SessionManager } from '../whatsapp/session-manager';
@@ -91,6 +97,7 @@ export interface HandleInteractionOptions {
   transport?: TelegramMessageTransport;
   skipDuplicateCheck?: boolean;
   chatId?: number;
+  userMessageId?: number;
 }
 
 export interface IncomingTelegramMediaUpload {
@@ -380,19 +387,79 @@ export class TelegramBotController {
   }
 
   public getConversationMode(adminId: number): ConversationMode {
+    const owner = this.uiState.getActiveInputOwner(adminId);
+    if (owner !== 'NONE') {
+      const modeMap: Record<ActiveInputOwner, ConversationMode> = {
+        NONE: 'NONE',
+        PAIRING: 'PAIRING',
+        SEND_TEXT: 'MESSAGE',
+        SEND_MEDIA: 'MEDIA',
+        VIDEO_CALL: 'VIDEO_CALL',
+        GROUP: 'GROUP',
+        TOOLS: 'TOOLS',
+        INBOX: 'INBOX_FORWARD',
+        STORIES: 'NONE',
+        SETTINGS: 'SETTINGS',
+        SUBSCRIPTIONS: 'SETTINGS',
+      };
+      return modeMap[owner] || 'NONE';
+    }
     return this.activeConversationMode.get(adminId) || 'NONE';
   }
 
+  /**
+   * Enforces a single exclusive active input owner per user.
+   * Immediately cancels all other 9 workflows/handlers so stale states from earlier
+   * interactions can NEVER collide with the newly activated workflow.
+   */
+  public activateInputOwner(adminId: number, owner: ActiveInputOwner): void {
+    if (owner !== 'PAIRING') {
+      this.pairingWorkflow.cancel(adminId);
+    }
+    if (owner !== 'SEND_TEXT') {
+      this.messageWorkflow.cancel(adminId);
+    }
+    if (owner !== 'SEND_MEDIA') {
+      this.mediaWorkflow.cancel(adminId);
+    }
+    if (owner !== 'VIDEO_CALL') {
+      this.videoCallWorkflow.cancel(adminId);
+    }
+    if (owner !== 'GROUP') {
+      this.groupWorkflow.cancel(adminId);
+    }
+    if (owner !== 'TOOLS') {
+      this.toolsHandler.cancel(adminId);
+    }
+    if (owner !== 'INBOX') {
+      this.inboxHandler.cancel(adminId);
+    }
+    if (owner !== 'STORIES') {
+      this.storiesHandler.cancel(adminId);
+    }
+    if (owner !== 'SETTINGS' && owner !== 'SUBSCRIPTIONS') {
+      this.settingsHandler.cancel(adminId);
+    }
+
+    this.uiState.setActiveInputOwner(adminId, owner);
+    const modeMap: Record<ActiveInputOwner, ConversationMode> = {
+      NONE: 'NONE',
+      PAIRING: 'PAIRING',
+      SEND_TEXT: 'MESSAGE',
+      SEND_MEDIA: 'MEDIA',
+      VIDEO_CALL: 'VIDEO_CALL',
+      GROUP: 'GROUP',
+      TOOLS: 'TOOLS',
+      INBOX: 'INBOX_FORWARD',
+      STORIES: 'NONE',
+      SETTINGS: 'SETTINGS',
+      SUBSCRIPTIONS: 'SETTINGS',
+    };
+    this.activeConversationMode.set(adminId, modeMap[owner] || 'NONE');
+  }
+
   private cancelAllWorkflowsForAdmin(adminId: number): void {
-    this.pairingWorkflow.cancel(adminId);
-    this.messageWorkflow.cancel(adminId);
-    this.mediaWorkflow.cancel(adminId);
-    this.groupWorkflow.cancel(adminId);
-    this.videoCallWorkflow.cancel(adminId);
-    this.toolsHandler.cancel(adminId);
-    this.settingsHandler.cancel(adminId);
-    this.inboxHandler.cancel(adminId);
-    this.activeConversationMode.set(adminId, 'NONE');
+    this.activateInputOwner(adminId, 'NONE');
   }
 
   private async runWithTimeout<T>(
@@ -633,37 +700,41 @@ export class TelegramBotController {
     if (
       callbackData === 'menu:link_account' ||
       callbackData === 'menu:add_account' ||
-      callbackData === 'menu:pair'
+      callbackData === 'menu:pair' ||
+      callbackData === 'pair:mode:random' ||
+      callbackData === 'pair:mode:custom'
     ) {
-      this.cancelAllWorkflowsForAdmin(actorUserId);
-      this.activeConversationMode.set(actorUserId, 'PAIRING');
+      this.activateInputOwner(actorUserId, 'PAIRING');
       return this.pairingWorkflow.startNewLinking(actorUserId);
     }
     if (callbackData.startsWith('pair:prompt_label:')) {
       const sessId = callbackData.slice('pair:prompt_label:'.length);
-      this.activeConversationMode.set(actorUserId, 'PAIRING');
+      this.activateInputOwner(actorUserId, 'PAIRING');
       return this.pairingWorkflow.promptSessionLabel(actorUserId, sessId, false);
     }
     if (callbackData.startsWith('sess:prompt_rename:')) {
       const sessId = callbackData.slice('sess:prompt_rename:'.length);
-      this.cancelAllWorkflowsForAdmin(actorUserId);
-      this.activeConversationMode.set(actorUserId, 'PAIRING');
+      this.activateInputOwner(actorUserId, 'PAIRING');
       return this.pairingWorkflow.promptSessionLabel(actorUserId, sessId, true);
     }
 
     // 3: Manage Sessions & Session Status
     if (callbackData === 'menu:sessions') {
+      this.activateInputOwner(actorUserId, 'NONE');
       return this.sessionsHandler.renderSessionsList(1, actorUserId);
     }
     if (callbackData.startsWith('menu:sessions:page:')) {
       const page = Number(callbackData.split(':').pop() || '1');
+      this.activateInputOwner(actorUserId, 'NONE');
       return this.sessionsHandler.renderSessionsList(page, actorUserId);
     }
     if (callbackData === 'menu:session_status') {
+      this.activateInputOwner(actorUserId, 'NONE');
       return this.sessionsHandler.renderSessionStatusOverview(actorUserId, isOwner);
     }
     if (callbackData.startsWith('sess:refresh:')) {
       const page = Number(callbackData.split(':').pop() || '1');
+      this.activateInputOwner(actorUserId, 'NONE');
       const view = this.sessionsHandler.renderSessionsList(page, actorUserId);
       return {
         ...view,
@@ -672,180 +743,218 @@ export class TelegramBotController {
     }
     if (callbackData.startsWith('sess:view:')) {
       const sessionId = callbackData.slice('sess:view:'.length);
+      this.activateInputOwner(actorUserId, 'NONE');
       return this.sessionsHandler.renderSessionDetail(sessionId, actorUserId);
     }
     if (callbackData.startsWith('sess:reconnect:')) {
       const sessionId = callbackData.slice('sess:reconnect:'.length);
+      this.activateInputOwner(actorUserId, 'NONE');
       return this.sessionsHandler.handleReconnect(sessionId, actorUserId);
     }
     if (callbackData.startsWith('sess:disconnect:')) {
       const sessionId = callbackData.slice('sess:disconnect:'.length);
+      this.activateInputOwner(actorUserId, 'NONE');
       return this.sessionsHandler.handleDisconnect(sessionId, actorUserId);
     }
-    if (callbackData.startsWith('sess:repair:')) {
-      const sessionId = callbackData.slice('sess:repair:'.length);
-      this.cancelAllWorkflowsForAdmin(actorUserId);
-      this.activeConversationMode.set(actorUserId, 'PAIRING');
+    if (
+      callbackData.startsWith('sess:repair:') ||
+      callbackData.startsWith('sess:pair:')
+    ) {
+      const sessionId = callbackData.startsWith('sess:repair:')
+        ? callbackData.slice('sess:repair:'.length)
+        : callbackData.slice('sess:pair:'.length);
+      this.activateInputOwner(actorUserId, 'PAIRING');
       return this.pairingWorkflow.startNewLinking(actorUserId, sessionId);
     }
     if (callbackData.startsWith('sess:confirm_remove:')) {
       const sessionId = callbackData.slice('sess:confirm_remove:'.length);
+      this.activateInputOwner(actorUserId, 'NONE');
       return this.sessionsHandler.renderConfirmRemove(sessionId, actorUserId);
     }
     if (callbackData.startsWith('sess:remove:')) {
       const sessionId = callbackData.slice('sess:remove:'.length);
+      this.activateInputOwner(actorUserId, 'NONE');
       return this.sessionsHandler.handleRemove(sessionId, actorUserId);
     }
     if (callbackData === 'sess:confirm_purge_inactive') {
+      this.activateInputOwner(actorUserId, 'NONE');
       return this.sessionsHandler.renderConfirmPurgeInactive(actorUserId);
     }
     if (callbackData === 'sess:purge_inactive') {
+      this.activateInputOwner(actorUserId, 'NONE');
       return this.sessionsHandler.handlePurgeInactive(actorUserId);
     }
 
     // 4: Send Text Message Workflow
     if (callbackData === 'menu:send_text') {
-      this.cancelAllWorkflowsForAdmin(actorUserId);
-      this.activeConversationMode.set(actorUserId, 'MESSAGE');
+      this.activateInputOwner(actorUserId, 'SEND_TEXT');
       return this.messagingHandler.startSendText(actorUserId);
     }
     if (callbackData.startsWith('wf_msg:recent:')) {
       const target = callbackData.slice('wf_msg:recent:'.length);
-      this.activeConversationMode.set(actorUserId, 'MESSAGE');
+      this.activateInputOwner(actorUserId, 'SEND_TEXT');
       return this.messageWorkflow.handleTextInput(actorUserId, target);
     }
     if (callbackData === 'wf_msg:edit_text') {
-      this.activeConversationMode.set(actorUserId, 'MESSAGE');
+      this.activateInputOwner(actorUserId, 'SEND_TEXT');
       return this.messageWorkflow.promptEditText(actorUserId);
     }
     if (callbackData === 'wf_msg:edit_recipient') {
-      this.activeConversationMode.set(actorUserId, 'MESSAGE');
+      this.activateInputOwner(actorUserId, 'SEND_TEXT');
       return this.messageWorkflow.promptEditRecipient(actorUserId);
     }
     if (callbackData.startsWith('wf_msg:toggle_sess:')) {
       const sessId = callbackData.slice('wf_msg:toggle_sess:'.length);
+      this.activateInputOwner(actorUserId, 'SEND_TEXT');
       return this.messageWorkflow.toggleSession(actorUserId, sessId);
     }
     if (callbackData === 'wf_msg:select_all') {
+      this.activateInputOwner(actorUserId, 'SEND_TEXT');
       return this.messageWorkflow.selectAllConnected(actorUserId);
     }
     if (callbackData === 'wf_msg:clear_all') {
+      this.activateInputOwner(actorUserId, 'SEND_TEXT');
       return this.messageWorkflow.clearAll(actorUserId);
     }
     if (callbackData === 'wf_msg:back_sessions') {
+      this.activateInputOwner(actorUserId, 'SEND_TEXT');
       return this.messageWorkflow.renderSessionSelection(actorUserId);
     }
     if (callbackData === 'wf_msg:proceed_confirm') {
+      this.activateInputOwner(actorUserId, 'SEND_TEXT');
       return this.messageWorkflow.proceedToConfirmation(actorUserId);
     }
     if (callbackData === 'wf_msg:confirm_execute') {
-      this.activeConversationMode.set(actorUserId, 'NONE');
-      return this.messageWorkflow.confirmAndExecute(actorUserId);
+      const view = this.messageWorkflow.confirmAndExecute(actorUserId);
+      this.activateInputOwner(actorUserId, 'NONE');
+      return view;
     }
 
     // 5: Send Media or File Workflow
     if (callbackData === 'menu:send_media') {
-      this.cancelAllWorkflowsForAdmin(actorUserId);
-      this.activeConversationMode.set(actorUserId, 'MEDIA');
+      this.activateInputOwner(actorUserId, 'SEND_MEDIA');
       return this.mediaHandler.startSendMedia(actorUserId);
     }
     if (callbackData.startsWith('wf_media:recent:')) {
       const target = callbackData.slice('wf_media:recent:'.length);
-      this.activeConversationMode.set(actorUserId, 'MEDIA');
+      this.activateInputOwner(actorUserId, 'SEND_MEDIA');
       return this.mediaWorkflow.handleRecipientInput(actorUserId, target);
     }
     if (callbackData === 'wf_media:edit_recipient') {
-      this.activeConversationMode.set(actorUserId, 'MEDIA');
+      this.activateInputOwner(actorUserId, 'SEND_MEDIA');
       return this.mediaWorkflow.promptEditRecipient(actorUserId);
     }
     if (callbackData === 'wf_media:edit_file') {
-      this.activeConversationMode.set(actorUserId, 'MEDIA');
+      this.activateInputOwner(actorUserId, 'SEND_MEDIA');
       return this.mediaWorkflow.promptEditFile(actorUserId);
     }
     if (callbackData === 'wf_media:back_sessions') {
-      this.activeConversationMode.set(actorUserId, 'MEDIA');
+      this.activateInputOwner(actorUserId, 'SEND_MEDIA');
       return this.mediaWorkflow.renderSessionSelection(actorUserId);
     }
     if (callbackData === 'wf_media:sample:pdf') {
+      this.activateInputOwner(actorUserId, 'SEND_MEDIA');
       return this.mediaHandler.attachSampleFile(actorUserId, 'pdf');
     }
     if (callbackData === 'wf_media:sample:png') {
+      this.activateInputOwner(actorUserId, 'SEND_MEDIA');
       return this.mediaHandler.attachSampleFile(actorUserId, 'png');
     }
     if (callbackData.startsWith('wf_media:toggle_sess:')) {
       const sessId = callbackData.slice('wf_media:toggle_sess:'.length);
+      this.activateInputOwner(actorUserId, 'SEND_MEDIA');
       return this.mediaWorkflow.toggleSession(actorUserId, sessId);
     }
     if (callbackData === 'wf_media:select_all') {
+      this.activateInputOwner(actorUserId, 'SEND_MEDIA');
       return this.mediaWorkflow.selectAllConnected(actorUserId);
     }
     if (callbackData === 'wf_media:clear_all') {
+      this.activateInputOwner(actorUserId, 'SEND_MEDIA');
       return this.mediaWorkflow.clearAll(actorUserId);
     }
     if (callbackData === 'wf_media:proceed_confirm') {
+      this.activateInputOwner(actorUserId, 'SEND_MEDIA');
       return this.mediaWorkflow.proceedToConfirmation(actorUserId);
     }
     if (callbackData === 'wf_media:confirm_execute') {
-      this.activeConversationMode.set(actorUserId, 'NONE');
-      return this.mediaWorkflow.confirmAndExecute(actorUserId);
+      const view = this.mediaWorkflow.confirmAndExecute(actorUserId);
+      this.activateInputOwner(actorUserId, 'NONE');
+      return view;
     }
 
     // 5b: Live Video Call Streaming Workflow (3-Step Flow: Upload Video -> Send Phone -> Immediate Stream)
     if (callbackData === 'menu:video_call' || callbackData === 'wf_vcall:start') {
-      this.cancelAllWorkflowsForAdmin(actorUserId);
-      this.activeConversationMode.set(actorUserId, 'VIDEO_CALL');
+      this.activateInputOwner(actorUserId, 'VIDEO_CALL');
       return this.videoCallWorkflow.start(actorUserId);
     }
     if (callbackData.startsWith('wf_vcall:start_sess:')) {
       const sessId = callbackData.slice('wf_vcall:start_sess:'.length);
-      this.cancelAllWorkflowsForAdmin(actorUserId);
-      this.activeConversationMode.set(actorUserId, 'VIDEO_CALL');
+      this.activateInputOwner(actorUserId, 'VIDEO_CALL');
       return this.videoCallWorkflow.start(actorUserId, sessId);
     }
     if (callbackData.startsWith('wf_vcall:recent:')) {
       const target = callbackData.slice('wf_vcall:recent:'.length);
+      this.activateInputOwner(actorUserId, 'VIDEO_CALL');
       const res = await this.videoCallWorkflow.handleRecipientInput(
         actorUserId,
         target
       );
       const nextStep = this.videoCallWorkflow.getState(actorUserId)?.step;
-      this.activeConversationMode.set(
-        actorUserId,
-        nextStep === 'STREAMING_ACTIVE' ? 'NONE' : 'VIDEO_CALL'
-      );
+      if (nextStep === 'STREAMING_ACTIVE') {
+        this.uiState.setActiveInputOwner(actorUserId, 'NONE');
+        this.activeConversationMode.set(actorUserId, 'NONE');
+      } else {
+        this.activateInputOwner(actorUserId, 'VIDEO_CALL');
+      }
       return res;
     }
     if (callbackData === 'wf_vcall:instant_ring_video') {
+      const res = await this.videoCallWorkflow.startInstantCallRing(
+        actorUserId,
+        'video'
+      );
+      this.uiState.setActiveInputOwner(actorUserId, 'NONE');
       this.activeConversationMode.set(actorUserId, 'NONE');
-      return this.videoCallWorkflow.startInstantCallRing(actorUserId, 'video');
+      return res;
     }
     if (callbackData === 'wf_vcall:instant_ring_voice') {
+      const res = await this.videoCallWorkflow.startInstantCallRing(
+        actorUserId,
+        'voice'
+      );
+      this.uiState.setActiveInputOwner(actorUserId, 'NONE');
       this.activeConversationMode.set(actorUserId, 'NONE');
-      return this.videoCallWorkflow.startInstantCallRing(actorUserId, 'voice');
+      return res;
     }
     if (callbackData === 'wf_vcall:sample_video') {
+      this.activateInputOwner(actorUserId, 'VIDEO_CALL');
       const res = await this.videoCallWorkflow.attachSampleVideo(actorUserId);
       const nextStep = this.videoCallWorkflow.getState(actorUserId)?.step;
-      this.activeConversationMode.set(
-        actorUserId,
-        nextStep === 'STREAMING_ACTIVE' ? 'NONE' : 'VIDEO_CALL'
-      );
+      if (nextStep === 'STREAMING_ACTIVE') {
+        this.uiState.setActiveInputOwner(actorUserId, 'NONE');
+        this.activeConversationMode.set(actorUserId, 'NONE');
+      } else {
+        this.activateInputOwner(actorUserId, 'VIDEO_CALL');
+      }
       return res;
     }
     if (callbackData === 'wf_vcall:repeat_call') {
+      const res = await this.videoCallWorkflow.repeatCall(actorUserId);
+      this.uiState.setActiveInputOwner(actorUserId, 'NONE');
       this.activeConversationMode.set(actorUserId, 'NONE');
-      return this.videoCallWorkflow.repeatCall(actorUserId);
+      return res;
     }
     if (callbackData === 'wf_vcall:change_recipient') {
-      this.activeConversationMode.set(actorUserId, 'VIDEO_CALL');
+      this.activateInputOwner(actorUserId, 'VIDEO_CALL');
       return this.videoCallWorkflow.promptChangeRecipient(actorUserId);
     }
     if (callbackData === 'wf_vcall:toggle_loop') {
-      this.activeConversationMode.set(actorUserId, 'VIDEO_CALL');
+      this.activateInputOwner(actorUserId, 'VIDEO_CALL');
       return this.videoCallWorkflow.toggleLoop(actorUserId);
     }
     if (callbackData === 'wf_vcall:toggle_record') {
-      this.activeConversationMode.set(actorUserId, 'VIDEO_CALL');
+      this.activateInputOwner(actorUserId, 'VIDEO_CALL');
       return this.videoCallWorkflow.toggleRecordCall(actorUserId);
     }
     if (
@@ -863,15 +972,15 @@ export class TelegramBotController {
       );
     }
     if (callbackData === 'wf_vcall:cycle_duration') {
-      this.activeConversationMode.set(actorUserId, 'VIDEO_CALL');
+      this.activateInputOwner(actorUserId, 'VIDEO_CALL');
       return this.videoCallWorkflow.cycleDuration(actorUserId);
     }
     if (callbackData === 'wf_vcall:cycle_mode') {
-      this.activeConversationMode.set(actorUserId, 'VIDEO_CALL');
+      this.activateInputOwner(actorUserId, 'VIDEO_CALL');
       return this.videoCallWorkflow.cycleProtocolMode(actorUserId);
     }
     if (callbackData === 'wf_vcall:cycle_waves') {
-      this.activeConversationMode.set(actorUserId, 'VIDEO_CALL');
+      this.activateInputOwner(actorUserId, 'VIDEO_CALL');
       return this.videoCallWorkflow.cycleWavesCount(actorUserId);
     }
     if (
@@ -879,107 +988,127 @@ export class TelegramBotController {
       callbackData.startsWith('wf_vcall:sess:')
     ) {
       const sessId = callbackData.split(':').pop() || '';
-      this.activeConversationMode.set(actorUserId, 'VIDEO_CALL');
+      this.activateInputOwner(actorUserId, 'VIDEO_CALL');
       return this.videoCallWorkflow.selectSession(actorUserId, sessId);
     }
     if (callbackData === 'wf_vcall:reupload') {
-      this.activeConversationMode.set(actorUserId, 'VIDEO_CALL');
+      this.activateInputOwner(actorUserId, 'VIDEO_CALL');
       return this.videoCallWorkflow.promptReupload(actorUserId);
     }
     if (callbackData === 'wf_vcall:confirm_execute') {
+      const res = await this.videoCallWorkflow.confirmAndExecute(actorUserId);
+      this.uiState.setActiveInputOwner(actorUserId, 'NONE');
       this.activeConversationMode.set(actorUserId, 'NONE');
-      return this.videoCallWorkflow.confirmAndExecute(actorUserId);
+      return res;
     }
     if (callbackData === 'wf_vcall:stop' || callbackData.startsWith('wf_vcall:stop:')) {
-      this.activeConversationMode.set(actorUserId, 'NONE');
-      return this.videoCallWorkflow.stopActiveCall(actorUserId);
+      const res = await this.videoCallWorkflow.stopActiveCall(actorUserId);
+      this.activateInputOwner(actorUserId, 'NONE');
+      return res;
     }
 
     // 5c: Incoming Messages Receiver & Archive (Inbox)
     if (callbackData === 'menu:inbox') {
-      this.cancelAllWorkflowsForAdmin(actorUserId);
+      this.activateInputOwner(actorUserId, 'NONE');
       return this.inboxHandler.renderInboxMenu(actorUserId, 1);
     }
     if (callbackData.startsWith('menu:inbox:page:')) {
       const page = Number(callbackData.split(':').pop() || '1');
-      this.cancelAllWorkflowsForAdmin(actorUserId);
+      this.activateInputOwner(actorUserId, 'NONE');
       return this.inboxHandler.renderInboxMenu(actorUserId, page);
     }
     if (callbackData.startsWith('inbox:view:')) {
       const id = callbackData.slice('inbox:view:'.length);
+      this.activateInputOwner(actorUserId, 'NONE');
       return this.inboxHandler.viewMessage(actorUserId, id);
     }
-    if (callbackData.startsWith('inbox:fwd:')) {
-      const id = callbackData.slice('inbox:fwd:'.length);
-      this.cancelAllWorkflowsForAdmin(actorUserId);
-      this.activeConversationMode.set(actorUserId, 'INBOX_FORWARD');
+    if (
+      callbackData.startsWith('inbox:fwd:') ||
+      callbackData.startsWith('inbox:reply:')
+    ) {
+      const id = callbackData.startsWith('inbox:fwd:')
+        ? callbackData.slice('inbox:fwd:'.length)
+        : callbackData.slice('inbox:reply:'.length);
+      this.activateInputOwner(actorUserId, 'INBOX');
       return this.inboxHandler.promptForward(actorUserId, id);
     }
     if (callbackData.startsWith('inbox:dl:')) {
       const id = callbackData.slice('inbox:dl:'.length);
+      this.activateInputOwner(actorUserId, 'NONE');
       return this.inboxHandler.downloadMessageFile(actorUserId, id);
     }
     if (callbackData.startsWith('inbox:filter:')) {
       const filter = callbackData
         .slice('inbox:filter:'.length)
         .toUpperCase() as InboxFilterKind;
+      this.activateInputOwner(actorUserId, 'NONE');
       return this.inboxHandler.setFilter(actorUserId, filter);
     }
     if (callbackData === 'inbox:toggle_autoforward') {
+      this.activateInputOwner(actorUserId, 'NONE');
       return this.inboxHandler.toggleAutoForward(actorUserId);
     }
     if (callbackData === 'inbox:simulate_batch') {
+      this.activateInputOwner(actorUserId, 'NONE');
       return this.inboxHandler.simulateBatch(actorUserId);
     }
 
     // 5d: WhatsApp Status / Stories Downloader
     if (callbackData === 'menu:stories') {
-      this.cancelAllWorkflowsForAdmin(actorUserId);
+      this.activateInputOwner(actorUserId, 'NONE');
       return this.storiesHandler.renderStoriesMenu(actorUserId, 1);
     }
     if (callbackData.startsWith('menu:stories:page:')) {
       const page = Number(callbackData.split(':').pop() || '1');
-      this.cancelAllWorkflowsForAdmin(actorUserId);
+      this.activateInputOwner(actorUserId, 'NONE');
       return this.storiesHandler.renderStoriesMenu(actorUserId, page);
     }
     if (callbackData.startsWith('stories:dl:')) {
       const id = callbackData.slice('stories:dl:'.length);
+      this.activateInputOwner(actorUserId, 'NONE');
       return this.storiesHandler.downloadStatus(actorUserId, id);
     }
     if (callbackData.startsWith('stories:dlc:')) {
       const phone = callbackData.slice('stories:dlc:'.length);
+      this.activateInputOwner(actorUserId, 'NONE');
       return this.storiesHandler.downloadAllByContact(actorUserId, phone);
     }
     if (callbackData.startsWith('stories:filter:')) {
       const filter = callbackData
         .slice('stories:filter:'.length)
         .toUpperCase() as StoriesFilterKind;
+      this.activateInputOwner(actorUserId, 'NONE');
       return this.storiesHandler.setFilter(actorUserId, filter);
     }
     if (callbackData === 'stories:toggle_autoforward') {
+      this.activateInputOwner(actorUserId, 'NONE');
       return this.storiesHandler.toggleAutoForward(actorUserId);
     }
     if (callbackData === 'stories:simulate_batch') {
+      this.activateInputOwner(actorUserId, 'NONE');
       return this.storiesHandler.simulateBatch(actorUserId);
     }
 
     // 6: Group Management
     if (callbackData === 'menu:groups') {
-      this.cancelAllWorkflowsForAdmin(actorUserId);
+      this.activateInputOwner(actorUserId, 'NONE');
       return this.groupsHandler.renderGroupManagementSubmenu(actorUserId);
     }
     if (callbackData.startsWith('grp:list:')) {
       const sessionId = callbackData.slice('grp:list:'.length);
+      this.activateInputOwner(actorUserId, 'NONE');
       return this.groupsHandler.renderSessionGroups(sessionId, 1, actorUserId);
     }
     if (callbackData.startsWith('grp:list_page:')) {
       const parts = callbackData.split(':');
       const sessionId = parts[2];
       const page = Number(parts[3] || '1');
+      this.activateInputOwner(actorUserId, 'NONE');
       return this.groupsHandler.renderSessionGroups(sessionId, page, actorUserId);
     }
     if (callbackData.startsWith('gv:')) {
       const shortId = callbackData.slice('gv:'.length);
+      this.activateInputOwner(actorUserId, 'NONE');
       const resolved = this.groupWorkflow.resolveGroupRef(shortId, actorUserId);
       if (!resolved) {
         return this.groupsHandler.renderGroupManagementSubmenu(actorUserId);
@@ -999,9 +1128,10 @@ export class TelegramBotController {
       const resolvedGroup = this.groupWorkflow.resolveGroupRef(shortId, actorUserId);
       const resolvedAction = this.groupWorkflow.resolveCompactAction(actionCode);
       if (!resolvedGroup || !resolvedAction) {
+        this.activateInputOwner(actorUserId, 'NONE');
         return this.groupsHandler.renderGroupManagementSubmenu(actorUserId);
       }
-      this.activeConversationMode.set(actorUserId, 'GROUP');
+      this.activateInputOwner(actorUserId, 'GROUP');
       return this.groupWorkflow.initiateGroupAction({
         adminId: actorUserId,
         sessionId: resolvedGroup.sessionId,
@@ -1013,6 +1143,7 @@ export class TelegramBotController {
       const parts = callbackData.split(':');
       const sessionId = parts[2];
       const groupJid = parts.slice(3).join(':');
+      this.activateInputOwner(actorUserId, 'NONE');
       return this.groupWorkflow.renderGroupDetails(sessionId, groupJid, actorUserId);
     }
     if (callbackData.startsWith('grp:act:')) {
@@ -1020,7 +1151,7 @@ export class TelegramBotController {
       const sessionId = parts[2];
       const groupJid = parts[3];
       const action = parts[4] as GroupManagementActionType;
-      this.activeConversationMode.set(actorUserId, 'GROUP');
+      this.activateInputOwner(actorUserId, 'GROUP');
       return this.groupWorkflow.initiateGroupAction({
         adminId: actorUserId,
         sessionId,
@@ -1029,110 +1160,122 @@ export class TelegramBotController {
       });
     }
     if (callbackData === 'wf_grp:confirm_action') {
-      this.activeConversationMode.set(actorUserId, 'NONE');
-      return this.groupWorkflow.confirmGroupAction(actorUserId);
+      const view = this.groupWorkflow.confirmGroupAction(actorUserId);
+      this.activateInputOwner(actorUserId, 'NONE');
+      return view;
     }
 
     // 7: Join Group Workflow
     if (callbackData === 'menu:join_group') {
-      this.cancelAllWorkflowsForAdmin(actorUserId);
-      this.activeConversationMode.set(actorUserId, 'GROUP');
+      this.activateInputOwner(actorUserId, 'GROUP');
       return this.groupWorkflow.startJoinGroup(actorUserId);
     }
     if (callbackData.startsWith('wf_join:toggle_sess:')) {
       const sessId = callbackData.slice('wf_join:toggle_sess:'.length);
+      this.activateInputOwner(actorUserId, 'GROUP');
       return this.groupWorkflow.toggleJoinSession(actorUserId, sessId);
     }
     if (callbackData === 'wf_join:select_all') {
+      this.activateInputOwner(actorUserId, 'GROUP');
       return this.groupWorkflow.selectAllJoinSessions(actorUserId);
     }
     if (callbackData === 'wf_join:clear_all') {
+      this.activateInputOwner(actorUserId, 'GROUP');
       return this.groupWorkflow.clearAllJoinSessions(actorUserId);
     }
     if (callbackData === 'wf_join:proceed_confirm') {
+      this.activateInputOwner(actorUserId, 'GROUP');
       return this.groupWorkflow.proceedJoinConfirmation(actorUserId);
     }
     if (callbackData === 'wf_join:confirm_execute') {
-      this.activeConversationMode.set(actorUserId, 'NONE');
-      return this.groupWorkflow.executeJoinGroup(actorUserId);
+      const view = this.groupWorkflow.executeJoinGroup(actorUserId);
+      this.activateInputOwner(actorUserId, 'NONE');
+      return view;
     }
 
     // 8: Task Monitor & Admin Controls
     if (callbackData === 'menu:admin') {
-      this.cancelAllWorkflowsForAdmin(actorUserId);
+      this.activateInputOwner(actorUserId, 'NONE');
       return this.startHandler.renderAdminControls();
     }
     if (callbackData.startsWith('menu:tasks:page:')) {
       const page = Number(callbackData.split(':').pop() || '1');
+      this.activateInputOwner(actorUserId, 'NONE');
       return this.tasksHandler.renderTaskMonitor(page, actorUserId, isOwner);
     }
     if (callbackData.startsWith('task:view:')) {
       const taskId = callbackData.slice('task:view:'.length);
+      this.activateInputOwner(actorUserId, 'NONE');
       return this.tasksHandler.renderTaskDetail(taskId, actorUserId, isOwner);
     }
     if (callbackData.startsWith('task:cancel:')) {
       const taskId = callbackData.slice('task:cancel:'.length);
+      this.activateInputOwner(actorUserId, 'NONE');
       return this.tasksHandler.handleCancelTask(taskId, actorUserId, isOwner);
     }
 
     // 9: Activity History
     if (callbackData.startsWith('menu:audit:page:')) {
       const page = Number(callbackData.split(':').pop() || '1');
+      this.activateInputOwner(actorUserId, 'NONE');
       return this.tasksHandler.renderAuditHistory(page);
     }
 
     // 10: Settings, Cooldown & Subscriptions Management
     if (callbackData === 'menu:settings' || callbackData === '/controls') {
-      this.cancelAllWorkflowsForAdmin(actorUserId);
+      this.activateInputOwner(actorUserId, 'NONE');
       return this.settingsHandler.renderSettings();
     }
     if (callbackData === 'settings:toggle_ratelimit') {
+      this.activateInputOwner(actorUserId, 'NONE');
       return this.settingsHandler.toggleSetting('rate_limit_profile', actorUserId);
     }
     if (callbackData === 'settings:toggle_notify') {
+      this.activateInputOwner(actorUserId, 'NONE');
       return this.settingsHandler.toggleSetting('notify_on_disconnect', actorUserId);
     }
     if (callbackData === 'settings:cycle_cooldown') {
+      this.activateInputOwner(actorUserId, 'NONE');
       return this.settingsHandler.cycleCooldown(actorUserId);
     }
     if (callbackData === 'settings:prompt_cooldown') {
-      this.cancelAllWorkflowsForAdmin(actorUserId);
-      this.activeConversationMode.set(actorUserId, 'SETTINGS');
+      this.activateInputOwner(actorUserId, 'SETTINGS');
       return this.settingsHandler.promptCustomCooldown(actorUserId);
     }
     if (
       callbackData === 'settings:view_access' ||
       callbackData === 'menu:subscriptions'
     ) {
-      this.cancelAllWorkflowsForAdmin(actorUserId);
+      this.activateInputOwner(actorUserId, 'NONE');
       return this.settingsHandler.renderSubscriptionsMenu(1);
     }
     if (callbackData.startsWith('menu:subscriptions:page:')) {
       const page = Number(callbackData.split(':').pop() || '1');
-      this.cancelAllWorkflowsForAdmin(actorUserId);
+      this.activateInputOwner(actorUserId, 'NONE');
       return this.settingsHandler.renderSubscriptionsMenu(page);
     }
     if (callbackData === 'sub:prompt_add') {
-      this.cancelAllWorkflowsForAdmin(actorUserId);
-      this.activeConversationMode.set(actorUserId, 'SETTINGS');
+      this.activateInputOwner(actorUserId, 'SUBSCRIPTIONS');
       return this.settingsHandler.promptAddSubscription(actorUserId);
     }
     if (callbackData === 'sub:prompt_add_group') {
-      this.cancelAllWorkflowsForAdmin(actorUserId);
-      this.activeConversationMode.set(actorUserId, 'SETTINGS');
+      this.activateInputOwner(actorUserId, 'SUBSCRIPTIONS');
       return this.settingsHandler.promptAddClaimGroup(actorUserId);
     }
     if (callbackData.startsWith('sub:confirm_remove:')) {
       const targetId = callbackData.slice('sub:confirm_remove:'.length);
+      this.activateInputOwner(actorUserId, 'NONE');
       return this.settingsHandler.renderConfirmRemoveSubscription(targetId);
     }
     if (callbackData.startsWith('sub:remove:')) {
       const targetId = callbackData.slice('sub:remove:'.length);
+      this.activateInputOwner(actorUserId, 'NONE');
       return this.settingsHandler.handleRemoveSubscription(targetId, actorUserId);
     }
 
     // 11: Help and System Status
     if (callbackData === 'menu:help_status' || callbackData === 'menu:help') {
+      this.activateInputOwner(actorUserId, 'NONE');
       return this.startHandler.renderHelpAndSystemStatus({
         isAdmin: isOwner,
         actorUserId,
@@ -1141,55 +1284,54 @@ export class TelegramBotController {
 
     // 12: Sender Management & Integrated Tools & Diagnostics
     if (callbackData === 'menu:senders' || callbackData === 'tools:ceksender') {
+      this.activateInputOwner(actorUserId, 'NONE');
       return this.toolsHandler.renderSenderDiagnostics(1, actorUserId);
     }
     if (callbackData.startsWith('menu:senders:page:')) {
       const page = Number(callbackData.split(':').pop() || '1');
+      this.activateInputOwner(actorUserId, 'NONE');
       return this.toolsHandler.renderSenderDiagnostics(page, actorUserId);
     }
     if (callbackData === 'menu:tools' || callbackData === '/tools') {
-      this.cancelAllWorkflowsForAdmin(actorUserId);
+      this.activateInputOwner(actorUserId, 'NONE');
       return this.toolsHandler.renderToolsMenu(isOwner);
     }
     if (callbackData === 'tools:prompt_testfunction') {
-      this.cancelAllWorkflowsForAdmin(actorUserId);
-      this.activeConversationMode.set(actorUserId, 'TOOLS');
+      this.activateInputOwner(actorUserId, 'TOOLS');
       return this.toolsHandler.promptTestFunction(actorUserId);
     }
     if (callbackData === 'tools:tf_prompt_max') {
-      this.cancelAllWorkflowsForAdmin(actorUserId);
-      this.activeConversationMode.set(actorUserId, 'TOOLS');
+      this.activateInputOwner(actorUserId, 'TOOLS');
       return this.toolsHandler.promptCustomMaxSends(actorUserId);
     }
     if (callbackData === 'tools:tf_prompt_delay') {
-      this.cancelAllWorkflowsForAdmin(actorUserId);
-      this.activeConversationMode.set(actorUserId, 'TOOLS');
+      this.activateInputOwner(actorUserId, 'TOOLS');
       return this.toolsHandler.promptCustomDelay(actorUserId);
     }
     if (callbackData.startsWith('tools:tf_set_max:')) {
       const val = callbackData.slice('tools:tf_set_max:'.length);
-      this.activeConversationMode.set(actorUserId, 'TOOLS');
+      this.activateInputOwner(actorUserId, 'TOOLS');
       return this.toolsHandler.setMaxSendsConfig(actorUserId, val);
     }
     if (callbackData.startsWith('tools:tf_set_delay:')) {
       const val = callbackData.slice('tools:tf_set_delay:'.length);
-      this.activeConversationMode.set(actorUserId, 'TOOLS');
+      this.activateInputOwner(actorUserId, 'TOOLS');
       return this.toolsHandler.setDelayConfig(actorUserId, val);
     }
     if (callbackData === 'tools:tf_toggle_scope') {
-      this.activeConversationMode.set(actorUserId, 'TOOLS');
+      this.activateInputOwner(actorUserId, 'TOOLS');
       return this.toolsHandler.toggleScopeConfig(actorUserId);
     }
     if (callbackData === 'tools:tf_toggle_stop_on_error') {
-      this.activeConversationMode.set(actorUserId, 'TOOLS');
+      this.activateInputOwner(actorUserId, 'TOOLS');
       return this.toolsHandler.toggleStopOnErrorConfig(actorUserId);
     }
     if (callbackData === 'tools:tf_toggle_smart_wrap') {
-      this.activeConversationMode.set(actorUserId, 'TOOLS');
+      this.activateInputOwner(actorUserId, 'TOOLS');
       return this.toolsHandler.toggleSmartWrapConfig(actorUserId);
     }
     if (callbackData === 'tools:run_sample_testfunction') {
-      this.cancelAllWorkflowsForAdmin(actorUserId);
+      this.activateInputOwner(actorUserId, 'NONE');
       const fallbackMode =
         this.deps.sessionManager.listConnectedSessions(actorUserId).length === 0
           ? '--mode=SIMULATION'
@@ -1201,17 +1343,17 @@ export class TelegramBotController {
       );
     }
     if (callbackData === 'tools:flab_catalog') {
-      this.cancelAllWorkflowsForAdmin(actorUserId);
+      this.activateInputOwner(actorUserId, 'NONE');
       return this.toolsHandler.renderFunctionCatalog(actorUserId);
     }
     if (callbackData.startsWith('tools:flab_select:')) {
       const fnName = callbackData.slice('tools:flab_select:'.length);
-      this.activeConversationMode.set(actorUserId, 'TOOLS');
+      this.activateInputOwner(actorUserId, 'TOOLS');
       return this.toolsHandler.selectFunctionForAdmin(actorUserId, fnName);
     }
     if (callbackData.startsWith('tools:flab_dryrun:')) {
       const fnName = callbackData.slice('tools:flab_dryrun:'.length);
-      this.cancelAllWorkflowsForAdmin(actorUserId);
+      this.activateInputOwner(actorUserId, 'NONE');
       return this.toolsHandler.executeTestFunction(
         actorUserId,
         `+966501234567 1 ${fnName} --dry-run`
@@ -1221,89 +1363,85 @@ export class TelegramBotController {
       const modeVal = callbackData
         .slice('tools:flab_mode:'.length)
         .toUpperCase() as 'LIVE' | 'DRY_RUN' | 'SIMULATION';
-      this.activeConversationMode.set(actorUserId, 'TOOLS');
+      this.activateInputOwner(actorUserId, 'TOOLS');
       return this.toolsHandler.setExecutionModeForAdmin(actorUserId, modeVal);
     }
     if (
       callbackData === 'tools:flab_run_scenarios' ||
       callbackData === 'tools:flab_scenarios'
     ) {
-      this.cancelAllWorkflowsForAdmin(actorUserId);
+      this.activateInputOwner(actorUserId, 'NONE');
       return this.toolsHandler.renderScenarioSuiteReport(actorUserId);
     }
     if (callbackData === 'tools:flab_capabilities') {
-      this.cancelAllWorkflowsForAdmin(actorUserId);
+      this.activateInputOwner(actorUserId, 'NONE');
       return this.toolsHandler.renderCapabilitiesMatrix();
     }
     if (
       callbackData === 'tools:flab_prompt_save' ||
       callbackData === 'tools:flab_save_last'
     ) {
-      this.activeConversationMode.set(actorUserId, 'TOOLS');
+      this.activateInputOwner(actorUserId, 'TOOLS');
       return this.toolsHandler.promptSaveLastFunction(actorUserId);
     }
     if (callbackData === 'tools:flab_prompt_upload_save') {
-      this.cancelAllWorkflowsForAdmin(actorUserId);
-      this.activeConversationMode.set(actorUserId, 'TOOLS');
+      this.activateInputOwner(actorUserId, 'TOOLS');
       return this.toolsHandler.promptUploadFunctionToSave(actorUserId);
     }
     if (callbackData === 'tools:flab_confirm_upload_name') {
-      this.activeConversationMode.set(actorUserId, 'TOOLS');
+      this.activateInputOwner(actorUserId, 'TOOLS');
       const view = this.toolsHandler.confirmUploadedFunctionName(actorUserId);
       if (this.toolsHandler.getStep(actorUserId) === 'NONE') {
-        this.activeConversationMode.set(actorUserId, 'NONE');
+        this.activateInputOwner(actorUserId, 'NONE');
       }
       return view;
     }
     if (callbackData.startsWith('tools:flab_prompt_run:')) {
       const fnName = callbackData.slice('tools:flab_prompt_run:'.length);
-      this.cancelAllWorkflowsForAdmin(actorUserId);
-      this.activeConversationMode.set(actorUserId, 'TOOLS');
+      this.activateInputOwner(actorUserId, 'TOOLS');
       return this.toolsHandler.promptRunSavedFunction(actorUserId, fnName);
     }
     if (callbackData === 'tools:flab_stop') {
       return this.toolsHandler.stopActiveFunction(actorUserId);
     }
     if (callbackData === 'tools:prompt_channel') {
-      this.cancelAllWorkflowsForAdmin(actorUserId);
-      this.activeConversationMode.set(actorUserId, 'TOOLS');
+      this.activateInputOwner(actorUserId, 'TOOLS');
       return this.toolsHandler.promptChannelLookup(actorUserId);
     }
     if (callbackData === 'tools:prompt_ip') {
-      this.cancelAllWorkflowsForAdmin(actorUserId);
-      this.activeConversationMode.set(actorUserId, 'TOOLS');
+      this.activateInputOwner(actorUserId, 'TOOLS');
       return this.toolsHandler.promptIpLookup(actorUserId);
     }
     if (callbackData === 'tools:prompt_shortlink') {
-      this.cancelAllWorkflowsForAdmin(actorUserId);
-      this.activeConversationMode.set(actorUserId, 'TOOLS');
+      this.activateInputOwner(actorUserId, 'TOOLS');
       return this.toolsHandler.promptShortlink(actorUserId);
     }
     if (callbackData === 'tools:cekall') {
+      this.activateInputOwner(actorUserId, 'NONE');
       return this.toolsHandler.renderCheckAllReport(actorUserId);
     }
     if (callbackData === 'tools:info') {
+      this.activateInputOwner(actorUserId, 'NONE');
       return this.toolsHandler.renderUserInfo(actorUserId, isOwner);
     }
     if (callbackData === 'tools:gempa') {
+      this.activateInputOwner(actorUserId, 'NONE');
       return this.toolsHandler.executeEarthquakeCheck();
     }
     if (callbackData === 'tools:prompt_anon_lid') {
-      this.cancelAllWorkflowsForAdmin(actorUserId);
-      this.activeConversationMode.set(actorUserId, 'TOOLS');
+      this.activateInputOwner(actorUserId, 'TOOLS');
       return this.toolsHandler.promptAnonymousLidMessage(actorUserId);
     }
     if (callbackData === 'tools:prompt_lid_lookup') {
-      this.cancelAllWorkflowsForAdmin(actorUserId);
-      this.activeConversationMode.set(actorUserId, 'TOOLS');
+      this.activateInputOwner(actorUserId, 'TOOLS');
       return this.toolsHandler.promptLidResolve(actorUserId);
     }
     if (callbackData === 'tools:reachout_status') {
-      this.cancelAllWorkflowsForAdmin(actorUserId);
+      this.activateInputOwner(actorUserId, 'NONE');
       return this.toolsHandler.executeReachoutDiagnostic(actorUserId);
     }
     if (callbackData === 'tools:prompt_username_mgr') {
-      this.cancelAllWorkflowsForAdmin(actorUserId);
+      this.activateInputOwner(actorUserId, 'NONE');
       return this.toolsHandler.renderUsernameManager(actorUserId);
     }
     if (callbackData.startsWith('tools:uname_mode:')) {
@@ -1314,48 +1452,42 @@ export class TelegramBotController {
         modeRaw === 'set' || modeRaw === 'pin' || modeRaw === 'recommend'
           ? modeRaw
           : 'check';
-      this.cancelAllWorkflowsForAdmin(actorUserId);
-      this.activeConversationMode.set(actorUserId, 'TOOLS');
+      this.activateInputOwner(actorUserId, 'TOOLS');
       return this.toolsHandler.promptUsernameMode(actorUserId, validMode);
     }
     if (callbackData === 'tools:uname_delete') {
-      this.cancelAllWorkflowsForAdmin(actorUserId);
+      this.activateInputOwner(actorUserId, 'NONE');
       return this.toolsHandler.executeUsernameCommand(actorUserId, 'delete');
     }
     if (callbackData === 'tools:prompt_menfess_start') {
-      this.cancelAllWorkflowsForAdmin(actorUserId);
-      this.activeConversationMode.set(actorUserId, 'TOOLS');
+      this.activateInputOwner(actorUserId, 'TOOLS');
       return this.toolsHandler.promptMenfessStart(actorUserId);
     }
     if (callbackData === 'tools:menfess_list') {
-      this.cancelAllWorkflowsForAdmin(actorUserId);
+      this.activateInputOwner(actorUserId, 'NONE');
       return this.toolsHandler.renderMenfessSessionsMenu(actorUserId);
     }
     if (callbackData.startsWith('tools:menfess_relay:')) {
       const anonId = callbackData.slice('tools:menfess_relay:'.length).trim();
-      this.cancelAllWorkflowsForAdmin(actorUserId);
-      this.activeConversationMode.set(actorUserId, 'TOOLS');
+      this.activateInputOwner(actorUserId, 'TOOLS');
       return this.toolsHandler.promptMenfessRelayMessage(actorUserId, anonId);
     }
     if (callbackData.startsWith('tools:menfess_stop:')) {
       const anonId = callbackData.slice('tools:menfess_stop:'.length).trim();
-      this.cancelAllWorkflowsForAdmin(actorUserId);
+      this.activateInputOwner(actorUserId, 'NONE');
       return this.toolsHandler.executeAnonStopCommand(actorUserId, anonId);
     }
     if (callbackData === 'tools:prompt_presence') {
-      this.cancelAllWorkflowsForAdmin(actorUserId);
-      this.activeConversationMode.set(actorUserId, 'TOOLS');
+      this.activateInputOwner(actorUserId, 'TOOLS');
       return this.toolsHandler.promptPresenceTool(actorUserId);
     }
     if (callbackData === 'tools:presence_mode_track') {
-      this.cancelAllWorkflowsForAdmin(actorUserId);
-      this.activeConversationMode.set(actorUserId, 'TOOLS');
+      this.activateInputOwner(actorUserId, 'TOOLS');
       return this.toolsHandler.promptPresenceTrackMode(actorUserId);
     }
     if (callbackData.startsWith('tools:presence_dur:')) {
       const durSec = Number(callbackData.slice('tools:presence_dur:'.length));
-      this.cancelAllWorkflowsForAdmin(actorUserId);
-      this.activeConversationMode.set(actorUserId, 'TOOLS');
+      this.activateInputOwner(actorUserId, 'TOOLS');
       return this.toolsHandler.promptPresenceTrackMode(
         actorUserId,
         Number.isFinite(durSec) && durSec >= 5 ? durSec : 15
@@ -1367,8 +1499,7 @@ export class TelegramBotController {
       const target = lastColon > 0 ? rest.slice(0, lastColon) : rest;
       const durSec =
         lastColon > 0 ? Number(rest.slice(lastColon + 1)) || 15 : 15;
-      this.cancelAllWorkflowsForAdmin(actorUserId);
-      this.activeConversationMode.set(actorUserId, 'NONE');
+      this.activateInputOwner(actorUserId, 'NONE');
       return this.toolsHandler.executePresenceTracking(
         actorUserId,
         `${target} ${durSec}`,
@@ -1380,8 +1511,7 @@ export class TelegramBotController {
       const firstColon = rest.indexOf(':');
       const modeRaw = firstColon > 0 ? rest.slice(0, firstColon) : 'composing';
       const target = firstColon > 0 ? rest.slice(firstColon + 1) : '';
-      this.cancelAllWorkflowsForAdmin(actorUserId);
-      this.activeConversationMode.set(actorUserId, 'NONE');
+      this.activateInputOwner(actorUserId, 'NONE');
       return this.toolsHandler.executePresenceHeartbeat(
         actorUserId,
         `${modeRaw} ${target} 15`,
@@ -1390,8 +1520,7 @@ export class TelegramBotController {
     }
     if (callbackData.startsWith('tools:presence_prof:')) {
       const target = callbackData.slice('tools:presence_prof:'.length);
-      this.cancelAllWorkflowsForAdmin(actorUserId);
-      this.activeConversationMode.set(actorUserId, 'NONE');
+      this.activateInputOwner(actorUserId, 'NONE');
       return this.toolsHandler.executeFullProfileLookup(actorUserId, target);
     }
     if (callbackData.startsWith('presence:stop:')) {
@@ -1417,37 +1546,33 @@ export class TelegramBotController {
           : modeRaw === 'available'
             ? 'available'
             : 'composing';
-      this.cancelAllWorkflowsForAdmin(actorUserId);
-      this.activeConversationMode.set(actorUserId, 'TOOLS');
+      this.activateInputOwner(actorUserId, 'TOOLS');
       return this.toolsHandler.promptPresenceHeartbeatMode(actorUserId, mode);
     }
     if (callbackData === 'tools:prompt_full_profile') {
-      this.cancelAllWorkflowsForAdmin(actorUserId);
-      this.activeConversationMode.set(actorUserId, 'TOOLS');
+      this.activateInputOwner(actorUserId, 'TOOLS');
       return this.toolsHandler.promptFullProfileLookup(actorUserId);
     }
     if (callbackData === 'tools:prompt_short_ephemeral') {
-      this.cancelAllWorkflowsForAdmin(actorUserId);
-      this.activeConversationMode.set(actorUserId, 'TOOLS');
+      this.activateInputOwner(actorUserId, 'TOOLS');
       return this.toolsHandler.promptShortEphemeralMessage(actorUserId);
     }
     if (callbackData.startsWith('tools:ephemeral_preset:')) {
       const sec = Number(callbackData.slice('tools:ephemeral_preset:'.length));
-      this.cancelAllWorkflowsForAdmin(actorUserId);
-      this.activeConversationMode.set(actorUserId, 'TOOLS');
+      this.activateInputOwner(actorUserId, 'TOOLS');
       return this.toolsHandler.promptShortEphemeralMessage(
         actorUserId,
         Number.isFinite(sec) && sec >= 1 && sec <= 60 ? sec : 10
       );
     }
     if (callbackData === 'tools:ephemeral_toggle_trigger') {
-      this.activeConversationMode.set(actorUserId, 'TOOLS');
+      this.activateInputOwner(actorUserId, 'TOOLS');
       return this.toolsHandler.toggleEphemeralTriggerMode(actorUserId);
     }
 
     // 13: Network Traffic & Protocol Telemetry Inspector (Owner-Only)
     if (callbackData === 'menu:network') {
-      this.cancelAllWorkflowsForAdmin(actorUserId);
+      this.activateInputOwner(actorUserId, 'NONE');
       return this.networkHandler.renderDashboard(actorUserId, 'ALL', 1);
     }
     if (callbackData.startsWith('net:list:')) {
@@ -1462,41 +1587,51 @@ export class TelegramBotController {
         rawFilter === 'ERRORS'
           ? (rawFilter as NetworkTrafficFilter)
           : 'ALL';
+      this.activateInputOwner(actorUserId, 'NONE');
       return this.networkHandler.renderDashboard(actorUserId, validFilter, page);
     }
     if (callbackData.startsWith('net:view:')) {
       const shortId = callbackData.slice('net:view:'.length);
+      this.activateInputOwner(actorUserId, 'NONE');
       return this.networkHandler.renderEntryDetail(actorUserId, shortId);
     }
     if (callbackData === 'net:ping') {
+      this.activateInputOwner(actorUserId, 'NONE');
       return this.networkHandler.executeLivePing(actorUserId);
     }
     if (callbackData === 'net:export') {
+      this.activateInputOwner(actorUserId, 'NONE');
       return this.networkHandler.exportTrafficReport(actorUserId);
     }
     if (callbackData === 'net:toggle') {
+      this.activateInputOwner(actorUserId, 'NONE');
       return this.networkHandler.toggleCapture(actorUserId);
     }
     if (callbackData === 'net:clear') {
+      this.activateInputOwner(actorUserId, 'NONE');
       return this.networkHandler.clearBuffer(actorUserId);
     }
 
     // 14: Security & Forensic Payload Analyzer (Owner-Only)
     if (callbackData === 'menu:sec_analyzer') {
-      this.cancelAllWorkflowsForAdmin(actorUserId);
+      this.activateInputOwner(actorUserId, 'NONE');
       return this.securityAnalyzerHandler.renderDashboard(actorUserId, 1);
     }
     if (callbackData === 'sec:toggle') {
+      this.activateInputOwner(actorUserId, 'NONE');
       return this.securityAnalyzerHandler.toggleEnabled(actorUserId);
     }
     if (callbackData === 'sec:toggle_autoupload') {
+      this.activateInputOwner(actorUserId, 'NONE');
       return this.securityAnalyzerHandler.toggleAutoUpload(actorUserId);
     }
     if (callbackData === 'sec:toggle_raw_nodes') {
+      this.activateInputOwner(actorUserId, 'NONE');
       return this.securityAnalyzerHandler.toggleRawBinaryNodes(actorUserId);
     }
     if (callbackData.startsWith('sec:filter:')) {
       const rawFilter = callbackData.slice('sec:filter:'.length);
+      this.activateInputOwner(actorUserId, 'NONE');
       return this.securityAnalyzerHandler.setSurfaceFilter(
         actorUserId,
         rawFilter
@@ -1504,19 +1639,23 @@ export class TelegramBotController {
     }
     if (callbackData.startsWith('sec:page:')) {
       const page = Number(callbackData.slice('sec:page:'.length)) || 1;
+      this.activateInputOwner(actorUserId, 'NONE');
       return this.securityAnalyzerHandler.renderDashboard(actorUserId, page);
     }
     if (callbackData.startsWith('sec:download:')) {
       const shortId = callbackData.slice('sec:download:'.length);
+      this.activateInputOwner(actorUserId, 'NONE');
       return this.securityAnalyzerHandler.downloadCaptureBundle(
         actorUserId,
         shortId
       );
     }
     if (callbackData === 'sec:clear') {
+      this.activateInputOwner(actorUserId, 'NONE');
       return this.securityAnalyzerHandler.clearArchive(actorUserId);
     }
 
+    this.activateInputOwner(actorUserId, 'NONE');
     return this.startHandler.renderMainMenu({
       isAdmin: isOwner,
       actorUserId,
@@ -1542,6 +1681,10 @@ export class TelegramBotController {
       chatId: options?.chatId,
     });
 
+    if (typeof options?.userMessageId === 'number') {
+      this.uiState.recordChatActivityMessageId(actorUserId, options.userMessageId);
+    }
+
     this.cancelAllWorkflowsForAdmin(actorUserId);
     this.uiState.resetHome(actorUserId);
 
@@ -1549,6 +1692,9 @@ export class TelegramBotController {
     const view = this.startHandler.renderMainMenu({
       isAdmin: isOwner,
       actorUserId,
+      activeModeLabel: formatActiveInputOwnerArabic(
+        this.uiState.getActiveInputOwner(actorUserId)
+      ),
     });
 
     return this.uiState.deliverView({
@@ -1577,6 +1723,10 @@ export class TelegramBotController {
       settingsRepo: this.deps.settingsRepo,
       chatId: options?.chatId,
     });
+
+    if (typeof options?.userMessageId === 'number') {
+      this.uiState.recordChatActivityMessageId(actorUserId, options.userMessageId);
+    }
 
     const mode = this.getConversationMode(actorUserId);
     const caption = (upload.caption || '').trim();
@@ -1608,20 +1758,22 @@ export class TelegramBotController {
         codeText,
         caption: upload.caption,
       });
-      this.activeConversationMode.set(actorUserId, 'TOOLS');
+      this.activateInputOwner(actorUserId, 'TOOLS');
     } else if (isAwaitingMenfessMedia || isMenfessCaption) {
       view = await this.toolsHandler.handleMenfessMediaUpload(
         actorUserId,
         upload
       );
-      this.activeConversationMode.set(actorUserId, 'NONE');
+      this.activateInputOwner(actorUserId, 'NONE');
     } else if (mode === 'VIDEO_CALL') {
       view = await this.videoCallWorkflow.handleVideoUpload(actorUserId, upload);
       const nextStep = this.videoCallWorkflow.getState(actorUserId)?.step;
-      this.activeConversationMode.set(
-        actorUserId,
-        nextStep === 'STREAMING_ACTIVE' ? 'NONE' : 'VIDEO_CALL'
-      );
+      if (nextStep === 'STREAMING_ACTIVE') {
+        this.uiState.setActiveInputOwner(actorUserId, 'NONE');
+        this.activeConversationMode.set(actorUserId, 'NONE');
+      } else {
+        this.activateInputOwner(actorUserId, 'VIDEO_CALL');
+      }
     } else {
       const mediaState = this.mediaWorkflow.getState(actorUserId);
       if (mode === 'MEDIA' && mediaState?.step === 'AWAITING_FILE') {
@@ -1631,8 +1783,7 @@ export class TelegramBotController {
         const tokens = caption.split(/\s+/);
         const firstToken = tokens[0] || '';
         if (/^(?:\+?\d{8,15}|\d+@g\.us|\d+@s\.whatsapp\.net)$/.test(firstToken)) {
-          this.cancelAllWorkflowsForAdmin(actorUserId);
-          this.activeConversationMode.set(actorUserId, 'MEDIA');
+          this.activateInputOwner(actorUserId, 'SEND_MEDIA');
           this.mediaWorkflow.start(actorUserId);
           const recView = this.mediaWorkflow.handleRecipientInput(
             actorUserId,
@@ -1647,13 +1798,11 @@ export class TelegramBotController {
             view = recView;
           }
         } else {
-          this.cancelAllWorkflowsForAdmin(actorUserId);
-          this.activeConversationMode.set(actorUserId, 'MEDIA');
+          this.activateInputOwner(actorUserId, 'SEND_MEDIA');
           view = this.mediaWorkflow.start(actorUserId);
         }
       } else {
-        this.cancelAllWorkflowsForAdmin(actorUserId);
-        this.activeConversationMode.set(actorUserId, 'MEDIA');
+        this.activateInputOwner(actorUserId, 'SEND_MEDIA');
         view = this.mediaWorkflow.start(actorUserId);
       }
     }
@@ -1689,6 +1838,10 @@ export class TelegramBotController {
       settingsRepo: this.deps.settingsRepo,
       chatId: options?.chatId,
     });
+
+    if (typeof options?.userMessageId === 'number') {
+      this.uiState.recordChatActivityMessageId(actorUserId, options.userMessageId);
+    }
 
     const trimmed = text.trim();
     // Fast-path /start and /menu commands (with optional @bot and payload)
@@ -1750,6 +1903,7 @@ export class TelegramBotController {
       });
     }
     if (command === '/status' || command === '/help') {
+      this.activateInputOwner(actorUserId, 'NONE');
       this.uiState.recordRouteTransition(actorUserId, 'menu:help_status');
       return this.startHandler.renderHelpAndSystemStatus({
         isAdmin: isOwner,
@@ -1786,110 +1940,115 @@ export class TelegramBotController {
       }
 
       if (command === '/controls' || command === '/settings') {
-        this.cancelAllWorkflowsForAdmin(actorUserId);
+        this.activateInputOwner(actorUserId, 'NONE');
         this.uiState.recordRouteTransition(actorUserId, 'menu:settings');
         return this.settingsHandler.renderSettings();
       }
 
       if (command === '/admin') {
-        this.cancelAllWorkflowsForAdmin(actorUserId);
+        this.activateInputOwner(actorUserId, 'NONE');
         this.uiState.recordRouteTransition(actorUserId, 'menu:admin');
         return this.startHandler.renderAdminControls();
       }
 
       if (command === '/sessions') {
-        this.cancelAllWorkflowsForAdmin(actorUserId);
+        this.activateInputOwner(actorUserId, 'NONE');
         this.uiState.recordRouteTransition(actorUserId, 'menu:sessions:page:1');
         return this.sessionsHandler.renderSessionsList(1, actorUserId);
       }
 
       if (command === '/tools') {
-        this.cancelAllWorkflowsForAdmin(actorUserId);
+        this.activateInputOwner(actorUserId, 'NONE');
         this.uiState.recordRouteTransition(actorUserId, 'menu:tools');
         return this.toolsHandler.renderToolsMenu(isOwner);
       }
 
       if (command === '/inbox') {
-        this.cancelAllWorkflowsForAdmin(actorUserId);
+        this.activateInputOwner(actorUserId, 'NONE');
         this.uiState.recordRouteTransition(actorUserId, 'menu:inbox:page:1');
         return this.inboxHandler.renderInboxMenu(actorUserId, 1);
       }
 
       if (command === '/stories' || command === '/statusdl') {
-        this.cancelAllWorkflowsForAdmin(actorUserId);
+        this.activateInputOwner(actorUserId, 'NONE');
         this.uiState.recordRouteTransition(actorUserId, 'menu:stories:page:1');
         return this.storiesHandler.renderStoriesMenu(actorUserId, 1);
       }
 
       if (command === '/ceksender') {
+        this.activateInputOwner(actorUserId, 'NONE');
         this.uiState.recordRouteTransition(actorUserId, 'menu:senders:page:1');
         return this.toolsHandler.renderSenderDiagnostics(1, actorUserId);
       }
 
       if (command === '/cekall') {
+        this.activateInputOwner(actorUserId, 'NONE');
         this.uiState.recordRouteTransition(actorUserId, 'tools:cekall');
         return this.toolsHandler.renderCheckAllReport(actorUserId);
       }
 
       if (command === '/info' || command === '/cekprem') {
+        this.activateInputOwner(actorUserId, 'NONE');
         this.uiState.recordRouteTransition(actorUserId, 'tools:info');
         return this.toolsHandler.renderUserInfo(actorUserId, isOwner);
       }
 
       if (command === '/gempa') {
+        this.activateInputOwner(actorUserId, 'NONE');
         this.uiState.recordRouteTransition(actorUserId, 'tools:gempa');
         return this.toolsHandler.executeEarthquakeCheck();
       }
 
       if (command === '/cekidch') {
         if (args.length === 0) {
-          this.cancelAllWorkflowsForAdmin(actorUserId);
-          this.activeConversationMode.set(actorUserId, 'TOOLS');
+          this.activateInputOwner(actorUserId, 'TOOLS');
           return this.toolsHandler.promptChannelLookup(actorUserId);
         }
+        this.activateInputOwner(actorUserId, 'NONE');
         return this.toolsHandler.executeChannelLookup(actorUserId, args.join(' '));
       }
 
       if (command === '/trackip') {
         if (args.length === 0) {
-          this.cancelAllWorkflowsForAdmin(actorUserId);
-          this.activeConversationMode.set(actorUserId, 'TOOLS');
+          this.activateInputOwner(actorUserId, 'TOOLS');
           return this.toolsHandler.promptIpLookup(actorUserId);
         }
+        this.activateInputOwner(actorUserId, 'NONE');
         return this.toolsHandler.executeIpLookup(actorUserId, args[0]);
       }
 
       if (command === '/shortlink') {
         if (args.length === 0) {
-          this.cancelAllWorkflowsForAdmin(actorUserId);
-          this.activeConversationMode.set(actorUserId, 'TOOLS');
+          this.activateInputOwner(actorUserId, 'TOOLS');
           return this.toolsHandler.promptShortlink(actorUserId);
         }
+        this.activateInputOwner(actorUserId, 'NONE');
         return this.toolsHandler.executeShortlink(actorUserId, args.join(' '));
       }
 
       if (command === '/anonmsg' || command === '/lidmsg') {
         const rawArgs = trimmed.replace(/^\/\S+\s*/, '');
         if (!rawArgs) {
-          this.cancelAllWorkflowsForAdmin(actorUserId);
-          this.activeConversationMode.set(actorUserId, 'TOOLS');
+          this.activateInputOwner(actorUserId, 'TOOLS');
           return this.toolsHandler.promptAnonymousLidMessage(actorUserId);
         }
+        this.activateInputOwner(actorUserId, 'NONE');
         return this.toolsHandler.executeAnonymousLidMessage(actorUserId, rawArgs);
       }
 
       if (command === '/lid') {
         const rawArgs = trimmed.replace(/^\/\S+\s*/, '');
         if (!rawArgs) {
-          this.cancelAllWorkflowsForAdmin(actorUserId);
-          this.activeConversationMode.set(actorUserId, 'TOOLS');
+          this.activateInputOwner(actorUserId, 'TOOLS');
           return this.toolsHandler.promptLidResolve(actorUserId);
         }
+        this.activateInputOwner(actorUserId, 'NONE');
         return this.toolsHandler.executeLidResolveCommand(actorUserId, rawArgs);
       }
 
       if (command === '/reachout' || command === '/tctoken') {
         const rawArgs = trimmed.replace(/^\/\S+\s*/, '');
+        this.activateInputOwner(actorUserId, 'NONE');
         return this.toolsHandler.executeReachoutDiagnostic(
           actorUserId,
           rawArgs || undefined
@@ -1898,31 +2057,33 @@ export class TelegramBotController {
 
       if (command === '/username') {
         const rawArgs = trimmed.replace(/^\/\S+\s*/, '');
+        this.activateInputOwner(actorUserId, 'NONE');
         return this.toolsHandler.executeUsernameCommand(actorUserId, rawArgs);
       }
 
       if (command === '/anonstart') {
         const rawArgs = trimmed.replace(/^\/\S+\s*/, '');
         if (!rawArgs) {
-          this.cancelAllWorkflowsForAdmin(actorUserId);
-          this.activeConversationMode.set(actorUserId, 'TOOLS');
+          this.activateInputOwner(actorUserId, 'TOOLS');
           return this.toolsHandler.promptMenfessStart(actorUserId);
         }
+        this.activateInputOwner(actorUserId, 'NONE');
         return this.toolsHandler.executeAnonStartCommand(actorUserId, rawArgs);
       }
 
       if (command === '/anonstop') {
         const rawArgs = trimmed.replace(/^\/\S+\s*/, '');
+        this.activateInputOwner(actorUserId, 'NONE');
         return this.toolsHandler.executeAnonStopCommand(actorUserId, rawArgs);
       }
 
       if (command === '/presence') {
         const rawArgs = trimmed.replace(/^\/\S+\s*/, '');
         if (!rawArgs) {
-          this.cancelAllWorkflowsForAdmin(actorUserId);
-          this.activeConversationMode.set(actorUserId, 'TOOLS');
+          this.activateInputOwner(actorUserId, 'TOOLS');
           return this.toolsHandler.promptPresenceTool(actorUserId);
         }
+        this.activateInputOwner(actorUserId, 'NONE');
         return this.toolsHandler.executePresenceCommand(
           actorUserId,
           rawArgs,
@@ -1933,20 +2094,20 @@ export class TelegramBotController {
       if (command === '/fullprofile' || command === '/whois') {
         const rawArgs = trimmed.replace(/^\/\S+\s*/, '');
         if (!rawArgs) {
-          this.cancelAllWorkflowsForAdmin(actorUserId);
-          this.activeConversationMode.set(actorUserId, 'TOOLS');
+          this.activateInputOwner(actorUserId, 'TOOLS');
           return this.toolsHandler.promptFullProfileLookup(actorUserId);
         }
+        this.activateInputOwner(actorUserId, 'NONE');
         return this.toolsHandler.executeFullProfileLookup(actorUserId, rawArgs);
       }
 
       if (command === '/ephemeral' || command === '/selfdestruct') {
         const rawArgs = trimmed.replace(/^\/\S+\s*/, '');
         if (!rawArgs) {
-          this.cancelAllWorkflowsForAdmin(actorUserId);
-          this.activeConversationMode.set(actorUserId, 'TOOLS');
+          this.activateInputOwner(actorUserId, 'TOOLS');
           return this.toolsHandler.promptShortEphemeralMessage(actorUserId);
         }
+        this.activateInputOwner(actorUserId, 'NONE');
         return this.toolsHandler.executeShortEphemeralMessage(
           actorUserId,
           rawArgs
@@ -1954,13 +2115,13 @@ export class TelegramBotController {
       }
 
       if (command === '/nettraffic') {
-        this.cancelAllWorkflowsForAdmin(actorUserId);
+        this.activateInputOwner(actorUserId, 'NONE');
         this.uiState.recordRouteTransition(actorUserId, 'menu:network');
         return this.networkHandler.handleCommandNetTraffic(actorUserId, args[0]);
       }
 
       if (command === '/netinspect') {
-        this.cancelAllWorkflowsForAdmin(actorUserId);
+        this.activateInputOwner(actorUserId, 'NONE');
         const targetId = args[0] || '';
         if (!targetId) {
           return this.networkHandler.renderDashboard(actorUserId, 'ALL', 1);
@@ -1969,13 +2130,13 @@ export class TelegramBotController {
       }
 
       if (command === '/secanalyzer') {
-        this.cancelAllWorkflowsForAdmin(actorUserId);
+        this.activateInputOwner(actorUserId, 'NONE');
         this.uiState.recordRouteTransition(actorUserId, 'menu:sec_analyzer');
         return this.securityAnalyzerHandler.renderDashboard(actorUserId, 1);
       }
 
       if (command === '/secupload') {
-        this.cancelAllWorkflowsForAdmin(actorUserId);
+        this.activateInputOwner(actorUserId, 'NONE');
         const targetId = args[0] || '';
         if (!targetId) {
           return this.securityAnalyzerHandler.renderDashboard(actorUserId, 1);
@@ -1990,16 +2151,17 @@ export class TelegramBotController {
         const rawArgsAfterCommand = trimmed.replace(/^\/\S+\s*/, '');
         if (!rawArgsAfterCommand) {
           if (repliedText || this.toolsHandler.getSelectedFunction(actorUserId)) {
+            this.activateInputOwner(actorUserId, 'NONE');
             return this.toolsHandler.executeTestFunction(
               actorUserId,
               '',
               repliedText
             );
           }
-          this.cancelAllWorkflowsForAdmin(actorUserId);
-          this.activeConversationMode.set(actorUserId, 'TOOLS');
+          this.activateInputOwner(actorUserId, 'TOOLS');
           return this.toolsHandler.promptTestFunction(actorUserId);
         }
+        this.activateInputOwner(actorUserId, 'NONE');
         return this.toolsHandler.executeTestFunction(
           actorUserId,
           rawArgsAfterCommand,
@@ -2010,11 +2172,10 @@ export class TelegramBotController {
       if (command === '/savefunction') {
         const rawArgsAfterCommand = trimmed.replace(/^\/\S+\s*/, '');
         if (!rawArgsAfterCommand && !repliedText) {
-          this.cancelAllWorkflowsForAdmin(actorUserId);
-          this.activeConversationMode.set(actorUserId, 'TOOLS');
+          this.activateInputOwner(actorUserId, 'TOOLS');
           return this.toolsHandler.promptSaveLastFunction(actorUserId);
         }
-        this.activeConversationMode.set(actorUserId, 'TOOLS');
+        this.activateInputOwner(actorUserId, 'TOOLS');
         return this.toolsHandler.saveCustomFunction(
           actorUserId,
           rawArgsAfterCommand,
@@ -2028,40 +2189,42 @@ export class TelegramBotController {
 
       if (command === '/settfmax') {
         if (args.length === 0) {
-          this.cancelAllWorkflowsForAdmin(actorUserId);
-          this.activeConversationMode.set(actorUserId, 'TOOLS');
+          this.activateInputOwner(actorUserId, 'TOOLS');
           return this.toolsHandler.promptCustomMaxSends(actorUserId);
         }
-        this.activeConversationMode.set(actorUserId, 'TOOLS');
+        this.activateInputOwner(actorUserId, 'TOOLS');
         return this.toolsHandler.setMaxSendsConfig(actorUserId, args[0]);
       }
 
       if (command === '/settfdelay') {
         if (args.length === 0) {
-          this.cancelAllWorkflowsForAdmin(actorUserId);
-          this.activeConversationMode.set(actorUserId, 'TOOLS');
+          this.activateInputOwner(actorUserId, 'TOOLS');
           return this.toolsHandler.promptCustomDelay(actorUserId);
         }
-        this.activeConversationMode.set(actorUserId, 'TOOLS');
+        this.activateInputOwner(actorUserId, 'TOOLS');
         return this.toolsHandler.setDelayConfig(actorUserId, args[0]);
       }
 
       if (command === '/settfscope') {
         if (args.length === 0) {
-          this.activeConversationMode.set(actorUserId, 'TOOLS');
+          this.activateInputOwner(actorUserId, 'TOOLS');
           return this.toolsHandler.toggleScopeConfig(actorUserId);
         }
-        this.activeConversationMode.set(actorUserId, 'TOOLS');
+        this.activateInputOwner(actorUserId, 'TOOLS');
         return this.toolsHandler.setScopeConfig(actorUserId, args[0]);
       }
 
-      // Direct pairing commands: /requestpair <phone> [custom8] or /addsender <phone> [custom8]
-      if (command === '/requestpair' || command === '/addsender') {
+      // Direct pairing commands: /pair, /requestpair <phone> [custom8] or /addsender <phone> [custom8]
+      if (
+        command === '/pair' ||
+        command === '/requestpair' ||
+        command === '/addsender'
+      ) {
         if (args.length === 0) {
-          this.cancelAllWorkflowsForAdmin(actorUserId);
-          this.activeConversationMode.set(actorUserId, 'PAIRING');
+          this.activateInputOwner(actorUserId, 'PAIRING');
           return this.pairingWorkflow.startNewLinking(actorUserId);
         }
+        this.activateInputOwner(actorUserId, 'NONE');
         try {
           const result = await this.deps.sessionManager.initiatePairing({
             rawPhoneNumber: args.join(' '),
@@ -2099,6 +2262,7 @@ export class TelegramBotController {
 
       // Safe session reset command: /resetsession [sessionId]
       if (command === '/resetsession') {
+        this.activateInputOwner(actorUserId, 'NONE');
         try {
           if (args[0]) {
             await this.deps.sessionManager.removeSession(args[0], actorUserId);
@@ -2125,6 +2289,7 @@ export class TelegramBotController {
 
       // Cooldown configuration: /setcooldown <seconds>
       if (command === '/setcooldown') {
+        this.activateInputOwner(actorUserId, 'NONE');
         try {
           const seconds = Number(args[0]);
           const updated = this.deps.settingsRepo.setCooldownSeconds(seconds);
@@ -2160,6 +2325,7 @@ export class TelegramBotController {
         command === '/addprem' ||
         command === '/addgcpremium'
       ) {
+        this.activateInputOwner(actorUserId, 'NONE');
         try {
           const targetId = args[0] || '';
           const daysRaw = (args[1] || '').replace(/d$/i, '');
@@ -2211,6 +2377,7 @@ export class TelegramBotController {
         command === '/delprem' ||
         command === '/delgcpremium'
       ) {
+        this.activateInputOwner(actorUserId, 'NONE');
         const targetId = args[0] || '';
         const removed = this.deps.settingsRepo.removePremiumSubscription(targetId);
         return {
@@ -2233,11 +2400,13 @@ export class TelegramBotController {
       }
 
       if (command === '/listprem') {
+        this.activateInputOwner(actorUserId, 'NONE');
         return this.settingsHandler.renderSubscriptionsMenu(1);
       }
 
       // Claim groups commands: /addgb, /delgb, /listgb, /claim
       if (command === '/addgb') {
+        this.activateInputOwner(actorUserId, 'NONE');
         try {
           const groupId = args[0] || '';
           const title = args.slice(1).join(' ') || undefined;
@@ -2270,6 +2439,7 @@ export class TelegramBotController {
       }
 
       if (command === '/delgb') {
+        this.activateInputOwner(actorUserId, 'NONE');
         const groupId = args[0] || '';
         const removed = this.deps.settingsRepo.removeClaimGroup(groupId);
         return {
@@ -2292,12 +2462,12 @@ export class TelegramBotController {
       }
 
       if (command === '/listgb') {
+        this.activateInputOwner(actorUserId, 'NONE');
         return this.settingsHandler.renderSubscriptionsMenu(1);
       }
 
       if (command === '/videocall') {
-        this.cancelAllWorkflowsForAdmin(actorUserId);
-        this.activeConversationMode.set(actorUserId, 'VIDEO_CALL');
+        this.activateInputOwner(actorUserId, 'VIDEO_CALL');
         if (args.length > 0) {
           return this.videoCallWorkflow.start(
             actorUserId,
@@ -2309,6 +2479,7 @@ export class TelegramBotController {
       }
 
       if (command === '/claim') {
+        this.activateInputOwner(actorUserId, 'NONE');
         const claimGroups = this.deps.settingsRepo.listClaimGroups();
         const isInRegisteredClaimGroup =
           chatId !== undefined &&
@@ -2344,148 +2515,174 @@ export class TelegramBotController {
       }
     }
 
+    // Strict exclusive non-command text routing via ActiveInputOwner (zero cross-workflow fallthrough)
+    const owner = this.uiState.getActiveInputOwner(actorUserId);
     const mode = this.getConversationMode(actorUserId);
     const buttonStepGuidanceBanner =
       'ℹ️ *يرجى استخدام الأزرار التفاعلية أدناه للمتابعة أو الضغط على ❌ إلغاء.*';
 
-    if (mode === 'PAIRING') {
+    if (owner === 'PAIRING' || mode === 'PAIRING') {
+      this.activateInputOwner(actorUserId, 'PAIRING');
       const res = await this.pairingWorkflow.handlePhoneInput(actorUserId, trimmed);
       if (!this.pairingWorkflow.getState(actorUserId)) {
-        this.activeConversationMode.set(actorUserId, 'NONE');
+        this.activateInputOwner(actorUserId, 'NONE');
       }
       return res;
     }
 
-    if (mode === 'MESSAGE') {
+    if (owner === 'SEND_TEXT' || (owner === 'NONE' && mode === 'MESSAGE')) {
       const state = this.messageWorkflow.getState(actorUserId);
-      if (state?.step === 'SELECTING_SESSIONS') {
-        const currentView = this.messageWorkflow.renderSessionSelection(actorUserId);
-        return {
-          ...currentView,
-          text: `${buttonStepGuidanceBanner}\n\n${currentView.text}`,
-        };
-      }
-      if (state?.step === 'AWAITING_CONFIRMATION') {
-        const currentView = this.messageWorkflow.proceedToConfirmation(actorUserId);
-        return {
-          ...currentView,
-          text: `${buttonStepGuidanceBanner}\n\n${currentView.text}`,
-        };
-      }
-      return this.messageWorkflow.handleTextInput(actorUserId, trimmed);
-    }
-
-    if (mode === 'MEDIA') {
-      const state = this.mediaWorkflow.getState(actorUserId);
-      if (state?.step === 'AWAITING_RECIPIENT') {
-        return this.mediaWorkflow.handleRecipientInput(actorUserId, trimmed);
-      }
-      if (state?.step === 'SELECTING_SESSIONS') {
-        const currentView = this.mediaWorkflow.renderSessionSelection(actorUserId);
-        return {
-          ...currentView,
-          text: `${buttonStepGuidanceBanner}\n\n${currentView.text}`,
-        };
-      }
-      if (state?.step === 'AWAITING_CONFIRMATION') {
-        const currentView = this.mediaWorkflow.proceedToConfirmation(actorUserId);
-        return {
-          ...currentView,
-          text: `${buttonStepGuidanceBanner}\n\n${currentView.text}`,
-        };
-      }
-    }
-
-    if (mode === 'VIDEO_CALL') {
-      const state = this.videoCallWorkflow.getState(actorUserId);
-      if (state?.step === 'AWAITING_RECIPIENT') {
-        const res = await this.videoCallWorkflow.handleRecipientInput(
-          actorUserId,
-          trimmed
-        );
-        const nextStep = this.videoCallWorkflow.getState(actorUserId)?.step;
-        this.activeConversationMode.set(
-          actorUserId,
-          nextStep === 'STREAMING_ACTIVE' ? 'NONE' : 'VIDEO_CALL'
-        );
-        return res;
-      }
-      if (state?.step === 'AWAITING_VIDEO') {
-        if (/^[\d+\s()-]{7,20}$/.test(trimmed)) {
-          return this.videoCallWorkflow.handleRecipientInput(actorUserId, trimmed);
-        }
-        return {
-          text: `🎬 *الخطوة 1 من 2:* الرجاء رفع ملف الفيديو المسجل (\`.mp4\`, \`.mov\`, \`.webm\`, \`.mkv\`) أولاً أو الضغط على زر الفيديو التجريبي أدناه:`,
-          keyboard: [
-            [
-              {
-                text: '🎬 استخدام فيديو تجريبي جاهز (sample_call.mp4)',
-                callbackData: 'wf_vcall:sample_video',
-              },
-            ],
-            buildBackCancelRow('menu:main'),
-          ],
-        };
-      }
-    }
-
-    if (mode === 'GROUP') {
-      const state = this.groupWorkflow.getState(actorUserId);
-      if (state?.mode === 'JOIN_GROUP') {
-        if (state.step === 'AWAITING_LINK') {
-          return this.groupWorkflow.handleJoinLinkInput(actorUserId, trimmed);
-        }
+      if (!state) {
+        this.activateInputOwner(actorUserId, 'NONE');
+      } else {
+        this.activateInputOwner(actorUserId, 'SEND_TEXT');
         if (state.step === 'SELECTING_SESSIONS') {
-          const currentView =
-            this.groupWorkflow.renderJoinSessionSelection(actorUserId);
+          const currentView = this.messageWorkflow.renderSessionSelection(actorUserId);
           return {
             ...currentView,
             text: `${buttonStepGuidanceBanner}\n\n${currentView.text}`,
           };
         }
         if (state.step === 'AWAITING_CONFIRMATION') {
-          const currentView =
-            this.groupWorkflow.proceedJoinConfirmation(actorUserId);
+          const currentView = this.messageWorkflow.proceedToConfirmation(actorUserId);
+          return {
+            ...currentView,
+            text: `${buttonStepGuidanceBanner}\n\n${currentView.text}`,
+          };
+        }
+        return this.messageWorkflow.handleTextInput(actorUserId, trimmed);
+      }
+    }
+
+    if (owner === 'SEND_MEDIA' || (owner === 'NONE' && mode === 'MEDIA')) {
+      const state = this.mediaWorkflow.getState(actorUserId);
+      if (!state) {
+        this.activateInputOwner(actorUserId, 'NONE');
+      } else {
+        this.activateInputOwner(actorUserId, 'SEND_MEDIA');
+        if (state.step === 'AWAITING_RECIPIENT') {
+          return this.mediaWorkflow.handleRecipientInput(actorUserId, trimmed);
+        }
+        if (state.step === 'SELECTING_SESSIONS') {
+          const currentView = this.mediaWorkflow.renderSessionSelection(actorUserId);
+          return {
+            ...currentView,
+            text: `${buttonStepGuidanceBanner}\n\n${currentView.text}`,
+          };
+        }
+        if (state.step === 'AWAITING_CONFIRMATION') {
+          const currentView = this.mediaWorkflow.proceedToConfirmation(actorUserId);
           return {
             ...currentView,
             text: `${buttonStepGuidanceBanner}\n\n${currentView.text}`,
           };
         }
       }
-      if (state?.mode === 'MANAGE_GROUP') {
-        if (state.step === 'AWAITING_PARTICIPANT_PHONE') {
-          return this.groupWorkflow.handleParticipantPhoneInput(
+    }
+
+    if (owner === 'VIDEO_CALL' || (owner === 'NONE' && mode === 'VIDEO_CALL')) {
+      const state = this.videoCallWorkflow.getState(actorUserId);
+      if (!state) {
+        this.activateInputOwner(actorUserId, 'NONE');
+      } else {
+        this.activateInputOwner(actorUserId, 'VIDEO_CALL');
+        if (state.step === 'AWAITING_RECIPIENT') {
+          const res = await this.videoCallWorkflow.handleRecipientInput(
             actorUserId,
             trimmed
           );
+          const nextStep = this.videoCallWorkflow.getState(actorUserId)?.step;
+          if (nextStep === 'STREAMING_ACTIVE') {
+            this.uiState.setActiveInputOwner(actorUserId, 'NONE');
+            this.activeConversationMode.set(actorUserId, 'NONE');
+          } else {
+            this.activateInputOwner(actorUserId, 'VIDEO_CALL');
+          }
+          return res;
         }
-        if (state.step === 'AWAITING_ACTION_CONFIRMATION') {
-          const shortId = this.groupWorkflow.registerGroupRef(
-            state.sessionId,
-            state.groupJid
-          );
+        if (state.step === 'AWAITING_VIDEO') {
+          if (/^[\d+\s()-]{7,20}$/.test(trimmed)) {
+            return this.videoCallWorkflow.handleRecipientInput(actorUserId, trimmed);
+          }
           return {
-            text:
-              `${buttonStepGuidanceBanner}\n\n` +
-              `⚠️ *تأكيد إجراء إداري على المجموعة*\n\n` +
-              `📌 المجموعة: *${state.groupSubject}*\n` +
-              `🆔 الجلسة: \`${state.sessionId}\`\n` +
-              `⚡ الإجراء: \`${state.action}\``,
+            text: `🎬 *الخطوة 1 من 2:* الرجاء رفع ملف الفيديو المسجل (\`.mp4\`, \`.mov\`, \`.webm\`, \`.mkv\`) أولاً أو الضغط على زر الفيديو التجريبي أدناه:`,
             keyboard: [
               [
                 {
-                  text: '✅ تأكيد التنفيذ',
-                  callbackData: 'wf_grp:confirm_action',
+                  text: '🎬 استخدام فيديو تجريبي جاهز (sample_call.mp4)',
+                  callbackData: 'wf_vcall:sample_video',
                 },
-                { text: '❌ إلغاء', callbackData: `gv:${shortId}` },
               ],
+              buildBackCancelRow('menu:main'),
             ],
           };
         }
       }
     }
 
-    if (mode === 'TOOLS') {
+    if (owner === 'GROUP' || (owner === 'NONE' && mode === 'GROUP')) {
+      const state = this.groupWorkflow.getState(actorUserId);
+      if (!state) {
+        this.activateInputOwner(actorUserId, 'NONE');
+      } else {
+        this.activateInputOwner(actorUserId, 'GROUP');
+        if (state.mode === 'JOIN_GROUP') {
+          if (state.step === 'AWAITING_LINK') {
+            return this.groupWorkflow.handleJoinLinkInput(actorUserId, trimmed);
+          }
+          if (state.step === 'SELECTING_SESSIONS') {
+            const currentView =
+              this.groupWorkflow.renderJoinSessionSelection(actorUserId);
+            return {
+              ...currentView,
+              text: `${buttonStepGuidanceBanner}\n\n${currentView.text}`,
+            };
+          }
+          if (state.step === 'AWAITING_CONFIRMATION') {
+            const currentView =
+              this.groupWorkflow.proceedJoinConfirmation(actorUserId);
+            return {
+              ...currentView,
+              text: `${buttonStepGuidanceBanner}\n\n${currentView.text}`,
+            };
+          }
+        }
+        if (state.mode === 'MANAGE_GROUP') {
+          if (state.step === 'AWAITING_PARTICIPANT_PHONE') {
+            return this.groupWorkflow.handleParticipantPhoneInput(
+              actorUserId,
+              trimmed
+            );
+          }
+          if (state.step === 'AWAITING_ACTION_CONFIRMATION') {
+            const shortId = this.groupWorkflow.registerGroupRef(
+              state.sessionId,
+              state.groupJid
+            );
+            return {
+              text:
+                `${buttonStepGuidanceBanner}\n\n` +
+                `⚠️ *تأكيد إجراء إداري على المجموعة*\n\n` +
+                `📌 المجموعة: *${state.groupSubject}*\n` +
+                `🆔 الجلسة: \`${state.sessionId}\`\n` +
+                `⚡ الإجراء: \`${state.action}\``,
+              keyboard: [
+                [
+                  {
+                    text: '✅ تأكيد التنفيذ',
+                    callbackData: 'wf_grp:confirm_action',
+                  },
+                  { text: '❌ إلغاء', callbackData: `gv:${shortId}` },
+                ],
+              ],
+            };
+          }
+        }
+      }
+    }
+
+    if (owner === 'TOOLS' || (owner === 'NONE' && mode === 'TOOLS')) {
+      this.activateInputOwner(actorUserId, 'TOOLS');
       const response = await this.toolsHandler.handleGuidedInput(
         actorUserId,
         trimmed,
@@ -2493,30 +2690,38 @@ export class TelegramBotController {
         onProgressUpdate
       );
       const nextStep = this.toolsHandler.getStep(actorUserId);
-      this.activeConversationMode.set(
+      this.activateInputOwner(
         actorUserId,
         nextStep === 'NONE' ? 'NONE' : 'TOOLS'
       );
       return response;
     }
 
-    if (mode === 'SETTINGS') {
+    if (
+      owner === 'SETTINGS' ||
+      owner === 'SUBSCRIPTIONS' ||
+      (owner === 'NONE' && mode === 'SETTINGS')
+    ) {
+      const currentOwner =
+        owner === 'SUBSCRIPTIONS' ? 'SUBSCRIPTIONS' : 'SETTINGS';
+      this.activateInputOwner(actorUserId, currentOwner);
       const response = this.settingsHandler.handleGuidedInput(
         actorUserId,
         trimmed
       );
       const nextStep = this.settingsHandler.getStep(actorUserId);
-      this.activeConversationMode.set(
+      this.activateInputOwner(
         actorUserId,
-        nextStep === 'NONE' ? 'NONE' : 'SETTINGS'
+        nextStep === 'NONE' ? 'NONE' : currentOwner
       );
       return response;
     }
 
-    if (mode === 'INBOX_FORWARD') {
+    if (owner === 'INBOX' || (owner === 'NONE' && mode === 'INBOX_FORWARD')) {
+      this.activateInputOwner(actorUserId, 'INBOX');
       const response = await this.inboxHandler.executeForward(actorUserId, trimmed);
       if (!this.inboxHandler.hasPendingForward(actorUserId)) {
-        this.activeConversationMode.set(actorUserId, 'NONE');
+        this.activateInputOwner(actorUserId, 'NONE');
       }
       return response;
     }
@@ -2551,6 +2756,42 @@ export function createGrammyBot(
       controller['deps'].settingsRepo
     )
   );
+
+  const reanchorControlPanelToBottom = async (
+    targetAdminId: number,
+    targetChatId: number
+  ): Promise<void> => {
+    const state = controller.uiState.getOrCreateSession(targetAdminId);
+    if (!state.activeMessageId || !state.lastView) {
+      return;
+    }
+    const oldMessageId = state.activeMessageId;
+    try {
+      const sent = await bot.api.sendMessage(
+        targetChatId,
+        state.lastView.text,
+        {
+          parse_mode: 'Markdown',
+          reply_markup: toGrammyInlineKeyboard(state.lastView.keyboard),
+        }
+      );
+      await bot.api.deleteMessage(targetChatId, oldMessageId).catch(() => undefined);
+      await bot.api
+        .pinChatMessage(targetChatId, sent.message_id, {
+          disable_notification: true,
+        })
+        .catch(() => undefined);
+      state.activeMessageId = sent.message_id;
+      state.pinnedMessageId = sent.message_id;
+      state.lastSeenChatMessageId = Math.max(
+        state.lastSeenChatMessageId ?? 0,
+        sent.message_id
+      );
+      state.panelBuriedByNewMessages = false;
+    } catch {
+      // Ignore if Telegram chat is unreachable or Markdown fallback is needed
+    }
+  };
 
   const forwardCapturedAttachmentToTelegram = async (
     ownerTelegramId: number,
@@ -2615,6 +2856,8 @@ export function createGrammyBot(
       const remainder = rawCaption.slice(0, 4096).replace(/[*_`]/g, '');
       await bot.api.sendMessage(targetChatId, remainder).catch(() => undefined);
     }
+    controller.uiState.markPanelBuried(targetChatId);
+    await reanchorControlPanelToBottom(targetChatId, targetChatId);
     onForwarded();
   };
 
@@ -2682,11 +2925,20 @@ export function createGrammyBot(
         ? ownerTelegramId
         : config.TELEGRAM_ADMIN_ID;
     if (targetChatId > 0) {
-      void bot.api.sendMessage(targetChatId, messageArabic).catch((err) => {
-        log.warn('Failed sending NO_REMOTE_CAMERA notice to Telegram', {
-          error: err instanceof Error ? err.message : String(err),
+      void bot.api
+        .sendMessage(targetChatId, messageArabic)
+        .then(async (sent) => {
+          controller.uiState.recordChatActivityMessageId(
+            targetChatId,
+            sent.message_id
+          );
+          await reanchorControlPanelToBottom(targetChatId, targetChatId);
+        })
+        .catch((err) => {
+          log.warn('Failed sending NO_REMOTE_CAMERA notice to Telegram', {
+            error: err instanceof Error ? err.message : String(err),
+          });
         });
-      });
     }
   };
 
@@ -2733,6 +2985,8 @@ export function createGrammyBot(
             safeCaption ? { caption: safeCaption } : {}
           );
         }
+        controller.uiState.markPanelBuried(targetChatId);
+        await reanchorControlPanelToBottom(targetChatId, targetChatId);
       } catch (err) {
         log.warn('Failed auto-uploading forensic capture bundle to Telegram', {
           captureId: record.captureId,
@@ -2797,6 +3051,7 @@ export function createGrammyBot(
       await controller.handleStartCommand(ctx.from.id, {
         transport,
         chatId: ctx.chat?.id,
+        userMessageId: ctx.message?.message_id,
       });
     } catch (err) {
       const safeErr = toSafeArabicError(err);
@@ -2819,6 +3074,7 @@ export function createGrammyBot(
       await controller.handleStartCommand(ctx.from.id, {
         transport,
         chatId: ctx.chat?.id,
+        userMessageId: ctx.message?.message_id,
       });
     } catch (err) {
       const safeErr = toSafeArabicError(err);
@@ -2842,12 +3098,23 @@ export function createGrammyBot(
         controller.uiState,
         ctx.from.id
       );
+      const hadActiveInput =
+        controller.uiState.getActiveInputOwner(ctx.from.id) !== 'NONE';
       await controller.handleTextMessage(
         ctx.from.id,
         ctx.message.text,
         repliedText,
-        { transport, chatId: ctx.chat?.id }
+        {
+          transport,
+          chatId: ctx.chat?.id,
+          userMessageId: ctx.message.message_id,
+        }
       );
+      if (hadActiveInput && ctx.chat?.id && ctx.message.message_id) {
+        await ctx.api
+          .deleteMessage(ctx.chat.id, ctx.message.message_id)
+          .catch(() => undefined);
+      }
     } catch (err) {
       const safeErr = toSafeArabicError(err);
       log.error('Telegram text message error', {
@@ -2868,6 +3135,8 @@ export function createGrammyBot(
         controller.uiState,
         ctx.from.id
       );
+      const hadActiveInput =
+        controller.uiState.getActiveInputOwner(ctx.from.id) !== 'NONE';
       await controller.handleMediaUpload(
         ctx.from.id,
         {
@@ -2877,8 +3146,17 @@ export function createGrammyBot(
           contentBuffer: buffer,
           caption: ctx.message.caption,
         },
-        { transport, chatId: ctx.chat?.id }
+        {
+          transport,
+          chatId: ctx.chat?.id,
+          userMessageId: ctx.message.message_id,
+        }
       );
+      if (hadActiveInput && ctx.chat?.id && ctx.message.message_id) {
+        await ctx.api
+          .deleteMessage(ctx.chat.id, ctx.message.message_id)
+          .catch(() => undefined);
+      }
     } catch (err) {
       const safeErr = toSafeArabicError(err);
       await ctx.reply(safeErr.userMessage);
@@ -2895,6 +3173,8 @@ export function createGrammyBot(
         controller.uiState,
         ctx.from.id
       );
+      const hadActiveInput =
+        controller.uiState.getActiveInputOwner(ctx.from.id) !== 'NONE';
       await controller.handleMediaUpload(
         ctx.from.id,
         {
@@ -2904,8 +3184,17 @@ export function createGrammyBot(
           contentBuffer: buffer,
           caption: ctx.message.caption,
         },
-        { transport, chatId: ctx.chat?.id }
+        {
+          transport,
+          chatId: ctx.chat?.id,
+          userMessageId: ctx.message.message_id,
+        }
       );
+      if (hadActiveInput && ctx.chat?.id && ctx.message.message_id) {
+        await ctx.api
+          .deleteMessage(ctx.chat.id, ctx.message.message_id)
+          .catch(() => undefined);
+      }
     } catch (err) {
       const safeErr = toSafeArabicError(err);
       await ctx.reply(safeErr.userMessage);
@@ -2922,6 +3211,8 @@ export function createGrammyBot(
         controller.uiState,
         ctx.from.id
       );
+      const hadActiveInput =
+        controller.uiState.getActiveInputOwner(ctx.from.id) !== 'NONE';
       await controller.handleMediaUpload(
         ctx.from.id,
         {
@@ -2931,8 +3222,17 @@ export function createGrammyBot(
           contentBuffer: buffer,
           caption: ctx.message.caption,
         },
-        { transport, chatId: ctx.chat?.id }
+        {
+          transport,
+          chatId: ctx.chat?.id,
+          userMessageId: ctx.message.message_id,
+        }
       );
+      if (hadActiveInput && ctx.chat?.id && ctx.message.message_id) {
+        await ctx.api
+          .deleteMessage(ctx.chat.id, ctx.message.message_id)
+          .catch(() => undefined);
+      }
     } catch (err) {
       const safeErr = toSafeArabicError(err);
       await ctx.reply(safeErr.userMessage);
@@ -2949,6 +3249,8 @@ export function createGrammyBot(
         controller.uiState,
         ctx.from.id
       );
+      const hadActiveInput =
+        controller.uiState.getActiveInputOwner(ctx.from.id) !== 'NONE';
       await controller.handleMediaUpload(
         ctx.from.id,
         {
@@ -2958,8 +3260,17 @@ export function createGrammyBot(
           contentBuffer: buffer,
           caption: ctx.message.caption,
         },
-        { transport, chatId: ctx.chat?.id }
+        {
+          transport,
+          chatId: ctx.chat?.id,
+          userMessageId: ctx.message.message_id,
+        }
       );
+      if (hadActiveInput && ctx.chat?.id && ctx.message.message_id) {
+        await ctx.api
+          .deleteMessage(ctx.chat.id, ctx.message.message_id)
+          .catch(() => undefined);
+      }
     } catch (err) {
       const safeErr = toSafeArabicError(err);
       await ctx.reply(safeErr.userMessage);
@@ -2976,6 +3287,8 @@ export function createGrammyBot(
         controller.uiState,
         ctx.from.id
       );
+      const hadActiveInput =
+        controller.uiState.getActiveInputOwner(ctx.from.id) !== 'NONE';
       await controller.handleMediaUpload(
         ctx.from.id,
         {
@@ -2985,8 +3298,17 @@ export function createGrammyBot(
           contentBuffer: buffer,
           caption: ctx.message.caption,
         },
-        { transport, chatId: ctx.chat?.id }
+        {
+          transport,
+          chatId: ctx.chat?.id,
+          userMessageId: ctx.message.message_id,
+        }
       );
+      if (hadActiveInput && ctx.chat?.id && ctx.message.message_id) {
+        await ctx.api
+          .deleteMessage(ctx.chat.id, ctx.message.message_id)
+          .catch(() => undefined);
+      }
     } catch (err) {
       const safeErr = toSafeArabicError(err);
       await ctx.reply(safeErr.userMessage);
@@ -3003,6 +3325,8 @@ export function createGrammyBot(
         controller.uiState,
         ctx.from.id
       );
+      const hadActiveInput =
+        controller.uiState.getActiveInputOwner(ctx.from.id) !== 'NONE';
       await controller.handleMediaUpload(
         ctx.from.id,
         {
@@ -3011,8 +3335,17 @@ export function createGrammyBot(
           sizeBytes: stk.file_size || buffer.length,
           contentBuffer: buffer,
         },
-        { transport, chatId: ctx.chat?.id }
+        {
+          transport,
+          chatId: ctx.chat?.id,
+          userMessageId: ctx.message.message_id,
+        }
       );
+      if (hadActiveInput && ctx.chat?.id && ctx.message.message_id) {
+        await ctx.api
+          .deleteMessage(ctx.chat.id, ctx.message.message_id)
+          .catch(() => undefined);
+      }
     } catch (err) {
       const safeErr = toSafeArabicError(err);
       await ctx.reply(safeErr.userMessage);

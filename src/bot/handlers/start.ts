@@ -40,6 +40,7 @@ export class StartHandler {
     isAdmin?: boolean;
     actorUserId?: number;
     noticeBanner?: string;
+    activeModeLabel?: string;
   }): BotViewResponse {
     const isAdmin = options?.isAdmin ?? true;
     const sessions = this.sessionManager.listSessions(options?.actorUserId);
@@ -56,6 +57,15 @@ export class StartHandler {
       0,
       sessions.length - connectedCount - pairingCount
     );
+    const primarySession =
+      sessions.find(
+        (s) => s.status === 'CONNECTED' || s.status === 'AUTHENTICATED'
+      ) || sessions[0];
+    const activeSessionBadge = primarySession
+      ? `\`${primarySession.id}\` (${primarySession.masked_phone || primarySession.label})`
+      : 'لا توجد جلسة نشطة';
+    const currentModeBadge =
+      options?.activeModeLabel || 'القائمة الرئيسية (لا توجد عملية معلقة)';
     const stats = this.taskManager.getRunnerStats();
 
     return {
@@ -64,8 +74,10 @@ export class StartHandler {
         `${renderBreadcrumb(['🏠 الرئيسية'])}\n` +
         `👋 *مرحباً بك في لوحة التحكم المركزية لجلسات واتساب*\n` +
         `━━━━━━━━━━━━━━━━━━\n` +
-        `📡 *حالة الجلسات:* ${renderSessionHealthPill(connectedCount, sessions.length)}\n` +
+        `🟢 *الجلسات المتصلة:* *${connectedCount} / ${sessions.length}* (${renderSessionHealthPill(connectedCount, sessions.length)})\n` +
         `   └ 🟢 المتصلة: *${connectedCount}* | 🟡 قيد الربط: *${pairingCount}* | 🔴 غير المتصلة: *${inactiveCount}*\n` +
+        `📱 *الجلسة النشطة:* ${activeSessionBadge}\n` +
+        `🎯 *الوضع الحالي:* *${currentModeBadge}*\n` +
         `🔄 *المهام المتزامنة:* نشطة *${stats.active}/${stats.max}* | ⏳ الطابور: *${stats.queued}*\n` +
         `⏱️ *مدة التشغيل:* \`${formatRuntime()}\` | 💾 *الذاكرة:* \`${formatMemory()}\`\n` +
         `━━━━━━━━━━━━━━━━━━\n` +
