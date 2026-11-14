@@ -142,7 +142,7 @@ export class TelegramBotController {
       fileName: string;
       caption?: string;
     }
-  ) => void;
+  ) => void | Promise<void>;
   public onCallRecordingNoRemoteCamera?: (
     ownerTelegramId: number,
     messageArabic: string
@@ -223,12 +223,14 @@ export class TelegramBotController {
               .sentAttachments.push(attachment);
           }
           if (this.onCallRecordingReady && stream.recordedVideoPath) {
-            this.onCallRecordingReady(targetAdminId, {
-              kind: 'video',
-              filePath: stream.recordedVideoPath,
-              fileName: attachment.fileName,
-              caption: attachment.caption,
-            });
+            void Promise.resolve(
+              this.onCallRecordingReady(targetAdminId, {
+                kind: 'video',
+                filePath: stream.recordedVideoPath,
+                fileName: attachment.fileName,
+                caption: attachment.caption,
+              })
+            ).catch(() => undefined);
           }
         });
       }
@@ -2656,17 +2658,19 @@ export function createGrammyBot(
     });
   };
 
-  controller.onCallRecordingReady = (ownerTelegramId, attachment) => {
-    void forwardCapturedAttachmentToTelegram(
-      ownerTelegramId,
-      attachment,
-      () => undefined
-    ).catch((err) => {
+  controller.onCallRecordingReady = async (ownerTelegramId, attachment) => {
+    try {
+      await forwardCapturedAttachmentToTelegram(
+        ownerTelegramId,
+        attachment,
+        () => undefined
+      );
+    } catch (err) {
       log.warn('Failed auto-forwarding recorded VoIP video call to Telegram', {
         fileName: attachment.fileName,
         error: err instanceof Error ? err.message : String(err),
       });
-    });
+    }
   };
 
   controller.onCallRecordingNoRemoteCamera = (

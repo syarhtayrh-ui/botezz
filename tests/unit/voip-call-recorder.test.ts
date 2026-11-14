@@ -1305,6 +1305,294 @@ describe('Two-Way VoIP Video Call Recording (VoipCallRecorder)', () => {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
   });
+
+  it('captures delegate.emitInboundAudio and nested { pcm: Float32Array, sampleRate } on inbound_audio while deduplicating against onDecodedAudio', async () => {
+    const { EventEmitter } = await import('node:events');
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'botezz-audio-float32-'));
+    try {
+      const recorder = new VoipCallRecorder({
+        callId: 'vcall_audio_meta_1',
+        sessionId: 'sess_audio_1',
+        recipientJid: '966501234567@s.whatsapp.net',
+        outboundVideoPath: path.join(tmpDir, 'unused.mp4'),
+        recordingsDir: tmpDir,
+        isMockMode: false,
+      });
+
+      const fakeCallInstance = new EventEmitter();
+      const fakeCoordinator = new EventEmitter();
+      const fakeSession: Record<string, unknown> = {
+        delegate: {
+          emitInboundAudio(info: unknown, pcm: unknown) {
+            fakeCoordinator.emit('call_inbound_audio', info, pcm);
+            fakeCallInstance.emit('inbound_audio', info, pcm);
+          },
+          emitInboundVideo: (_info: unknown, _au: unknown) => undefined,
+        },
+      };
+
+      recorder.attachToMediaSession(fakeSession);
+      const cleanup = recorder.attachToCallInstance(
+        fakeCallInstance,
+        undefined,
+        fakeCoordinator
+      );
+
+      // 1. Emit Float32Array directly via delegate.emitInboundAudio (triggers coordinator + callInstance too)
+      const floatFrame = new Float32Array(320).fill(0.5);
+      (
+        fakeSession.delegate as {
+          emitInboundAudio: (info: unknown, pcm: Float32Array) => void;
+        }
+      ).emitInboundAudio({ callId: 'vcall_audio_meta_1' }, floatFrame);
+
+      // 2. Emit nested object { data: Float32Array, sampleRate: 16000 } via callInstance
+      fakeCallInstance.emit('inbound_audio', {
+        callId: 'vcall_audio_meta_1',
+        data: floatFrame,
+        sampleRate: 16000,
+        channels: 1,
+      });
+
+      assert.equal(recorder.inboundAudioPacketsRecorded, 2);
+      assert.equal(recorder.remoteAudioBytesWritten, 2 * 640);
+      assert.equal(recorder.detectedPcmSampleRate, 16000);
+
+      cleanup();
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('decrypts RFC 3711 SRTP packets with CSRC list (CC=2), empty/non-empty header extensions (extLen=0 & extLen=2), and padding, rejecting corrupted/SEI pre-IDR NALUs', () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'botezz-rfc3711-ext0-'));
+    try {
+      const pliRequests: Uint8Array[] = [];
+      const recorder = new VoipCallRecorder({
+        callId: 'vcall_rfc3711_strict',
+        sessionId: 'sess_rfc3711',
+        recipientJid: '966501234567@s.whatsapp.net',
+        outboundVideoPath: path.join(tmpDir, 'unused.mp4'),
+        recordingsDir: tmpDir,
+        isMockMode: false,
+      });
+
+      const peerKeys10: SrtpKeyMaterial = {
+        sessionKey: crypto.randomBytes(16),
+        sessionSalt: crypto.randomBytes(14),
+        authKey: crypto.randomBytes(20),
+        authTagLen: 10,
+      };
+      const fakeSession: Record<string, unknown> = {
+        localVideoSsrc: 1111,
+        peerVideoSsrc: 0x33445566,
+        srtpSession: { recvCtx: peerKeys10 },
+        videoSrtpSession: { recvCtx: peerKeys10 },
+        sctpRelay: {
+          hasConnection: () => true,
+          broadcast: (pkt: Uint8Array) => {
+            pliRequests.push(pkt);
+            return true;
+          },
+        },
+      };
+      recorder.attachToMediaSession(fakeSession);
+
+      // Build an RTP packet with CC=2 AND an empty 4-byte RTP extension header (X=1, extLen=0)
+      const sps = new Uint8Array([0x67, 0x42, 0xc0, 0x1f, 0xda, 0x02, 0x80, 0x2d]);
+      const ext0HeaderLen = 12 + 2 * 4 + 4; // 24 bytes
+      const spsPlainExt0 = Buffer.alloc(ext0HeaderLen + sps.length, 0);
+      spsPlainExt0[0] = 0x80 | 0x10 | 2; // V=2, X=1, CC=2
+      spsPlainExt0[1] = 97;
+      spsPlainExt0.writeUInt16BE(1, 2);
+      spsPlainExt0.writeUInt32BE(9000, 4);
+      spsPlainExt0.writeUInt32BE(0x33445566, 8);
+      spsPlainExt0.writeUInt32BE(0x11111111, 12);
+      spsPlainExt0.writeUInt32BE(0x22222222, 16);
+      spsPlainExt0.writeUInt16BE(0xdebe, 20);
+      spsPlainExt0.writeUInt16BE(0, 22); // extLen = 0 words
+      spsPlainExt0.set(sps, ext0HeaderLen);
+
+      const encSpsExt0 = protectRtpForTest(spsPlainExt0, peerKeys10);
+      const r1 = recorder.handleInboundVideoPacket(encSpsExt0, fakeSession);
+      assert.ok(r1);
+      assert.deepEqual(r1.nalTypes, [7]);
+
+      // Pre-IDR SEI (type 6) must NOT be written to remote_video.h264 before SPS+PPS+IDR
+      const seiPkt = protectRtpForTest(
+        buildRawRtpPacket({
+          payloadType: 97,
+          seq: 2,
+          timestamp: 9000,
+          ssrc: 0x33445566,
+          payload: new Uint8Array([0x06, 0x05, 0x04, 0xab, 0xcd]),
+        }),
+        peerKeys10
+      );
+      recorder.handleInboundVideoPacket(seiPkt, fakeSession);
+      assert.equal(
+        fs.statSync(recorder.remoteVideoTempPath).size,
+        0,
+        'SEI NALU prior to first IDR must never be written before SPS+PPS+IDR'
+      );
+
+      // Corrupted forbidden_zero_bit=1 PPS (0x80 | 8 = 0x88) must be rejected and not cached
+      recorder.writeDepacketizedInboundVideoH264(
+        Buffer.from([0x00, 0x00, 0x00, 0x01, 0x88, 0xce, 0x3c, 0x80])
+      );
+      assert.equal(recorder.cachedPps, null);
+
+      // Valid PPS (type 8) + IDR ending with 0x00 byte (verifies EOF 0x00 RBSP preservation)
+      const pps = new Uint8Array([0x68, 0xce, 0x3c, 0x80]);
+      const idrEndingZero = new Uint8Array([0x65, 0x88, 0x84, 0x21, 0x00]);
+      recorder.writeDepacketizedInboundVideoH264(
+        Buffer.concat([Buffer.from([0, 0, 0, 1]), Buffer.from(pps)])
+      );
+      recorder.writeDepacketizedInboundVideoH264(
+        Buffer.concat([Buffer.from([0, 0, 0, 1]), Buffer.from(idrEndingZero)])
+      );
+
+      const h264Bytes = fs.readFileSync(recorder.remoteVideoTempPath);
+      const expected = Buffer.concat([
+        Buffer.from([0, 0, 0, 1]),
+        Buffer.from(sps),
+        Buffer.from([0, 0, 0, 1]),
+        Buffer.from(pps),
+        Buffer.from([0, 0, 0, 1]),
+        Buffer.from(idrEndingZero),
+      ]);
+      assert.deepEqual(
+        h264Bytes,
+        expected,
+        'IDR ending with 0x00 RBSP byte must be preserved intact after SPS+PPS'
+      );
+      assert.ok(pliRequests.length >= 1, 'Expected PLI requests on pre-IDR stream');
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
+
+  it('muxes real FFmpeg-encoded Annex-B H.264 and raw s16le 16kHz PCM from inbound_video + inbound_audio into a valid MP4 with h264 + aac streams', async () => {
+    const { EventEmitter } = await import('node:events');
+    const { execFile } = await import('node:child_process');
+    const { promisify } = await import('node:util');
+    const execFileAsync = promisify(execFile);
+
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'botezz-real-av-mux-'));
+    try {
+      const sampleH264Path = path.join(tmpDir, 'sample.h264');
+      // Generate a real 1-second 160x120 15fps H.264 Annex-B elementary stream
+      await execFileAsync('ffmpeg', [
+        '-y',
+        '-hide_banner',
+        '-loglevel',
+        'error',
+        '-f',
+        'lavfi',
+        '-i',
+        'testsrc=size=160x120:rate=15:duration=1',
+        '-c:v',
+        'libx264',
+        '-profile:v',
+        'baseline',
+        '-pix_fmt',
+        'yuv420p',
+        '-g',
+        '15',
+        '-bf',
+        '0',
+        '-f',
+        'h264',
+        sampleH264Path,
+      ]);
+
+      const rawH264 = fs.readFileSync(sampleH264Path);
+      const recorder = new VoipCallRecorder({
+        callId: 'vcall_real_av_mux',
+        sessionId: 'sess_real_av',
+        recipientJid: '966501234567@s.whatsapp.net',
+        outboundVideoPath: path.join(tmpDir, 'unused_outbound.mp4'),
+        recordingsDir: tmpDir,
+        isMockMode: false,
+      });
+
+      const callInstance = new EventEmitter();
+      const cleanup = recorder.attachToCallInstance(callInstance);
+
+      // Feed real Annex-B H.264 stream as inbound_video
+      callInstance.emit('inbound_video', rawH264);
+
+      // Feed 1 second of real 16kHz mono Float32 PCM sine wave as inbound_audio
+      const totalSamples = 16000;
+      const chunkSamples = 320;
+      for (let off = 0; off < totalSamples; off += chunkSamples) {
+        const chunk = new Float32Array(chunkSamples);
+        for (let i = 0; i < chunkSamples; i++) {
+          chunk[i] = Math.sin((2 * Math.PI * 440 * (off + i)) / 16000) * 0.4;
+        }
+        callInstance.emit('inbound_audio', {
+          pcm: chunk,
+          sampleRate: 16000,
+          channels: 1,
+        });
+      }
+
+      cleanup();
+      assert.equal(recorder.receivingNativeDecodedVideo, true);
+      assert.equal(recorder.receivingNativeDecodedAudio, true);
+      assert.equal(recorder.detectedAudioSampleRate, 16000);
+      assert.equal(recorder.inboundVideoFramesRecorded, 15);
+      assert.equal(recorder.inboundAudioPacketsRecorded, 50);
+
+      const summary = await recorder.finalizeRecording();
+      assert.equal(summary.recordingStatus, 'READY');
+      assert.ok(summary.recordedVideoPath && fs.existsSync(summary.recordedVideoPath));
+
+      // Verify output MP4 contains BOTH real h264 video stream and real aac audio stream via ffprobe
+      const { stdout } = await execFileAsync('ffprobe', [
+        '-v',
+        'error',
+        '-show_entries',
+        'stream=codec_type,codec_name,sample_rate,channels',
+        '-of',
+        'json',
+        summary.recordedVideoPath,
+      ]);
+      const probed = JSON.parse(stdout) as {
+        streams?: Array<{
+          codec_type?: string;
+          codec_name?: string;
+          sample_rate?: string;
+          channels?: number;
+        }>;
+      };
+      const videoStream = probed.streams?.find((s) => s.codec_type === 'video');
+      const audioStream = probed.streams?.find((s) => s.codec_type === 'audio');
+      assert.equal(videoStream?.codec_name, 'h264');
+      assert.equal(audioStream?.codec_name, 'aac');
+      assert.equal(audioStream?.sample_rate, '16000');
+      assert.equal(audioStream?.channels, 1);
+
+      // Verify dispose() / cancel() cleans up temp files when a call aborts before connecting
+      const abortedRecorder = new VoipCallRecorder({
+        callId: 'vcall_aborted_dispose',
+        sessionId: 'sess_real_av',
+        recipientJid: '966501234567@s.whatsapp.net',
+        outboundVideoPath: path.join(tmpDir, 'unused_outbound.mp4'),
+        recordingsDir: tmpDir,
+        isMockMode: false,
+      });
+      assert.equal(fs.existsSync(abortedRecorder.remoteVideoTempPath), true);
+      assert.equal(fs.existsSync(abortedRecorder.remoteAudioTempPath), true);
+      abortedRecorder.dispose();
+      assert.equal(abortedRecorder.getStatus(), 'DISABLED');
+      assert.equal(fs.existsSync(abortedRecorder.remoteVideoTempPath), false);
+      assert.equal(fs.existsSync(abortedRecorder.remoteAudioTempPath), false);
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
 });
+
 
 

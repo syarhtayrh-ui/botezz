@@ -166,6 +166,7 @@ export interface ActiveVideoCallStream {
   __endedEventEmitted?: boolean;
   __terminalizePromise?: Promise<void>;
   startedAt: string;
+  hasConnected?: boolean;
   connectedAt?: string;
   endedAt?: string;
   failureReason?: string;
@@ -285,6 +286,30 @@ export class RealVideoCallService extends EventEmitter {
     if (!stream || !stream.recordingEnabled || !stream.recorder) {
       return undefined;
     }
+    if (!stream.hasConnected) {
+      try {
+        const recAny = stream.recorder as unknown as {
+          dispose?: () => void;
+          cancel?: () => void;
+          finalizeRecording?: () => Promise<VoipCallRecordingSummary>;
+        };
+        if (typeof recAny.dispose === 'function') {
+          recAny.dispose();
+        } else if (typeof recAny.cancel === 'function') {
+          recAny.cancel();
+        } else if (typeof recAny.finalizeRecording === 'function') {
+          await recAny.finalizeRecording();
+        }
+      } catch {
+        // Ignore recorder cleanup failure when call never connected
+      }
+      stream.recordingStatus = 'DISABLED';
+      stream.recordedVideoPath = undefined;
+      stream.recordedVideoFileName = undefined;
+      stream.recordedVideoSizeBytes = undefined;
+      stream.recordedDurationSeconds = undefined;
+      return undefined;
+    }
     try {
       const summary = await stream.recorder.finalizeRecording();
       stream.recordingStatus = summary.recordingStatus;
@@ -314,6 +339,7 @@ export class RealVideoCallService extends EventEmitter {
           summary,
         });
       } else if (
+        stream.hasConnected === true &&
         summary.recordingStatus === 'NO_REMOTE_CAMERA' &&
         !stream.__recordingReadyEmitted
       ) {
@@ -465,11 +491,92 @@ export class RealVideoCallService extends EventEmitter {
    * 5. Removes any `connection.update` listener added by `VoipClient` during `voip.listen()`
    *    without disturbing `HiroosyBaileysSessionDriver` listeners.
    */
+  private async drainStaleCoordinatorCalls(
+    voipInstance: unknown
+  ): Promise<boolean> {
+    if (!voipInstance || typeof voipInstance !== 'object') {
+      return false;
+    }
+    const voipWithCoordinator = voipInstance as {
+      coordinator?: {
+        endCall?: (callId: string, reason?: string) => Promise<void>;
+        manager?: {
+          calls?: Map<
+            string,
+            {
+              callId?: string;
+              info?: { isEnded?: boolean };
+              cleanup?: () => void;
+            }
+          >;
+        };
+      };
+    };
+    const coordinatorObj = voipWithCoordinator.coordinator;
+    const callsMap = coordinatorObj?.manager?.calls;
+    if (!(callsMap instanceof Map) || callsMap.size === 0) {
+      return false;
+    }
+
+    let drained = false;
+    for (const [cid, mediaSess] of Array.from(callsMap.entries())) {
+      if (mediaSess?.info && !mediaSess.info.isEnded) {
+        drained = true;
+        if (typeof coordinatorObj?.endCall === 'function') {
+          try {
+            await Promise.resolve(coordinatorObj.endCall(cid)).catch(
+              () => undefined
+            );
+          } catch {
+            // Ignore coordinator endCall error
+          }
+        }
+        if (callsMap.has(cid)) {
+          try {
+            mediaSess.cleanup?.();
+          } catch {
+            // Ignore cleanup error
+          }
+          callsMap.delete(cid);
+        }
+      }
+    }
+    return drained;
+  }
+
   public async teardownSessionVoipInstance(
     sessionId: string,
-    stream?: ActiveVideoCallStream,
-    options?: { forceFullDispose?: boolean }
+    streamOrOpts?:
+      | ActiveVideoCallStream
+      | {
+          forceFullDispose?: boolean;
+          disposeVoip?: boolean;
+          ignoreCallId?: string;
+        },
+    options?: {
+      forceFullDispose?: boolean;
+      disposeVoip?: boolean;
+      ignoreCallId?: string;
+    }
   ): Promise<void> {
+    const isStreamArg =
+      Boolean(streamOrOpts) &&
+      typeof streamOrOpts === 'object' &&
+      'callId' in (streamOrOpts as object);
+    const stream = isStreamArg
+      ? (streamOrOpts as ActiveVideoCallStream)
+      : undefined;
+    const resolvedOptions = isStreamArg
+      ? options
+      : ((streamOrOpts as
+          | {
+              forceFullDispose?: boolean;
+              disposeVoip?: boolean;
+              ignoreCallId?: string;
+            }
+          | undefined) ?? options);
+    const ignoreCallId = resolvedOptions?.ignoreCallId ?? stream?.callId;
+
     const ctx = this.attachedSessions.get(sessionId);
     const voipInstance = stream?.voipInstance ?? ctx?.voipInstance;
 
@@ -483,7 +590,8 @@ export class RealVideoCallService extends EventEmitter {
     }
 
     const isFullVoipDispose = Boolean(
-      options?.forceFullDispose ||
+      resolvedOptions?.forceFullDispose ||
+        resolvedOptions?.disposeVoip ||
         (voipInstance as { __forceFullTeardown?: boolean } | undefined)
           ?.__forceFullTeardown
     );
@@ -547,11 +655,19 @@ export class RealVideoCallService extends EventEmitter {
       ctx.activeCallInstances.clear();
     }
 
+    const hasOtherActiveStream = Boolean(
+      this.getActiveStreamForSession(sessionId, ignoreCallId)
+    );
+    const voipCalls = (voipInstance as { calls?: unknown[] } | undefined)
+      ?.calls;
+    const hasStaleVoipCalls = Array.isArray(voipCalls) && voipCalls.length > 0;
+
     if (
       !isFullVoipDispose &&
-      voipInstance instanceof Voip &&
+      voipInstance &&
       typeof voipInstance.end === 'function' &&
-      !this.getActiveStreamForSession(sessionId)
+      !hasOtherActiveStream &&
+      (voipInstance instanceof Voip || hasStaleVoipCalls)
     ) {
       // Clear lingering entries from Voip.#calls so consecutive calls never hit "Maximum concurrent calls reached (1)"
       // while leaving coordinator listeners intact for session reuse.
@@ -560,6 +676,9 @@ export class RealVideoCallService extends EventEmitter {
       } catch {
         // Ignore end(true) error
       }
+    }
+    if (!isFullVoipDispose && voipInstance && !hasOtherActiveStream) {
+      await this.drainStaleCoordinatorCalls(voipInstance);
     }
 
     if (isFullVoipDispose) {
@@ -807,11 +926,13 @@ export class RealVideoCallService extends EventEmitter {
   }
 
   public getActiveStreamForSession(
-    sessionId: string
+    sessionId: string,
+    ignoreCallId?: string
   ): ActiveVideoCallStream | undefined {
     for (const stream of this.activeStreams.values()) {
       if (
         stream.sessionId === sessionId &&
+        stream.callId !== ignoreCallId &&
         !this.isTerminalState(stream.callState)
       ) {
         this.syncRecorderStatsToStream(stream);
@@ -973,6 +1094,7 @@ export class RealVideoCallService extends EventEmitter {
         inboundAudioPacketsReceived: 0,
         remoteCameraCaptured: false,
         startedAt: new Date().toISOString(),
+        hasConnected: false,
         endedAt: new Date().toISOString(),
         failureReason: VOIP_INCOMPATIBLE_ARABIC_MESSAGE,
         detailsArabic: VOIP_INCOMPATIBLE_ARABIC_MESSAGE,
@@ -1062,6 +1184,7 @@ export class RealVideoCallService extends EventEmitter {
       remoteCameraCaptured: false,
       recorder,
       startedAt: new Date().toISOString(),
+      hasConnected: false,
       messageId: callId,
       cleanupFns: [],
       abortController: new AbortController(),
@@ -1681,6 +1804,7 @@ export class RealVideoCallService extends EventEmitter {
         sessionId: stream.sessionId,
       });
 
+      stream.hasConnected = true;
       stream.connectedAt = new Date().toISOString();
       this.transitionCallState(stream, 'CONNECTED');
       this.emit('call:connected', {
@@ -2253,29 +2377,66 @@ export class RealVideoCallService extends EventEmitter {
         }
       }
 
-      // Ensure no stale entry remains in Voip.#calls when placing a new call on a reused Voip instance
-      if (voip instanceof Voip && typeof voip.end === 'function') {
-        const otherActive = Array.from(this.activeStreams.values()).some(
-          (s) =>
-            s.sessionId === stream.sessionId &&
-            s.callId !== stream.callId &&
-            !this.isTerminalState(s.callState)
-        );
-        if (!otherActive) {
+      // Ensure no stale entry remains in Voip.#calls or WaCallManager.calls when placing a new call
+      const otherActive = Boolean(
+        this.getActiveStreamForSession(stream.sessionId, stream.callId)
+      );
+      if (!otherActive) {
+        const voipCalls = (voip as { calls?: unknown[] }).calls;
+        const hasStaleVoipCalls =
+          Array.isArray(voipCalls) && voipCalls.length > 0;
+        let drainedAny = false;
+        if (hasStaleVoipCalls && typeof voip.end === 'function') {
+          await Promise.resolve(voip.end(true)).catch(() => undefined);
+          drainedAny = true;
+        }
+        if (await this.drainStaleCoordinatorCalls(voip)) {
+          drainedAny = true;
+        }
+        if (drainedAny) {
+          await new Promise((r) => setTimeout(r, 100));
+        } else if (voip instanceof Voip && typeof voip.end === 'function') {
           await Promise.resolve(voip.end(true)).catch(() => undefined);
         }
       }
 
-      const callResult = await voip.call(
-        sanitizedTargetJid,
-        mediaPayload as never,
-        normalizedVoipPreset,
-        {
-          loop: Boolean(stream.loopVideo),
-          autoEndCall: !stream.loopVideo,
-          autoDowngrade: false,
-        } as never
-      );
+      const invokeVoipCall = () =>
+        voip.call(
+          sanitizedTargetJid,
+          mediaPayload as never,
+          normalizedVoipPreset,
+          {
+            loop: Boolean(stream.loopVideo),
+            autoEndCall: !stream.loopVideo,
+            autoDowngrade: false,
+          } as never
+        );
+
+      let callResult: VoipCallInstance | string;
+      try {
+        callResult = await invokeVoipCall();
+      } catch (callErr) {
+        const callErrMsg =
+          callErr instanceof Error ? callErr.message : String(callErr);
+        if (/max(?:imum)? concurrent calls reached/i.test(callErrMsg)) {
+          log.warn(
+            'voip.call hit concurrent call limit; force-clearing stale Voip calls and retrying once',
+            {
+              callId: stream.callId,
+              sessionId: stream.sessionId,
+              error: callErrMsg,
+            }
+          );
+          if (typeof voip.end === 'function') {
+            await Promise.resolve(voip.end(true)).catch(() => undefined);
+          }
+          await this.drainStaleCoordinatorCalls(voip);
+          await new Promise((r) => setTimeout(r, 150));
+          callResult = await invokeVoipCall();
+        } else {
+          throw callErr;
+        }
+      }
 
     if (callResult && typeof callResult === 'object') {
       callInstance = callResult as VoipCallInstance;
@@ -2457,19 +2618,8 @@ export class RealVideoCallService extends EventEmitter {
       }
       this.ringingTimeoutTimers.set(stream.callId, ringTimeout);
     }
-
-    const timer = setTimeout(() => {
-      void this.stopVideoCallStream(
-        stream.callId,
-        actorTelegramId,
-        { autoCompleted: true, deleteFile: false },
-        driver
-      );
-    }, Math.min(maxDurationSeconds * 1000, 15_000));
-    if (typeof timer.unref === 'function') {
-      timer.unref();
-    }
-    this.stopTimers.set(stream.callId, timer);
+    void maxDurationSeconds;
+    void actorTelegramId;
   }
 
   /**
@@ -2486,6 +2636,25 @@ export class RealVideoCallService extends EventEmitter {
       this.ringingTimeoutTimers.delete(callId);
     }
 
+    const existingStopTimer = this.stopTimers.get(callId);
+    if (existingStopTimer) {
+      clearTimeout(existingStopTimer);
+      this.stopTimers.delete(callId);
+    }
+    const attachedDriver = this.attachedSessions.get(stream.sessionId)?.driver;
+    const timer = setTimeout(() => {
+      void this.stopVideoCallStream(
+        stream.callId,
+        stream.actorTelegramId,
+        { autoCompleted: true, deleteFile: false },
+        attachedDriver
+      );
+    }, Math.min((stream.maxDurationSeconds || 60) * 1000, 15_000));
+    if (typeof timer.unref === 'function') {
+      timer.unref();
+    }
+    this.stopTimers.set(stream.callId, timer);
+
     this.transitionCallState(stream, 'CONNECTING');
     this.emit('call:connecting', {
       callId: stream.callId,
@@ -2493,6 +2662,7 @@ export class RealVideoCallService extends EventEmitter {
       sessionId: stream.sessionId,
     });
 
+    stream.hasConnected = true;
     stream.connectedAt = new Date().toISOString();
     this.transitionCallState(stream, 'CONNECTED');
     this.emit('call:connected', {

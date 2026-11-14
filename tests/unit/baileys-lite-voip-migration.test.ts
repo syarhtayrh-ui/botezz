@@ -1788,6 +1788,7 @@ describe('@hiroosy/baileys-lite & Real WhatsApp VoIP Video Call Suite', () => {
       });
 
       const callInst = harness.createdCallInstances[0]!;
+      callInst.emit('connected');
       callInst.emit('ended', 'completed');
 
       const endedResult = await endedPromise;
@@ -1796,11 +1797,155 @@ describe('@hiroosy/baileys-lite & Real WhatsApp VoIP Video Call Suite', () => {
       assert.deepEqual(
         eventOrder,
         ['recording-no-remote-camera', 'call:ended'],
-        'Recording finalization MUST complete and emit recording event BEFORE call:ended fires'
+        'Recording finalization MUST complete and emit recording event BEFORE call:ended fires when call connected'
       );
+      assert.equal(stream.hasConnected, true);
       assert.equal(stream.recordingStatus, 'NO_REMOTE_CAMERA');
 
       service.detachSession('sess_finalize_order');
+    });
+
+    it('clears stale voip.calls before voip.call(), retries once on "max concurrent calls reached (1)", and skips false NO_REMOTE_CAMERA when call never connected', async () => {
+      const service = new RealVideoCallService();
+      service.setCompatibilityOverride(
+        runBaileysCompatibilityProbe({ requireLiveSocket: false })
+      );
+
+      const rawSocket = {
+        authState: { creds: { me: { id: '966500000000@s.whatsapp.net' } } },
+        ev: new EventEmitter(),
+        ws: { send: async () => undefined },
+      };
+
+      // 1. Stale voip.calls must be cleared BEFORE voip.call() even while new stream is INITIALIZING in activeStreams
+      service.attachSession('sess_stale_voip_calls', rawSocket);
+      const harnessStale = createRealisticHiroosyVoipMock();
+      const staleCallsArray: unknown[] = [{ callId: 'STALE_1' }];
+      const endForceArgs: boolean[] = [];
+      let callAttempts = 0;
+
+      const voipWithStale = Object.assign(harnessStale.voipMock, {
+        get calls() {
+          return staleCallsArray;
+        },
+        async end(force = false) {
+          endForceArgs.push(Boolean(force));
+          if (force) {
+            staleCallsArray.length = 0;
+          }
+          harnessStale.callsMap.clear();
+        },
+      });
+      const origCall = voipWithStale.call.bind(voipWithStale);
+      voipWithStale.call = async (jid: string, media: string, preset: string) => {
+        callAttempts += 1;
+        if (staleCallsArray.length > 0) {
+          throw new Error('max concurrent calls reached (1)');
+        }
+        return origCall(jid, media, preset);
+      };
+
+      const attachedMap = (
+        service as unknown as {
+          attachedSessions: Map<string, { voipInstance?: unknown }>;
+        }
+      ).attachedSessions;
+      attachedMap.get('sess_stale_voip_calls')!.voipInstance = voipWithStale;
+
+      const streamOk = await service.startVideoCall({
+        sessionId: 'sess_stale_voip_calls',
+        socket: rawSocket,
+        recipientJid: '966501234567@s.whatsapp.net',
+        videoFilePath: validLandscapeMp4,
+        allowedRootDirs: [tmpDir],
+      });
+
+      assert.equal(callAttempts, 1, 'Pre-call drain must clear stale voip.calls before first voip.call()');
+      assert.ok(endForceArgs.includes(true), 'voip.end(true) must be invoked to clear stale calls');
+      assert.ok(streamOk.voipCallInstance);
+
+      // Verify getActiveStreamForSession(..., ignoreCallId) excludes the specified callId
+      assert.equal(
+        service.getActiveStreamForSession('sess_stale_voip_calls', streamOk.callId),
+        undefined
+      );
+
+      // Ended WITHOUT connected -> MUST NOT emit call:recording-no-remote-camera
+      let falseNoCamEvents = 0;
+      service.on('call:recording-no-remote-camera', () => {
+        falseNoCamEvents += 1;
+      });
+      await service.stopVideoCall('sess_stale_voip_calls', streamOk.callId);
+      assert.equal(falseNoCamEvents, 0, 'Non-connected call must NEVER emit call:recording-no-remote-camera');
+      assert.equal(streamOk.hasConnected, false);
+      assert.notEqual(streamOk.recordingStatus, 'NO_REMOTE_CAMERA');
+
+      // 2. Automatic 1-time recovery retry if voip.call() throws "max concurrent calls reached (1)" despite empty voip.calls
+      service.attachSession('sess_retry_concurrent', rawSocket);
+      const harnessRetry = createRealisticHiroosyVoipMock();
+      const retryEndForceArgs: boolean[] = [];
+      let retryCallAttempts = 0;
+      const voipRetry = Object.assign(harnessRetry.voipMock, {
+        calls: [] as unknown[],
+        async end(force = false) {
+          retryEndForceArgs.push(Boolean(force));
+        },
+      });
+      const origRetryCall = voipRetry.call.bind(voipRetry);
+      voipRetry.call = async (jid: string, media: string, preset: string) => {
+        retryCallAttempts += 1;
+        if (retryCallAttempts === 1) {
+          throw new Error('max concurrent calls reached (1)');
+        }
+        return origRetryCall(jid, media, preset);
+      };
+      attachedMap.get('sess_retry_concurrent')!.voipInstance = voipRetry;
+
+      const streamRetried = await service.startVideoCall({
+        sessionId: 'sess_retry_concurrent',
+        socket: rawSocket,
+        recipientJid: '966501234567@s.whatsapp.net',
+        videoFilePath: validLandscapeMp4,
+        allowedRootDirs: [tmpDir],
+      });
+      assert.equal(retryCallAttempts, 2, 'Must automatically retry voip.call() once after max concurrent calls error');
+      assert.ok(retryEndForceArgs.includes(true));
+      assert.ok(streamRetried.voipCallInstance);
+
+      await service.stopVideoCall('sess_retry_concurrent', streamRetried.callId);
+
+      // 3. Permanent failure during INITIALIZING must NOT emit call:recording-no-remote-camera
+      service.attachSession('sess_fail_init_nocam', rawSocket);
+      const harnessAlwaysBusy = createRealisticHiroosyVoipMock();
+      const voipAlwaysBusy = Object.assign(harnessAlwaysBusy.voipMock, {
+        calls: [] as unknown[],
+        async end() {
+          // Simulates stuck call
+        },
+      });
+      voipAlwaysBusy.call = async () => {
+        throw new Error('max concurrent calls reached (1)');
+      };
+      attachedMap.get('sess_fail_init_nocam')!.voipInstance = voipAlwaysBusy;
+
+      await assert.rejects(() =>
+        service.startVideoCall({
+          sessionId: 'sess_fail_init_nocam',
+          socket: rawSocket,
+          recipientJid: '966501234567@s.whatsapp.net',
+          videoFilePath: validLandscapeMp4,
+          allowedRootDirs: [tmpDir],
+        })
+      );
+      assert.equal(
+        falseNoCamEvents,
+        0,
+        'Failed call during INITIALIZING must NEVER emit call:recording-no-remote-camera'
+      );
+
+      service.detachSession('sess_stale_voip_calls');
+      service.detachSession('sess_retry_concurrent');
+      service.detachSession('sess_fail_init_nocam');
     });
   });
 });

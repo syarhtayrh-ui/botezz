@@ -1203,6 +1203,8 @@ export function syncReceiveOnlySrtpOnMediaSession(
     return;
   }
   const s = mediaSession as InstrumentedMediaSession & {
+    initSrtpKeys?: () => void;
+    videoRtpStream?: unknown;
     srtpSession?: {
       recvCipher?: unknown;
       recvKeying?: unknown;
@@ -1232,6 +1234,53 @@ export function syncReceiveOnlySrtpOnMediaSession(
     } | null;
   };
 
+  const localCallKey =
+    (mediaSession.info?.callKey instanceof Uint8Array
+      ? mediaSession.info.callKey
+      : undefined) ||
+    (mediaSession.info?.encryptionKey instanceof Uint8Array
+      ? mediaSession.info.encryptionKey
+      : undefined) ||
+    (mediaSession.localCallKey instanceof Uint8Array
+      ? mediaSession.localCallKey
+      : undefined);
+  if (localCallKey) {
+    mediaSession.__localCallKey = localCallKey;
+  }
+
+  const peerCallKey =
+    (mediaSession.peerCallKey instanceof Uint8Array
+      ? mediaSession.peerCallKey
+      : undefined) ||
+    (mediaSession.__peerCallKey instanceof Uint8Array
+      ? mediaSession.__peerCallKey
+      : undefined);
+  if (peerCallKey) {
+    mediaSession.__peerCallKey = peerCallKey;
+  }
+
+  // If handleCallAccept set srtpFromPeerKey = true before initSrtpKeys() created videoSrtpSession,
+  // initialize videoSrtpSession with our local encryptionKey while preserving the peer-derived srtpSession.
+  const isVideoMedia =
+    (mediaSession.info as { mediaType?: string } | undefined)?.mediaType ===
+      'video' || Boolean(s.videoRtpStream);
+  if (
+    !s.videoSrtpSession &&
+    s.srtpSession &&
+    isVideoMedia &&
+    typeof s.initSrtpKeys === 'function'
+  ) {
+    const peerDerivedSrtp = s.srtpSession;
+    try {
+      s.initSrtpKeys();
+    } catch {
+      // Ignore initSrtpKeys error
+    }
+    s.srtpSession = peerDerivedSrtp;
+  }
+
+  // Copy ONLY receive-side cipher/context from srtpSession onto videoSrtpSession;
+  // NEVER overwrite videoSrtpSession.sendCipher or videoSrtpSession.sendCtx with peerCallKey.
   if (s.videoSrtpSession && s.srtpSession?.recvCipher) {
     s.videoSrtpSession.recvCipher = s.srtpSession.recvCipher;
     s.videoSrtpSession.recvKeying = s.srtpSession.recvKeying;
