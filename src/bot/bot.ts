@@ -154,12 +154,27 @@ export class TelegramBotController {
     ownerTelegramId: number,
     messageArabic: string
   ) => void;
+  public onCallLiveViewUpdate?: (
+    ownerTelegramId: number,
+    view: BotViewResponse
+  ) => void | Promise<void>;
   public onForensicCaptureReady?: (
     ownerTelegramId: number,
     record: ForensicCaptureRecord,
     summaryMessageArabic: string,
     documentAttachments: TelegramMediaAttachment[]
   ) => void;
+
+  public readonly activeCallTelegramMonitorByCallId = new Map<
+    string,
+    {
+      adminId: number;
+      chatId: number;
+      messageId?: number;
+      liveTimer?: NodeJS.Timeout;
+      lastUpdatedAtMs?: number;
+    }
+  >();
 
   private activeConversationMode = new Map<number, ConversationMode>();
 
@@ -191,6 +206,7 @@ export class TelegramBotController {
     this.videoCallBridge =
       deps.videoCallBridge ??
       new UbuntuVideoCallBridge(deps.sessionManager, deps.auditRepo);
+    this.videoCallBridge.setSettingsRepository?.(deps.settingsRepo);
     this.videoCallWorkflow = new VideoCallWorkflow(
       deps.sessionManager,
       this.videoCallBridge,
@@ -198,20 +214,159 @@ export class TelegramBotController {
       deps.config.TEMP_UPLOAD_DIR,
       deps.config.MAX_UPLOAD_SIZE_MB
     );
+    this.videoCallWorkflow.setSettingsRepository(deps.settingsRepo);
+
+    const resolveCallAdminId = (payload?: {
+      initiatedByAdminId?: number;
+      actorTelegramId?: number;
+      stream?: NonNullable<ReturnType<UbuntuVideoCallBridge['getCallStatus']>>;
+    }): number => {
+      const candidate =
+        payload?.initiatedByAdminId ||
+        payload?.actorTelegramId ||
+        payload?.stream?.initiatedByAdminId ||
+        payload?.stream?.actorTelegramId ||
+        deps.config.TELEGRAM_ADMIN_ID;
+      return candidate && candidate > 0
+        ? candidate
+        : deps.config.TELEGRAM_ADMIN_ID;
+    };
+
+    const clearLiveMonitorTimer = (callId: string): void => {
+      const monitor = this.activeCallTelegramMonitorByCallId.get(callId);
+      if (monitor?.liveTimer) {
+        clearInterval(monitor.liveTimer);
+        monitor.liveTimer = undefined;
+      }
+    };
+
+    const pushLiveStreamViewUpdate = (
+      callId: string,
+      adminId: number,
+      stream?: NonNullable<ReturnType<UbuntuVideoCallBridge['getCallStatus']>>
+    ): void => {
+      const resolvedStream =
+        stream || this.videoCallBridge.getCallStatus(callId);
+      if (!resolvedStream || adminId <= 0) {
+        return;
+      }
+      const sess = this.uiState.getOrCreateSession(adminId);
+      const existingMonitor =
+        this.activeCallTelegramMonitorByCallId.get(callId) || {
+          adminId,
+          chatId: adminId,
+          messageId: sess.activeMessageId,
+        };
+      existingMonitor.messageId =
+        sess.activeMessageId ?? existingMonitor.messageId;
+      existingMonitor.lastUpdatedAtMs = Date.now();
+      this.activeCallTelegramMonitorByCallId.set(callId, existingMonitor);
+
+      const view = this.videoCallWorkflow.renderStreamStatusView(resolvedStream);
+      sess.lastView = view;
+      if (this.onCallLiveViewUpdate) {
+        void Promise.resolve(this.onCallLiveViewUpdate(adminId, view)).catch(
+          () => undefined
+        );
+      }
+    };
+
+    const startLiveMonitorTimerIfNeeded = (
+      callId: string,
+      adminId: number
+    ): void => {
+      const monitor = this.activeCallTelegramMonitorByCallId.get(callId) || {
+        adminId,
+        chatId: adminId,
+      };
+      if (monitor.liveTimer) {
+        return;
+      }
+      const timer = setInterval(() => {
+        const currentStream = this.videoCallBridge.getCallStatus(callId);
+        if (
+          !currentStream ||
+          (currentStream.callState !== 'CONNECTED' &&
+            currentStream.callState !== 'MEDIA_NEGOTIATING' &&
+            currentStream.callState !== 'MEDIA_STARTED')
+        ) {
+          clearLiveMonitorTimer(callId);
+          return;
+        }
+        pushLiveStreamViewUpdate(callId, adminId, currentStream);
+      }, 4000);
+      timer.unref?.();
+      monitor.liveTimer = timer;
+      this.activeCallTelegramMonitorByCallId.set(callId, monitor);
+    };
+
+    for (const evtName of [
+      'call:initiating',
+      'call:ringing',
+      'call:connected',
+      'call:media-started',
+      'call:rejected',
+      'call:timeout',
+      'call:ended',
+      'call:media-error',
+    ] as const) {
+      this.videoCallBridge.on(
+        evtName,
+        (payload: {
+          callId: string;
+          initiatedByAdminId?: number;
+          actorTelegramId?: number;
+          stream?: NonNullable<
+            ReturnType<UbuntuVideoCallBridge['getCallStatus']>
+          >;
+        }) => {
+          const callId = payload?.callId;
+          if (!callId) return;
+          const targetAdminId = resolveCallAdminId(payload);
+          if (
+            evtName === 'call:connected' ||
+            evtName === 'call:media-started'
+          ) {
+            startLiveMonitorTimerIfNeeded(callId, targetAdminId);
+          } else if (
+            evtName === 'call:rejected' ||
+            evtName === 'call:timeout' ||
+            evtName === 'call:ended'
+          ) {
+            clearLiveMonitorTimer(callId);
+          }
+          pushLiveStreamViewUpdate(callId, targetAdminId, payload.stream);
+        }
+      );
+    }
 
     this.videoCallBridge.on(
       'call:recording-ready',
       (payload: {
         callId: string;
+        initiatedByAdminId?: number;
         actorTelegramId?: number;
+        outputFilePath?: string;
         stream?: NonNullable<
           ReturnType<UbuntuVideoCallBridge['getCallStatus']>
         >;
       }) => {
         // Defer by one turn so synchronous `stopActiveCall` can attach the recording to its view response first
         setImmediate(() => {
-          const stream = payload?.stream;
-          if (!stream || stream.recordingDeliveredToTelegram) {
+          const callId = payload?.callId;
+          if (callId) {
+            clearLiveMonitorTimer(callId);
+          }
+          const stream =
+            payload?.stream ||
+            (callId ? this.videoCallBridge.getCallStatus(callId) : undefined);
+          if (!stream) {
+            return;
+          }
+          const targetAdminId = resolveCallAdminId(payload);
+          pushLiveStreamViewUpdate(stream.callId, targetAdminId, stream);
+
+          if (stream.recordingDeliveredToTelegram) {
             return;
           }
           const attachment =
@@ -220,20 +375,20 @@ export class TelegramBotController {
             return;
           }
           stream.recordingDeliveredToTelegram = true;
-          const targetAdminId =
-            stream.actorTelegramId && stream.actorTelegramId > 0
-              ? stream.actorTelegramId
-              : deps.config.TELEGRAM_ADMIN_ID;
           if (targetAdminId > 0) {
             this.uiState
               .getOrCreateSession(targetAdminId)
               .sentAttachments.push(attachment);
           }
-          if (this.onCallRecordingReady && stream.recordedVideoPath) {
+          const filePath =
+            payload?.outputFilePath ||
+            stream.outputFilePath ||
+            stream.recordedVideoPath;
+          if (this.onCallRecordingReady && filePath) {
             void Promise.resolve(
               this.onCallRecordingReady(targetAdminId, {
                 kind: 'video',
-                filePath: stream.recordedVideoPath,
+                filePath,
                 fileName: attachment.fileName,
                 caption: attachment.caption,
               })
@@ -247,6 +402,7 @@ export class TelegramBotController {
       'call:recording-no-remote-camera',
       (payload: {
         callId: string;
+        initiatedByAdminId?: number;
         actorTelegramId?: number;
         messageArabic?: string;
         stream?: NonNullable<
@@ -254,15 +410,21 @@ export class TelegramBotController {
         >;
       }) => {
         setImmediate(() => {
-          const stream = payload?.stream;
+          const callId = payload?.callId;
+          if (callId) {
+            clearLiveMonitorTimer(callId);
+          }
+          const stream =
+            payload?.stream ||
+            (callId ? this.videoCallBridge.getCallStatus(callId) : undefined);
+          const targetAdminId = resolveCallAdminId(payload);
+          if (stream) {
+            pushLiveStreamViewUpdate(stream.callId, targetAdminId, stream);
+          }
           if (!stream || stream.recordingDeliveredToTelegram) {
             return;
           }
           stream.recordingDeliveredToTelegram = true;
-          const targetAdminId =
-            stream.actorTelegramId && stream.actorTelegramId > 0
-              ? stream.actorTelegramId
-              : deps.config.TELEGRAM_ADMIN_ID;
           const notice =
             payload.messageArabic ||
             'ℹ️ انتهت المكالمة، ولم يتم إرسال فيديو تسجيل لأن الطرف المستقبل لم يفتح الكاميرا أثناء المكالمة.';
@@ -1001,9 +1163,71 @@ export class TelegramBotController {
       this.activeConversationMode.set(actorUserId, 'NONE');
       return res;
     }
-    if (callbackData === 'wf_vcall:stop' || callbackData.startsWith('wf_vcall:stop:')) {
-      const res = await this.videoCallWorkflow.stopActiveCall(actorUserId);
+    if (
+      callbackData === 'wf_vcall:stop' ||
+      callbackData.startsWith('wf_vcall:stop:') ||
+      callbackData.startsWith('vcall:stop:')
+    ) {
+      const explicitCallId = callbackData.startsWith('vcall:stop:')
+        ? callbackData.slice('vcall:stop:'.length).trim()
+        : callbackData.startsWith('wf_vcall:stop:')
+          ? callbackData.slice('wf_vcall:stop:'.length).trim()
+          : undefined;
+      const res = await this.videoCallWorkflow.stopActiveCall(
+        actorUserId,
+        explicitCallId || undefined
+      );
       this.activateInputOwner(actorUserId, 'NONE');
+      return res;
+    }
+    if (callbackData === 'vcall:rec_history') {
+      this.activateInputOwner(actorUserId, 'NONE');
+      return this.videoCallWorkflow.renderRecordedCallsHistory(actorUserId);
+    }
+    if (callbackData.startsWith('vcall:dl_rec:')) {
+      const idx = Number(callbackData.slice('vcall:dl_rec:'.length)) || 0;
+      this.activateInputOwner(actorUserId, 'NONE');
+      return this.videoCallWorkflow.downloadRecordedCallFromHistory(
+        actorUserId,
+        idx
+      );
+    }
+    if (callbackData.startsWith('vcall:reuse_bcast:')) {
+      const idx = Number(callbackData.slice('vcall:reuse_bcast:'.length)) || 0;
+      this.activateInputOwner(actorUserId, 'VIDEO_CALL');
+      const res = await this.videoCallWorkflow.reuseBroadcastVideo(
+        actorUserId,
+        idx
+      );
+      const nextStep = this.videoCallWorkflow.getState(actorUserId)?.step;
+      if (nextStep === 'STREAMING_ACTIVE') {
+        this.uiState.setActiveInputOwner(actorUserId, 'NONE');
+        this.activeConversationMode.set(actorUserId, 'NONE');
+      } else {
+        this.activateInputOwner(actorUserId, 'VIDEO_CALL');
+      }
+      return res;
+    }
+    if (callbackData.startsWith('vcall:mute:')) {
+      const callId = callbackData.slice('vcall:mute:'.length).trim();
+      return this.videoCallWorkflow.toggleMuteActiveCall(actorUserId, callId);
+    }
+    if (callbackData.startsWith('vcall:react:')) {
+      const callId = callbackData.slice('vcall:react:'.length).trim();
+      return this.videoCallWorkflow.sendReactionOnActiveCall(
+        actorUserId,
+        callId,
+        '❤️'
+      );
+    }
+    if (callbackData.startsWith('vcall:retry:')) {
+      const callId = callbackData.slice('vcall:retry:'.length).trim();
+      const res = await this.videoCallWorkflow.retryCallById(
+        actorUserId,
+        callId
+      );
+      this.uiState.setActiveInputOwner(actorUserId, 'NONE');
+      this.activeConversationMode.set(actorUserId, 'NONE');
       return res;
     }
 
@@ -2899,6 +3123,59 @@ export function createGrammyBot(
         error: err instanceof Error ? err.message : String(err),
       });
     });
+  };
+
+  const lastLiveCallEditMsByChat = new Map<number, number>();
+  controller.onCallLiveViewUpdate = async (ownerTelegramId, view) => {
+    const targetChatId =
+      ownerTelegramId && ownerTelegramId > 0
+        ? ownerTelegramId
+        : config.TELEGRAM_ADMIN_ID;
+    if (!targetChatId || targetChatId <= 0) return;
+
+    const now = Date.now();
+    const prevMs = lastLiveCallEditMsByChat.get(targetChatId) ?? 0;
+    if (now - prevMs < 1500) {
+      return;
+    }
+    lastLiveCallEditMsByChat.set(targetChatId, now);
+
+    const sess = controller.uiState.getOrCreateSession(targetChatId);
+    if (!sess.activeMessageId) {
+      return;
+    }
+
+    try {
+      await bot.api.editMessageText(
+        targetChatId,
+        sess.activeMessageId,
+        view.text,
+        {
+          parse_mode: 'Markdown',
+          reply_markup: toGrammyInlineKeyboard(view.keyboard),
+        }
+      );
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (
+        msg.includes('message is not modified') ||
+        msg.includes('message to edit not found')
+      ) {
+        return;
+      }
+      try {
+        await bot.api.editMessageText(
+          targetChatId,
+          sess.activeMessageId,
+          view.text.replace(/[*_`]/g, ''),
+          {
+            reply_markup: toGrammyInlineKeyboard(view.keyboard),
+          }
+        );
+      } catch {
+        // Ignore harmless edit conflicts during live call updates
+      }
+    }
   };
 
   controller.onCallRecordingReady = async (ownerTelegramId, attachment) => {

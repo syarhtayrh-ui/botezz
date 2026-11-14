@@ -1,3 +1,4 @@
+import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
 import { SessionManager } from '../../whatsapp/session-manager';
@@ -9,7 +10,10 @@ import {
 import { AuditRepository } from '../../database/repositories/audit-repository';
 import { normalizePhoneNumber } from '../../security/validation';
 import { createMinimalMp4Buffer } from '../../function-lab/media-sticker-toolkit';
-import { generatePlayableVoipMp4File } from '../../whatsapp/voip-media-pipeline';
+import {
+  generatePlayableVoipMp4File,
+  validateAndInspectVideoMedia,
+} from '../../whatsapp/voip-media-pipeline';
 import {
   InlineButtonSpec,
   InlineKeyboardRows,
@@ -35,6 +39,18 @@ export type VideoCallStep =
   | 'READY_TO_CALL'
   | 'STREAMING_ACTIVE'
   | 'STREAMING';
+
+export interface RecentBroadcastVideoItem {
+  videoId: string;
+  fileName: string;
+  filePath: string;
+  fileSizeBytes: number;
+  durationSeconds: number;
+  width: number;
+  height: number;
+  hasAudio: boolean;
+  lastUsedAtIso: string;
+}
 
 export interface VideoCallWorkflowState {
   step: VideoCallStep;
@@ -83,6 +99,14 @@ function formatFileSize(bytes: number): string {
 
 export class VideoCallWorkflow {
   private readonly states = new Map<number, VideoCallWorkflowState>();
+  private readonly inMemoryBroadcastVideosByOwner = new Map<
+    number,
+    RecentBroadcastVideoItem[]
+  >();
+  private settingsRepo?: {
+    get: (key: string) => string | undefined;
+    set: (key: string, value: string) => void;
+  };
 
   constructor(
     private readonly sessionManager: SessionManager,
@@ -93,9 +117,217 @@ export class VideoCallWorkflow {
       'data',
       'temp_uploads'
     ),
-    private readonly maxUploadSizeMb = 50
+    private readonly maxUploadSizeMb = 50,
+    settingsRepo?: {
+      get: (key: string) => string | undefined;
+      set: (key: string, value: string) => void;
+    }
   ) {
     fs.mkdirSync(this.tempUploadDir, { recursive: true });
+    this.settingsRepo = settingsRepo;
+  }
+
+  public setSettingsRepository(settingsRepo?: {
+    get: (key: string) => string | undefined;
+    set: (key: string, value: string) => void;
+  }): void {
+    this.settingsRepo = settingsRepo;
+  }
+
+  private getRecentBroadcastVideosDir(): string {
+    const dir = path.join(this.tempUploadDir, 'recent_broadcast_videos');
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    return dir;
+  }
+
+  private getRecentBroadcastVideosSettingKey(ownerTelegramId: number): string {
+    return `recent_broadcast_videos_json:${ownerTelegramId || 0}`;
+  }
+
+  public getRecentBroadcastVideos(
+    ownerTelegramId: number
+  ): RecentBroadcastVideoItem[] {
+    const ownerId = ownerTelegramId || 0;
+    let parsed: RecentBroadcastVideoItem[] = [];
+    const rawJson = this.settingsRepo?.get(
+      this.getRecentBroadcastVideosSettingKey(ownerId)
+    );
+    if (rawJson) {
+      try {
+        const arr = JSON.parse(rawJson);
+        if (Array.isArray(arr)) {
+          parsed = arr as RecentBroadcastVideoItem[];
+        }
+      } catch {
+        parsed = [];
+      }
+    }
+    if (parsed.length === 0) {
+      parsed = this.inMemoryBroadcastVideosByOwner.get(ownerId) ?? [];
+    }
+    const valid = parsed
+      .filter(
+        (item) =>
+          item &&
+          typeof item.filePath === 'string' &&
+          item.filePath.length > 0 &&
+          fs.existsSync(item.filePath)
+      )
+      .slice(0, 3);
+    this.inMemoryBroadcastVideosByOwner.set(ownerId, valid);
+    return valid;
+  }
+
+  private persistRecentBroadcastVideosList(
+    ownerTelegramId: number,
+    list: RecentBroadcastVideoItem[]
+  ): RecentBroadcastVideoItem[] {
+    const ownerId = ownerTelegramId || 0;
+    const top3 = list.slice(0, 3);
+    const evicted = list.slice(3);
+
+    this.inMemoryBroadcastVideosByOwner.set(ownerId, top3);
+    try {
+      this.settingsRepo?.set(
+        this.getRecentBroadcastVideosSettingKey(ownerId),
+        JSON.stringify(top3)
+      );
+    } catch {
+      // Ignore settings persistence error
+    }
+
+    const activePaths = new Set(top3.map((x) => path.resolve(x.filePath)));
+    for (const stale of evicted) {
+      if (
+        stale?.filePath &&
+        !activePaths.has(path.resolve(stale.filePath)) &&
+        fs.existsSync(stale.filePath)
+      ) {
+        try {
+          fs.unlinkSync(stale.filePath);
+        } catch {
+          // Ignore unlink error
+        }
+      }
+    }
+
+    // Also prune any orphaned files for this owner beyond the 3 active ones
+    try {
+      const bcastDir = this.getRecentBroadcastVideosDir();
+      const prefix = `bcast_${ownerId}_`;
+      const ownerFiles = fs
+        .readdirSync(bcastDir)
+        .filter((f) => f.startsWith(prefix) && f.endsWith('.mp4'))
+        .map((f) => path.join(bcastDir, f));
+      for (const candidate of ownerFiles) {
+        if (!activePaths.has(path.resolve(candidate))) {
+          try {
+            fs.unlinkSync(candidate);
+          } catch {
+            // Ignore unlink error
+          }
+        }
+      }
+    } catch {
+      // Ignore directory prune error
+    }
+
+    return top3;
+  }
+
+  public async cacheBroadcastVideoForOwner(
+    ownerTelegramId: number,
+    sourceFilePath: string,
+    originalFileName: string,
+    fileSizeBytes: number
+  ): Promise<RecentBroadcastVideoItem | undefined> {
+    if (!sourceFilePath || !fs.existsSync(sourceFilePath)) {
+      return undefined;
+    }
+    const ownerId = ownerTelegramId || 0;
+    const bcastDir = this.getRecentBroadcastVideosDir();
+
+    let durationSeconds = 10;
+    let width = 640;
+    let height = 360;
+    let hasAudio = true;
+
+    try {
+      const inspection = await validateAndInspectVideoMedia(sourceFilePath, {
+        allowSyntheticMinimalMp4: true,
+      });
+      durationSeconds = Math.max(
+        1,
+        Math.round(inspection.durationSeconds || 10)
+      );
+      width = inspection.width || 640;
+      height = inspection.height || 360;
+      hasAudio = Boolean(inspection.hasAudioStream);
+    } catch {
+      // Keep default metadata if synthetic buffer in unit tests
+    }
+
+    let contentHash = '';
+    try {
+      const buf = fs.readFileSync(sourceFilePath);
+      contentHash = crypto
+        .createHash('sha1')
+        .update(originalFileName || '')
+        .update(':')
+        .update(buf)
+        .digest('hex')
+        .slice(0, 10);
+    } catch {
+      contentHash = `${Date.now().toString(36)}`;
+    }
+
+    const videoId = contentHash || crypto.randomUUID().slice(0, 8);
+    const cachedFilePath = path.join(
+      bcastDir,
+      `bcast_${ownerId}_${videoId}.mp4`
+    );
+
+    try {
+      if (path.resolve(sourceFilePath) !== path.resolve(cachedFilePath)) {
+        fs.copyFileSync(sourceFilePath, cachedFilePath);
+        try {
+          fs.chmodSync(cachedFilePath, 0o600);
+        } catch {
+          // Ignore chmod error
+        }
+      }
+    } catch {
+      return undefined;
+    }
+
+    const statSize = fs.existsSync(cachedFilePath)
+      ? fs.statSync(cachedFilePath).size
+      : fileSizeBytes;
+
+    const newItem: RecentBroadcastVideoItem = {
+      videoId,
+      fileName: originalFileName || path.basename(sourceFilePath),
+      filePath: cachedFilePath,
+      fileSizeBytes: statSize,
+      durationSeconds,
+      width,
+      height,
+      hasAudio,
+      lastUsedAtIso: new Date().toISOString(),
+    };
+
+    const existing = this.getRecentBroadcastVideos(ownerId);
+    const deduped = existing.filter(
+      (it) =>
+        it.videoId !== newItem.videoId &&
+        !(
+          it.fileName === newItem.fileName &&
+          it.fileSizeBytes === newItem.fileSizeBytes
+        )
+    );
+
+    this.persistRecentBroadcastVideosList(ownerId, [newItem, ...deduped]);
+    return newItem;
   }
 
   public getState(adminId: number): VideoCallWorkflowState | undefined {
@@ -120,8 +352,25 @@ export class VideoCallWorkflow {
         path.dirname(resolvedPath) === resolvedTempDir;
       if (!isInsideTempDir) return;
 
+      // Never delete cached recent broadcast videos
+      const recentBcastDir = path.resolve(
+        this.tempUploadDir,
+        'recent_broadcast_videos'
+      );
+      if (
+        resolvedPath.startsWith(recentBcastDir + path.sep) ||
+        path.dirname(resolvedPath) === recentBcastDir
+      ) {
+        return;
+      }
+
       const baseName = path.basename(resolvedPath);
-      if (baseName.startsWith('synthetic_call_')) return;
+      if (
+        baseName.startsWith('synthetic_call_') ||
+        baseName.startsWith('bcast_')
+      ) {
+        return;
+      }
 
       const activeStreams = this.videoCallBridge.listActiveStreams();
       const inUseByActiveCall = activeStreams.some(
@@ -152,7 +401,8 @@ export class VideoCallWorkflow {
   }
 
   /**
-   * Step 1 of 2: Prompt user to upload the video file first (`step = 'AWAITING_VIDEO'`).
+   * Step 1 of 2: Prompt user to upload the video file first (`step = 'AWAITING_VIDEO'`),
+   * while displaying the latest 3 outbound broadcast videos for 1-tap reuse and the latest 3 recorded calls.
    */
   public start(
     adminId: number,
@@ -179,6 +429,12 @@ export class VideoCallWorkflow {
         ].join('\n'),
         keyboard: [
           [{ text: '📲 ربط جلسة جديدة', callbackData: 'menu:link_account' }],
+          [
+            {
+              text: '📼 استعراض وتحميل آخر 3 مكالمات مسجلة',
+              callbackData: 'vcall:rec_history',
+            },
+          ],
           buildBackCancelRow('menu:main'),
         ],
         route: 'menu:video_call',
@@ -219,6 +475,10 @@ export class VideoCallWorkflow {
       maxDurationSeconds: 60,
     });
 
+    const recentBcastVideos = this.getRecentBroadcastVideos(adminId);
+    const recentRecordings =
+      this.videoCallBridge.getRecentRecordedCalls(adminId);
+
     const lines = [
       renderBreadcrumb(['الرئيسية', 'مكالمة فيديو VoIP']),
       renderStepProgressBar(1, 2, 'رفع ملف الفيديو للبث'),
@@ -230,21 +490,233 @@ export class VideoCallWorkflow {
         ? [`• *المستلم المحدد مسبقاً:* \`${recipientDisplay}\``]
         : []),
       '',
-      'الخطوة 1 من 2: *الرجاء إرسال أو رفع ملف الفيديو* (`.mp4`, `.mov`, `.webm`, `.mkv`) ليتم فحصه بـ `ffprobe` وبثه مباشرة داخل مكالمة الفيديو:',
+      '🎬 *آخر 3 فيديوهات استخدمتها لبث المكالمة:*',
+      ...(recentBcastVideos.length > 0
+        ? recentBcastVideos.map(
+            (v, idx) =>
+              `  ${idx + 1}. \`${v.fileName}\` (${v.width}x${v.height} • ${v.durationSeconds}s • ${formatFileSize(v.fileSizeBytes)})`
+          )
+        : ['  • _لا توجد فيديوهات بث محفوظة بعد_']),
+      '',
+      '📼 *آخر 3 فيديوهات مسجلة للمكالمات:*',
+      ...(recentRecordings.length > 0
+        ? recentRecordings.map(
+            (r, idx) =>
+              `  ${idx + 1}. المستلم: \`${r.recipientMasked}\` • المدة: \`${r.durationSeconds}s\` • الحجم: \`${formatFileSize(r.fileSizeBytes)}\` (${r.videoFramesRecorded} إطار)`
+          )
+        : ['  • _لا توجد مكالمات مسجلة محفوظة حتى الآن_']),
+      '',
+      'الخطوة 1 من 2: *الرجاء إرسال أو رفع ملف الفيديو* (`.mp4`, `.mov`, `.webm`, `.mkv`) أو اختيار أحد الفيديوهات المحفوظة بالأسفل:',
     ];
+
+    const keyboard: InlineKeyboardRows = [];
+
+    for (let idx = 0; idx < recentBcastVideos.length; idx++) {
+      const v = recentBcastVideos[idx]!;
+      const shortName =
+        v.fileName.length > 20 ? `${v.fileName.slice(0, 17)}...` : v.fileName;
+      keyboard.push([
+        {
+          text: `🎬 استخدام فيديو #${idx + 1}: ${shortName} (${v.durationSeconds}s • ${formatFileSize(v.fileSizeBytes)})`,
+          callbackData: `vcall:reuse_bcast:${idx}`,
+        },
+      ]);
+    }
+
+    keyboard.push([
+      {
+        text: '🎬 استخدام فيديو تجريبي جاهز (sample_call.mp4)',
+        callbackData: 'wf_vcall:sample_video',
+      },
+    ]);
+
+    keyboard.push([
+      {
+        text: `📼 استعراض وتحميل آخر 3 مكالمات مسجلة (${recentRecordings.length}/3)`,
+        callbackData: 'vcall:rec_history',
+      },
+    ]);
+
+    keyboard.push(buildBackCancelRow('menu:main'));
 
     return {
       text: lines.join('\n'),
-      keyboard: [
-        [
-          {
-            text: '🎬 استخدام فيديو تجريبي جاهز (sample_call.mp4)',
-            callbackData: 'wf_vcall:sample_video',
-          },
-        ],
-        buildBackCancelRow('menu:main'),
-      ],
+      keyboard,
       route: 'menu:video_call',
+    };
+  }
+
+  /**
+   * Renders the "Recent 3 Recorded Call Videos" Archive & Viewer (`vcall:rec_history`).
+   */
+  public renderRecordedCallsHistory(adminId: number): BotViewResponse {
+    const recordings = this.videoCallBridge.getRecentRecordedCalls(adminId);
+    const lines: string[] = [
+      renderBreadcrumb(['الرئيسية', 'مكالمة فيديو VoIP', 'المكالمات المسجلة']),
+      '📼 *آخر 3 فيديوهات مسجلة للمكالمات (Two-Way Call Recordings)*',
+      '━━━━━━━━━━━━━━━━━━━━━━',
+    ];
+
+    const keyboard: InlineKeyboardRows = [];
+
+    if (recordings.length === 0) {
+      lines.push(
+        'ℹ️ *لا توجد فيديوهات مكالمات مسجلة محفوظة حالياً.*',
+        '',
+        'عند إجراء مكالمة فيديو وقيام الطرف المستلم بفتح الكاميرا، يتم حفظ آخر 3 مكالمات مسجلة تلقائياً هنا لتتمكن من استعراضها وتحميلها في أي وقت.'
+      );
+    } else {
+      for (let i = 0; i < recordings.length; i++) {
+        const rec = recordings[i]!;
+        lines.push(
+          `*#${i + 1} — مكالمة \`${rec.callId}\`*`,
+          `• *المستلم:* \`${rec.recipientMasked}\` (الجلسة: \`${rec.sessionId}\`)`,
+          `• *المدة والحجم:* \`${rec.durationSeconds} ثانية\` • \`${formatFileSize(rec.fileSizeBytes)}\``,
+          `• *الإطارات الملتقطة:* \`${rec.videoFramesRecorded} إطار فيديو\` • \`${rec.audioPacketsRecorded} حزمة صوت\``,
+          `• *التاريخ:* \`${rec.recordedAtIso}\``,
+          ''
+        );
+        keyboard.push([
+          {
+            text: `📥 إرسال الفيديو المسجل #${i + 1} (${rec.recipientMasked})`,
+            callbackData: `vcall:dl_rec:${i}`,
+          },
+        ]);
+      }
+    }
+
+    keyboard.push(
+      buildAppNavigationRow({
+        backCallback: 'menu:video_call',
+        refreshCallback: 'vcall:rec_history',
+      })
+    );
+
+    return {
+      text: lines.join('\n'),
+      keyboard,
+      route: 'vcall:rec_history',
+    };
+  }
+
+  /**
+   * Sends one of the recent 3 recorded call `.mp4` videos (`vcall:dl_rec:0..2`) to the user in Telegram.
+   */
+  public downloadRecordedCallFromHistory(
+    adminId: number,
+    index: number
+  ): BotViewResponse {
+    const rec = this.videoCallBridge.getRecordedCallByIndex(adminId, index);
+    if (!rec || !rec.filePath || !fs.existsSync(rec.filePath)) {
+      return {
+        text: '⚠️ *ملف التسجيل المطلوب غير موجود أو تم استبداله بمكالمات أحدث.*',
+        keyboard: [
+          [
+            {
+              text: '🔄 تحديث قائمة المكالمات المسجلة',
+              callbackData: 'vcall:rec_history',
+            },
+          ],
+          buildBackCancelRow('menu:video_call'),
+        ],
+        toastText: '⚠️ ملف التسجيل غير متاح',
+      };
+    }
+
+    const sizeStr = formatFileSize(rec.fileSizeBytes);
+    const caption = [
+      `📼 *الفيديو المسجل للمكالمة #${index + 1}*`,
+      '━━━━━━━━━━━━━━━━━━━━━━',
+      `• *معرف المكالمة:* \`${rec.callId}\``,
+      `• *المستلم:* \`${rec.recipientMasked}\` (\`${rec.sessionId}\`)`,
+      `• *المدة:* \`${rec.durationSeconds} ثانية\` • *الحجم:* \`${sizeStr}\``,
+      `• *الإطارات:* \`${rec.videoFramesRecorded} إطار فيديو\` • \`${rec.audioPacketsRecorded} حزمة صوت\``,
+      `• *التوقيت:* \`${rec.recordedAtIso}\``,
+    ].join('\n');
+
+    const attachment: TelegramMediaAttachment = {
+      kind: 'video',
+      filePath: rec.filePath,
+      fileName: path.basename(rec.filePath),
+      mimeType: 'video/mp4',
+      caption,
+    };
+
+    const view = this.renderRecordedCallsHistory(adminId);
+    return {
+      ...view,
+      mediaAttachments: [attachment],
+      toastText: `📥 جاري إرسال الفيديو المسجل #${index + 1}...`,
+    };
+  }
+
+  /**
+   * Reuses one of the recent 3 outbound broadcast videos (`vcall:reuse_bcast:0..2`) without re-uploading.
+   */
+  public async reuseBroadcastVideo(
+    adminId: number,
+    index: number
+  ): Promise<BotViewResponse> {
+    let state = this.states.get(adminId);
+    if (!state || !state.selectedSessionId) {
+      this.start(adminId);
+      state = this.states.get(adminId);
+      if (!state) {
+        return this.start(adminId);
+      }
+    }
+
+    const recent = this.getRecentBroadcastVideos(adminId);
+    const chosen = recent[index];
+    if (!chosen || !chosen.filePath || !fs.existsSync(chosen.filePath)) {
+      return {
+        ...this.start(adminId, state.selectedSessionId, state.recipientDisplay),
+        toastText: '⚠️ ملف الفيديو المحفوظ لم يعد متوفراً، يرجى رفع ملف جديد.',
+      };
+    }
+
+    // Verify with validateAndInspectVideoMedia before attaching
+    await validateAndInspectVideoMedia(chosen.filePath, {
+      allowSyntheticMinimalMp4: true,
+    });
+
+    // Update lastUsedAtIso and move to index 0
+    chosen.lastUsedAtIso = new Date().toISOString();
+    const reordered = [
+      chosen,
+      ...recent.filter((_, i) => i !== index),
+    ];
+    this.persistRecentBroadcastVideosList(adminId, reordered);
+
+    if (
+      state.videoFilePath &&
+      path.resolve(state.videoFilePath) !== path.resolve(chosen.filePath)
+    ) {
+      this.releaseOwnedTempVideoFile(state.videoFilePath);
+    }
+
+    state.videoFilePath = chosen.filePath;
+    state.videoFileName = chosen.fileName;
+    state.mimeType = 'video/mp4';
+    state.sizeBytes = chosen.fileSizeBytes;
+    state.protocolMode = 'HIROOSY_VOIP_VIDEO_CALL';
+
+    if (state.recipientJid) {
+      state.step = 'READY_TO_CALL';
+      this.states.set(adminId, state);
+      const execView = await this.confirmAndExecute(adminId);
+      return {
+        ...execView,
+        toastText: '✅ تم اختيار الفيديو المحفوظ بنجاح!',
+      };
+    }
+
+    state.step = 'AWAITING_RECIPIENT';
+    this.states.set(adminId, state);
+    const step2View = this.renderAwaitingRecipientStep(adminId);
+    return {
+      ...step2View,
+      toastText: '✅ تم اختيار الفيديو المحفوظ بنجاح!',
     };
   }
 
@@ -298,6 +770,10 @@ export class VideoCallWorkflow {
         text: '🎬 تغيير ملف الفيديو',
         callbackData: 'wf_vcall:reupload',
       },
+      {
+        text: '📼 المكالمات المسجلة (3)',
+        callbackData: 'vcall:rec_history',
+      },
     ]);
 
     rows.push(buildBackCancelRow('menu:main'));
@@ -322,8 +798,8 @@ export class VideoCallWorkflow {
   }
 
   /**
-   * Step 2 of 2: Handle uploaded video file -> transitions to `AWAITING_RECIPIENT`
-   * (or starts call immediately if recipient was pre-supplied via `/videocall <phone>`).
+   * Step 2 of 2: Handle uploaded video file -> caches in Recent 3 Outbound Broadcast Videos
+   * and transitions to `AWAITING_RECIPIENT` (or starts call immediately if recipient was pre-supplied).
    */
   public async handleVideoUpload(
     adminId: number,
@@ -358,6 +834,14 @@ export class VideoCallWorkflow {
       `vcall_${adminId}_${Date.now()}_${safeName}`
     );
     fs.writeFileSync(filePath, upload.contentBuffer);
+
+    // Cache a persistent copy into the Recent 3 Outbound Broadcast Videos store
+    await this.cacheBroadcastVideoForOwner(
+      adminId,
+      filePath,
+      safeName,
+      upload.sizeBytes
+    );
 
     if (state.videoFilePath && state.videoFilePath !== filePath) {
       this.releaseOwnedTempVideoFile(state.videoFilePath);
@@ -617,6 +1101,69 @@ export class VideoCallWorkflow {
     return this.confirmAndExecute(adminId);
   }
 
+  public async retryCallById(
+    adminId: number,
+    callId: string
+  ): Promise<BotViewResponse> {
+    const prev = this.videoCallBridge.getCallStatus(callId);
+    if (prev) {
+      const existing = this.states.get(adminId);
+      this.states.set(adminId, {
+        step: 'READY_TO_CALL',
+        selectedSessionId: prev.sessionId || existing?.selectedSessionId,
+        recipientJid: prev.recipientJid,
+        recipientDisplay: prev.recipientMasked || prev.recipientJid,
+        videoFilePath:
+          prev.videoFilePath && fs.existsSync(prev.videoFilePath)
+            ? prev.videoFilePath
+            : existing?.videoFilePath,
+        videoFileName: prev.videoFileName || existing?.videoFileName,
+        mimeType: 'video/mp4',
+        callKind: prev.callKind || 'video',
+        protocolMode: 'HIROOSY_VOIP_VIDEO_CALL',
+        wavesCount: 1,
+        loopVideo: prev.loopVideo ?? true,
+        recordCall: prev.recordingEnabled ?? true,
+        maxDurationSeconds: prev.maxDurationSeconds || 60,
+      });
+      return this.confirmAndExecute(adminId);
+    }
+    return this.repeatCall(adminId);
+  }
+
+  public async toggleMuteActiveCall(
+    adminId: number,
+    callId: string
+  ): Promise<BotViewResponse> {
+    const res = await this.videoCallBridge.toggleMuteCall(callId);
+    const stream = this.videoCallBridge.getCallStatus(callId);
+    if (!stream) {
+      return this.start(adminId);
+    }
+    const view = this.renderStreamStatusView(stream);
+    return {
+      ...view,
+      toastText: res.muted ? '🔇 تم كتم صوت البث' : '🔊 تم تشغيل صوت البث',
+    };
+  }
+
+  public async sendReactionOnActiveCall(
+    adminId: number,
+    callId: string,
+    emoji = '❤️'
+  ): Promise<BotViewResponse> {
+    await this.videoCallBridge.sendCallReaction(callId, emoji);
+    const stream = this.videoCallBridge.getCallStatus(callId);
+    if (!stream) {
+      return this.start(adminId);
+    }
+    const view = this.renderStreamStatusView(stream);
+    return {
+      ...view,
+      toastText: `${emoji} تم إرسال التفاعل في المكالمة`,
+    };
+  }
+
   public async startInstantCallRing(
     adminId: number,
     callKind: 'video' | 'voice'
@@ -640,6 +1187,10 @@ export class VideoCallWorkflow {
 
     const isMediaActivelyStreaming =
       stream.callState === 'MEDIA_STARTED' && stream.mediaStarted;
+    const isConnectedOrStreaming =
+      stream.callState === 'CONNECTED' ||
+      stream.callState === 'MEDIA_NEGOTIATING' ||
+      stream.callState === 'MEDIA_STARTED';
     const isTerminal =
       stream.callState === 'ENDED' ||
       stream.callState === 'REJECTED' ||
@@ -658,9 +1209,11 @@ export class VideoCallWorkflow {
         ? isMockMode
           ? '🧪 *تم بدء المكالمة المرئية وبث الفيديو بنجاح (MOCK_SIMULATION)*'
           : '✅ *تم بدء المكالمة المرئية وبث الفيديو بنجاح*'
-        : isMockMode
-          ? '🧪 *تم إنشاء جلسة محاكاة مكالمة الفيديو (MOCK_SIMULATION)*'
-          : '📞 *تم إرسال طلب مكالمة الفيديو وجاري الرنين وتأسيس قناة الوسائط*';
+        : isConnectedOrStreaming
+          ? '🟢 *تم الرد على المكالمة وتأسيس قناة الاتصال المباشر*'
+          : isMockMode
+            ? '🧪 *تم إنشاء جلسة محاكاة مكالمة الفيديو (MOCK_SIMULATION)*'
+            : '📞 *تم إرسال طلب مكالمة الفيديو وجاري الرنين وتأسيس قناة الوسائط*';
 
     const recordingStatusLabel =
       stream.recordingStatus === 'RECORDING'
@@ -675,22 +1228,46 @@ export class VideoCallWorkflow {
                 ? '⚪ معطل (`DISABLED`)'
                 : '⚠️ تعذر الحفظ (`FAILED`)';
 
-    const keyboardRows: InlineKeyboardRows = [
-      [
+    const keyboardRows: InlineKeyboardRows = [];
+
+    if (!isTerminal) {
+      keyboardRows.push([
         {
-          text: '🔁 إعادة الاتصال وبث الفيديو لنفس الرقم',
+          text: '🛑 إنهاء المكالمة الآن',
+          callbackData: `vcall:stop:${stream.callId}`,
+        },
+      ]);
+      if (isConnectedOrStreaming) {
+        keyboardRows.push([
+          {
+            text: stream.muted
+              ? '🔊 إلغاء كتم الصوت'
+              : '🔇 كتم/تشغيل الصوت',
+            callbackData: `vcall:mute:${stream.callId}`,
+          },
+          {
+            text: '👍 إرسال تفاعل',
+            callbackData: `vcall:react:${stream.callId}`,
+          },
+        ]);
+      }
+    } else {
+      keyboardRows.push([
+        {
+          text: '🔄 إعادة المحاولة',
+          callbackData: `vcall:retry:${stream.callId}`,
+        },
+        {
+          text: '🔁 إعادة الاتصال لنفس الرقم',
           callbackData: 'wf_vcall:repeat_call',
         },
-      ],
-      [
-        {
-          text: '🛑 إنهاء المكالمة وإيقاف البث',
-          callbackData: 'wf_vcall:stop',
-        },
-      ],
-    ];
+      ]);
+    }
 
-    if (stream.recordingStatus === 'READY' && stream.recordedVideoPath) {
+    if (
+      stream.recordingStatus === 'READY' &&
+      (stream.outputFilePath || stream.recordedVideoPath)
+    ) {
       keyboardRows.push([
         {
           text: '📥 إرسال ملف تسجيل المكالمة (.mp4)',
@@ -700,6 +1277,12 @@ export class VideoCallWorkflow {
     }
 
     keyboardRows.push(
+      [
+        {
+          text: '📼 آخر 3 مكالمات مسجلة',
+          callbackData: 'vcall:rec_history',
+        },
+      ],
       [
         {
           text: '👤 إرسال المكالمة لرقم آخر (بنفس الفيديو)',
@@ -718,6 +1301,17 @@ export class VideoCallWorkflow {
       })
     );
 
+    const elapsedSeconds = stream.connectedAt
+      ? Math.max(
+          0,
+          Math.round(
+            ((stream.endedAt ? Date.parse(stream.endedAt) : Date.now()) -
+              Date.parse(stream.connectedAt)) /
+              1000
+          )
+        )
+      : 0;
+
     return {
       text: [
         headerLine,
@@ -731,6 +1325,9 @@ export class VideoCallWorkflow {
         `• *طبقة الوسائط:* \`@hiroosy/baileys-lite/voip (${stream.resolutionPreset})\``,
         `• *ملف الفيديو:* \`${stream.videoFileName}\``,
         `• *الحالة الحالية:* ${stateLabel}`,
+        ...(stream.connectedAt
+          ? [`• *زمن المكالمة الفعلي:* \`${elapsedSeconds} ثانية\``]
+          : []),
         `• *حالة البث الفعلي (RTP/SRTP):* ${isMediaActivelyStreaming ? '🟢 نشط ومؤكد (`MEDIA_STARTED`)' : isTerminal ? '⏹️ متوقف / منتهي' : '⏳ بانتظار رد المستلم وبدء تدفق إطارات الصوت والفيديو'}`,
         `• *تسجيل المكالمة (Two-Way):* ${recordingStatusLabel}`,
         `• *إطارات كاميرا المستلم الملتقطة:* \`${stream.inboundVideoFramesRecorded ?? 0} إطار (${stream.inboundVideoPacketsReceived ?? 0} حزمة RTP)\``,
@@ -759,24 +1356,24 @@ export class VideoCallWorkflow {
   public buildRecordingAttachment(
     stream: NonNullable<ReturnType<UbuntuVideoCallBridge['getCallStatus']>>
   ): TelegramMediaAttachment | undefined {
+    const videoPath = stream.outputFilePath || stream.recordedVideoPath;
     if (
       stream.recordingStatus !== 'READY' ||
-      !stream.recordedVideoPath ||
-      !fs.existsSync(stream.recordedVideoPath)
+      !videoPath ||
+      !fs.existsSync(videoPath)
     ) {
       return undefined;
     }
     try {
-      const stat = fs.statSync(stream.recordedVideoPath);
+      const stat = fs.statSync(videoPath);
       const fileName =
-        stream.recordedVideoFileName ||
-        path.basename(stream.recordedVideoPath);
+        stream.recordedVideoFileName || path.basename(videoPath);
       const sizeStr = formatFileSize(
         stream.recordedVideoSizeBytes || stat.size
       );
       return {
         kind: 'video',
-        filePath: stream.recordedVideoPath,
+        filePath: videoPath,
         fileName,
         mimeType: 'video/mp4',
         caption: [
@@ -812,7 +1409,8 @@ export class VideoCallWorkflow {
       };
     }
 
-    if (!stream || stream.recordingStatus !== 'READY' || !stream.recordedVideoPath) {
+    const videoPath = stream?.outputFilePath || stream?.recordedVideoPath;
+    if (!stream || stream.recordingStatus !== 'READY' || !videoPath) {
       return {
         text: '⚠️ *لا يوجد ملف تسجيل متاح لهذه المكالمة حالياً.*',
         keyboard: [buildBackCancelRow('menu:video_call')],
@@ -862,6 +1460,7 @@ export class VideoCallWorkflow {
         recordCall: state.recordCall !== false,
         maxDurationSeconds: state.maxDurationSeconds,
         actorTelegramId: adminId,
+        initiatedByAdminId: adminId,
       });
 
       state.activeCallId = stream.callId;
@@ -883,9 +1482,13 @@ export class VideoCallWorkflow {
     }
   }
 
-  public async stopActiveCall(adminId: number): Promise<BotViewResponse> {
+  public async stopActiveCall(
+    adminId: number,
+    explicitCallId?: string
+  ): Promise<BotViewResponse> {
     const state = this.states.get(adminId);
     const callId =
+      explicitCallId ||
       state?.activeCallId ||
       (state?.selectedSessionId
         ? this.videoCallBridge.getActiveStreamForSession(state.selectedSessionId)
@@ -932,7 +1535,10 @@ export class VideoCallWorkflow {
       ],
     ];
 
-    if (stopped?.recordingStatus === 'READY' && stopped.recordedVideoPath) {
+    if (
+      stopped?.recordingStatus === 'READY' &&
+      (stopped.outputFilePath || stopped.recordedVideoPath)
+    ) {
       keyboardRows.push([
         {
           text: '📥 إعادة إرسال ملف تسجيل المكالمة (.mp4)',
@@ -942,6 +1548,12 @@ export class VideoCallWorkflow {
     }
 
     keyboardRows.push(
+      [
+        {
+          text: '📼 استعراض آخر 3 مكالمات مسجلة',
+          callbackData: 'vcall:rec_history',
+        },
+      ],
       [
         {
           text: '👤 إرسال المكالمة لرقم آخر (بنفس الفيديو)',

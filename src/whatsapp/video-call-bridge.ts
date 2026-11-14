@@ -91,6 +91,20 @@ export interface OutboundMediaEvidence {
     | 'mock_simulation';
 }
 
+export interface RecordedCallHistoryItem {
+  callId: string;
+  sessionId: string;
+  recipientJid: string;
+  recipientMasked: string;
+  filePath: string;
+  fileSizeBytes: number;
+  durationSeconds: number;
+  videoFramesRecorded: number;
+  audioPacketsRecorded: number;
+  recordedAtIso: string;
+  ownerTelegramId?: number;
+}
+
 export interface StartVideoCallRequest {
   sessionId: string;
   driver?: WhatsAppSessionDriver;
@@ -107,6 +121,7 @@ export interface StartVideoCallRequest {
   callTimeoutMs?: number;
   mediaStartTimeoutMs?: number;
   actorTelegramId?: number;
+  initiatedByAdminId?: number;
   recordCall?: boolean;
   strictMediaValidation?: boolean;
   allowedRootDirs?: string[];
@@ -128,6 +143,7 @@ export interface ActiveVideoCallStream {
   abortController?: AbortController;
   sessionId: string;
   actorTelegramId?: number;
+  initiatedByAdminId?: number;
   recipientJid: string;
   recipientMasked: string;
   videoFilePath: string;
@@ -138,6 +154,7 @@ export interface ActiveVideoCallStream {
   mode: VideoCallExecutionMode;
   executionMode?: 'REAL_VOIP' | 'MOCK_SIMULATION';
   aborted?: boolean;
+  muted?: boolean;
   callState: RealCallState;
   stateHistory: RealCallState[];
   status: RealCallState;
@@ -153,6 +170,7 @@ export interface ActiveVideoCallStream {
   recordingEnabled: boolean;
   recordingStatus: CallRecordingStatus;
   recordedVideoPath?: string;
+  outputFilePath?: string;
   recordedVideoFileName?: string;
   recordedVideoSizeBytes?: number;
   recordedDurationSeconds?: number;
@@ -229,13 +247,228 @@ export class RealVideoCallService extends EventEmitter {
   >();
   private readonly nonLoopCompletionTimers = new Map<string, NodeJS.Timeout>();
   private readonly callListenerCleanups = new Map<string, () => void>();
+  private readonly inMemoryRecordedHistoryByOwner = new Map<
+    number,
+    RecordedCallHistoryItem[]
+  >();
+  private settingsRepo?: {
+    get: (key: string) => string | undefined;
+    set: (key: string, value: string) => void;
+  };
   private compatibilityOverride?: CompatibilityReport;
 
   constructor(
     private readonly sessionManager?: SessionManager,
-    private readonly auditRepo?: AuditRepository
+    private readonly auditRepo?: AuditRepository,
+    settingsRepo?: {
+      get: (key: string) => string | undefined;
+      set: (key: string, value: string) => void;
+    }
   ) {
     super();
+    this.settingsRepo = settingsRepo;
+  }
+
+  public setSettingsRepository(settingsRepo?: {
+    get: (key: string) => string | undefined;
+    set: (key: string, value: string) => void;
+  }): void {
+    this.settingsRepo = settingsRepo;
+  }
+
+  private getRecordedCallsHistoryDir(): string {
+    const dir = path.resolve(process.cwd(), 'data', 'call_recordings_history');
+    fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+    return dir;
+  }
+
+  private getRecordedCallsSettingKey(ownerTelegramId: number): string {
+    return `recent_call_recordings_json:${ownerTelegramId || 0}`;
+  }
+
+  /**
+   * Archives a completed call recording into `data/call_recordings_history/rec_<callId>.mp4`,
+   * persists the newest 3 recordings per owner in SQLite `settings` (and in-memory fallback),
+   * and unlinks older archived recording files beyond the newest 5.
+   */
+  public recordCompletedCallRecording(
+    item: RecordedCallHistoryItem
+  ): RecordedCallHistoryItem {
+    const ownerId = item.ownerTelegramId ?? 0;
+    const historyDir = this.getRecordedCallsHistoryDir();
+    const safeCallId = item.callId.replace(/[^a-zA-Z0-9_-]/g, '_');
+    const archivePath = path.join(historyDir, `rec_${safeCallId}.mp4`);
+
+    let finalPath = item.filePath;
+    let finalSize = item.fileSizeBytes;
+    if (item.filePath && fs.existsSync(item.filePath)) {
+      try {
+        if (path.resolve(item.filePath) !== path.resolve(archivePath)) {
+          fs.copyFileSync(item.filePath, archivePath);
+          try {
+            fs.chmodSync(archivePath, 0o600);
+          } catch {
+            // Ignore chmod error
+          }
+        }
+        finalPath = archivePath;
+        finalSize = fs.statSync(archivePath).size;
+      } catch {
+        finalPath = item.filePath;
+      }
+    }
+
+    const savedItem: RecordedCallHistoryItem = {
+      ...item,
+      filePath: finalPath,
+      fileSizeBytes: finalSize,
+      ownerTelegramId: ownerId,
+    };
+
+    const current = this.getRecentRecordedCalls(ownerId);
+    const merged = [
+      savedItem,
+      ...current.filter((existing) => existing.callId !== savedItem.callId),
+    ];
+    const top3 = merged.slice(0, 3);
+
+    this.inMemoryRecordedHistoryByOwner.set(ownerId, top3);
+    try {
+      this.settingsRepo?.set(
+        this.getRecordedCallsSettingKey(ownerId),
+        JSON.stringify(top3)
+      );
+    } catch {
+      // Ignore settings persistence error
+    }
+
+    // Prune older archived files in historyDir beyond the newest 5
+    try {
+      const files = fs
+        .readdirSync(historyDir)
+        .filter((f) => f.startsWith('rec_') && f.endsWith('.mp4'))
+        .map((f) => {
+          const full = path.join(historyDir, f);
+          const stat = fs.statSync(full);
+          return { full, mtimeMs: stat.mtimeMs };
+        })
+        .sort((a, b) => b.mtimeMs - a.mtimeMs);
+
+      const activePaths = new Set(top3.map((x) => path.resolve(x.filePath)));
+      for (const stale of files.slice(5)) {
+        if (!activePaths.has(path.resolve(stale.full))) {
+          try {
+            fs.unlinkSync(stale.full);
+          } catch {
+            // Ignore unlink error
+          }
+        }
+      }
+    } catch {
+      // Non-fatal cleanup error
+    }
+
+    return savedItem;
+  }
+
+  /**
+   * Returns the latest 3 recorded call videos for the given Telegram user (`ownerTelegramId`),
+   * filtering out any entry whose `.mp4` file no longer exists on disk.
+   */
+  public getRecentRecordedCalls(
+    ownerTelegramId = 0
+  ): RecordedCallHistoryItem[] {
+    const ownerId = ownerTelegramId || 0;
+    let parsed: RecordedCallHistoryItem[] = [];
+    const rawJson = this.settingsRepo?.get(
+      this.getRecordedCallsSettingKey(ownerId)
+    );
+    if (rawJson) {
+      try {
+        const arr = JSON.parse(rawJson);
+        if (Array.isArray(arr)) {
+          parsed = arr as RecordedCallHistoryItem[];
+        }
+      } catch {
+        parsed = [];
+      }
+    }
+    if (parsed.length === 0) {
+      parsed = this.inMemoryRecordedHistoryByOwner.get(ownerId) ?? [];
+    }
+    const valid = parsed
+      .filter(
+        (item) =>
+          item &&
+          typeof item.filePath === 'string' &&
+          item.filePath.length > 0 &&
+          fs.existsSync(item.filePath)
+      )
+      .slice(0, 3);
+
+    this.inMemoryRecordedHistoryByOwner.set(ownerId, valid);
+    return valid;
+  }
+
+  public getRecordedCallByIndex(
+    ownerTelegramId: number,
+    index: number
+  ): RecordedCallHistoryItem | undefined {
+    const list = this.getRecentRecordedCalls(ownerTelegramId);
+    return list[index];
+  }
+
+  /**
+   * Toggles outbound audio mute state on an active call.
+   */
+  public toggleMuteCall(callId: string): {
+    muted: boolean;
+    stream?: ActiveVideoCallStream;
+  } {
+    const stream = this.activeStreams.get(callId);
+    if (!stream) {
+      return { muted: false };
+    }
+    stream.muted = !stream.muted;
+    try {
+      const callInstAny = stream.voipCallInstance as unknown as {
+        mute?: () => void;
+        unmute?: () => void;
+        setMuted?: (m: boolean) => void;
+      } | undefined;
+      if (typeof callInstAny?.setMuted === 'function') {
+        callInstAny.setMuted(stream.muted);
+      } else if (stream.muted && typeof callInstAny?.mute === 'function') {
+        callInstAny.mute();
+      } else if (!stream.muted && typeof callInstAny?.unmute === 'function') {
+        callInstAny.unmute();
+      }
+    } catch {
+      // Non-fatal mute toggle
+    }
+    return { muted: Boolean(stream.muted), stream };
+  }
+
+  /**
+   * Sends a mid-call reaction or refreshes keyframe/PLI on an active call.
+   */
+  public async sendCallReaction(
+    callId: string,
+    emoji = '👍'
+  ): Promise<boolean> {
+    const stream = this.activeStreams.get(callId);
+    if (!stream) return false;
+    try {
+      stream.recorder?.sendPli();
+      this.emit('call:reaction', {
+        callId: stream.callId,
+        sessionId: stream.sessionId,
+        emoji,
+      });
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   private isTerminalState(state: RealCallState): boolean {
@@ -257,6 +490,7 @@ export class RealVideoCallService extends EventEmitter {
     }
     if (summary.recordedVideoPath) {
       stream.recordedVideoPath = summary.recordedVideoPath;
+      stream.outputFilePath = summary.recordedVideoPath;
       stream.recordedVideoFileName = summary.recordedVideoFileName;
       stream.recordedVideoSizeBytes = summary.recordedVideoSizeBytes;
       stream.recordedDurationSeconds = summary.recordedDurationSeconds;
@@ -277,7 +511,14 @@ export class RealVideoCallService extends EventEmitter {
       return;
     }
     stream.__endedEventEmitted = true;
-    this.emit('call:ended', payload);
+    const recordingSummary = stream.recorder?.getSummary();
+    this.emit('call:ended', {
+      ...payload,
+      initiatedByAdminId: stream.initiatedByAdminId ?? stream.actorTelegramId,
+      actorTelegramId: stream.actorTelegramId,
+      stream,
+      recordingSummary,
+    });
   }
 
   private async finalizeStreamRecording(
@@ -305,6 +546,7 @@ export class RealVideoCallService extends EventEmitter {
       }
       stream.recordingStatus = 'DISABLED';
       stream.recordedVideoPath = undefined;
+      stream.outputFilePath = undefined;
       stream.recordedVideoFileName = undefined;
       stream.recordedVideoSizeBytes = undefined;
       stream.recordedDurationSeconds = undefined;
@@ -314,6 +556,7 @@ export class RealVideoCallService extends EventEmitter {
       const summary = await stream.recorder.finalizeRecording();
       stream.recordingStatus = summary.recordingStatus;
       stream.recordedVideoPath = summary.recordedVideoPath;
+      stream.outputFilePath = summary.recordedVideoPath;
       stream.recordedVideoFileName = summary.recordedVideoFileName;
       stream.recordedVideoSizeBytes = summary.recordedVideoSizeBytes;
       stream.recordedDurationSeconds = summary.recordedDurationSeconds;
@@ -327,12 +570,36 @@ export class RealVideoCallService extends EventEmitter {
         summary.recordedVideoPath &&
         !stream.__recordingReadyEmitted
       ) {
+        try {
+          const archived = this.recordCompletedCallRecording({
+            callId: stream.callId,
+            sessionId: stream.sessionId,
+            recipientJid: stream.recipientJid,
+            recipientMasked: stream.recipientMasked,
+            filePath: summary.recordedVideoPath,
+            fileSizeBytes: summary.recordedVideoSizeBytes ?? 0,
+            durationSeconds: summary.recordedDurationSeconds ?? 1,
+            videoFramesRecorded: summary.inboundVideoFramesRecorded,
+            audioPacketsRecorded: summary.inboundAudioPacketsReceived,
+            recordedAtIso: new Date().toISOString(),
+            ownerTelegramId:
+              stream.initiatedByAdminId ?? stream.actorTelegramId ?? 0,
+          });
+          if (archived?.filePath && fs.existsSync(archived.filePath)) {
+            stream.outputFilePath = archived.filePath;
+          }
+        } catch {
+          // Non-fatal history archive error
+        }
+
         stream.__recordingReadyEmitted = true;
         this.emit('call:recording-ready', {
           callId: stream.callId,
           voipCallId: stream.voipCallId,
           sessionId: stream.sessionId,
           actorTelegramId: stream.actorTelegramId,
+          initiatedByAdminId:
+            stream.initiatedByAdminId ?? stream.actorTelegramId,
           recipientJid: stream.recipientJid,
           recipientMasked: stream.recipientMasked,
           stream,
@@ -349,6 +616,8 @@ export class RealVideoCallService extends EventEmitter {
           voipCallId: stream.voipCallId,
           sessionId: stream.sessionId,
           actorTelegramId: stream.actorTelegramId,
+          initiatedByAdminId:
+            stream.initiatedByAdminId ?? stream.actorTelegramId,
           recipientJid: stream.recipientJid,
           recipientMasked: stream.recipientMasked,
           stream,
@@ -1001,7 +1270,9 @@ export class RealVideoCallService extends EventEmitter {
   public async startVideoCall(
     req: StartVideoCallRequest
   ): Promise<ActiveVideoCallStream> {
-    const actorTelegramId = req.actorTelegramId ?? 0;
+    const initiatedByAdminId =
+      req.initiatedByAdminId ?? req.actorTelegramId ?? 0;
+    const actorTelegramId = req.actorTelegramId ?? initiatedByAdminId;
     const recipientMasked = req.recipientMasked || req.recipientJid;
     const callKind = req.callKind || 'video';
     const loopVideo = req.loopVideo ?? true;
@@ -1069,6 +1340,7 @@ export class RealVideoCallService extends EventEmitter {
         callId: failedCallId,
         sessionId: req.sessionId,
         actorTelegramId,
+        initiatedByAdminId,
         recipientJid: req.recipientJid,
         recipientMasked,
         videoFilePath: req.videoFilePath || '',
@@ -1108,12 +1380,14 @@ export class RealVideoCallService extends EventEmitter {
         callId: failedCallId,
         sessionId: req.sessionId,
         error: err,
+        stream: failedStream,
       });
       this.emit('call:ended', {
         callId: failedCallId,
         sessionId: req.sessionId,
         state: 'FAILED',
         reason: VOIP_INCOMPATIBLE_ARABIC_MESSAGE,
+        stream: failedStream,
       });
       throw err;
     }
@@ -1157,6 +1431,7 @@ export class RealVideoCallService extends EventEmitter {
       callId,
       sessionId: req.sessionId,
       actorTelegramId,
+      initiatedByAdminId,
       recipientJid: req.recipientJid,
       recipientMasked,
       videoFilePath: mediaInspection.resolvedPath,
@@ -1198,6 +1473,9 @@ export class RealVideoCallService extends EventEmitter {
       recipientJid: req.recipientJid,
       resolutionPreset: mediaInspection.targetVoipResolution,
       executionMode,
+      initiatedByAdminId,
+      actorTelegramId,
+      stream: streamRecord,
     });
 
     await driver
@@ -2725,8 +3003,11 @@ export class RealVideoCallService extends EventEmitter {
       callId: stream.callId,
       sessionId: stream.sessionId,
       reason,
+      initiatedByAdminId: stream.initiatedByAdminId ?? stream.actorTelegramId,
+      actorTelegramId: stream.actorTelegramId,
+      stream,
     });
-    this.emit('call:ended', {
+    this.emitCallEndedSafely(stream, {
       callId: stream.callId,
       sessionId: stream.sessionId,
       state: 'REJECTED',
@@ -2746,8 +3027,11 @@ export class RealVideoCallService extends EventEmitter {
       callId: stream.callId,
       sessionId: stream.sessionId,
       reason,
+      initiatedByAdminId: stream.initiatedByAdminId ?? stream.actorTelegramId,
+      actorTelegramId: stream.actorTelegramId,
+      stream,
     });
-    this.emit('call:ended', {
+    this.emitCallEndedSafely(stream, {
       callId: stream.callId,
       sessionId: stream.sessionId,
       state: 'TIMEOUT',

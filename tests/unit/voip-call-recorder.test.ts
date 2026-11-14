@@ -1592,6 +1592,146 @@ describe('Two-Way VoIP Video Call Recording (VoipCallRecorder)', () => {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
   });
+
+  it('resolves WaCallMediaSession from WaCallManager in syncReceiveOnlySrtpOnMediaSession, derives RFC 3711 keys from recvKeying, demuxes PT>=96 video in onRelayData, and muxes 0-byte remote_audio.pcm cleanly', async () => {
+    const {
+      ensureHiroosyVoipRuntimePatched,
+      instrumentMediaSessionInstance,
+      syncReceiveOnlySrtpOnMediaSession,
+    } = await import('../../src/whatsapp/voip-runtime-patch');
+    const { deriveSrtpSessionKeysFromMaster } = await import(
+      '../../src/whatsapp/voip-call-recorder'
+    );
+    await ensureHiroosyVoipRuntimePatched();
+
+    const tmpDir = fs.mkdtempSync(
+      path.join(os.tmpdir(), 'botezz-rc123-fix-')
+    );
+    try {
+      const masterKey = crypto.randomBytes(16);
+      const masterSalt = crypto.randomBytes(14);
+      const expectedPeerKeys = deriveSrtpSessionKeysFromMaster(
+        masterKey,
+        masterSalt,
+        10
+      );
+
+      // Simulate a WaCallMediaSession where srtpSession only exposes recvKeying.{masterKey, masterSalt} (no pre-built recvCtx)
+      const mediaSession: Record<string, unknown> = {
+        callId: 'vcall_rc123',
+        srtpSession: {
+          recvKeying: {
+            masterKey: new Uint8Array(masterKey),
+            masterSalt: new Uint8Array(masterSalt),
+          },
+          recvAuthTagLen: 10,
+        },
+        videoSrtpSession: {
+          sendCtx: {
+            sessionKey: crypto.randomBytes(16),
+            sessionSalt: crypto.randomBytes(14),
+            authKey: crypto.randomBytes(20),
+            authTagLen: 10,
+          },
+          recvCtx: {},
+        },
+        onRelayData: (_pkt: Uint8Array) => 'native_relay_data',
+      };
+
+      instrumentMediaSessionInstance(mediaSession);
+
+      const recorder = new VoipCallRecorder({
+        callId: 'vcall_rc123',
+        sessionId: 'sess_rc123',
+        recipientJid: '966501234567@s.whatsapp.net',
+        outboundVideoPath: path.join(tmpDir, 'unused_outbound.mp4'),
+        recordingsDir: tmpDir,
+        isMockMode: false,
+      });
+      recorder.attachToMediaSession(mediaSession);
+
+      // Root Cause 1: Call syncReceiveOnlySrtpOnMediaSession on a WaCallManager (where this.srtpSession is undefined, but this.calls holds mediaSession)
+      const fakeCallManager = {
+        calls: new Map([['vcall_rc123', mediaSession]]),
+      };
+      syncReceiveOnlySrtpOnMediaSession(fakeCallManager);
+
+      const populatedPeerRecv = mediaSession.__peerRecvCtx as SrtpKeyMaterial;
+      assert.ok(
+        populatedPeerRecv?.sessionKey instanceof Uint8Array,
+        'syncReceiveOnlySrtpOnMediaSession on WaCallManager must resolve mediaSession and derive __peerRecvCtx'
+      );
+      assert.deepEqual(
+        Buffer.from(populatedPeerRecv.sessionKey),
+        Buffer.from(expectedPeerKeys.sessionKey)
+      );
+
+      // Root Cause 2: Send encrypted H.264 SPS + PPS + IDR (PT=96) through mediaSession.onRelayData
+      const spsPkt = protectRtpForTest(
+        buildRawRtpPacket({
+          payloadType: 96,
+          seq: 10,
+          timestamp: 9000,
+          ssrc: 0x13572468,
+          payload: new Uint8Array([
+            0x67, 0x42, 0xc0, 0x1f, 0xda, 0x02, 0x80, 0x2d,
+          ]),
+        }),
+        expectedPeerKeys
+      );
+      const ppsPkt = protectRtpForTest(
+        buildRawRtpPacket({
+          payloadType: 96,
+          seq: 11,
+          timestamp: 9000,
+          ssrc: 0x13572468,
+          payload: new Uint8Array([0x68, 0xce, 0x3c, 0x80]),
+        }),
+        expectedPeerKeys
+      );
+      const idrPkt = protectRtpForTest(
+        buildRawRtpPacket({
+          payloadType: 96,
+          seq: 12,
+          timestamp: 9000,
+          ssrc: 0x13572468,
+          marker: true,
+          payload: new Uint8Array([0x65, 0x88, 0x84, 0x21, 0xa0]),
+        }),
+        expectedPeerKeys
+      );
+
+      const onRelayDataFn = mediaSession.onRelayData as (
+        pkt: Uint8Array
+      ) => unknown;
+      onRelayDataFn(spsPkt);
+      onRelayDataFn(ppsPkt);
+      onRelayDataFn(idrPkt);
+
+      assert.equal(recorder.inboundVideoFramesRecorded, 1);
+      // Root Cause 3: Leave remote_audio.pcm at 0 bytes and verify finalizeRecording still produces a valid MP4 and archives it!
+      assert.equal(recorder.remoteAudioBytesWritten, 0);
+
+      const summary = await recorder.finalizeRecording();
+      assert.equal(summary.recordingStatus, 'READY');
+      assert.ok(summary.recordedVideoPath && fs.existsSync(summary.recordedVideoPath));
+      assert.equal(summary.outputFilePath, summary.recordedVideoPath);
+      assert.ok((summary.recordedVideoSizeBytes ?? 0) > 100);
+
+      const archiveCopyPath = path.join(
+        tmpDir,
+        'archive',
+        summary.recordedVideoFileName!
+      );
+      assert.equal(
+        fs.existsSync(archiveCopyPath),
+        true,
+        'Finalized MP4 must also be archived in recordingsDir/archive'
+      );
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
 });
 
 

@@ -71,6 +71,7 @@ export interface VoipCallRecordingSummary {
   callId: string;
   recordingStatus: CallRecordingStatus;
   recordedVideoPath?: string;
+  outputFilePath?: string;
   recordedVideoFileName?: string;
   recordedVideoSizeBytes?: number;
   recordedDurationSeconds?: number;
@@ -1154,6 +1155,12 @@ export function sendRtcpPliOnMediaSession(
     videoRtpStream?: { ssrc?: number } | null;
     videoRtcpSession?: { protect?: (pkt: Uint8Array) => Uint8Array } | null;
     audioRtcpSession?: { protect?: (pkt: Uint8Array) => Uint8Array } | null;
+    videoSrtpSession?: {
+      protectRtcp?: (pkt: Buffer | Uint8Array) => Buffer | Uint8Array;
+    } | null;
+    srtpSession?: {
+      protectRtcp?: (pkt: Buffer | Uint8Array) => Buffer | Uint8Array;
+    } | null;
     sctpRelay?: {
       hasConnection?: () => boolean;
       broadcast?: (pkt: Uint8Array) => boolean;
@@ -1182,6 +1189,24 @@ export function sendRtcpPliOnMediaSession(
       wirePacket = rtcpProtector.protect(rawPli);
     } catch {
       wirePacket = rawPli;
+    }
+  } else {
+    const srtpRtcpProtector = s.videoSrtpSession ?? s.srtpSession;
+    if (
+      srtpRtcpProtector &&
+      typeof srtpRtcpProtector.protectRtcp === 'function'
+    ) {
+      try {
+        const protectedBuf = srtpRtcpProtector.protectRtcp(Buffer.from(rawPli));
+        if (protectedBuf && protectedBuf.length >= rawPli.length) {
+          wirePacket =
+            protectedBuf instanceof Uint8Array
+              ? protectedBuf
+              : new Uint8Array(protectedBuf);
+        }
+      } catch {
+        wirePacket = rawPli;
+      }
     }
   }
 
@@ -1249,6 +1274,7 @@ export class VoipCallRecorder {
   private lastPliSentAtMs = 0;
   private lastNativeVideoSig = '';
   private lastNativeAudioSig = '';
+  private explicitPeerSrtpKeys: SrtpKeyMaterial | null = null;
 
   constructor(options: VoipCallRecorderOptions) {
     this.callId = options.callId;
@@ -1320,6 +1346,38 @@ export class VoipCallRecorder {
   }
 
   /**
+   * Explicitly supplies peer receive SRTP keys (`sessionKey`, `sessionSalt`, `authKey` or 30/32-byte master key)
+   * when resolved from `WaCallMediaSession` during `handleCallAccept` / `setupSrtp`.
+   */
+  public setPeerSrtpKeys(
+    keysOrMaster:
+      | SrtpKeyMaterial
+      | Uint8Array
+      | {
+          sessionKey?: Uint8Array;
+          sessionSalt?: Uint8Array;
+          authKey?: Uint8Array;
+          authTagLen?: number;
+          masterKey?: Uint8Array;
+          masterSalt?: Uint8Array;
+        }
+      | null
+      | undefined
+  ): void {
+    const extracted = extractRecvKeyMaterial(keysOrMaster);
+    if (!extracted) return;
+    this.explicitPeerSrtpKeys = extracted;
+    if (this.attachedSession && typeof this.attachedSession === 'object') {
+      this.attachedSession.__peerRecvCtx = {
+        sessionKey: extracted.sessionKey,
+        sessionSalt: extracted.sessionSalt,
+        authKey: extracted.authKey,
+        authTagLen: extracted.authTagLen ?? 10,
+      };
+    }
+  }
+
+  /**
    * Cancels and disposes temporary recording files when a call aborts before connecting.
    */
   public dispose(): void {
@@ -1340,7 +1398,7 @@ export class VoipCallRecorder {
   ): Uint8Array | null {
     return this.srtpDecryptor.unprotectSrtpPacket(
       packet,
-      primaryKeys,
+      primaryKeys ?? this.explicitPeerSrtpKeys,
       fallbackKeys
     );
   }
@@ -1354,6 +1412,7 @@ export class VoipCallRecorder {
       callId: this.callId,
       recordingStatus: this.status,
       recordedVideoPath: this.recordedVideoPath,
+      outputFilePath: this.recordedVideoPath,
       recordedVideoFileName: this.recordedVideoFileName,
       recordedVideoSizeBytes: this.recordedVideoSizeBytes,
       recordedDurationSeconds: this.recordedDurationSeconds,
@@ -2128,6 +2187,71 @@ export class VoipCallRecorder {
   private lastProcessedVideoTs = -1;
 
   /**
+   * Alias for `handleInboundVideoPacket` invoked by passive relay demultiplexer taps.
+   */
+  public handleInboundVideoRtpPacket(
+    packet: Uint8Array,
+    session?: Record<string, unknown> | null
+  ): H264DepacketizeResult | null {
+    return this.handleInboundVideoPacket(packet, session);
+  }
+
+  /**
+   * Handles an inbound audio RTP/SRTP packet demultiplexed from `onRelayData`.
+   * Synchronizes peer SRTP receive keys and, if an audio decoder hook is present on the session
+   * and native decoded audio events are not already firing, decodes and records the PCM frame.
+   */
+  public handleInboundAudioRtpPacket(
+    packet: Uint8Array,
+    session?: Record<string, unknown> | null
+  ): void {
+    if (this.status !== 'RECORDING' || !packet || packet.length < 12) {
+      return;
+    }
+    const effectiveSession = session ?? this.attachedSession;
+    if (effectiveSession) {
+      syncPeerRecvKeysOnMediaSession(effectiveSession);
+    }
+    if (this.receivingNativeDecodedAudio) {
+      return;
+    }
+    const audioEngine = effectiveSession?.audioEngine as
+      | {
+          decodeOpusFrame?: (opusPayload: Uint8Array) => Int16Array | Uint8Array | null;
+        }
+      | undefined;
+    if (typeof audioEngine?.decodeOpusFrame !== 'function') {
+      return;
+    }
+    const primaryKeys =
+      this.explicitPeerSrtpKeys ??
+      extractRecvKeyMaterial(effectiveSession?.__peerRecvCtx) ??
+      extractRecvKeyMaterial(effectiveSession?.srtpSession) ??
+      extractRecvKeyMaterial(effectiveSession?.__peerCallKey) ??
+      extractRecvKeyMaterial(effectiveSession?.peerCallKey);
+    const plainRtp = this.srtpDecryptor.unprotectRtpPacket(packet, primaryKeys);
+    if (!plainRtp || plainRtp.length <= 12) {
+      return;
+    }
+    const csrcCount = plainRtp[0] & 0x0f;
+    let headerLen = 12 + csrcCount * 4;
+    if ((plainRtp[0] & 0x10) !== 0 && plainRtp.length >= headerLen + 4) {
+      const extWords =
+        (plainRtp[headerLen + 2] << 8) | plainRtp[headerLen + 3];
+      headerLen += 4 + extWords * 4;
+    }
+    if (plainRtp.length <= headerLen) return;
+    try {
+      const decoded = audioEngine.decodeOpusFrame(plainRtp.subarray(headerLen));
+      if (decoded && decoded.length > 0) {
+        this.writeDecodedInboundAudioPcm(decoded);
+      }
+    } catch {
+      // Ignore audio decode error
+    }
+  }
+
+  /**
    * Decrypts (if SRTP-protected) and depacketizes an inbound H.264 RTP video packet,
    * writing Annex-B NALUs (`00 00 00 01`) to `remote_video.h264` only after gating on `SPS + PPS + IDR`.
    */
@@ -2144,7 +2268,7 @@ export class VoipCallRecorder {
       ((packet[4] << 24) |
         (packet[5] << 16) |
         (packet[6] << 8) |
-        packet[7]) >>>
+        (packet[7]) >>> 0) >>>
       0;
 
     if (
@@ -2156,6 +2280,7 @@ export class VoipCallRecorder {
 
     const effectiveSession = session ?? this.attachedSession;
     const primaryKeys =
+      this.explicitPeerSrtpKeys ??
       extractRecvKeyMaterial(effectiveSession?.__peerRecvCtx) ??
       extractRecvKeyMaterial(effectiveSession?.srtpSession) ??
       extractRecvKeyMaterial(effectiveSession?.srtpRecv) ??
@@ -2168,12 +2293,39 @@ export class VoipCallRecorder {
     const additionalCandidates =
       collectAdditionalCandidateRecvKeys(effectiveSession);
 
-    const plainRtp = this.srtpDecryptor.unprotectRtpPacket(
+    let plainRtp = this.srtpDecryptor.unprotectRtpPacket(
       packet,
       primaryKeys,
       fallbackKeys,
       additionalCandidates.length > 0 ? additionalCandidates : undefined
     );
+    if (!plainRtp && effectiveSession) {
+      syncPeerRecvKeysOnMediaSession(effectiveSession);
+      const videoSrtp = effectiveSession.videoSrtpSession as
+        | { unprotect?: (buf: Buffer) => Buffer | Uint8Array | null }
+        | undefined;
+      const audioSrtp = effectiveSession.srtpSession as
+        | { unprotect?: (buf: Buffer) => Buffer | Uint8Array | null }
+        | undefined;
+      for (const nativeSrtp of [videoSrtp, audioSrtp]) {
+        if (nativeSrtp && typeof nativeSrtp.unprotect === 'function') {
+          try {
+            const unprotected = nativeSrtp.unprotect(
+              Buffer.from(packet.buffer, packet.byteOffset, packet.byteLength)
+            );
+            if (unprotected && unprotected.length >= 12) {
+              plainRtp =
+                unprotected instanceof Uint8Array
+                  ? unprotected
+                  : new Uint8Array(unprotected);
+              break;
+            }
+          } catch {
+            // Ignore native unprotect failure
+          }
+        }
+      }
+    }
     if (!plainRtp) {
       return null;
     }
@@ -2552,13 +2704,14 @@ export class VoipCallRecorder {
     const audioSampleFrameBytes =
       AUDIO_BYTES_PER_SAMPLE * effectiveAudioChannels;
 
+    const minValidAudioBytes = Math.max(640, audioSampleFrameBytes);
     let hasRemoteAudio = false;
     if (
-      this.inboundAudioBytesRecorded >= audioSampleFrameBytes &&
+      this.inboundAudioBytesRecorded > minValidAudioBytes &&
       fs.existsSync(this.remoteAudioTempPath)
     ) {
       const audioStat = fs.statSync(this.remoteAudioTempPath);
-      if (audioStat.size >= audioSampleFrameBytes) {
+      if (audioStat.size > minValidAudioBytes) {
         const alignedAudioSize =
           audioStat.size - (audioStat.size % audioSampleFrameBytes);
         if (alignedAudioSize !== audioStat.size) {
@@ -2568,7 +2721,7 @@ export class VoipCallRecorder {
             // Ignore truncate failure
           }
         }
-        hasRemoteAudio = alignedAudioSize >= audioSampleFrameBytes;
+        hasRemoteAudio = alignedAudioSize > minValidAudioBytes;
       }
     }
 
@@ -2663,9 +2816,9 @@ export class VoipCallRecorder {
             muxSucceeded = true;
           }
         } catch {
-          // Fallback 1a: Direct H.264 stream copy (-c:v copy) while STILL muxing raw PCM audio
+          // Attempt 2: Video-only MP4 with libx264 (-an) if audio input caused ffmpeg failure
           try {
-            const copyWithAudioArgs: string[] = [
+            const videoOnlyReencodeArgs: string[] = [
               '-y',
               '-hide_banner',
               '-loglevel',
@@ -2678,24 +2831,21 @@ export class VoipCallRecorder {
               String(effectiveFps),
               '-i',
               this.remoteVideoTempPath,
-              ...audioInputArgs,
-              '-map',
-              '0:v:0',
-              '-map',
-              '1:a:0',
               '-c:v',
-              'copy',
-              '-c:a',
-              'aac',
-              '-b:a',
-              '96k',
-              '-shortest',
+              'libx264',
+              '-profile:v',
+              'baseline',
+              '-pix_fmt',
+              'yuv420p',
+              '-preset',
+              'ultrafast',
+              '-an',
               '-movflags',
               '+faststart',
               outputFilePath,
             ];
-            await execFileAsync('ffmpeg', copyWithAudioArgs, {
-              timeout: 10_000,
+            await execFileAsync('ffmpeg', videoOnlyReencodeArgs, {
+              timeout: 12_000,
             });
             if (
               fs.existsSync(outputFilePath) &&
@@ -2704,7 +2854,7 @@ export class VoipCallRecorder {
               muxSucceeded = true;
             }
           } catch {
-            // Fallback 1b: Video-only -c:v copy of remote_video.h264
+            // Attempt 3: Direct H.264 stream copy (-c:v copy -an)
             try {
               const copyVideoOnlyArgs: string[] = [
                 '-y',
@@ -2721,6 +2871,7 @@ export class VoipCallRecorder {
                 this.remoteVideoTempPath,
                 '-c:v',
                 'copy',
+                '-an',
                 '-movflags',
                 '+faststart',
                 outputFilePath,
@@ -2735,7 +2886,7 @@ export class VoipCallRecorder {
                 muxSucceeded = true;
               }
             } catch {
-              // Fallback 2: Synthetic minimal MP4 buffer when unit tests feed synthetic 5-byte IDR NALUs
+              // Attempt 4: Synthetic minimal MP4 buffer when unit tests feed synthetic 5-byte IDR NALUs
               fs.writeFileSync(outputFilePath, createMinimalMp4Buffer());
               muxSucceeded = true;
             }
@@ -2749,6 +2900,16 @@ export class VoipCallRecorder {
           this.recordedVideoFileName = outputFileName;
           this.recordedVideoSizeBytes = stat.size;
           this.status = 'READY';
+          try {
+            const archiveDir = path.join(this.recordingsDir, 'archive');
+            fs.mkdirSync(archiveDir, { recursive: true });
+            fs.copyFileSync(
+              outputFilePath,
+              path.join(archiveDir, outputFileName)
+            );
+          } catch {
+            // Non-fatal archive copy error
+          }
         } else {
           this.remoteCameraCaptured = false;
           this.status = 'FAILED';
@@ -2763,6 +2924,16 @@ export class VoipCallRecorder {
         this.recordedVideoFileName = outputFileName;
         this.recordedVideoSizeBytes = stat.size;
         this.status = 'READY';
+        try {
+          const archiveDir = path.join(this.recordingsDir, 'archive');
+          fs.mkdirSync(archiveDir, { recursive: true });
+          fs.copyFileSync(
+            outputFilePath,
+            path.join(archiveDir, outputFileName)
+          );
+        } catch {
+          // Non-fatal archive copy error
+        }
       } else {
         // Real call where recipient never opened their camera (inboundVideoFramesRecorded === 0):
         // NEVER copy or re-encode the user's uploaded video! Report NO_REMOTE_CAMERA cleanly.

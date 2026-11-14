@@ -1,5 +1,5 @@
 import { spawn, type ChildProcess } from 'node:child_process';
-import { hkdfSync } from 'node:crypto';
+import { createCipheriv, hkdfSync } from 'node:crypto';
 import fs from 'node:fs';
 import { createRequire } from 'node:module';
 import path from 'node:path';
@@ -59,6 +59,23 @@ export interface InstrumentedVideoEngine {
 export interface InstrumentedMediaSession extends WaCallMediaSessionLike {
   __botezzInstrumented?: boolean;
   __botezzDisposed?: boolean;
+  __botezzPassiveTapApplied?: boolean;
+  __botezzRecorderAttached?: {
+    setPeerSrtpKeys?: (keys: {
+      sessionKey: Uint8Array;
+      sessionSalt: Uint8Array;
+      authKey: Uint8Array;
+      authTagLen?: number;
+    }) => void;
+    handleInboundVideoRtpPacket?: (
+      packet: Uint8Array,
+      session?: unknown
+    ) => void;
+    handleInboundAudioRtpPacket?: (
+      packet: Uint8Array,
+      session?: unknown
+    ) => void;
+  } | null;
   __relayBroadcastAttempted?: boolean;
   __relayBroadcastAcceptedCount?: number;
   __mediaStartDelayTimers?: Set<ReturnType<typeof setTimeout>>;
@@ -1196,25 +1213,132 @@ function syncSessionVideoSsrcWithDeviceJid(
   }
 }
 
+function deriveSrtpLabelBlock(
+  masterKey: Uint8Array,
+  masterSalt: Uint8Array,
+  label: number,
+  outBytes: number
+): Uint8Array {
+  const keyId = Buffer.alloc(14, 0);
+  keyId[7] = label & 0xff;
+  const x = Buffer.alloc(16, 0);
+  for (let i = 0; i < 14; i++) {
+    x[i] = (masterSalt[i] ?? 0) ^ (keyId[i] ?? 0);
+  }
+  const numBlocks = Math.ceil(outBytes / 16);
+  const out = Buffer.alloc(numBlocks * 16, 0);
+  const cipher = createCipheriv('aes-128-ecb', Buffer.from(masterKey), null);
+  cipher.setAutoPadding(false);
+  for (let b = 0; b < numBlocks; b++) {
+    const blockIn = Buffer.from(x);
+    blockIn.writeUInt16BE(b, 14);
+    const enc = cipher.update(blockIn);
+    enc.copy(out, b * 16);
+  }
+  return new Uint8Array(out.subarray(0, outBytes));
+}
+
+function derivePeerRecvCtxFromKeyMaterial(
+  rawOrKeying:
+    | Uint8Array
+    | {
+        masterKey?: Uint8Array;
+        masterSalt?: Uint8Array;
+        key?: Uint8Array;
+        salt?: Uint8Array;
+      }
+    | null
+    | undefined,
+  authTagLen = 10
+): {
+  sessionKey: Uint8Array;
+  sessionSalt: Uint8Array;
+  authKey: Uint8Array;
+  authTagLen: number;
+} | null {
+  if (!rawOrKeying) return null;
+  let masterKey: Uint8Array | undefined;
+  let masterSalt: Uint8Array | undefined;
+  if (rawOrKeying instanceof Uint8Array) {
+    if (rawOrKeying.length < 30) return null;
+    masterKey = rawOrKeying.subarray(0, 16);
+    masterSalt = rawOrKeying.subarray(16, 30);
+  } else if (typeof rawOrKeying === 'object') {
+    const mk = rawOrKeying.masterKey ?? rawOrKeying.key;
+    const ms = rawOrKeying.masterSalt ?? rawOrKeying.salt;
+    if (
+      mk instanceof Uint8Array &&
+      mk.length >= 16 &&
+      ms instanceof Uint8Array &&
+      ms.length >= 14
+    ) {
+      masterKey = mk.subarray(0, 16);
+      masterSalt = ms.subarray(0, 14);
+    }
+  }
+  if (!masterKey || !masterSalt) return null;
+  try {
+    return {
+      sessionKey: deriveSrtpLabelBlock(masterKey, masterSalt, 0x00, 16),
+      authKey: deriveSrtpLabelBlock(masterKey, masterSalt, 0x01, 20),
+      sessionSalt: deriveSrtpLabelBlock(masterKey, masterSalt, 0x02, 14),
+      authTagLen,
+    };
+  } catch {
+    return null;
+  }
+}
+
 export function syncReceiveOnlySrtpOnMediaSession(
-  mediaSession: InstrumentedMediaSession | null | undefined
+  target: InstrumentedMediaSession | Record<string, unknown> | null | undefined
 ): void {
+  if (!target || typeof target !== 'object') {
+    return;
+  }
+
+  // If `target` is a `WaCallManager` holding `this.calls` Map, sync all active media sessions
+  const targetWithCalls = target as {
+    calls?: Map<string, InstrumentedMediaSession>;
+    mediaSession?: InstrumentedMediaSession;
+    callMediaSession?: InstrumentedMediaSession;
+  };
+  if (targetWithCalls.calls instanceof Map) {
+    for (const activeCallSession of targetWithCalls.calls.values()) {
+      if (activeCallSession && activeCallSession !== target) {
+        syncReceiveOnlySrtpOnMediaSession(activeCallSession);
+      }
+    }
+  }
+
+  const mediaSession = (targetWithCalls.mediaSession ||
+    targetWithCalls.callMediaSession ||
+    target) as InstrumentedMediaSession;
   if (!mediaSession || typeof mediaSession !== 'object') {
     return;
   }
+
   const s = mediaSession as InstrumentedMediaSession & {
     initSrtpKeys?: () => void;
     videoRtpStream?: unknown;
     srtpSession?: {
-      recvCipher?: unknown;
-      recvKeying?: unknown;
+      recvCipher?: Record<string, unknown> | null;
+      recvKeying?: {
+        masterKey?: Uint8Array;
+        masterSalt?: Uint8Array;
+        key?: Uint8Array;
+        salt?: Uint8Array;
+      } | null;
       recvAuthTagLen?: number;
+      sendCtx?: {
+        sessionKey?: Uint8Array;
+      } | null;
       recvCtx?: {
         sessionKey?: Uint8Array;
         sessionSalt?: Uint8Array;
         authKey?: Uint8Array;
         authTagLen?: number;
       };
+      [key: string]: unknown;
     } | null;
     videoSrtpSession?: {
       recvCipher?: unknown;
@@ -1248,7 +1372,11 @@ export function syncReceiveOnlySrtpOnMediaSession(
     mediaSession.__localCallKey = localCallKey;
   }
 
+  const infoPeerCallKey = (
+    mediaSession.info as { peerCallKey?: unknown } | undefined
+  )?.peerCallKey;
   const peerCallKey =
+    (infoPeerCallKey instanceof Uint8Array ? infoPeerCallKey : undefined) ||
     (mediaSession.peerCallKey instanceof Uint8Array
       ? mediaSession.peerCallKey
       : undefined) ||
@@ -1289,30 +1417,111 @@ export function syncReceiveOnlySrtpOnMediaSession(
     }
   }
 
+  let resolvedRecv:
+    | {
+        sessionKey: Uint8Array;
+        sessionSalt: Uint8Array;
+        authKey: Uint8Array;
+        authTagLen: number;
+      }
+    | undefined;
+
   const recv = s.srtpSession?.recvCtx;
-  if (recv?.sessionKey instanceof Uint8Array) {
-    mediaSession.__peerRecvCtx = {
+  if (
+    recv?.sessionKey instanceof Uint8Array &&
+    recv.sessionSalt instanceof Uint8Array &&
+    recv.authKey instanceof Uint8Array
+  ) {
+    resolvedRecv = {
       sessionKey: recv.sessionKey,
       sessionSalt: recv.sessionSalt,
       authKey: recv.authKey,
-      authTagLen: recv.authTagLen ?? 4,
+      authTagLen: recv.authTagLen ?? s.srtpSession?.recvAuthTagLen ?? 4,
     };
-    if (
-      s.videoSrtpSession?.recvCtx &&
-      recv.sessionSalt instanceof Uint8Array &&
-      recv.authKey instanceof Uint8Array
-    ) {
+  }
+
+  // Fallback 1: Scan `s.srtpSession` properties (`recvCipher`, `recvKeying`, or internal sub-objects)
+  if (!resolvedRecv && s.srtpSession && typeof s.srtpSession === 'object') {
+    const sendKeyRef = s.srtpSession.sendCtx?.sessionKey;
+    for (const [propName, propVal] of Object.entries(s.srtpSession)) {
+      if (
+        propName === 'sendCtx' ||
+        propName === 'sendCipher' ||
+        propName === 'sendKeying' ||
+        !propVal ||
+        typeof propVal !== 'object'
+      ) {
+        continue;
+      }
+      const cand = propVal as {
+        sessionKey?: unknown;
+        sessionSalt?: unknown;
+        authKey?: unknown;
+        authTagLen?: number;
+        masterKey?: Uint8Array;
+        masterSalt?: Uint8Array;
+        key?: Uint8Array;
+        salt?: Uint8Array;
+      };
+      if (
+        cand.sessionKey instanceof Uint8Array &&
+        cand.sessionSalt instanceof Uint8Array &&
+        cand.authKey instanceof Uint8Array
+      ) {
+        if (sendKeyRef && cand.sessionKey === sendKeyRef) {
+          continue;
+        }
+        resolvedRecv = {
+          sessionKey: cand.sessionKey,
+          sessionSalt: cand.sessionSalt,
+          authKey: cand.authKey,
+          authTagLen: cand.authTagLen ?? s.srtpSession.recvAuthTagLen ?? 10,
+        };
+        break;
+      }
+      const derivedFromSub = derivePeerRecvCtxFromKeyMaterial(
+        cand,
+        s.srtpSession.recvAuthTagLen ?? 10
+      );
+      if (derivedFromSub) {
+        resolvedRecv = derivedFromSub;
+        break;
+      }
+    }
+  }
+
+  // Fallback 2: Derive RFC 3711 receive keys from `peerCallKey` if available
+  if (!resolvedRecv && peerCallKey && peerCallKey.length >= 30) {
+    const derived = derivePeerRecvCtxFromKeyMaterial(
+      peerCallKey,
+      s.srtpSession?.recvAuthTagLen ?? 10
+    );
+    if (derived) {
+      resolvedRecv = derived;
+    }
+  }
+
+  if (resolvedRecv) {
+    mediaSession.__peerRecvCtx = {
+      sessionKey: resolvedRecv.sessionKey,
+      sessionSalt: resolvedRecv.sessionSalt,
+      authKey: resolvedRecv.authKey,
+      authTagLen: resolvedRecv.authTagLen,
+    };
+    if (s.videoSrtpSession?.recvCtx) {
       const targetRecv = s.videoSrtpSession.recvCtx;
       const keyChanged =
         !(targetRecv.sessionKey instanceof Uint8Array) ||
-        targetRecv.sessionKey.length !== recv.sessionKey.length ||
-        !targetRecv.sessionKey.every((b, idx) => b === recv.sessionKey![idx]);
+        targetRecv.sessionKey.length !== resolvedRecv.sessionKey.length ||
+        !targetRecv.sessionKey.every(
+          (b, idx) => b === resolvedRecv!.sessionKey[idx]
+        );
 
-      targetRecv.sessionKey = recv.sessionKey;
-      targetRecv.sessionSalt = recv.sessionSalt;
-      targetRecv.authKey = recv.authKey;
-      if (recv.authTagLen) {
-        targetRecv.authTagLen = recv.authTagLen;
+      targetRecv.sessionKey = resolvedRecv.sessionKey;
+      targetRecv.sessionSalt = resolvedRecv.sessionSalt;
+      targetRecv.authKey = resolvedRecv.authKey;
+      if (resolvedRecv.authTagLen) {
+        targetRecv.authTagLen = resolvedRecv.authTagLen;
       }
       if (keyChanged) {
         targetRecv.initialized = false;
@@ -1322,6 +1531,180 @@ export function syncReceiveOnlySrtpOnMediaSession(
         targetRecv.replayMask = BigInt(0);
       }
     }
+    try {
+      mediaSession.__botezzRecorderAttached?.setPeerSrtpKeys?.(resolvedRecv);
+    } catch {
+      // Non-fatal recorder notification
+    }
+  }
+}
+
+function attachPassiveNativeMediaSessionTaps(
+  target: InstrumentedMediaSession & {
+    __botezzPassiveTapApplied?: boolean;
+    handleCallAccept?: (...args: unknown[]) => Promise<unknown>;
+    handleCallAck?: (node: unknown) => Promise<void>;
+    connectRelays?: (...args: unknown[]) => Promise<unknown>;
+    setupSrtp?: (...args: unknown[]) => unknown;
+    initSrtpKeys?: (...args: unknown[]) => unknown;
+    onRelayData?: (data: Uint8Array) => unknown;
+    onRelayVideoData?: (data: Uint8Array) => unknown;
+  }
+): void {
+  if (!target || typeof target !== 'object' || target.__botezzPassiveTapApplied) {
+    return;
+  }
+  target.__botezzPassiveTapApplied = true;
+
+  if (typeof target.handleCallAccept === 'function') {
+    const origAccept = target.handleCallAccept;
+    target.handleCallAccept = async function passiveAcceptTap(
+      this: typeof target,
+      ...args: unknown[]
+    ) {
+      const res = await origAccept.apply(this, args);
+      try {
+        syncReceiveOnlySrtpOnMediaSession(this);
+        syncSessionVideoSsrcWithDeviceJid(this);
+      } catch {
+        // Passive receive-side sync must never throw
+      }
+      return res;
+    };
+  }
+
+  if (typeof target.handleCallAck === 'function') {
+    const origAck = target.handleCallAck;
+    target.handleCallAck = async function passiveAckTap(
+      this: typeof target,
+      node: unknown
+    ): Promise<void> {
+      await origAck.call(this, node);
+      try {
+        syncSessionVideoSsrcWithDeviceJid(this);
+        syncReceiveOnlySrtpOnMediaSession(this);
+      } catch {
+        // Passive ack sync must never throw
+      }
+    };
+  }
+
+  if (typeof target.connectRelays === 'function') {
+    const origRelays = target.connectRelays;
+    target.connectRelays = async function passiveRelaysTap(
+      this: typeof target,
+      ...args: unknown[]
+    ) {
+      try {
+        syncSessionVideoSsrcWithDeviceJid(this);
+      } catch {
+        // Non-fatal
+      }
+      const res = await origRelays.apply(this, args);
+      try {
+        syncSessionVideoSsrcWithDeviceJid(this);
+        syncReceiveOnlySrtpOnMediaSession(this);
+      } catch {
+        // Non-fatal
+      }
+      return res;
+    };
+  }
+
+  if (typeof target.setupSrtp === 'function') {
+    const origSetupSrtp = target.setupSrtp;
+    target.setupSrtp = function passiveSetupSrtpTap(
+      this: typeof target,
+      ...args: unknown[]
+    ) {
+      const res = origSetupSrtp.apply(this, args);
+      try {
+        syncReceiveOnlySrtpOnMediaSession(this);
+      } catch {
+        // Non-fatal
+      }
+      return res;
+    };
+  }
+
+  if (typeof target.initSrtpKeys === 'function') {
+    const origInitSrtp = target.initSrtpKeys;
+    target.initSrtpKeys = function passiveInitSrtpTap(
+      this: typeof target,
+      ...args: unknown[]
+    ) {
+      const res = origInitSrtp.apply(this, args);
+      try {
+        syncReceiveOnlySrtpOnMediaSession(this);
+      } catch {
+        // Non-fatal
+      }
+      return res;
+    };
+  }
+
+  if (typeof target.onRelayVideoData === 'function') {
+    const origOnRelayVideoData = target.onRelayVideoData;
+    target.onRelayVideoData = function passiveOnRelayVideoDataTap(
+      this: typeof target,
+      data: Uint8Array
+    ) {
+      try {
+        if (!this.__peerRecvCtx?.sessionKey) {
+          syncReceiveOnlySrtpOnMediaSession(this);
+        }
+        const packet = data instanceof Uint8Array ? data : null;
+        if (packet && packet.length >= 12) {
+          this.__botezzRecorderAttached?.handleInboundVideoRtpPacket?.(
+            packet,
+            this
+          );
+        }
+      } catch {
+        // Passive video tap must never throw
+      }
+      return origOnRelayVideoData.call(this, data);
+    };
+  }
+
+  if (typeof target.onRelayData === 'function') {
+    const origOnRelayData = target.onRelayData;
+    target.onRelayData = function passiveOnRelayDataTap(
+      this: typeof target,
+      data: Uint8Array
+    ) {
+      try {
+        if (!this.__peerRecvCtx?.sessionKey) {
+          syncReceiveOnlySrtpOnMediaSession(this);
+        }
+        const packet = data instanceof Uint8Array ? data : null;
+        if (packet && packet.length >= 12 && (packet[0] >>> 6) === 2) {
+          const packetType = packet[1] & 0xff;
+          // Skip RTCP packets (PT 192..223)
+          if (packetType < 192 || packetType > 223) {
+            const pt = packet[1] & 0x7f;
+            const isVideoPt =
+              pt >= 96 && pt <= 127 && pt !== 111 && pt !== 120;
+            const isAudioPt =
+              pt < 96 || pt === 111 || pt === 120 || pt === 0 || pt === 8;
+            if (isVideoPt) {
+              this.__botezzRecorderAttached?.handleInboundVideoRtpPacket?.(
+                packet,
+                this
+              );
+            } else if (isAudioPt) {
+              this.__botezzRecorderAttached?.handleInboundAudioRtpPacket?.(
+                packet,
+                this
+              );
+            }
+          }
+        }
+      } catch {
+        // Passive relay tap must never throw
+      }
+      return origOnRelayData.call(this, data);
+    };
   }
 }
 
@@ -1335,7 +1718,7 @@ export function instrumentMediaSessionInstance(
 
   // For real `@hiroosy/baileys-lite` `WaCallMediaSession` instances, NEVER monkey-patch or override
   // outbound audio/video engines (`WaVideoEngine`, `WaAudioEngine`, `sendCapturedVideoAU`, `videoSrtpSession.sendCipher`).
-  // Attach ONLY non-destructive receive-side cipher sync (`recvCipher`/`recvKeying`/`recvCtx`) and videoSsrc sync after call ack/accept.
+  // Attach ONLY non-destructive receive-side cipher sync (`recvCipher`/`recvKeying`/`recvCtx`), videoSsrc sync, and passive recorder tap.
   const isNativeWaCallMediaSession =
     (session as { constructor?: { name?: string } }).constructor?.name ===
     'WaCallMediaSession';
@@ -1346,62 +1729,7 @@ export function instrumentMediaSessionInstance(
       return session;
     }
     session.__botezzInstrumented = true;
-    const nativeWithTaps = session as InstrumentedMediaSession & {
-      handleCallAccept?: (...args: unknown[]) => Promise<unknown>;
-      connectRelays?: (...args: unknown[]) => Promise<unknown>;
-    };
-    if (typeof nativeWithTaps.handleCallAccept === 'function') {
-      const origAccept = nativeWithTaps.handleCallAccept;
-      nativeWithTaps.handleCallAccept = async function passiveAcceptTap(
-        this: typeof nativeWithTaps,
-        ...args: unknown[]
-      ) {
-        const res = await origAccept.apply(this, args);
-        try {
-          syncReceiveOnlySrtpOnMediaSession(this);
-          syncSessionVideoSsrcWithDeviceJid(this);
-        } catch {
-          // Passive receive-side sync must never throw
-        }
-        return res;
-      };
-    }
-    if (typeof nativeWithTaps.handleCallAck === 'function') {
-      const origAck = nativeWithTaps.handleCallAck;
-      nativeWithTaps.handleCallAck = async function passiveAckTap(
-        this: typeof nativeWithTaps,
-        node: unknown
-      ): Promise<void> {
-        await origAck.call(this, node);
-        try {
-          syncSessionVideoSsrcWithDeviceJid(this);
-          syncReceiveOnlySrtpOnMediaSession(this);
-        } catch {
-          // Passive ack sync must never throw
-        }
-      };
-    }
-    if (typeof nativeWithTaps.connectRelays === 'function') {
-      const origRelays = nativeWithTaps.connectRelays;
-      nativeWithTaps.connectRelays = async function passiveRelaysTap(
-        this: typeof nativeWithTaps,
-        ...args: unknown[]
-      ) {
-        try {
-          syncSessionVideoSsrcWithDeviceJid(this);
-        } catch {
-          // Non-fatal
-        }
-        const res = await origRelays.apply(this, args);
-        try {
-          syncSessionVideoSsrcWithDeviceJid(this);
-          syncReceiveOnlySrtpOnMediaSession(this);
-        } catch {
-          // Non-fatal
-        }
-        return res;
-      };
-    }
+    attachPassiveNativeMediaSessionTaps(session);
     return session;
   }
 
@@ -2350,76 +2678,45 @@ export async function ensureHiroosyVoipRuntimePatched(): Promise<void> {
       const pkgDir = resolveBaileysLitePackageDir();
       if (!pkgDir) return;
 
-      // Passive read-only tap on `WaCallMediaSession.prototype.handleCallAccept` to expose `srtpSession.recvCtx`
-      // as `__peerRecvCtx` for `VoipCallRecorder` without mutating any outbound media or SRTP state.
-      const mediaSessionPath = path.join(
-        pkgDir,
-        'src/voip/call/WaCallMediaSession.js'
-      );
-      if (fs.existsSync(mediaSessionPath)) {
-        const mod = (await import(
-          /* webpackIgnore: true */ pathToFileURL(mediaSessionPath).href
-        )) as {
-          WaCallMediaSession?: {
-            prototype?: InstrumentedMediaSession & {
-              __botezzPassiveTapApplied?: boolean;
-              handleCallAccept?: (...args: unknown[]) => Promise<unknown>;
-              srtpSession?: {
-                recvCtx?: {
-                  sessionKey?: Uint8Array;
-                  sessionSalt?: Uint8Array;
-                  authKey?: Uint8Array;
-                  authTagLen?: number;
-                };
-              } | null;
+      // Passive read-only tap on `WaCallMediaSession.prototype` to expose `srtpSession.recvCtx`
+      // as `__peerRecvCtx` and demultiplex inbound video/audio RTP packets for `VoipCallRecorder`
+      // without mutating any outbound media or SRTP state.
+      const mediaSessionCandidateRelPaths = [
+        'src/voip/call/WaCallMediaSession.js',
+        'lib/package/voip/call/WaCallMediaSession.js',
+        'dist/voip/call/WaCallMediaSession.js',
+      ];
+      for (const relPath of mediaSessionCandidateRelPaths) {
+        const mediaSessionPath = path.join(pkgDir, relPath);
+        if (!fs.existsSync(mediaSessionPath)) continue;
+        try {
+          const mod = (await import(
+            /* webpackIgnore: true */ pathToFileURL(mediaSessionPath).href
+          )) as {
+            WaCallMediaSession?: {
+              prototype?: InstrumentedMediaSession;
             };
           };
-        };
-        const sessionProto = mod?.WaCallMediaSession?.prototype;
-        if (sessionProto && !sessionProto.__botezzPassiveTapApplied) {
-          sessionProto.__botezzPassiveTapApplied = true;
-          if (typeof sessionProto.handleCallAccept === 'function') {
-            const origHandleCallAccept = sessionProto.handleCallAccept;
-            sessionProto.handleCallAccept =
-              async function passiveHandleCallAcceptTap(
-                this: NonNullable<typeof sessionProto>,
-                ...args: unknown[]
-              ) {
-                const res = await origHandleCallAccept.apply(this, args);
-                try {
-                  syncReceiveOnlySrtpOnMediaSession(this);
-                  syncSessionVideoSsrcWithDeviceJid(this);
-                } catch {
-                  // Passive receive-side sync must never throw
-                }
-                return res;
-              };
+          const sessionProto = mod?.WaCallMediaSession?.prototype;
+          if (sessionProto) {
+            attachPassiveNativeMediaSessionTaps(sessionProto);
           }
-          if (typeof sessionProto.handleCallAck === 'function') {
-            const origHandleCallAck = sessionProto.handleCallAck;
-            sessionProto.handleCallAck = async function passiveHandleCallAckTap(
-              this: NonNullable<typeof sessionProto>,
-              node: unknown
-            ): Promise<void> {
-              await origHandleCallAck.call(this, node);
-              try {
-                syncSessionVideoSsrcWithDeviceJid(this);
-                syncReceiveOnlySrtpOnMediaSession(this);
-              } catch {
-                // Passive ack sync must never throw
-              }
-            };
-          }
+        } catch {
+          // Ignore non-fatal import error
         }
       }
 
-      // Clean up calls when a `<reject>` stanza arrives (`P0-B` + `BZ-021`)
+      // Clean up calls when a `<reject>` stanza arrives (`P0-B` + `BZ-021`),
+      // sync receive-only SRTP on `WaCallManager.prototype.handleCallAccept`,
       // and harden `syncDeviceList` + `ensureSessionsBatch` against empty `@lid` USync responses.
-      const callManagerPath = path.join(
-        pkgDir,
-        'src/voip/call/WaCallManager.js'
-      );
-      if (fs.existsSync(callManagerPath)) {
+      const callManagerCandidateRelPaths = [
+        'src/voip/call/WaCallManager.js',
+        'lib/package/voip/call/WaCallManager.js',
+        'dist/voip/call/WaCallManager.js',
+      ];
+      for (const relPath of callManagerCandidateRelPaths) {
+        const callManagerPath = path.join(pkgDir, relPath);
+        if (!fs.existsSync(callManagerPath)) continue;
         const mod = (await import(
           /* webpackIgnore: true */ pathToFileURL(callManagerPath).href
         )) as {
@@ -2427,6 +2724,8 @@ export async function ensureHiroosyVoipRuntimePatched(): Promise<void> {
             prototype?: {
               __botezzCallManagerPatched?: boolean;
               calls?: Map<string, InstrumentedMediaSession>;
+              mediaSession?: InstrumentedMediaSession;
+              callMediaSession?: InstrumentedMediaSession;
               deps?: {
                 __botezzDepsHardened?: boolean;
                 signalDeviceSync?: {
@@ -2459,6 +2758,7 @@ export async function ensureHiroosyVoipRuntimePatched(): Promise<void> {
               resolveSessionFromNode?: (
                 node: unknown
               ) => InstrumentedMediaSession | null;
+              handleCallAccept?: (...args: unknown[]) => Promise<unknown>;
               handleCallTerminate?: (node: unknown) => Promise<void>;
               handleCallReject?: (node: unknown) => Promise<void>;
               emitState?: (info: unknown) => void;
@@ -2470,6 +2770,30 @@ export async function ensureHiroosyVoipRuntimePatched(): Promise<void> {
         const proto = mod?.WaCallManager?.prototype;
         if (proto && !proto.__botezzCallManagerPatched) {
           proto.__botezzCallManagerPatched = true;
+
+          if (typeof proto.handleCallAccept === 'function') {
+            const origManagerAccept = proto.handleCallAccept;
+            proto.handleCallAccept = async function passiveManagerAcceptTap(
+              this: NonNullable<typeof proto>,
+              ...args: unknown[]
+            ) {
+              const res = await origManagerAccept.apply(this, args);
+              try {
+                const resolvedSession =
+                  this.mediaSession ||
+                  this.callMediaSession ||
+                  (args[0] ? this.resolveSessionFromNode?.(args[0]) : null);
+                if (resolvedSession) {
+                  syncReceiveOnlySrtpOnMediaSession(resolvedSession);
+                  syncSessionVideoSsrcWithDeviceJid(resolvedSession);
+                }
+                syncReceiveOnlySrtpOnMediaSession(this as Record<string, unknown>);
+              } catch {
+                // Non-fatal
+              }
+              return res;
+            };
+          }
 
           const normalizeCallOfferDeviceJids = (
             rawList: string[],

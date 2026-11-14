@@ -1947,6 +1947,140 @@ describe('@hiroosy/baileys-lite & Real WhatsApp VoIP Video Call Suite', () => {
       service.detachSession('sess_retry_concurrent');
       service.detachSession('sess_fail_init_nocam');
     });
+
+    it('persists Recent 3 Outbound Broadcast Videos (vcall:reuse_bcast:0..2), Recent 3 Recorded Call Videos (vcall:rec_history & vcall:dl_rec:0..2), and mid-call controls (vcall:mute / vcall:react / vcall:stop / vcall:retry)', async () => {
+      const { SettingsRepository } = await import(
+        '../../src/database/repositories/settings-repository'
+      );
+      const { VideoCallWorkflow } = await import(
+        '../../src/bot/workflows/video-call-workflow'
+      );
+
+      const dbPath = path.join(tmpDir, 'vcall_history_features.sqlite');
+      const db = new AppDatabase(dbPath);
+      const sessionRepo = new SessionRepository(db);
+      const auditRepo = new AuditRepository(db);
+      const settingsRepo = new SettingsRepository(db);
+      const sessionStore = new SessionStore(path.join(tmpDir, 'wa-hist-sessions'));
+      const sessionManager = new SessionManager(
+        sessionRepo,
+        auditRepo,
+        sessionStore,
+        (id) => new MockWhatsAppSessionDriver(id)
+      );
+
+      const ownerId = 777001;
+      sessionManager.setConfiguredAdminId(ownerId);
+      const sess = sessionManager.createSession('Primary VoIP', ownerId);
+      await sessionManager.initiatePairing({
+        sessionId: sess.id,
+        rawPhoneNumber: '+966509998877',
+        actorTelegramId: ownerId,
+      });
+      const driver = sessionManager.getDriver(
+        sess.id,
+        ownerId
+      ) as MockWhatsAppSessionDriver;
+      driver.completeSimulatedPairing('966509998877@s.whatsapp.net');
+
+      const bridge = new RealVideoCallService(sessionManager, auditRepo, settingsRepo);
+      const workflow = new VideoCallWorkflow(
+        sessionManager,
+        bridge,
+        auditRepo,
+        tmpDir,
+        50,
+        settingsRepo
+      );
+
+      // 1. Upload 4 outbound broadcast videos -> only newest 3 are retained in SQLite & disk
+      const videoBuf = fs.readFileSync(validLandscapeMp4);
+      for (let i = 1; i <= 4; i++) {
+        workflow.start(ownerId, sess.id);
+        await workflow.handleVideoUpload(ownerId, {
+          originalFilename: `promo_clip_${i}.mp4`,
+          mimeType: 'video/mp4',
+          sizeBytes: videoBuf.length,
+          contentBuffer: videoBuf,
+        });
+      }
+
+      const recentBcast = workflow.getRecentBroadcastVideos(ownerId);
+      assert.equal(recentBcast.length, 3, 'Must keep newest 3 broadcast videos per user');
+      assert.equal(recentBcast[0]!.fileName, 'promo_clip_4.mp4');
+      assert.equal(recentBcast[1]!.fileName, 'promo_clip_3.mp4');
+      assert.equal(recentBcast[2]!.fileName, 'promo_clip_2.mp4');
+
+      // Verify start() menu shows the 3 quick-reuse buttons and the recorded calls history button
+      const startView = workflow.start(ownerId, sess.id);
+      assert.ok(
+        startView.text.includes('آخر 3 فيديوهات استخدمتها لبث المكالمة')
+      );
+      assert.ok(
+        startView.text.includes('آخر 3 فيديوهات مسجلة للمكالمات')
+      );
+      const allCallbacks = startView.keyboard
+        .flat()
+        .map((b) => b.callbackData);
+      assert.ok(allCallbacks.includes('vcall:reuse_bcast:0'));
+      assert.ok(allCallbacks.includes('vcall:reuse_bcast:1'));
+      assert.ok(allCallbacks.includes('vcall:reuse_bcast:2'));
+      assert.ok(allCallbacks.includes('vcall:rec_history'));
+
+      // 2. Tap vcall:reuse_bcast:1 ('promo_clip_3.mp4') -> jumps directly to Step 2 (AWAITING_RECIPIENT)
+      const reusedView = await workflow.reuseBroadcastVideo(ownerId, 1);
+      assert.equal(
+        reusedView.toastText,
+        '✅ تم اختيار الفيديو المحفوظ بنجاح!'
+      );
+      assert.equal(workflow.getState(ownerId)?.step, 'AWAITING_RECIPIENT');
+      assert.equal(
+        workflow.getState(ownerId)?.videoFileName,
+        'promo_clip_3.mp4'
+      );
+
+      // 3. Start a call by entering recipient phone -> test mid-call mute, reaction, stop, and Recent 3 Recorded Calls archive
+      const activeCallView = await workflow.handleRecipientInput(
+        ownerId,
+        '+966501234567'
+      );
+      const activeCallId = workflow.getState(ownerId)?.activeCallId;
+      assert.ok(activeCallId);
+      const activeBtns = activeCallView.keyboard
+        .flat()
+        .map((b) => b.callbackData);
+      assert.ok(activeBtns.includes(`vcall:stop:${activeCallId}`));
+      assert.ok(activeBtns.includes(`vcall:mute:${activeCallId}`));
+      assert.ok(activeBtns.includes(`vcall:react:${activeCallId}`));
+
+      const muteView = await workflow.toggleMuteActiveCall(
+        ownerId,
+        activeCallId!
+      );
+      assert.equal(muteView.toastText, '🔇 تم كتم صوت البث');
+
+      const reactView = await workflow.sendReactionOnActiveCall(
+        ownerId,
+        activeCallId!,
+        '❤️'
+      );
+      assert.equal(reactView.toastText, '❤️ تم إرسال التفاعل في المكالمة');
+
+      const stopView = await workflow.stopActiveCall(ownerId, activeCallId!);
+      assert.ok(stopView.text.includes('تم إنهاء المكالمة المرئية'));
+
+      // 4. Verify the recorded call was archived into Recent 3 Recorded Call Videos and downloadable via vcall:dl_rec:0
+      const recordedHistory = bridge.getRecentRecordedCalls(ownerId);
+      assert.equal(recordedHistory.length, 1);
+      assert.equal(recordedHistory[0]!.callId, activeCallId);
+      assert.ok(fs.existsSync(recordedHistory[0]!.filePath));
+
+      const historyView = workflow.renderRecordedCallsHistory(ownerId);
+      assert.ok(historyView.text.includes(activeCallId!));
+      const dlView = workflow.downloadRecordedCallFromHistory(ownerId, 0);
+      assert.equal(dlView.mediaAttachments?.length, 1);
+      assert.equal(dlView.mediaAttachments?.[0]?.kind, 'video');
+    });
   });
 });
 
