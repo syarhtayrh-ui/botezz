@@ -34,7 +34,7 @@ elif [ -f "/opt/whatsapp-telegram-bot/.env" ]; then
   echo "✅ تم استرجاع ملف .env من /opt/whatsapp-telegram-bot/.env"
 fi
 
-# 3. إيقاف وقتل جميع النسخ المكررة (سواء تحت المستخدم ubuntu أو root أو systemd أو screen)
+# 3. إيقاف وقتل جميع النسخ المكررة (سواء تحت المستخدم ubuntu أو root أو systemd)
 echo "🛑 إيقاف وقتل جميع العمليات القديمة والمكررة للبوت..."
 sudo systemctl stop whatsapp-telegram-bot.service 2>/dev/null || true
 sudo systemctl disable whatsapp-telegram-bot.service 2>/dev/null || true
@@ -93,7 +93,7 @@ chmod 700 ./data ./data/whatsapp-sessions ./data/tmp ./data/recordings ./data/fo
 echo "📦 جاري تحديث الحزم البرمجية..."
 npm install --no-audit --no-fund
 
-# 8. إنشاء ملف ecosystem.config.cjs يقرأ .env مباشرة ويمرره لعملية Node لمنع أي فقدان للمتغيرات داخل PM2
+# 8. إنشاء ملف ecosystem.config.cjs يقرأ .env مباشرة ويمرره لعملية Node (بدون وضع --env-file في NODE_OPTIONS)
 cat > "$PROJECT_DIR/ecosystem.config.cjs" << 'EOF'
 const fs = require('node:fs');
 const path = require('node:path');
@@ -101,7 +101,7 @@ const path = require('node:path');
 const envPath = path.resolve(__dirname, '.env');
 const parsedEnv = {
   NODE_ENV: 'production',
-  NODE_OPTIONS: `--env-file=${envPath} --no-warnings`,
+  NODE_OPTIONS: '--no-warnings',
 };
 
 if (fs.existsSync(envPath)) {
@@ -133,7 +133,7 @@ module.exports = {
       cwd: __dirname,
       script: './node_modules/tsx/dist/cli.mjs',
       args: 'src/app.ts',
-      node_args: `--env-file=${envPath} --no-warnings`,
+      node_args: '--no-warnings',
       autorestart: true,
       max_restarts: 10,
       restart_delay: 3000,

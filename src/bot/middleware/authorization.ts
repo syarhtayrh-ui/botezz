@@ -119,6 +119,8 @@ export function verifyTelegramAdmin(params: {
 /**
  * grammY middleware that enforces strict numeric administrator allowlist and active subscription
  * checks on every message, command, and callback query before any handler runs.
+ * Automatically ignores Telegram service updates (such as `pinned_message` generated when the bot
+ * pins the Control Panel) and self-authored bot events so they never trigger false unauthorized replies.
  */
 export function createGrammyAuthorizationMiddleware(
   configuredAdminId: number,
@@ -128,13 +130,46 @@ export function createGrammyAuthorizationMiddleware(
   return async (ctx: Context, next: NextFunction): Promise<void> => {
     const candidateUserId = ctx.from?.id;
     const chatId = ctx.chat?.id;
+
+    // 1. Ignore service messages generated when the bot pins/unpins the Control Panel or bot self-events
+    if (
+      ctx.message?.pinned_message ||
+      (candidateUserId !== undefined &&
+        ctx.me?.id !== undefined &&
+        candidateUserId === ctx.me.id) ||
+      (ctx.from?.is_bot && chatId === configuredAdminId)
+    ) {
+      if (ctx.message?.pinned_message && chatId && ctx.message.message_id) {
+        await ctx.api
+          .deleteMessage(chatId, ctx.message.message_id)
+          .catch(() => undefined);
+      }
+      return;
+    }
+
+    // 2. Ignore non-interactive Telegram service updates (e.g., my_chat_member, chat_member)
+    const hasInteractivePayload = Boolean(
+      ctx.callbackQuery ||
+        ctx.message?.text ||
+        ctx.message?.caption ||
+        ctx.message?.document ||
+        ctx.message?.photo ||
+        ctx.message?.video ||
+        ctx.message?.audio ||
+        ctx.message?.voice ||
+        ctx.message?.sticker
+    );
+    if (!hasInteractivePayload) {
+      return;
+    }
+
     const actionDescription = ctx.callbackQuery?.data
       ? `callback:${ctx.callbackQuery.data}`
       : ctx.message?.text
       ? `message:${ctx.message.text.slice(0, 32)}`
       : ctx.message?.caption
       ? `message:${ctx.message.caption.slice(0, 32)}`
-      : 'telegram_update';
+      : 'telegram_media_update';
 
     try {
       verifyTelegramAdmin({

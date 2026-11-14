@@ -18,6 +18,7 @@ import { OperationRateLimiter } from '../../src/security/validation';
 import { TaskRunner } from '../../src/tasks/task-runner';
 import { TaskManager } from '../../src/tasks/task-manager';
 import { TelegramBotController } from '../../src/bot/bot';
+import { createGrammyAuthorizationMiddleware } from '../../src/bot/middleware/authorization';
 import { AppConfig } from '../../src/config/env';
 import { TelegramMessageTransport } from '../../src/bot/ui-state';
 import { InlineKeyboardRows } from '../../src/bot/keyboards/main-menu';
@@ -90,6 +91,8 @@ function createTestEnvironment() {
     baseTmp,
     config,
     db,
+    auditRepo,
+    settingsRepo,
     sessionManager,
     controller,
     cleanup: async () => {
@@ -304,6 +307,48 @@ test('Bottom-Anchored Control Panel re-sends at bottom, deletes old buried messa
     assert.ok(transport.deletedMessageIds.includes(firstPanelId));
     assert.ok(transport.pinnedMessageIds.includes(secondPanelId));
     assert.equal(controller.uiState.getActiveMessageId(ADMIN_ID), secondPanelId);
+  } finally {
+    await env.cleanup();
+  }
+});
+
+test('createGrammyAuthorizationMiddleware ignores pinned_message service updates from the bot itself without sending Unauthorized reply', async () => {
+  const env = createTestEnvironment();
+  try {
+    const middleware = createGrammyAuthorizationMiddleware(
+      ADMIN_ID,
+      env.auditRepo,
+      env.settingsRepo
+    );
+    const replies: string[] = [];
+    const deletedServiceMessages: number[] = [];
+    let nextCalled = false;
+
+    const fakePinnedServiceCtx = {
+      from: { id: 9191532217, is_bot: true },
+      me: { id: 9191532217, is_bot: true },
+      chat: { id: ADMIN_ID },
+      message: {
+        message_id: 555,
+        pinned_message: { message_id: 554, text: 'لوحة التحكم' },
+      },
+      api: {
+        deleteMessage: async (_chatId: number, msgId: number) => {
+          deletedServiceMessages.push(msgId);
+        },
+      },
+      reply: async (msg: string) => {
+        replies.push(msg);
+      },
+    };
+
+    await middleware(fakePinnedServiceCtx as never, async () => {
+      nextCalled = true;
+    });
+
+    assert.equal(replies.length, 0);
+    assert.equal(nextCalled, false);
+    assert.deepEqual(deletedServiceMessages, [555]);
   } finally {
     await env.cleanup();
   }
