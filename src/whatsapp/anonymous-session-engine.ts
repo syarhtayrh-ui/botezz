@@ -1189,6 +1189,7 @@ export class AnonymousSessionEngine {
     candidateJids: Array<string | undefined | null>;
     messageId?: string;
     text: string;
+    mediaKind?: AnonymousMediaKind;
     quotedMessageId?: string;
     fromMe?: boolean;
     markReadImmediately?: boolean;
@@ -1290,18 +1291,24 @@ export class AnonymousSessionEngine {
     const updatedReceiverLid =
       discoveredLid || matchedSession.receiverLidJid || null;
     const updatedReceiverPn =
-      discoveredPn && matchedSession.receiverJid.endsWith('@lid')
-        ? discoveredPn
-        : matchedSession.receiverJid;
+      discoveredPn || matchedSession.receiverJid;
+    const effectiveMediaKind: AnonymousMediaKind = params.mediaKind || 'text';
 
     if (!existingMsg) {
       this.db.sqlite
         .prepare(
           `INSERT INTO anonymous_relay_messages (
             relayed_wa_message_id, anon_session_id, session_id, direction, media_kind, text_content, created_at
-          ) VALUES (?, ?, ?, 'REPLY', 'text', ?, ?)`
+          ) VALUES (?, ?, ?, 'REPLY', ?, ?, ?)`
         )
-        .run(msgId, matchedSession.id, matchedSession.sessionId, cleanText, now);
+        .run(
+          msgId,
+          matchedSession.id,
+          matchedSession.sessionId,
+          effectiveMediaKind,
+          cleanText,
+          now
+        );
 
       const unreadIncrement = params.markReadImmediately ? 0 : 1;
       this.db.sqlite
@@ -1338,7 +1345,7 @@ export class AnonymousSessionEngine {
         anonSessionId: refreshed.id,
         sessionId: refreshed.sessionId,
         direction: 'INBOUND',
-        mediaKind: 'text',
+        mediaKind: effectiveMediaKind,
         textContent: cleanText,
         createdAt: existingMsg?.created_at ?? now,
       },

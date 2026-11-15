@@ -5023,14 +5023,56 @@ export class ToolsHandler {
       let targetLidJid: string | undefined;
       let targetDisplayLabel = cleaned;
 
+      const isPhoneCandidate =
+        !cleaned.startsWith('@') &&
+        !cleaned.includes('@') &&
+        /^\+?[\d\s\-()]{7,20}$/.test(cleaned);
+      if (isPhoneCandidate) {
+        const digits = cleaned.replace(/\D/g, '');
+        if (digits.length >= 7) {
+          targetPnJid = `${digits}@s.whatsapp.net`;
+          targetDisplayLabel = `+${digits}`;
+          if (typeof driver.checkNumberOnWhatsApp === 'function') {
+            const check = await driver.checkNumberOnWhatsApp(digits).catch(() => null);
+            if (check && check.exists === false) {
+              return {
+                text:
+                  `⚠️ *الرقم المحدد غير مسجل في واتساب:* \`+${escapeMarkdown(digits)}\`\n` +
+                  `يرجى التأكد من الرقم وإعادة المحاولة.`,
+                keyboard: [
+                  [
+                    {
+                      text: '🔄 إعادة المحاولة',
+                      callbackData: 'anon:add_prompt',
+                    },
+                    {
+                      text: '🔙 قائمة الجلسات المجهولة',
+                      callbackData: 'menu:anon_sessions',
+                    },
+                  ],
+                ],
+              };
+            }
+            if (check?.jid && check.jid.endsWith('@s.whatsapp.net')) {
+              targetPnJid = check.jid;
+            }
+            if (check?.lid && check.lid.endsWith('@lid')) {
+              targetLidJid = check.lid;
+            }
+          }
+        }
+      }
+
       // 1. Resolve via WhatsAppIdentityService (handles @username, @lid, and phone numbers)
       if (typeof driver.resolveIdentity === 'function') {
         const identityRes = await driver
           .resolveIdentity(cleaned)
           .catch(() => null);
         if (identityRes) {
-          targetPnJid = identityRes.pnJid;
-          targetLidJid = identityRes.lidJid;
+          targetPnJid = identityRes.pnJid || targetPnJid;
+          if (identityRes.lidJid && identityRes.lidJid.endsWith('@lid')) {
+            targetLidJid = identityRes.lidJid;
+          }
           if (identityRes.username) {
             targetDisplayLabel = `@${identityRes.username}`;
           } else if (identityRes.phoneNumber) {
@@ -5043,7 +5085,11 @@ export class ToolsHandler {
       if (!targetLidJid || !targetPnJid) {
         try {
           const lidRes = await driver.resolveLidForRecipient(cleaned);
-          targetLidJid = targetLidJid || lidRes.lidJid;
+          if (lidRes.lidJid && lidRes.lidJid.endsWith('@lid')) {
+            targetLidJid = targetLidJid || lidRes.lidJid;
+          } else if (lidRes.lidJid && lidRes.lidJid.endsWith('@s.whatsapp.net')) {
+            targetPnJid = targetPnJid || lidRes.lidJid;
+          }
           targetPnJid = targetPnJid || lidRes.pnJid;
         } catch {
           // If input is a valid phone number even when USync LID lookup is offline, normalize PN
@@ -5176,7 +5222,7 @@ export class ToolsHandler {
             return `${prefix} ${body}`;
           })
         : [
-            'ℹ️ _لا توجد رسائل بعد في هذه الجلسة. اكتب أي رسالة نصية الآن وسيتم إرسالها فوراً للمستلم بهوية مجهولة (`@lid`)!_',
+            'ℹ️ _لا توجد رسائل بعد في هذه الجلسة. اكتب أي رسالة نصية أو أرسل صورة/فيديو/صوت الآن وسيتم إرسالها فوراً للمستلم بهوية مجهولة (`@lid`)!_',
           ];
 
     const targetPnDisplay = sess.receiverJid.endsWith('@s.whatsapp.net')
@@ -5200,7 +5246,7 @@ export class ToolsHandler {
         `📜 *سجل رسائل الجلسة (آخر ${messages.length} رسائل):*\n` +
         transcriptLines.join('\n') +
         `\n━━━━━━━━━━━━━━━━━━\n` +
-        `✍️ *أنت الآن داخل الجلسة.* أي رسالة نصية تكتبها هنا سيتم إرسالها فوراً للمستلم بهوية مجهولة (\`@lid\`)، وأي رد منه سيظهر لك هنا لحظياً.`,
+        `✍️ *أنت الآن داخل الجلسة.* أي رسالة نصية أو وسائط (صورة/فيديو/بصمة صوتية/ملصق/مستند) ترسلها هنا سيتم إيصالها فوراً للمستلم بهوية مجهولة (\`@lid\`)، وأي رد منه سيظهر لك هنا لحظياً.`,
       keyboard: [
         [
           {
@@ -5263,10 +5309,19 @@ export class ToolsHandler {
       );
 
       const recipientTarget = sess.receiverLidJid || sess.receiverJid;
+      const fallbackPnJid = sess.receiverJid.endsWith('@s.whatsapp.net')
+        ? sess.receiverJid
+        : undefined;
+
       const sendRes = await driver.sendAnonymousLidMessage({
         recipient: recipientTarget,
+        fallbackPnJid,
         text: cleanText,
+        customPushName: sess.senderAlias || '🕵️ جلسة مجهولة',
+        ghostHeaderMode: 'plain',
       });
+
+      const deliveredJid = sendRes.deliveredJid || sendRes.targetLid;
 
       this.anonymousEngine.recordRoomOutboundMessage({
         anonSessionId: sess.id,
@@ -5274,8 +5329,12 @@ export class ToolsHandler {
         messageId: sendRes.messageId,
         text: cleanText,
         mediaKind: 'text',
-        deliveredLidJid: sendRes.usedLid ? sendRes.targetLid : undefined,
-        resolvedPnJid: sendRes.resolvedPn,
+        deliveredLidJid: deliveredJid.endsWith('@lid')
+          ? deliveredJid
+          : sess.receiverLidJid,
+        resolvedPnJid:
+          sendRes.resolvedPn ||
+          (deliveredJid.endsWith('@s.whatsapp.net') ? deliveredJid : fallbackPnJid),
       });
 
       this.auditRepo.record({
@@ -5287,20 +5346,181 @@ export class ToolsHandler {
           sessionId: session.id,
           messageId: sendRes.messageId,
           usedLid: sendRes.usedLid,
+          deliveredJid,
+          fallbackTriggered: sendRes.fallbackTriggered,
         },
       });
 
-      return this.renderAnonymousSessionRoom(
-        adminId,
-        sess.id,
-        `✅ *تم إرسال رسالتك بهوية مجهولة (\`${sendRes.targetLid}\`) بنجاح!*`
-      );
+      const deliveryBadge = sendRes.fallbackTriggered
+        ? `✅ *تم إرسال الرسالة وتأكيد استلام خادم واتساب عبر المسار البديل المضمون (\`${escapeMarkdown(deliveredJid)}\`)!*`
+        : `✅ *تم إرسال رسالتك بهوية مجهولة (\`${escapeMarkdown(deliveredJid)}\`) وتأكيد استلام الخادم بنجاح!*`;
+
+      return this.renderAnonymousSessionRoom(adminId, sess.id, deliveryBadge);
     } catch (err) {
       const safeErr = toSafeArabicError(err);
       return this.renderAnonymousSessionRoom(
         adminId,
         sess.id,
         `⚠️ *تعذر إرسال الرسالة:* ${safeErr.userMessage}`
+      );
+    }
+  }
+
+  /**
+   * Sends a live outbound media attachment (photo, video, voice, audio, sticker, document)
+   * while the user is inside `ANON_IN_ROOM`, records it in SQLite, and refreshes the Room View.
+   */
+  public async sendAnonymousRoomMedia(
+    adminId: number,
+    upload: {
+      originalFilename: string;
+      mimeType: string;
+      contentBuffer: Buffer;
+      caption?: string;
+      telegramMediaKind?: 'photo' | 'video' | 'audio' | 'voice' | 'sticker' | 'document';
+    }
+  ): Promise<BotViewResponse> {
+    const activeRoomId = this.activeAnonRoomByAdmin.get(adminId);
+    if (!activeRoomId) {
+      return this.renderAnonymousSessionsHub(adminId);
+    }
+
+    const ownerFilter = this.sessionManager.isOwner(adminId) ? undefined : adminId;
+    const sess = this.anonymousEngine.getAnonymousSessionById(
+      activeRoomId,
+      ownerFilter
+    );
+    if (!sess) {
+      this.cancel(adminId);
+      return this.renderAnonymousSessionsHub(
+        adminId,
+        '⚠️ الجلسة المجهولة لم تعد موجودة.'
+      );
+    }
+
+    try {
+      const { session, driver } = this.getPrimaryConnectedSessionAndDriver(
+        adminId,
+        sess.sessionId
+      );
+
+      const recipientTarget = sess.receiverLidJid || sess.receiverJid;
+      const fallbackPnJid = sess.receiverJid.endsWith('@s.whatsapp.net')
+        ? sess.receiverJid
+        : undefined;
+      const caption = (upload.caption || '').trim();
+      const mime = (upload.mimeType || '').toLowerCase();
+      const lowerName = (upload.originalFilename || '').toLowerCase();
+
+      let mediaContent: Record<string, unknown>;
+      let mediaKind: AnonymousMediaKind = 'document';
+      let transcriptLabel = '';
+
+      if (
+        upload.telegramMediaKind === 'photo' ||
+        (upload.telegramMediaKind !== 'sticker' &&
+          upload.telegramMediaKind !== 'document' &&
+          mime.startsWith('image/') &&
+          !mime.includes('webp'))
+      ) {
+        mediaContent = {
+          image: upload.contentBuffer,
+          mimetype: upload.mimeType || 'image/jpeg',
+          ...(caption ? { caption } : {}),
+        };
+        mediaKind = 'image';
+        transcriptLabel = caption ? `📷 [صورة] ${caption}` : '📷 [صورة]';
+      } else if (
+        upload.telegramMediaKind === 'video' ||
+        (upload.telegramMediaKind !== 'document' && mime.startsWith('video/'))
+      ) {
+        mediaContent = {
+          video: upload.contentBuffer,
+          mimetype: upload.mimeType || 'video/mp4',
+          ...(caption ? { caption } : {}),
+        };
+        mediaKind = 'video';
+        transcriptLabel = caption ? `🎥 [فيديو] ${caption}` : '🎥 [فيديو]';
+      } else if (
+        upload.telegramMediaKind === 'voice' ||
+        mime.includes('ogg') ||
+        lowerName.startsWith('voice_')
+      ) {
+        mediaContent = {
+          audio: upload.contentBuffer,
+          mimetype: 'audio/ogg; codecs=opus',
+          ptt: true,
+        };
+        mediaKind = 'ptt';
+        transcriptLabel = '🎤 [رسالة صوتية]';
+      } else if (
+        upload.telegramMediaKind === 'audio' ||
+        mime.startsWith('audio/')
+      ) {
+        mediaContent = {
+          audio: upload.contentBuffer,
+          mimetype: upload.mimeType || 'audio/mpeg',
+          ptt: false,
+        };
+        mediaKind = 'audio';
+        transcriptLabel = '🎵 [مقطع صوتي]';
+      } else if (
+        upload.telegramMediaKind === 'sticker' ||
+        mime.includes('webp') ||
+        lowerName.endsWith('.webp')
+      ) {
+        mediaContent = {
+          sticker: upload.contentBuffer,
+        };
+        mediaKind = 'sticker';
+        transcriptLabel = '🎭 [ملصق]';
+      } else {
+        mediaContent = {
+          document: upload.contentBuffer,
+          mimetype: upload.mimeType || 'application/octet-stream',
+          fileName: upload.originalFilename || 'attachment.bin',
+          ...(caption ? { caption } : {}),
+        };
+        mediaKind = 'document';
+        transcriptLabel = `📄 [مستند: ${upload.originalFilename || 'ملف'}]${caption ? ` ${caption}` : ''}`;
+      }
+
+      const sendRes = await driver.sendAnonymousLidMessage({
+        recipient: recipientTarget,
+        fallbackPnJid,
+        text: caption,
+        mediaContent: mediaContent as never,
+        customPushName: sess.senderAlias || '🕵️ جلسة مجهولة',
+        ghostHeaderMode: 'plain',
+      });
+
+      const deliveredJid = sendRes.deliveredJid || sendRes.targetLid;
+
+      this.anonymousEngine.recordRoomOutboundMessage({
+        anonSessionId: sess.id,
+        sessionId: session.id,
+        messageId: sendRes.messageId,
+        text: transcriptLabel,
+        mediaKind,
+        deliveredLidJid: deliveredJid.endsWith('@lid')
+          ? deliveredJid
+          : sess.receiverLidJid,
+        resolvedPnJid:
+          sendRes.resolvedPn ||
+          (deliveredJid.endsWith('@s.whatsapp.net') ? deliveredJid : fallbackPnJid),
+      });
+
+      return this.renderAnonymousSessionRoom(
+        adminId,
+        sess.id,
+        `✅ *تم إرسال الوسائط (${escapeMarkdown(transcriptLabel)}) للمستلم بنجاح!*`
+      );
+    } catch (err) {
+      const safeErr = toSafeArabicError(err);
+      return this.renderAnonymousSessionRoom(
+        adminId,
+        sess.id,
+        `⚠️ *تعذر إرسال الوسائط:* ${safeErr.userMessage}`
       );
     }
   }

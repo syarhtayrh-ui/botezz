@@ -234,7 +234,7 @@ function attachFakeSocketToDriver(
   driver: HiroosyBaileysSessionDriver,
   sock: WASocket
 ): void {
-  (driver as unknown as { sock: WASocket | null }).sock = sock;
+  driver.attachSocketForTesting(sock);
 }
 
 // ============================================================================
@@ -355,10 +355,11 @@ test('sendLidAddressedMessage delivers with addressing_mode="lid", initializes S
 
     const sent = fake.sentMessages[0]!;
     assert.equal(sent.jid, '77771111222233@lid');
-    assert.equal(sent.opts?.addressingMode, 'lid');
-    assert.deepEqual(sent.opts?.additionalAttributes, {
-      addressing_mode: 'lid',
-    });
+    assert.equal(sent.opts?.addressingMode, undefined);
+    assert.equal(
+      (sent.opts?.additionalAttributes as { addressing_mode?: string } | undefined)?.addressing_mode,
+      undefined
+    );
     assert.ok(fake.assertedSessions.some((s) => s.includes('77771111222233@lid')));
     assert.ok(
       fake.migratedSessions.some(
@@ -382,9 +383,10 @@ test('sendLidAddressedMessage delivers with addressing_mode="lid", initializes S
     assert.equal(relayRes.addressingMode, 'lid');
     assert.equal(fake.relayedMessages.length, 1);
     assert.equal(fake.relayedMessages[0]!.jid, '77771111222233@lid');
-    assert.deepEqual(fake.relayedMessages[0]!.opts?.additionalAttributes, {
-      addressing_mode: 'lid',
-    });
+    assert.equal(
+      (fake.relayedMessages[0]!.opts?.additionalAttributes as { addressing_mode?: string } | undefined)?.addressing_mode,
+      undefined
+    );
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
@@ -1296,4 +1298,329 @@ test('extractAddressingContext, storeTcTokensFromNode, and buildTcTokenNodeForJi
   assert.equal(tcNode!.attrs?.t, String(nowSec));
   assert.deepEqual(Buffer.from(tcNode!.content as Uint8Array), rawTokenBytes);
 });
+
+// ============================================================================
+// 7. ANONYMOUS GHOST ROOM PROTOCOL DELIVERY, ACK VERIFICATION, & DUAL-PATH FAILOVER
+// ============================================================================
+
+test('Zero-byte tctoken protection & 1-to-1 stanza attribute hygiene in sendAnonymousLidMessage', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'botezz_zero_tc_'));
+  try {
+    const driver = new HiroosyBaileysSessionDriver('sess_zero_tc', tmpDir);
+    const fake = createFakeIdentitySocket({
+      // Simulate issuePrivacyTokens returning an empty/no-token IQ response
+      issuePrivacyTokensFn: async () => ({
+        tag: 'iq',
+        attrs: { type: 'result' },
+        content: [],
+      }),
+    });
+    attachFakeSocketToDriver(driver, fake.sock);
+    const svc = driver.getIdentityService();
+
+    // 1. ensurePrivacyToken must NOT write Buffer.alloc(0) into authState.keys.tctoken
+    await svc.privacyTokens.ensurePrivacyToken('967771234535@s.whatsapp.net', {
+      forceRefresh: true,
+    });
+    const storedAfterEmptyIssue = await fake.sock.authState.keys.get('tctoken', [
+      '77771111222233@lid',
+      '967771234535@s.whatsapp.net',
+    ]);
+    for (const val of Object.values(storedAfterEmptyIssue)) {
+      if (val && typeof val === 'object' && 'token' in val && val.token) {
+        assert.ok(
+          Buffer.from(val.token as Uint8Array).byteLength > 0,
+          'authState.keys.tctoken must never store a 0-byte Buffer'
+        );
+      }
+    }
+
+    // 2. If a corrupted 0-byte token was previously persisted on disk, getValidPrivacyToken cleans it up
+    await fake.sock.authState.keys.set({
+      tctoken: {
+        '77771111222233@lid': {
+          token: Buffer.alloc(0),
+          timestamp: String(Math.floor(Date.now() / 1000)),
+        },
+      },
+    });
+    const checkZero = await svc.privacyTokens.getValidPrivacyToken('77771111222233@lid');
+    assert.equal(checkZero?.hasToken, false);
+
+    // 3. sendAnonymousLidMessage never attaches a 0-byte <tctoken> node and never sets addressing_mode="lid" on 1-to-1 stanzas
+    const sendRes = await driver.sendAnonymousLidMessage({
+      recipient: '77771111222233@lid',
+      fallbackPnJid: '967771234535@s.whatsapp.net',
+      text: 'Ghost message without 0-byte tctoken',
+      customPushName: 'Ghost Alias',
+      ghostHeaderMode: 'plain',
+    });
+    assert.equal(sendRes.deliveredJid, '77771111222233@lid');
+    assert.equal(sendRes.usedLid, true);
+    assert.equal(fake.sentMessages.length, 1);
+
+    const sentOpts = fake.sentMessages[0]!.opts;
+    assert.equal(sentOpts?.addressingMode, undefined);
+    assert.equal(
+      (sentOpts?.additionalAttributes as { addressing_mode?: string } | undefined)?.addressing_mode,
+      undefined
+    );
+    const additionalNodes = (sentOpts?.additionalNodes as BinaryNode[] | undefined) || [];
+    assert.equal(
+      additionalNodes.some((n) => n.tag === 'tctoken'),
+      false,
+      'Must not attach 0-byte <tctoken> node'
+    );
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('sendAnonymousLidMessage dual-path failover: retries via fallbackPnJid on server ACK error 479 or LID session assertion failure', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'botezz_dual_path_'));
+  try {
+    // Case A: Server returns <ack class="message" error="479"/> on @lid -> automatically retries via @s.whatsapp.net
+    const driverAckFallback = new HiroosyBaileysSessionDriver('sess_ack_fb', tmpDir);
+    const fakeAck = createFakeIdentitySocket();
+    const wsEmitter = new EventEmitter();
+    (fakeAck.sock as unknown as { ws: EventEmitter }).ws = wsEmitter;
+
+    const origSendMessage = fakeAck.sock.sendMessage.bind(fakeAck.sock);
+    (fakeAck.sock as unknown as { sendMessage: typeof origSendMessage }).sendMessage = async (
+      jid,
+      content,
+      opts
+    ) => {
+      const sent = await origSendMessage(jid, content, opts);
+      const msgId = sent?.key?.id || 'msg_1';
+      setImmediate(() => {
+        if (jid.endsWith('@lid')) {
+          wsEmitter.emit('CB:ack,class:message', {
+            tag: 'ack',
+            attrs: { class: 'message', id: msgId, error: '479' },
+          });
+        } else {
+          wsEmitter.emit('CB:ack,class:message', {
+            tag: 'ack',
+            attrs: { class: 'message', id: msgId },
+          });
+        }
+      });
+      return sent;
+    };
+
+    attachFakeSocketToDriver(driverAckFallback, fakeAck.sock);
+
+    const resAck = await driverAckFallback.sendAnonymousLidMessage({
+      recipient: '77771111222233@lid',
+      fallbackPnJid: '967771234535@s.whatsapp.net',
+      text: 'Failover on ACK 479',
+      ghostHeaderMode: 'plain',
+    });
+
+    assert.equal(resAck.fallbackTriggered, true);
+    assert.equal(resAck.usedLid, false);
+    assert.equal(resAck.deliveredJid, '967771234535@s.whatsapp.net');
+    assert.equal(resAck.ackVerified, true);
+    assert.equal(fakeAck.sentMessages.length, 2);
+    assert.equal(fakeAck.sentMessages[0]!.jid, '77771111222233@lid');
+    assert.equal(fakeAck.sentMessages[1]!.jid, '967771234535@s.whatsapp.net');
+
+    // Case B: assertSessions([targetLid]) returns false -> immediately falls back to fallbackPnJid
+    const driverAssertFallback = new HiroosyBaileysSessionDriver('sess_assert_fb', tmpDir);
+    const fakeAssert = createFakeIdentitySocket();
+    (fakeAssert.sock as unknown as { assertSessions: (jids: string[]) => Promise<boolean> }).assertSessions =
+      async (jids: string[]) => {
+        fakeAssert.assertedSessions.push(jids);
+        if (jids.some((j) => j.endsWith('@lid'))) {
+          return false;
+        }
+        return true;
+      };
+    attachFakeSocketToDriver(driverAssertFallback, fakeAssert.sock);
+
+    const resAssert = await driverAssertFallback.sendAnonymousLidMessage({
+      recipient: '77771111222233@lid',
+      fallbackPnJid: '967771234535@s.whatsapp.net',
+      text: 'Failover on LID assertSessions failure',
+      ghostHeaderMode: 'plain',
+    });
+
+    assert.equal(resAssert.fallbackTriggered, true);
+    assert.equal(resAssert.usedLid, false);
+    assert.equal(resAssert.deliveredJid, '967771234535@s.whatsapp.net');
+    assert.equal(fakeAssert.sentMessages.length, 1);
+    assert.equal(fakeAssert.sentMessages[0]!.jid, '967771234535@s.whatsapp.net');
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test('End-to-End Anonymous Room: phone + LID storage, outbound text & media in ANON_IN_ROOM, and incoming remoteJidAlt / senderPn / media reply matching', async () => {
+  const db = new AppDatabase(':memory:');
+  const tmpAuthDir = fs.mkdtempSync(path.join(os.tmpdir(), 'botezz_anon_room_e2e_'));
+  try {
+    const adminId = 999999;
+    const sessionRepo = new SessionRepository(db);
+    const taskRepo = new TaskRepository(db);
+    const auditRepo = new AuditRepository(db);
+    const settingsRepo = new SettingsRepository(db);
+    const sessionStore = new SessionStore(tmpAuthDir);
+
+    const mockDrivers = new Map<string, MockWhatsAppSessionDriver>();
+    const sessionManager = new SessionManager(
+      sessionRepo,
+      auditRepo,
+      sessionStore,
+      (sessionId) => {
+        const d = new MockWhatsAppSessionDriver(sessionId);
+        mockDrivers.set(sessionId, d);
+        return d;
+      }
+    );
+
+    const pairing = await sessionManager.initiatePairing({
+      rawPhoneNumber: '+966500000001',
+      actorTelegramId: adminId,
+      autoCompleteInMock: true,
+    });
+    const driver = mockDrivers.get(pairing.session.id)!;
+
+    const config: AppConfig = {
+      TELEGRAM_BOT_TOKEN: '123456:TESTTOKEN_ROOM_E2E',
+      TELEGRAM_ADMIN_ID: adminId,
+      NODE_ENV: 'test',
+      DATABASE_PATH: ':memory:',
+      WHATSAPP_AUTH_DIR: tmpAuthDir,
+      TEMP_UPLOAD_DIR: tmpAuthDir,
+      LOG_LEVEL: 'error',
+      MAX_CONCURRENT_TASKS: 2,
+      TASK_TIMEOUT_MS: 30_000,
+      MAX_UPLOAD_SIZE_MB: 20,
+    };
+
+    const rateLimiter = new OperationRateLimiter(50, 60_000, 0);
+    const sendMessageOp = new SendMessageOperation(sessionManager, rateLimiter);
+    const sendMediaOp = new SendMediaOperation(sessionManager, rateLimiter);
+    const groupOps = new GroupOperations(sessionManager, auditRepo, rateLimiter);
+    const taskRunner = new TaskRunner(taskRepo, 2, 10_000);
+    const taskManager = new TaskManager(taskRepo, auditRepo, taskRunner);
+
+    const bot = new TelegramBotController({
+      config,
+      sessionManager,
+      taskManager,
+      sendMessageOp,
+      sendMediaOp,
+      groupOps,
+      auditRepo,
+      settingsRepo,
+    });
+
+    // 1. Create room with phone number -> stores both receiverJid (@s.whatsapp.net) and receiverLidJid (@lid)
+    const createPrompt = await bot.handleCallbackQuery(adminId, 'anon:add_prompt');
+    assert.ok(createPrompt.text.includes('بدء جلسة تواصل مجهولة جديدة'));
+
+    const roomCreatedView = await bot.handleTextMessage(adminId, '+967771234535');
+    assert.ok(roomCreatedView.text.includes('غرفة المحادثة المجهولة الحية'));
+
+    const activeRoomId = bot.toolsHandler.getActiveAnonRoom(adminId);
+    assert.ok(activeRoomId, 'Expected admin to be inside active anonymous room');
+
+    const storedSess = bot.toolsHandler.anonymousEngine.getAnonymousSessionById(
+      activeRoomId!
+    );
+    assert.ok(storedSess);
+    assert.equal(storedSess!.receiverJid, '967771234535@s.whatsapp.net');
+    assert.ok(
+      storedSess!.receiverLidJid && storedSess!.receiverLidJid.endsWith('@lid'),
+      'Expected receiverLidJid to be stored alongside receiverJid'
+    );
+
+    // 2. Send text message while in ANON_IN_ROOM
+    const afterTextView = await bot.handleTextMessage(
+      adminId,
+      'مرحباً من داخل غرفة الشبح'
+    );
+    assert.ok(afterTextView.text.includes('مرحباً من داخل غرفة الشبح'));
+    assert.equal(driver.sentAnonymousLidMessages.length, 1);
+    assert.equal(
+      driver.sentAnonymousLidMessages[0]!.resolvedPn,
+      '967771234535@s.whatsapp.net'
+    );
+
+    // 3. Upload photo media while in ANON_IN_ROOM -> routed to sendAnonymousRoomMedia
+    const afterMediaView = await bot.handleMediaUpload(adminId, {
+      originalFilename: 'secret_photo.jpg',
+      mimeType: 'image/jpeg',
+      sizeBytes: 15,
+      contentBuffer: Buffer.from('fake_jpeg_bytes'),
+      caption: 'صورة سرية',
+      telegramMediaKind: 'photo',
+    });
+    assert.ok(afterMediaView.text.includes('📷'));
+    assert.equal(driver.sentAnonymousLidMessages.length, 2);
+
+    // 4. Incoming WhatsApp reply carrying remoteJid (@s.whatsapp.net) + senderLid / remoteJidAlt (@lid) + audio ptt media
+    let liveUpdatedText = '';
+    bot.onAnonRoomLiveUpdate = async (_adminId, view) => {
+      liveUpdatedText = view.text;
+    };
+
+    (
+      bot as unknown as {
+        handleIncomingAnonRoomMessage: (
+          sessionId: string,
+          rawMessage: Record<string, unknown>
+        ) => void;
+      }
+    ).handleIncomingAnonRoomMessage(pairing.session.id, {
+      key: {
+        id: 'INCOMING_REPLY_1',
+        fromMe: false,
+        remoteJid: '967771234535@s.whatsapp.net',
+        remoteJidAlt: '88889999000011@lid',
+        senderPn: '967771234535@s.whatsapp.net',
+        senderLid: '88889999000011@lid',
+      },
+      message: {
+        audioMessage: {
+          ptt: true,
+        },
+      },
+    });
+
+    assert.ok(
+      liveUpdatedText.includes('🎤') && liveUpdatedText.includes('رسالة صوتية واردة'),
+      'Expected incoming voice note reply to be recorded and rendered in room transcript'
+    );
+
+    const updatedSess = bot.toolsHandler.anonymousEngine.getAnonymousSessionById(
+      activeRoomId!
+    );
+    assert.equal(updatedSess?.receiverLidJid, '88889999000011@lid');
+    assert.equal(
+      driver.memoryStore.getLidForPn('967771234535@s.whatsapp.net'),
+      '88889999000011@lid',
+      'Expected incoming message PN<->LID pair to sync into driver memoryStore'
+    );
+  } finally {
+    await sessionManagerCloseSafe(db, tmpAuthDir);
+  }
+});
+
+async function sessionManagerCloseSafe(db: AppDatabase, tmpDir: string): Promise<void> {
+  try {
+    db.close();
+  } catch {
+    // Ignore
+  }
+  try {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  } catch {
+    // Ignore
+  }
+}
+
+
 

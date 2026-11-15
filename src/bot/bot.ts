@@ -568,6 +568,8 @@ export class TelegramBotController {
       fromMe?: boolean;
       remoteJid?: string;
       remoteJidAlt?: string;
+      senderPn?: string;
+      senderLid?: string;
       participant?: string;
       participantAlt?: string;
     };
@@ -592,6 +594,7 @@ export class TelegramBotController {
     }
 
     let text = '';
+    let mediaKind: 'text' | 'image' | 'video' | 'audio' | 'ptt' | 'sticker' | 'document' = 'text';
     let quotedMessageId: string | undefined;
     if (msg && typeof msg === 'object') {
       if (typeof msg.conversation === 'string') {
@@ -603,29 +606,77 @@ export class TelegramBotController {
         };
         text = typeof ext.text === 'string' ? ext.text : '';
         quotedMessageId = ext.contextInfo?.stanzaId;
-      } else {
-        const mediaObj =
-          (msg.imageMessage as Record<string, unknown> | undefined) ||
-          (msg.videoMessage as Record<string, unknown> | undefined) ||
-          (msg.documentMessage as Record<string, unknown> | undefined);
-        if (mediaObj) {
-          text =
-            typeof mediaObj.caption === 'string' && mediaObj.caption.trim()
-              ? mediaObj.caption
-              : '[وسائط واردة]';
-          const ci = mediaObj.contextInfo as { stanzaId?: string } | undefined;
-          quotedMessageId = ci?.stanzaId;
-        }
+      } else if (msg.imageMessage && typeof msg.imageMessage === 'object') {
+        const img = msg.imageMessage as {
+          caption?: string;
+          contextInfo?: { stanzaId?: string };
+        };
+        const cap = typeof img.caption === 'string' ? img.caption.trim() : '';
+        text = cap ? `📷 [صورة واردة] ${cap}` : '📷 [صورة واردة]';
+        mediaKind = 'image';
+        quotedMessageId = img.contextInfo?.stanzaId;
+      } else if (msg.videoMessage && typeof msg.videoMessage === 'object') {
+        const vid = msg.videoMessage as {
+          caption?: string;
+          contextInfo?: { stanzaId?: string };
+        };
+        const cap = typeof vid.caption === 'string' ? vid.caption.trim() : '';
+        text = cap ? `🎥 [فيديو وارد] ${cap}` : '🎥 [فيديو وارد]';
+        mediaKind = 'video';
+        quotedMessageId = vid.contextInfo?.stanzaId;
+      } else if (msg.audioMessage && typeof msg.audioMessage === 'object') {
+        const aud = msg.audioMessage as {
+          ptt?: boolean;
+          contextInfo?: { stanzaId?: string };
+        };
+        text = aud.ptt ? '🎤 [رسالة صوتية واردة]' : '🎵 [مقطع صوتي وارد]';
+        mediaKind = aud.ptt ? 'ptt' : 'audio';
+        quotedMessageId = aud.contextInfo?.stanzaId;
+      } else if (msg.stickerMessage && typeof msg.stickerMessage === 'object') {
+        const stk = msg.stickerMessage as {
+          contextInfo?: { stanzaId?: string };
+        };
+        text = '🎭 [ملصق وارد]';
+        mediaKind = 'sticker';
+        quotedMessageId = stk.contextInfo?.stanzaId;
+      } else if (msg.documentMessage && typeof msg.documentMessage === 'object') {
+        const doc = msg.documentMessage as {
+          fileName?: string;
+          caption?: string;
+          contextInfo?: { stanzaId?: string };
+        };
+        const fn = typeof doc.fileName === 'string' && doc.fileName.trim() ? doc.fileName.trim() : 'ملف';
+        const cap = typeof doc.caption === 'string' ? doc.caption.trim() : '';
+        text = `📄 [مستند وارد: ${fn}]${cap ? ` ${cap}` : ''}`;
+        mediaKind = 'document';
+        quotedMessageId = doc.contextInfo?.stanzaId;
+      } else if (msg.locationMessage || msg.liveLocationMessage) {
+        text = '📍 [موقع جغرافي وارد]';
+      } else if (msg.contactMessage || msg.contactsArrayMessage) {
+        text = '👤 [بطاقة جهة اتصال واردة]';
       }
     }
 
     if (!text.trim()) return;
 
+    const topSenderPn =
+      typeof (rawMessage as { senderPn?: unknown }).senderPn === 'string'
+        ? ((rawMessage as { senderPn: string }).senderPn)
+        : undefined;
+    const topSenderLid =
+      typeof (rawMessage as { senderLid?: unknown }).senderLid === 'string'
+        ? ((rawMessage as { senderLid: string }).senderLid)
+        : undefined;
+
     const candidateJids: Array<string | undefined> = [
       key.remoteJid,
       key.remoteJidAlt,
+      key.senderPn,
+      key.senderLid,
       key.participant,
       key.participantAlt,
+      topSenderPn,
+      topSenderLid,
       rawMeta.senderPn,
       rawMeta.senderLid,
       rawMeta.senderAlt,
@@ -636,6 +687,16 @@ export class TelegramBotController {
     // Also include any mapped PN/LID from the active driver's memoryStore / signalRepository
     try {
       const driver = this.deps.sessionManager.getDriver(sessionId);
+      const discoveredPn = candidateJids.find(
+        (j): j is string => typeof j === 'string' && j.endsWith('@s.whatsapp.net')
+      );
+      const discoveredLid = candidateJids.find(
+        (j): j is string => typeof j === 'string' && j.endsWith('@lid')
+      );
+      if (discoveredPn && discoveredLid && typeof driver.syncLidPnMapping === 'function') {
+        void driver.syncLidPnMapping(discoveredPn, discoveredLid).catch(() => undefined);
+      }
+
       const idSvc = driver.getIdentityService?.();
       if (idSvc) {
         for (const c of [...candidateJids]) {
@@ -668,6 +729,7 @@ export class TelegramBotController {
         candidateJids,
         messageId: key.id,
         text: text.trim(),
+        mediaKind,
         quotedMessageId,
         fromMe: Boolean(key.fromMe),
       });
@@ -2196,8 +2258,17 @@ export class TelegramBotController {
     const isAwaitingMenfessMedia =
       mode === 'TOOLS' &&
       this.toolsHandler.getStep(actorUserId) === 'AWAITING_MENFESS_RELAY_INPUT';
+    const isInAnonRoom =
+      this.toolsHandler.getStep(actorUserId) === 'ANON_IN_ROOM' &&
+      Boolean(this.toolsHandler.getActiveAnonRoom(actorUserId));
 
-    if (
+    if (isInAnonRoom && !isFunctionLabCaption) {
+      view = await this.toolsHandler.sendAnonymousRoomMedia(
+        actorUserId,
+        upload
+      );
+      this.activateInputOwner(actorUserId, 'TOOLS');
+    } else if (
       (mode === 'TOOLS' && isCodeExtension) ||
       (isFunctionLabCaption && isCodeExtension)
     ) {

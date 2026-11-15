@@ -267,10 +267,11 @@ test('1. validateRecipient & LID Resolution + sendAnonymousLidMessage across all
       }
     )?.extendedTextMessage?.text;
   assert.equal(sentBody, 'رسالة سرية عبر بروتوكول LID');
-  assert.equal(fake.sentMessages[0].options?.addressingMode, 'lid');
-  assert.deepEqual(
-    fake.sentMessages[0].options?.additionalAttributes,
-    { addressing_mode: 'lid' }
+  // 1-to-1 stanzas must NOT include addressing_mode="lid" (preventing smax-invalid Error 479)
+  assert.equal(fake.sentMessages[0].options?.addressingMode, undefined);
+  assert.equal(
+    (fake.sentMessages[0].options?.additionalAttributes as { addressing_mode?: string } | undefined)?.addressing_mode,
+    undefined
   );
   assert.ok(
     driver.memoryStore.getMessage({

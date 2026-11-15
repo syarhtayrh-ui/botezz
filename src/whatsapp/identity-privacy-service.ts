@@ -373,6 +373,7 @@ export interface SendLidAddressedResult {
 export interface PrivacyTokenRecord {
   storageJid: string;
   hasToken: boolean;
+  token?: Buffer;
   timestampSec?: number;
   senderTimestampSec?: number;
   expired: boolean;
@@ -578,6 +579,7 @@ export class PrivacyTokenManager {
     string,
     Promise<PrivacyTokenRecord>
   >();
+  private readonly lastIssuedSenderTimestampByJid = new Map<string, number>();
   private reachoutTimeLock: ReachoutTimelockInfo = { isActive: false };
   private selfUsernameCache?: string;
 
@@ -770,30 +772,40 @@ export class PrivacyTokenManager {
 
     if (!entry) return null;
 
-    const tokenLen = entry.token?.length ?? 0;
+    if (entry.senderTimestamp !== undefined) {
+      this.lastIssuedSenderTimestampByJid.set(effectiveStorageJid, entry.senderTimestamp);
+    }
+    const rememberedSenderTs =
+      entry.senderTimestamp ?? this.lastIssuedSenderTimestampByJid.get(effectiveStorageJid);
+
+    const tokenBuf =
+      entry.token && Buffer.isBuffer(entry.token)
+        ? entry.token
+        : entry.token instanceof Uint8Array
+          ? Buffer.from(entry.token)
+          : undefined;
+    const tokenLen = tokenBuf?.byteLength ?? 0;
     const expired = entry.timestamp !== undefined ? isTcTokenExpired(entry.timestamp) : true;
     const tsNum =
       entry.timestamp !== undefined && !Number.isNaN(Number(entry.timestamp))
         ? Number(entry.timestamp)
         : undefined;
 
-    if (tokenLen === 0 || expired) {
-      if (tokenLen > 0 && expired) {
-        const cleared: TcTokenEntry | null =
-          entry.senderTimestamp !== undefined
-            ? { token: Buffer.alloc(0), senderTimestamp: entry.senderTimestamp }
-            : null;
-        await sock.authState.keys.set({
+    if (!tokenBuf || tokenLen === 0 || expired) {
+      // Clear any 0-byte corrupted or expired entry from authState.keys so Baileys'
+      // internal buildTcTokenFromJid never attaches an empty <tctoken/> node.
+      await sock.authState.keys
+        .set({
           tctoken: {
-            [effectiveStorageJid]: cleared,
+            [effectiveStorageJid]: null,
           },
-        });
-      }
+        })
+        .catch(() => {});
       return {
         storageJid: effectiveStorageJid,
         hasToken: false,
         timestampSec: tsNum,
-        senderTimestampSec: entry.senderTimestamp,
+        senderTimestampSec: rememberedSenderTs,
         expired: true,
         source: 'auth_store',
         updatedAtIso: new Date().toISOString(),
@@ -803,8 +815,9 @@ export class PrivacyTokenManager {
     return {
       storageJid: effectiveStorageJid,
       hasToken: true,
+      token: tokenBuf,
       timestampSec: tsNum,
-      senderTimestampSec: entry.senderTimestamp,
+      senderTimestampSec: rememberedSenderTs,
       expired: false,
       source: 'auth_store',
       updatedAtIso: new Date().toISOString(),
@@ -827,12 +840,18 @@ export class PrivacyTokenManager {
     const normalized = jidNormalizedUser(targetJid);
     const existing = await this.getValidPrivacyToken(normalized);
 
+    const getLIDForPN = this.getGetLIDForPN(sock);
+    const getPNForLID = this.getGetPNForLID(sock);
+    const storageJid = await resolveTcTokenJid(normalized, getLIDForPN);
+    const knownSenderTs =
+      existing?.senderTimestampSec ?? this.lastIssuedSenderTimestampByJid.get(storageJid);
+
     const needsRefresh =
       Boolean(options?.forceRefresh) ||
       !existing ||
       !existing.hasToken ||
       existing.expired ||
-      shouldSendNewTcToken(existing.senderTimestampSec);
+      shouldSendNewTcToken(knownSenderTs);
 
     if (!needsRefresh && existing?.hasToken) {
       return { record: existing, refreshed: false };
@@ -842,10 +861,6 @@ export class PrivacyTokenManager {
       return { record: existing, refreshed: false };
     }
 
-    const getLIDForPN = this.getGetLIDForPN(sock);
-    const getPNForLID = this.getGetPNForLID(sock);
-    const storageJid = await resolveTcTokenJid(normalized, getLIDForPN);
-
     const inFlight = this.inFlightTokenRefreshes.get(storageJid);
     if (inFlight) {
       const record = await inFlight;
@@ -854,6 +869,7 @@ export class PrivacyTokenManager {
 
     const refreshPromise = (async (): Promise<PrivacyTokenRecord> => {
       const issueTimestamp = Math.floor(Date.now() / 1000);
+      this.lastIssuedSenderTimestampByJid.set(storageJid, issueTimestamp);
       const issueToLid = Boolean(sock.serverProps?.lidTrustedTokenIssueToLid);
       const issueJid = await resolveIssuanceJid(
         normalized,
@@ -872,15 +888,16 @@ export class PrivacyTokenManager {
       }
       const afterData = await sock.authState.keys.get('tctoken', [storageJid]);
       const afterEntry = afterData?.[storageJid];
-      await sock.authState.keys.set({
-        tctoken: {
-          [storageJid]: {
-            token: Buffer.alloc(0),
-            ...afterEntry,
-            senderTimestamp: issueTimestamp,
+      if (afterEntry?.token && afterEntry.token.byteLength > 0) {
+        await sock.authState.keys.set({
+          tctoken: {
+            [storageJid]: {
+              ...afterEntry,
+              senderTimestamp: issueTimestamp,
+            },
           },
-        },
-      });
+        });
+      }
       const updated = await this.getValidPrivacyToken(storageJid);
       emitIdentityTelemetry({
         sessionId: this.sessionId,
@@ -894,7 +911,11 @@ export class PrivacyTokenManager {
       return (
         updated || {
           storageJid,
-          hasToken: Boolean(afterEntry?.token?.length),
+          hasToken: Boolean(afterEntry?.token && afterEntry.token.byteLength > 0),
+          token:
+            afterEntry?.token && afterEntry.token.byteLength > 0
+              ? Buffer.from(afterEntry.token)
+              : undefined,
           timestampSec: afterEntry?.timestamp ? Number(afterEntry.timestamp) : undefined,
           senderTimestampSec: issueTimestamp,
           expired: false,
@@ -1884,7 +1905,7 @@ export class WhatsAppIdentityService {
       typeof params.content === 'string' ? { text: params.content } : params.content;
 
     const sendOptions: Record<string, unknown> = {};
-    if (usingLid) {
+    if (deliveryJid.endsWith('@g.us') && usingLid) {
       sendOptions.addressingMode = 'lid';
       sendOptions.additionalAttributes = { addressing_mode: 'lid' };
     }
