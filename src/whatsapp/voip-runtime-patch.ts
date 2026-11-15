@@ -312,29 +312,58 @@ export function ensureDeviceJidFormat(jid: string): string {
   return jid.replace('@', ':0@');
 }
 
+function encodeVarint(value: number): Uint8Array {
+  const bytes: number[] = [];
+  let v = value >>> 0;
+  while (v > 0x7f) {
+    bytes.push((v & 0x7f) | 0x80);
+    v >>>= 7;
+  }
+  bytes.push(v & 0x7f);
+  return new Uint8Array(bytes);
+}
+
+function encodeProtobufVarintField(
+  fieldNumber: number,
+  value: number
+): Uint8Array {
+  const tag = encodeVarint((fieldNumber << 3) | 0);
+  const val = encodeVarint(value);
+  return concatUint8Arrays([tag, val]);
+}
+
+function encodeProtobufLengthDelimited(
+  fieldNumber: number,
+  data: Uint8Array
+): Uint8Array {
+  const tag = encodeVarint((fieldNumber << 3) | 2);
+  const len = encodeVarint(data.length);
+  return concatUint8Arrays([tag, len, data]);
+}
+
 /**
- * Builds STUN `ATTR_SENDER_SUBSCRIPTIONS (0x4000)` payload for multiple SSRCs
- * (8 bytes per SSRC: 4B SSRC BE + `[0x00, 0x07, 0x00, 0x00]`).
+ * Builds STUN `ATTR_SENDER_SUBSCRIPTIONS (0x4000)` Protobuf payload for multiple SSRCs
+ * matching `@hiroosy/baileys-lite/voip/relay/stun.js` `buildSenderSubscriptions`.
  */
 export function buildMultiSenderSubscriptions(ssrcs: number[]): Uint8Array {
   const unique = Array.from(
     new Set(ssrcs.map((s) => s >>> 0).filter((s) => s !== 0))
   );
-  const out = new Uint8Array(unique.length * 8);
-  const view = new DataView(out.buffer, out.byteOffset, out.byteLength);
-  for (let i = 0; i < unique.length; i++) {
-    const offset = i * 8;
-    view.setUint32(offset, unique[i]!, false);
-    out[offset + 4] = 0x00;
-    out[offset + 5] = 0x07;
-    out[offset + 6] = 0x00;
-    out[offset + 7] = 0x00;
+  const entries: Uint8Array[] = [];
+  for (const ssrc of unique) {
+    const inner = concatUint8Arrays([
+      encodeProtobufVarintField(3, ssrc),
+      encodeProtobufVarintField(5, 0),
+      encodeProtobufVarintField(6, 0),
+    ]);
+    entries.push(encodeProtobufLengthDelimited(1, inner));
   }
-  return out;
+  return concatUint8Arrays(entries);
 }
 
 /**
- * Builds additional 20-byte stream descriptor entries for peer SSRCs inside STUN Allocate `0x4024`.
+ * Builds Protobuf stream descriptor entries for peer SSRCs inside STUN Allocate `0x4024`
+ * matching `@hiroosy/baileys-lite/voip/relay/stun.js` `buildSSRCSubscriptionList`.
  */
 export function buildPeerSsrcDescriptorEntries(
   peerSsrcs: number[],
@@ -343,18 +372,16 @@ export function buildPeerSsrcDescriptorEntries(
   const unique = Array.from(
     new Set(peerSsrcs.map((s) => s >>> 0).filter((s) => s !== 0))
   );
-  const out = new Uint8Array(unique.length * 20);
-  const view = new DataView(out.buffer, out.byteOffset, out.byteLength);
+  const entries: Uint8Array[] = [];
   for (let i = 0; i < unique.length; i++) {
-    const offset = i * 20;
-    view.setUint32(offset, unique[i]!, false);
-    view.setUint16(offset + 4, peerPid & 0xffff, false);
-    view.setUint16(offset + 6, (i + 1) & 0xffff, false);
-    view.setUint16(offset + 8, 1, false);
-    view.setUint16(offset + 10, 0x0003, false);
-    view.setUint16(offset + 12, 0x0007, false);
+    const inner = concatUint8Arrays([
+      encodeProtobufVarintField(1, peerPid >>> 0),
+      encodeProtobufVarintField(2, i + 1),
+      encodeProtobufVarintField(3, unique[i]!),
+    ]);
+    entries.push(encodeProtobufLengthDelimited(1, inner));
   }
-  return out;
+  return concatUint8Arrays(entries);
 }
 
 const ANNEX_B_START_CODE = new Uint8Array([0x00, 0x00, 0x00, 0x01]);
@@ -1597,7 +1624,7 @@ function derivePeerRecvCtxFromKeyMaterial(
       }
     | null
     | undefined,
-  authTagLen = 10
+  authTagLen = 4
 ): {
   sessionKey: Uint8Array;
   sessionSalt: Uint8Array;
@@ -1823,13 +1850,13 @@ export function syncReceiveOnlySrtpOnMediaSession(
           sessionKey: cand.sessionKey,
           sessionSalt: cand.sessionSalt,
           authKey: cand.authKey,
-          authTagLen: cand.authTagLen ?? s.srtpSession.recvAuthTagLen ?? 10,
+          authTagLen: cand.authTagLen ?? s.srtpSession.recvAuthTagLen ?? 4,
         };
         break;
       }
       const derivedFromSub = derivePeerRecvCtxFromKeyMaterial(
         cand,
-        s.srtpSession.recvAuthTagLen ?? 10
+        s.srtpSession.recvAuthTagLen ?? 4
       );
       if (derivedFromSub) {
         resolvedRecv = derivedFromSub;
@@ -1842,7 +1869,7 @@ export function syncReceiveOnlySrtpOnMediaSession(
   if (!resolvedRecv && peerCallKey && peerCallKey.length >= 30) {
     const derived = derivePeerRecvCtxFromKeyMaterial(
       peerCallKey,
-      s.srtpSession?.recvAuthTagLen ?? 10
+      s.srtpSession?.recvAuthTagLen ?? 4
     );
     if (derived) {
       resolvedRecv = derived;
@@ -1887,15 +1914,25 @@ export function syncReceiveOnlySrtpOnMediaSession(
   }
 }
 
-function cloneSrtpRecvContext(templateCtx: any): any {
+export function cloneSrtpRecvContext(templateCtx: any): any {
   if (!templateCtx || typeof templateCtx !== 'object') return null;
   const Ctor = templateCtx.constructor;
   let clone: any;
   if (typeof Ctor === 'function' && Ctor !== Object) {
     try {
-      clone = Object.create(Ctor.prototype);
+      const dummyKeying = {
+        masterKey:
+          templateCtx.masterKey instanceof Uint8Array
+            ? new Uint8Array(templateCtx.masterKey)
+            : new Uint8Array(16),
+        masterSalt:
+          templateCtx.masterSalt instanceof Uint8Array
+            ? new Uint8Array(templateCtx.masterSalt)
+            : new Uint8Array(14),
+      };
+      clone = new Ctor(dummyKeying, templateCtx.authTagLen ?? 4);
     } catch {
-      clone = {};
+      clone = Object.create(Ctor.prototype);
     }
   } else {
     clone = {};
@@ -1920,7 +1957,11 @@ function cloneSrtpRecvContext(templateCtx: any): any {
     templateCtx.authKey instanceof Uint8Array
       ? new Uint8Array(templateCtx.authKey)
       : templateCtx.authKey;
-  clone.authTagLen = templateCtx.authTagLen ?? 10;
+  clone.authTagLen = templateCtx.authTagLen ?? 4;
+  clone.ivBuffer = new Uint8Array(16);
+  clone.ssrcBuffer = new Uint8Array(4);
+  clone.indexBuffer = new Uint8Array(8);
+  clone.rocBuffer = new Uint8Array(4);
   clone.roc = 0;
   clone.lastSeq = 0;
   clone.initialized = false;
@@ -2046,10 +2087,14 @@ function unprotectInboundVideoPacket(
     const ctx = candidates[i];
     if (!ctx || typeof ctx.unprotect !== 'function') continue;
 
-    // Try with default authTagLen (usually 10 bytes for WhatsApp video) and fallback to 4 bytes
-    const primaryTagLen = ctx.authTagLen ?? 10;
+    // Try with 4-byte authTagLen first (standard in @hiroosy/baileys-lite/voip) and fallback to 10 bytes
+    const primaryTagLen = ctx.authTagLen ?? 4;
     const tagLengthsToTry =
-      primaryTagLen === 10 ? [10, 4] : [primaryTagLen, 10, 4];
+      primaryTagLen === 4
+        ? [4, 10]
+        : primaryTagLen === 10
+          ? [4, 10]
+          : [primaryTagLen, 4, 10];
 
     for (const tagLen of tagLengthsToTry) {
       const savedRoc = ctx.roc;
@@ -2061,6 +2106,7 @@ function unprotectInboundVideoPacket(
       try {
         ctx.authTagLen = tagLen;
         const pkt = ctx.unprotect(data);
+        ctx.authTagLen = savedTagLen;
         if (pkt && pkt.payload) {
           // Strip RTP padding if `header.padding === true`
           if (pkt.header?.padding && pkt.payload.byteLength > 0) {
@@ -2296,10 +2342,19 @@ function attachPassiveNativeMediaSessionTaps(
     onRelayVideoData?: (data: Uint8Array) => unknown;
   }
 ): void {
-  if (!target || typeof target !== 'object' || target.__botezzPassiveTapApplied) {
+  if (
+    !target ||
+    typeof target !== 'object' ||
+    Object.prototype.hasOwnProperty.call(target, '__botezzPassiveTapApplied')
+  ) {
     return;
   }
-  target.__botezzPassiveTapApplied = true;
+  Object.defineProperty(target, '__botezzPassiveTapApplied', {
+    value: true,
+    configurable: true,
+    enumerable: false,
+    writable: true,
+  });
 
   if (typeof target.handleCallAccept === 'function') {
     const origAccept = target.handleCallAccept;
@@ -2561,10 +2616,9 @@ function attachPassiveNativeMediaSessionTaps(
 
         const packet = data instanceof Uint8Array ? data : null;
         if (packet && packet.length >= 12 && (packet[0]! & 0xc0) === 0x80) {
-          const packetType = packet[1]! & 0xff;
-          // Skip RTCP packets (PT 192..223)
-          if (packetType < 192 || packetType > 223) {
-            const pt = packet[1]! & 0x7f;
+          const pt = packet[1]! & 0x7f;
+          // Skip RTCP packets (PT 72..78 / packetType 200..206)
+          if (pt < 72 || pt > 78) {
             const ssrc =
               ((packet[8]! << 24) |
                 (packet[9]! << 16) |
@@ -2915,7 +2969,7 @@ export function instrumentMediaSessionInstance(
           sessionKey: primaryRecv.sessionKey,
           sessionSalt: primaryRecv.sessionSalt,
           authKey: primaryRecv.authKey,
-          authTagLen: primaryRecv.authTagLen ?? 10,
+          authTagLen: primaryRecv.authTagLen ?? 4,
         };
       }
 
@@ -2951,7 +3005,7 @@ export function instrumentMediaSessionInstance(
               dummyKeying,
               dummyKeying,
               localOutboundSend.authTagLen ?? 4,
-              primaryRecv?.authTagLen ?? 10
+              primaryRecv?.authTagLen ?? 4
             ) as {
               sendCtx?: Record<string, unknown>;
               recvCtx?: Record<string, unknown>;
@@ -3660,7 +3714,7 @@ export function patchWaManualRelayPrototype(
                 multiSubs,
                 true,
                 true,
-                conn.stunTransactionId
+                undefined
               )
             )
           );
@@ -3678,7 +3732,7 @@ export function patchWaManualRelayPrototype(
                 multiSubs,
                 true,
                 true,
-                conn.stunTransactionId
+                undefined
               )
             )
           );
@@ -3692,90 +3746,10 @@ export function patchWaManualRelayPrototype(
               multiSubs,
               false,
               false,
-              conn.stunTransactionId
+              undefined
             )
           )
         );
-      } catch {
-        // Non-fatal
-      }
-    };
-  }
-
-  const origSendAllocate = proto.sendAllocate;
-  if (typeof origSendAllocate === 'function') {
-    proto.sendAllocate = function (conn: any, relayInfo: any) {
-      origSendAllocate.call(this, conn, relayInfo);
-      try {
-        if (conn?.allocateExhausted) return;
-        if (
-          !relayInfo?.rawToken ||
-          relayInfo.rawToken.length === 0 ||
-          !relayInfo?.key ||
-          !this.audioSsrc
-        ) {
-          return;
-        }
-        const peerList: number[] = Array.isArray(this._peerSubscriptionSsrcs)
-          ? [...this._peerSubscriptionSsrcs]
-          : this.subscriptionSsrc
-            ? [this.subscriptionSsrc >>> 0]
-            : [];
-        if (peerList.length <= 1) return;
-
-        const buildAllocateForRelay = stunMod?.buildAllocateForRelay;
-        const createWasmStreamDescriptors =
-          stunMod?.createWasmStreamDescriptors;
-        const buildSSRCSubscriptionList = stunMod?.buildSSRCSubscriptionList;
-        if (typeof buildAllocateForRelay !== 'function') return;
-
-        const candidates = this.getAllocateCandidates(conn, relayInfo);
-        const candidate =
-          candidates[Math.min(conn.allocateStage, candidates.length - 1)];
-        if (!candidate) return;
-
-        const selfSsrcs = [this.audioSsrc >>> 0];
-        if (this.videoSsrc) selfSsrcs.push(this.videoSsrc >>> 0);
-
-        let combinedDescriptors: Uint8Array;
-        if (this.streamSsrcs && typeof createWasmStreamDescriptors === 'function') {
-          const baseWasm = createWasmStreamDescriptors(this.streamSsrcs);
-          const peerDesc = buildPeerSsrcDescriptorEntries(
-            peerList,
-            this.peerPid ?? 0
-          );
-          combinedDescriptors = concatUint8Arrays([baseWasm, peerDesc]);
-        } else if (typeof buildSSRCSubscriptionList === 'function') {
-          combinedDescriptors = buildSSRCSubscriptionList(
-            selfSsrcs,
-            peerList,
-            this.selfPid ?? 0,
-            this.peerPid ?? 0
-          );
-        } else {
-          return;
-        }
-
-        const multiSubs = buildMultiSenderSubscriptions(peerList);
-        const encoder = new TextEncoder();
-        const pkt = buildAllocateForRelay(
-          relayInfo.rawToken,
-          combinedDescriptors,
-          encoder.encode(relayInfo.key),
-          candidate.ip,
-          candidate.port,
-          conn.stunTransactionId,
-          {
-            relayedAddress: candidate.form,
-            extraAttributes: [{ type: 0x4000, value: multiSubs }],
-          }
-        );
-        const ab = pkt.buffer.slice(
-          pkt.byteOffset,
-          pkt.byteOffset + pkt.byteLength
-        );
-        conn.allocatePacket = ab;
-        this.sendToChannel(conn, ab);
       } catch {
         // Non-fatal
       }
@@ -3793,13 +3767,18 @@ export function patchWaVoipCoordinatorPrototype(proto: any): void {
   if (typeof origWireClientEvents === 'function') {
     proto.wireClientEvents = function (this: any, ...args: unknown[]) {
       const res = origWireClientEvents.apply(this, args);
-      if (this.client && !this.client.__botezzInboundVideoWired) {
-        this.client.__botezzInboundVideoWired = true;
-        this.client.on?.('call_inbound_video', (call: any, au: Uint8Array) => {
+      const mgr = this.manager || this.client;
+      if (mgr && !mgr.__botezzInboundVideoWired) {
+        mgr.__botezzInboundVideoWired = true;
+        mgr.on?.('call_inbound_video', (call: any, au: Uint8Array) => {
           this.emit?.('call_inbound_video', call, au);
           emitGlobalInboundVideo(call?.callId, au);
         });
-        this.client.on?.('call_video_state', (call: any, state: unknown) => {
+        mgr.on?.('call_inbound_audio', (call: any, pcm: Float32Array) => {
+          this.emit?.('call_inbound_audio', call, pcm);
+          emitGlobalInboundAudio(call?.callId, pcm);
+        });
+        mgr.on?.('call_video_state', (call: any, state: unknown) => {
           this.emit?.('call_video_state', call, state);
         });
       }
@@ -3825,8 +3804,10 @@ export async function ensureHiroosyVoipRuntimePatched(): Promise<void> {
       const pkgDir = resolveBaileysLitePackageDir();
       if (!pkgDir) return;
 
-      // 1. Patch `WaVoipCoordinator.prototype` to forward `call_inbound_video` and `call_video_state`
+      // 1. Patch `WaVoipCoordinator.prototype` to forward `call_inbound_video`, `call_inbound_audio`, and `call_video_state`
       const coordinatorRelPaths = [
+        'voip/WaVoipCoordinator.js',
+        'lib/voip/WaVoipCoordinator.js',
         'src/voip/WaVoipCoordinator.js',
         'lib/package/voip/WaVoipCoordinator.js',
         'dist/voip/WaVoipCoordinator.js',
@@ -3850,6 +3831,14 @@ export async function ensureHiroosyVoipRuntimePatched(): Promise<void> {
 
       // 2. Patch `WaManualRelay.prototype` to subscribe to all peer audio + video SSRCs (`0x4000` + `0x4024`)
       const relayRelPaths = [
+        {
+          relay: 'voip/relay/WaManualRelay.js',
+          stun: 'voip/relay/stun.js',
+        },
+        {
+          relay: 'lib/voip/relay/WaManualRelay.js',
+          stun: 'lib/voip/relay/stun.js',
+        },
         {
           relay: 'src/voip/relay/WaManualRelay.js',
           stun: 'src/voip/relay/stun.js',
@@ -3892,6 +3881,8 @@ export async function ensureHiroosyVoipRuntimePatched(): Promise<void> {
       // 3. Patch `WaCallMediaSession.prototype` with Multi-Key SRTP Video Unprotector,
       // Multi-SSRC peer video subscriptions, Proactive Video State + SRTCP PLI, and SmartH264Assembler.
       const mediaSessionCandidateRelPaths = [
+        'voip/call/WaCallMediaSession.js',
+        'lib/voip/call/WaCallMediaSession.js',
         'src/voip/call/WaCallMediaSession.js',
         'lib/package/voip/call/WaCallMediaSession.js',
         'dist/voip/call/WaCallMediaSession.js',
@@ -3920,6 +3911,8 @@ export async function ensureHiroosyVoipRuntimePatched(): Promise<void> {
       // sync receive-only SRTP on `WaCallManager.prototype.handleCallAccept`,
       // and harden `syncDeviceList` + `ensureSessionsBatch` against empty `@lid` USync responses.
       const callManagerCandidateRelPaths = [
+        'voip/call/WaCallManager.js',
+        'lib/voip/call/WaCallManager.js',
         'src/voip/call/WaCallManager.js',
         'lib/package/voip/call/WaCallManager.js',
         'dist/voip/call/WaCallManager.js',
@@ -3968,6 +3961,9 @@ export async function ensureHiroosyVoipRuntimePatched(): Promise<void> {
               resolveSessionFromNode?: (
                 node: unknown
               ) => InstrumentedMediaSession | null;
+              createSession?: (
+                ...args: unknown[]
+              ) => InstrumentedMediaSession;
               handleCallAccept?: (...args: unknown[]) => Promise<unknown>;
               handleCallTerminate?: (node: unknown) => Promise<void>;
               handleCallReject?: (node: unknown) => Promise<void>;
@@ -3980,6 +3976,20 @@ export async function ensureHiroosyVoipRuntimePatched(): Promise<void> {
         const proto = mod?.WaCallManager?.prototype;
         if (proto && !proto.__botezzCallManagerPatched) {
           proto.__botezzCallManagerPatched = true;
+
+          if (typeof proto.createSession === 'function') {
+            const origCreateSession = proto.createSession;
+            proto.createSession = function (
+              this: NonNullable<typeof proto>,
+              ...args: unknown[]
+            ) {
+              const session = origCreateSession.apply(this, args);
+              if (session) {
+                attachPassiveNativeMediaSessionTaps(session);
+              }
+              return session;
+            };
+          }
 
           if (typeof proto.handleCallAccept === 'function') {
             const origManagerAccept = proto.handleCallAccept;

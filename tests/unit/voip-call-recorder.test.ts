@@ -1732,7 +1732,189 @@ describe('Two-Way VoIP Video Call Recording (VoipCallRecorder)', () => {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
   });
+
+  it('encodes Protobuf varint STUN subscriptions matching stun.js, initializes cloneSrtpRecvContext scratch buffers with authTagLen=4, patches baileys-lite voip prototypes, and records video even when session.videoAssembler is present', async () => {
+    const {
+      ensureHiroosyVoipRuntimePatched,
+      buildMultiSenderSubscriptions,
+      buildPeerSsrcDescriptorEntries,
+      cloneSrtpRecvContext,
+      patchWaVoipCoordinatorPrototype,
+    } = await import('../../src/whatsapp/voip-runtime-patch');
+    await ensureHiroosyVoipRuntimePatched();
+
+    // 1. Verify Protobuf encoding of buildMultiSenderSubscriptions and buildPeerSsrcDescriptorEntries against stun.js
+    const stunMod = await import(
+      '../../node_modules/@hiroosy/baileys-lite/src/voip/relay/stun.js'
+    );
+    const singleSsrc = 0x12345678;
+    const expectedSingleSub = stunMod.buildSenderSubscriptions(singleSsrc);
+    const actualMultiSub = buildMultiSenderSubscriptions([singleSsrc]);
+    assert.equal(
+      actualMultiSub[0],
+      0x0a,
+      'Protobuf length-delimited field 1 must start with 0x0a'
+    );
+    assert.deepEqual(
+      Buffer.from(actualMultiSub),
+      Buffer.from(expectedSingleSub),
+      'buildMultiSenderSubscriptions([ssrc]) must match stun.js buildSenderSubscriptions(ssrc) byte-for-byte'
+    );
+
+    const peerDesc = buildPeerSsrcDescriptorEntries([0xdeadbeef], 2);
+    assert.equal(
+      peerDesc[0],
+      0x0a,
+      'buildPeerSsrcDescriptorEntries must start with Protobuf tag 0x0a'
+    );
+
+    // 2. Verify cloneSrtpRecvContext initializes ivBuffer(16), ssrcBuffer(4), indexBuffer(8), rocBuffer(4) and defaults authTagLen=4
+    const clonedCtx = cloneSrtpRecvContext({
+      sessionKey: crypto.randomBytes(16),
+      sessionSalt: crypto.randomBytes(14),
+      authKey: crypto.randomBytes(20),
+    });
+    assert.ok(clonedCtx);
+    assert.equal(clonedCtx.authTagLen, 4);
+    assert.ok(
+      clonedCtx.ivBuffer instanceof Uint8Array &&
+        clonedCtx.ivBuffer.byteLength === 16
+    );
+    assert.ok(
+      clonedCtx.ssrcBuffer instanceof Uint8Array &&
+        clonedCtx.ssrcBuffer.byteLength === 4
+    );
+    assert.ok(
+      clonedCtx.indexBuffer instanceof Uint8Array &&
+        clonedCtx.indexBuffer.byteLength === 8
+    );
+    assert.ok(
+      clonedCtx.rocBuffer instanceof Uint8Array &&
+        clonedCtx.rocBuffer.byteLength === 4
+    );
+
+    // 3. Verify patchWaVoipCoordinatorPrototype supports `this.manager` as well as `this.client`
+    const { EventEmitter } = await import('node:events');
+    const fakeManager = new EventEmitter();
+    class FakeCoordinator extends EventEmitter {
+      manager = fakeManager;
+      wireClientEvents() {
+        return true;
+      }
+    }
+    patchWaVoipCoordinatorPrototype(FakeCoordinator.prototype);
+    const coord = new FakeCoordinator();
+    coord.wireClientEvents();
+    let forwardedAudio: Float32Array | null = null;
+    coord.on('call_inbound_audio', (_call: unknown, pcm: Float32Array) => {
+      forwardedAudio = pcm;
+    });
+    const testPcm = new Float32Array([0.1, -0.1, 0.25]);
+    fakeManager.emit('call_inbound_audio', { callId: 'c1' }, testPcm);
+    assert.equal(
+      forwardedAudio,
+      testPcm,
+      'patchWaVoipCoordinatorPrototype must wire call_inbound_audio from this.manager'
+    );
+
+    // 4. Verify session.onRelayVideoData records video even when session.videoAssembler is truthy,
+    //    and consecutive zero-filled silence audio frames arriving in the same millisecond are never dropped
+    const tmpDir = fs.mkdtempSync(
+      path.join(os.tmpdir(), 'botezz-assembler-silence-')
+    );
+    try {
+      const peerKeys4: SrtpKeyMaterial = {
+        sessionKey: crypto.randomBytes(16),
+        sessionSalt: crypto.randomBytes(14),
+        authKey: crypto.randomBytes(20),
+        authTagLen: 4,
+      };
+      const recorder = new VoipCallRecorder({
+        callId: 'vcall_assembler_1',
+        sessionId: 'sess_asm_1',
+        recipientJid: '966501234567@s.whatsapp.net',
+        outboundVideoPath: path.join(tmpDir, 'unused.mp4'),
+        recordingsDir: tmpDir,
+        isMockMode: false,
+      });
+
+      const sessionWithAssembler: Record<string, unknown> = {
+        videoAssembler: { active: true }, // Truthy native assembler that fails to emit
+        srtpSession: { recvCtx: peerKeys4 },
+        videoSrtpSession: { recvCtx: peerKeys4 },
+        onRelayVideoData: (_pkt: Uint8Array) => undefined,
+        onDecodedAudio: (_pcm: Int16Array) => undefined,
+      };
+      recorder.attachToMediaSession(sessionWithAssembler);
+
+      const onRelayVideoData = sessionWithAssembler.onRelayVideoData as (
+        pkt: Uint8Array
+      ) => void;
+      onRelayVideoData(
+        protectRtpForTest(
+          buildRawRtpPacket({
+            payloadType: 96,
+            seq: 1,
+            timestamp: 9000,
+            ssrc: 0x11223344,
+            payload: new Uint8Array([
+              0x67, 0x42, 0xc0, 0x1f, 0xda, 0x02, 0x80, 0x2d,
+            ]),
+          }),
+          peerKeys4
+        )
+      );
+      onRelayVideoData(
+        protectRtpForTest(
+          buildRawRtpPacket({
+            payloadType: 96,
+            seq: 2,
+            timestamp: 9000,
+            ssrc: 0x11223344,
+            payload: new Uint8Array([0x68, 0xce, 0x3c, 0x80]),
+          }),
+          peerKeys4
+        )
+      );
+      onRelayVideoData(
+        protectRtpForTest(
+          buildRawRtpPacket({
+            payloadType: 96,
+            seq: 3,
+            timestamp: 9000,
+            ssrc: 0x11223344,
+            marker: true,
+            payload: new Uint8Array([0x65, 0x88, 0x84, 0x21, 0xa0]),
+          }),
+          peerKeys4
+        )
+      );
+
+      assert.equal(
+        recorder.inboundVideoFramesRecorded,
+        1,
+        'onRelayVideoData must depacketize and record video even when session.videoAssembler is truthy'
+      );
+
+      // Feed 5 consecutive all-zero silence PCM chunks in the exact same millisecond
+      const onDecodedAudio = sessionWithAssembler.onDecodedAudio as (
+        pcm: Int16Array
+      ) => void;
+      for (let i = 0; i < 5; i++) {
+        onDecodedAudio(new Int16Array(320));
+      }
+      assert.equal(
+        recorder.inboundAudioPacketsRecorded,
+        5,
+        'Consecutive zero-filled silence PCM chunks arriving in the same millisecond must never be dropped'
+      );
+      recorder.dispose();
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
 });
+
 
 
 

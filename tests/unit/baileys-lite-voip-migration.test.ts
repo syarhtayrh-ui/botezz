@@ -2140,14 +2140,27 @@ describe('@hiroosy/baileys-lite & Real WhatsApp VoIP Video Call Suite', () => {
       assert.notEqual(audioSsrc, videoSsrc);
 
       const multiSubs = buildMultiSenderSubscriptions([audioSsrc, videoSsrc]);
-      assert.equal(multiSubs.byteLength, 16, '8 bytes per unique SSRC');
+      assert.equal(
+        multiSubs[0],
+        0x0a,
+        'Protobuf length-delimited field 1 must start with 0x0a'
+      );
+      assert.ok(
+        multiSubs.byteLength > 10,
+        'Protobuf multi-SSRC subscription payload must contain both SSRCs'
+      );
       const peerDesc = buildPeerSsrcDescriptorEntries([audioSsrc, videoSsrc], 1);
-      assert.equal(peerDesc.byteLength, 40, '20 bytes per unique SSRC');
+      assert.equal(
+        peerDesc[0],
+        0x0a,
+        'Protobuf peer SSRC descriptor entries must start with 0x0a'
+      );
 
       const sentRelayBuffers: ArrayBuffer[] = [];
+      const origSendAllocateFn = function () {};
       const fakeRelayProto: Record<string, any> = {
         sendBindingRegistrations() {},
-        sendAllocate() {},
+        sendAllocate: origSendAllocateFn,
       };
       patchWaManualRelayPrototype(fakeRelayProto, {
         buildBindingRequestWithSubs: (
@@ -2156,6 +2169,11 @@ describe('@hiroosy/baileys-lite & Real WhatsApp VoIP Video Call Suite', () => {
           subs?: Uint8Array
         ) => subs ?? new Uint8Array(0),
       });
+      assert.equal(
+        fakeRelayProto.sendAllocate,
+        origSendAllocateFn,
+        'patchWaManualRelayPrototype must not override sendAllocate'
+      );
       const relayInst = Object.assign(Object.create(fakeRelayProto), {
         subscriptionSsrc: audioSsrc,
         sendToChannel(_conn: unknown, ab: ArrayBuffer) {
@@ -2170,8 +2188,8 @@ describe('@hiroosy/baileys-lite & Real WhatsApp VoIP Video Call Suite', () => {
         audioSsrc
       );
       assert.ok(
-        sentRelayBuffers.some((b) => b.byteLength === 16),
-        'Patched WaManualRelay must send multi-SSRC binding subscriptions (16 bytes for audio+video)'
+        sentRelayBuffers.some((b) => b.byteLength === multiSubs.byteLength),
+        'Patched WaManualRelay must send Protobuf multi-SSRC binding subscriptions'
       );
 
       // 3. End-to-End Global Hook -> VoipCallRecorder H.264 + Audio capture and MP4 muxing

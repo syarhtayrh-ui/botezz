@@ -392,21 +392,15 @@ export class PerSsrcSrtpDecryptor {
     if ((pt >= 72 && pt <= 76) || (srtpData[1] >= 200 && srtpData[1] <= 209)) {
       return null;
     }
-    const isVideoPacket = pt >= 96 && pt !== 111 && pt !== 120;
     const preferredTagLen = keys.authTagLen;
 
-    // WhatsApp mobile clients frequently authenticate inbound video SRTP packets (PT >= 96)
-    // with 10-byte HMAC-SHA1-80 tags even when audio uses 4-byte HMAC-SHA1-32 tags.
-    // Always test 10-byte tag first for video packets (unless explicitly overridden), then 4-byte fallback.
-    const candidateTagLengths = isVideoPacket
-      ? preferredTagLen && preferredTagLen !== 10 && preferredTagLen !== 4
-        ? [10, 4, preferredTagLen]
-        : [10, 4]
-      : preferredTagLen === 10
-        ? [10, 4]
-        : preferredTagLen === 4 || !preferredTagLen
-          ? [4, 10]
-          : [preferredTagLen, 4, 10];
+    // Both audio and video SRTP sessions in @hiroosy/baileys-lite/voip use 4-byte HMAC-SHA1-32 tags by default,
+    // while some mobile clients or per-JID streams may use 10-byte HMAC-SHA1-80 tags.
+    // Always test [4, 10] (or include preferredTagLen if custom).
+    const candidateTagLengths =
+      preferredTagLen && preferredTagLen !== 4 && preferredTagLen !== 10
+        ? [4, 10, preferredTagLen]
+        : [4, 10];
 
     for (const tagLen of candidateTagLengths) {
       const dec = this.tryUnprotectWithTagLength(srtpData, keys, tagLen);
@@ -779,7 +773,7 @@ function extractRecvKeyMaterial(
     return deriveSrtpSessionKeysFromMaster(
       srtpSessionLike.subarray(0, 16),
       srtpSessionLike.subarray(16, 30),
-      10
+      4
     );
   }
   if (typeof srtpSessionLike !== 'object') return null;
@@ -810,7 +804,7 @@ function extractRecvKeyMaterial(
       sessionKey: ctx.sessionKey,
       sessionSalt: ctx.sessionSalt,
       authKey: ctx.authKey,
-      authTagLen: ctx.authTagLen ?? 10,
+      authTagLen: ctx.authTagLen ?? 4,
     };
   }
   if (
@@ -823,7 +817,7 @@ function extractRecvKeyMaterial(
     return deriveSrtpSessionKeysFromMaster(
       ctx.masterKey,
       ctx.masterSalt,
-      ctx.authTagLen ?? 10
+      ctx.authTagLen ?? 4
     );
   }
   return null;
@@ -853,7 +847,7 @@ function derivePerJidCandidateRecvKeys(
     return deriveSrtpSessionKeysFromMaster(
       derived.subarray(0, 16),
       derived.subarray(16, 30),
-      10
+      4
     );
   } catch {
     return null;
@@ -1142,6 +1136,49 @@ export function extractInboundMediaBuffer(...args: unknown[]): Buffer | null {
   return null;
 }
 
+function extractRawSampleRef(...args: unknown[]): object | null {
+  for (const arg of args) {
+    if (!arg || typeof arg !== 'object') continue;
+    if (
+      Buffer.isBuffer(arg) ||
+      arg instanceof Uint8Array ||
+      arg instanceof Int16Array ||
+      arg instanceof Float32Array ||
+      arg instanceof ArrayBuffer ||
+      ArrayBuffer.isView(arg)
+    ) {
+      return arg;
+    }
+    const obj = arg as Record<string, unknown>;
+    for (const key of [
+      'data',
+      'frame',
+      'pcm',
+      'accessUnit',
+      'au',
+      'video',
+      'audio',
+      'buffer',
+      'payload',
+    ]) {
+      const val = obj[key];
+      if (
+        val &&
+        typeof val === 'object' &&
+        (Buffer.isBuffer(val) ||
+          val instanceof Uint8Array ||
+          val instanceof Int16Array ||
+          val instanceof Float32Array ||
+          val instanceof ArrayBuffer ||
+          ArrayBuffer.isView(val))
+      ) {
+        return val;
+      }
+    }
+  }
+  return null;
+}
+
 /**
  * Sends an RTCP Picture Loss Indication (`PT=206, FMT=1`) packet over the session's SCTP relay
  * (protecting with `videoRtcpSession` or `audioRtcpSession` when available) to prompt the remote
@@ -1276,8 +1313,10 @@ export class VoipCallRecorder {
   private inAudioWriteHook = false;
   private inVideoWriteHook = false;
   private lastPliSentAtMs = 0;
-  private lastNativeVideoSig = '';
-  private lastNativeAudioSig = '';
+  private lastCallVideoRef: object | null = null;
+  private lastCallAudioRef: object | null = null;
+  private lastGlobalVideoRef: object | null = null;
+  private lastGlobalAudioRef: object | null = null;
   private explicitPeerSrtpKeys: SrtpKeyMaterial | null = null;
   private voipCallId?: string;
   private unregisterGlobalVideoHook: (() => void) | null = null;
@@ -1322,10 +1361,10 @@ export class VoipCallRecorder {
         if (this.status !== 'RECORDING' || !this.matchesHookCallId(hookCallId)) {
           return;
         }
-        if (this.inVideoWriteHook) return;
-        const sig = `${accessUnit.byteLength}:${accessUnit[0] ?? 0}:${accessUnit[Math.min(4, accessUnit.byteLength - 1)] ?? 0}:${accessUnit[accessUnit.byteLength - 1] ?? 0}:${Math.floor(Date.now() / 10)}`;
-        if (sig === this.lastNativeVideoSig) return;
-        this.lastNativeVideoSig = sig;
+        if (this.inVideoWriteHook || this.lastGlobalVideoRef === accessUnit) {
+          return;
+        }
+        this.markGlobalVideoRef(accessUnit);
         this.receivingNativeDecodedVideo = true;
         this.inVideoWriteHook = true;
         try {
@@ -1341,12 +1380,12 @@ export class VoipCallRecorder {
         if (this.status !== 'RECORDING' || !this.matchesHookCallId(hookCallId)) {
           return;
         }
-        if (this.inAudioWriteHook) return;
+        if (this.inAudioWriteHook || this.lastGlobalAudioRef === pcmFloat32) {
+          return;
+        }
         const pcmBuf = convertSampleValueToBuffer(pcmFloat32);
         if (!pcmBuf) return;
-        const sig = `${pcmBuf.length}:${pcmBuf[0] ?? 0}:${pcmBuf[pcmBuf.length - 1] ?? 0}:${Math.floor(Date.now() / 10)}`;
-        if (sig === this.lastNativeAudioSig) return;
-        this.lastNativeAudioSig = sig;
+        this.markGlobalAudioRef(pcmFloat32);
         this.receivingNativeDecodedAudio = true;
         this.inAudioWriteHook = true;
         try {
@@ -1356,6 +1395,26 @@ export class VoipCallRecorder {
         }
       }
     );
+  }
+
+  private markGlobalVideoRef(ref: object | null): void {
+    if (!ref) return;
+    this.lastGlobalVideoRef = ref;
+    queueMicrotask(() => {
+      if (this.lastGlobalVideoRef === ref) {
+        this.lastGlobalVideoRef = null;
+      }
+    });
+  }
+
+  private markGlobalAudioRef(ref: object | null): void {
+    if (!ref) return;
+    this.lastGlobalAudioRef = ref;
+    queueMicrotask(() => {
+      if (this.lastGlobalAudioRef === ref) {
+        this.lastGlobalAudioRef = null;
+      }
+    });
   }
 
   public setVoipCallId(voipCallId: string): void {
@@ -1454,7 +1513,7 @@ export class VoipCallRecorder {
         sessionKey: extracted.sessionKey,
         sessionSalt: extracted.sessionSalt,
         authKey: extracted.authKey,
-        authTagLen: extracted.authTagLen ?? 10,
+        authTagLen: extracted.authTagLen ?? 4,
       };
     }
   }
@@ -1570,15 +1629,29 @@ export class VoipCallRecorder {
       if (this.inAudioWriteHook || inCallAudioDispatch) {
         return;
       }
+      const rawRef = extractRawSampleRef(...args);
+      if (rawRef && this.lastCallAudioRef === rawRef) {
+        return;
+      }
       const pcmBuf = extractInboundMediaBuffer(...args);
       if (!pcmBuf) return;
       const audioMeta = extractInboundAudioMetadata(...args);
+      if (rawRef) {
+        this.lastCallAudioRef = rawRef;
+        queueMicrotask(() => {
+          if (this.lastCallAudioRef === rawRef) {
+            this.lastCallAudioRef = null;
+          }
+        });
+        this.markGlobalAudioRef(rawRef);
+      }
       inCallAudioDispatch = true;
+      this.inAudioWriteHook = true;
       try {
         this.receivingNativeDecodedAudio = true;
-        this.lastNativeAudioSig = `${pcmBuf.length}:${pcmBuf[0] ?? 0}:${pcmBuf[pcmBuf.length - 1] ?? 0}:${Math.floor(Date.now() / 10)}`;
         this.writeDecodedInboundAudioPcm(pcmBuf, Date.now(), audioMeta);
       } finally {
+        this.inAudioWriteHook = false;
         inCallAudioDispatch = false;
       }
     };
@@ -1587,11 +1660,24 @@ export class VoipCallRecorder {
       if (this.inVideoWriteHook || inCallVideoDispatch) {
         return;
       }
+      const rawRef = extractRawSampleRef(...args);
+      if (rawRef && this.lastCallVideoRef === rawRef) {
+        return;
+      }
       const h264Buf = extractInboundMediaBuffer(...args);
       if (!h264Buf) return;
+      if (rawRef) {
+        this.lastCallVideoRef = rawRef;
+        queueMicrotask(() => {
+          if (this.lastCallVideoRef === rawRef) {
+            this.lastCallVideoRef = null;
+          }
+        });
+        this.markGlobalVideoRef(rawRef);
+      }
       inCallVideoDispatch = true;
+      this.inVideoWriteHook = true;
       try {
-        this.lastNativeVideoSig = `${h264Buf.length}:${h264Buf[0] ?? 0}:${h264Buf[Math.min(4, h264Buf.length - 1)] ?? 0}:${h264Buf[h264Buf.length - 1] ?? 0}:${Math.floor(Date.now() / 10)}`;
         const isRtpHeader =
           h264Buf.length >= 12 &&
           (h264Buf[0] & 0xc0) === 0x80 &&
@@ -1614,6 +1700,7 @@ export class VoipCallRecorder {
           this.processDepacketizedH264Buffer(h264Buf);
         }
       } finally {
+        this.inVideoWriteHook = false;
         inCallVideoDispatch = false;
       }
     };
@@ -1714,7 +1801,7 @@ export class VoipCallRecorder {
       }
     };
 
-    // 2. Wrap `onRelayVideoData` to sync receive keys before native `videoSrtpSession.unprotect` runs
+    // 2. Wrap `onRelayVideoData` to sync receive keys and depacketize when native decoded video has not fired
     const origOnRelayVideoData =
       typeof session.onRelayVideoData === 'function'
         ? session.onRelayVideoData.bind(session)
@@ -1723,21 +1810,12 @@ export class VoipCallRecorder {
     session.onRelayVideoData = (data: Uint8Array) => {
       syncPeerRecvKeysOnMediaSession(session);
       const framesBefore = this.h264State.inboundVideoFramesRecorded;
-      const errorsBefore =
-        typeof session.srtpErrorCount === 'number' ? session.srtpErrorCount : 0;
       if (origOnRelayVideoData) {
         origOnRelayVideoData(data);
       }
-      const errorsAfter =
-        typeof session.srtpErrorCount === 'number' ? session.srtpErrorCount : 0;
-      // Fallback to our multi-tag depacketizer if `session.videoAssembler` is absent (unit tests)
-      // or if native 4-byte unprotect failed (`errorsAfter > errorsBefore` e.g. 10-byte HMAC tag)
       if (
         !this.receivingNativeDecodedVideo &&
-        (!session.videoAssembler ||
-          errorsAfter > errorsBefore ||
-          (!origOnRelayVideoData &&
-            this.h264State.inboundVideoFramesRecorded === framesBefore))
+        this.h264State.inboundVideoFramesRecorded === framesBefore
       ) {
         try {
           this.handleInboundVideoPacket(data, session);
@@ -1769,8 +1847,7 @@ export class VoipCallRecorder {
                 : undefined;
           if (rawBytes instanceof Uint8Array || Buffer.isBuffer(rawBytes)) {
             syncPeerRecvKeysOnMediaSession(session);
-            // Only inspect directly when `session.onRelayData` is not wired to `sctpRelay`
-            if (!session.videoAssembler && !this.receivingNativeDecodedVideo) {
+            if (!this.receivingNativeDecodedVideo) {
               try {
                 this.inspectRawRelayPacket(
                   rawBytes instanceof Uint8Array
@@ -1834,8 +1911,10 @@ export class VoipCallRecorder {
           if (this.inVideoWriteHook) {
             return origEmitInboundVideo(dataOrInfo, ...rest);
           }
+          const rawRef = extractRawSampleRef(dataOrInfo, ...rest);
           const candidateBuf = extractInboundMediaBuffer(dataOrInfo, ...rest);
           if (candidateBuf) {
+            this.markGlobalVideoRef(rawRef);
             syncPeerRecvKeysOnMediaSession(session);
             const isRtpHeader =
               candidateBuf.length >= 12 &&
@@ -1867,8 +1946,6 @@ export class VoipCallRecorder {
               }
             } else {
               this.receivingNativeDecodedVideo = true;
-              const sig = `${candidateBuf.length}:${candidateBuf[0] ?? 0}:${candidateBuf[Math.min(4, candidateBuf.length - 1)] ?? 0}:${candidateBuf[candidateBuf.length - 1] ?? 0}:${Math.floor(Date.now() / 10)}`;
-              this.lastNativeVideoSig = sig;
               this.inVideoWriteHook = true;
               try {
                 try {
@@ -1903,12 +1980,12 @@ export class VoipCallRecorder {
           if (this.inAudioWriteHook) {
             return origEmitInboundAudio(dataOrInfo, ...rest);
           }
+          const rawRef = extractRawSampleRef(dataOrInfo, ...rest);
           const pcmBuf = extractInboundMediaBuffer(dataOrInfo, ...rest);
           if (pcmBuf) {
+            this.markGlobalAudioRef(rawRef);
             this.receivingNativeDecodedAudio = true;
             const audioMeta = extractInboundAudioMetadata(dataOrInfo, ...rest);
-            const sig = `${pcmBuf.length}:${pcmBuf[0] ?? 0}:${pcmBuf[pcmBuf.length - 1] ?? 0}:${Math.floor(Date.now() / 10)}`;
-            this.lastNativeAudioSig = sig;
             this.inAudioWriteHook = true;
             try {
               try {
@@ -1939,12 +2016,8 @@ export class VoipCallRecorder {
         }
         return;
       }
+      this.markGlobalAudioRef(pcm);
       this.receivingNativeDecodedAudio = true;
-      const pcmBuf = extractInboundMediaBuffer(pcm);
-      if (pcmBuf) {
-        const sig = `${pcmBuf.length}:${pcmBuf[0] ?? 0}:${pcmBuf[pcmBuf.length - 1] ?? 0}:${Math.floor(Date.now() / 10)}`;
-        this.lastNativeAudioSig = sig;
-      }
       this.inAudioWriteHook = true;
       try {
         try {
