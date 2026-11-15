@@ -68,6 +68,8 @@ export type ToolsInputStep =
   | 'AWAITING_MENFESS_START_INPUT'
   | 'AWAITING_MENFESS_RELAY_INPUT'
   | 'AWAITING_MENFESS_STOP_INPUT'
+  | 'ANON_AWAITING_TARGET'
+  | 'ANON_IN_ROOM'
   | 'AWAITING_PRESENCE_TRACK_INPUT'
   | 'AWAITING_PRESENCE_HEARTBEAT_INPUT'
   | 'AWAITING_FULL_PROFILE_INPUT'
@@ -105,6 +107,8 @@ export class ToolsHandler {
   private readonly presenceTrackDurationByAdmin = new Map<number, number>();
   private readonly lastTrackedRecipientByAdmin = new Map<number, string>();
   private readonly activeAnonSessionByAdmin = new Map<number, string>();
+  private readonly activeAnonRoomByAdmin = new Map<number, string>();
+  private readonly selectedAnonSenderSessionByAdmin = new Map<number, string>();
   private readonly usernameModeByAdmin = new Map<
     number,
     'check' | 'set' | 'pin' | 'recommend'
@@ -145,8 +149,13 @@ export class ToolsHandler {
     return this.inputStates.get(adminId) || 'NONE';
   }
 
+  public getActiveAnonRoom(adminId: number): string | undefined {
+    return this.activeAnonRoomByAdmin.get(adminId);
+  }
+
   public cancel(adminId: number): void {
     this.inputStates.delete(adminId);
+    this.activeAnonRoomByAdmin.delete(adminId);
   }
 
   public getSelectedFunction(adminId: number): string | undefined {
@@ -374,22 +383,8 @@ export class ToolsHandler {
       ],
       [
         {
-          text: '🕵️ رسالة مجهولة عبر LID (/anonmsg)',
-          callbackData: 'tools:prompt_anon_lid',
-        },
-        {
-          text: '🎭 جلسات التواصل المجهول (/anonstart)',
-          callbackData: 'tools:menfess_list',
-        },
-      ],
-      [
-        {
-          text: '🧬 كاشف الهوية PN↔LID (/lid)',
-          callbackData: 'tools:prompt_lid_lookup',
-        },
-        {
-          text: '📛 إدارة اسم المستخدم (/username)',
-          callbackData: 'tools:prompt_username_mgr',
+          text: '🕵️ جلسة مجهولة (تواصل مخفي)',
+          callbackData: 'menu:anon_sessions',
         },
       ],
       [
@@ -416,10 +411,6 @@ export class ToolsHandler {
         {
           text: '📱 فحص مقابس الإرسال (/ceksender)',
           callbackData: 'tools:ceksender',
-        },
-        {
-          text: '🛡️ قيود Reachout & TC-Token',
-          callbackData: 'tools:reachout_status',
         },
       ],
       isAdmin
@@ -961,6 +952,13 @@ export class ToolsHandler {
     if (step === 'AWAITING_MENFESS_STOP_INPUT') {
       this.cancel(adminId);
       return this.executeAnonStopCommand(adminId, rawText);
+    }
+    if (step === 'ANON_AWAITING_TARGET') {
+      this.inputStates.delete(adminId);
+      return this.createAndEnterAnonymousRoom(adminId, rawText);
+    }
+    if (step === 'ANON_IN_ROOM') {
+      return this.sendAnonymousRoomMessage(adminId, rawText);
     }
     if (step === 'AWAITING_PRESENCE_TRACK_INPUT') {
       this.cancel(adminId);
@@ -2311,14 +2309,20 @@ export class ToolsHandler {
     }
   }
 
-  private getPrimaryConnectedSessionAndDriver(adminId: number) {
+  private getPrimaryConnectedSessionAndDriver(
+    adminId: number,
+    preferredSessionId?: string
+  ) {
     const connected = this.sessionManager.listConnectedSessions(adminId);
     if (connected.length === 0) {
       throw new WhatsAppConnectionError(
         'لا توجد جلسة واتساب متصلة حالياً. يرجى ربط جلسة أو تشغيل جلسة متصلة أولاً.'
       );
     }
-    const session = connected[0];
+    const session =
+      (preferredSessionId
+        ? connected.find((s) => s.id === preferredSessionId)
+        : undefined) || connected[0];
     const driver = this.sessionManager.getDriver(session.id, adminId);
     return { session, driver };
   }
@@ -4824,6 +4828,513 @@ export class ToolsHandler {
     return this.renderMenfessSessionsMenu(
       adminId,
       `🛑 *تم إغلاق جلسة التواصل المجهول (\`${matched.id}\`) بنجاح.*`
+    );
+  }
+
+  // ============================================================================
+  // Unified Interactive "Anonymous Chat Session" Room (`🕵️ جلسة مجهولة`)
+  // ============================================================================
+
+  private resolveSelectedAnonSenderSession(adminId: number): {
+    sessionId?: string;
+    label: string;
+  } {
+    const connected = this.sessionManager.listConnectedSessions(adminId);
+    if (connected.length === 0) {
+      return { sessionId: undefined, label: 'غير متصل ⚠️' };
+    }
+    const preferredId = this.selectedAnonSenderSessionByAdmin.get(adminId);
+    const chosen =
+      (preferredId && connected.find((s) => s.id === preferredId)) || connected[0]!;
+    this.selectedAnonSenderSessionByAdmin.set(adminId, chosen.id);
+    const shortPhone = chosen.masked_phone || chosen.jid?.split('@')[0] || chosen.id;
+    return {
+      sessionId: chosen.id,
+      label: `${chosen.label} (${shortPhone})`.slice(0, 32),
+    };
+  }
+
+  public cycleAnonymousSenderSession(adminId: number): BotViewResponse {
+    const connected = this.sessionManager.listConnectedSessions(adminId);
+    if (connected.length <= 1) {
+      return this.renderAnonymousSessionsHub(
+        adminId,
+        connected.length === 1
+          ? `ℹ️ توجد جلسة متصلة واحدة فقط حالياً (\`${connected[0]!.id}\`).`
+          : '⚠️ لا توجد جلسات واتساب متصلة حالياً.'
+      );
+    }
+    const currentId = this.selectedAnonSenderSessionByAdmin.get(adminId);
+    const currentIdx = connected.findIndex((s) => s.id === currentId);
+    const nextSession = connected[(currentIdx + 1) % connected.length]!;
+    this.selectedAnonSenderSessionByAdmin.set(adminId, nextSession.id);
+    return this.renderAnonymousSessionsHub(
+      adminId,
+      `🔀 *تم تبديل حساب الإرسال النشط إلى:* *${escapeMarkdown(nextSession.label)}* (\`${nextSession.id}\`)`
+    );
+  }
+
+  /**
+   * Screen 1 — Sessions List & Control Hub (`menu:anon_sessions` / `tools:anon_hub`)
+   */
+  public renderAnonymousSessionsHub(
+    adminId: number,
+    notice?: string
+  ): BotViewResponse {
+    this.activeAnonRoomByAdmin.delete(adminId);
+    this.inputStates.delete(adminId);
+
+    const ownerFilter = this.sessionManager.isOwner(adminId) ? undefined : adminId;
+    const sessions = this.anonymousEngine.listAnonymousSessions({
+      ownerTelegramId: ownerFilter,
+      includeClosed: false,
+    });
+    const senderInfo = this.resolveSelectedAnonSenderSession(adminId);
+
+    const sessionDetails =
+      sessions.length > 0
+        ? sessions.slice(0, 10).map((s, idx) => {
+            const targetPhoneOrJid = s.receiverJid.endsWith('@s.whatsapp.net')
+              ? `+${s.receiverJid.split('@')[0]}`
+              : s.receiverJid;
+            const targetLid = s.receiverLidJid || (s.receiverJid.endsWith('@lid') ? s.receiverJid : '—');
+            const unreadBadge =
+              s.unreadCount > 0 ? ` | 🔔 *${s.unreadCount} غير مقروءة*` : '';
+            return (
+              `${idx + 1}. 🕵️ *${escapeMarkdown(s.senderAlias || targetPhoneOrJid)}* (\`${s.id}\`)\n` +
+              `   📱 الهدف: \`${escapeMarkdown(targetPhoneOrJid)}\` | 🎭 LID: \`${escapeMarkdown(targetLid)}\`\n` +
+              `   📤 مرسل: *${s.messagesRelayedCount}* | 📥 ردود: *${s.repliesRelayedCount}*${unreadBadge}`
+            );
+          })
+        : [
+            'ℹ️ *لا توجد جلسات تواصل مجهولة نشطة حالياً.*\nاضغط على **➕ إضافة جلسة مجهولة جديدة** بالأسفل وأدخل رقم المستلم أو `@lid` أو `@username` لبدء المحادثة فوراً.',
+          ];
+
+    const rows: InlineKeyboardRows = [];
+    for (const s of sessions.slice(0, 8)) {
+      const rawLabel =
+        s.senderAlias && s.senderAlias !== 'Anonymous Sender'
+          ? s.senderAlias
+          : s.receiverJid.endsWith('@s.whatsapp.net')
+            ? `+${s.receiverJid.split('@')[0]}`
+            : s.receiverJid.split('@')[0] || s.id;
+      const shortLabel = rawLabel.slice(0, 20);
+      const unreadSuffix = s.unreadCount > 0 ? ` (🔔 ${s.unreadCount})` : '';
+      rows.push([
+        {
+          text: `💬 دخول الجلسة: ${shortLabel}${unreadSuffix}`,
+          callbackData: `anon:room:${s.id}`,
+        },
+        {
+          text: '🗑️ حذف',
+          callbackData: `anon:del:${s.id}`,
+        },
+      ]);
+    }
+
+    rows.push([
+      {
+        text: '➕ إضافة جلسة مجهولة جديدة',
+        callbackData: 'anon:add_prompt',
+      },
+    ]);
+    rows.push([
+      {
+        text: `🔀 حساب الإرسال: ${senderInfo.label}`,
+        callbackData: 'anon:cycle_sender',
+      },
+    ]);
+    rows.push(
+      buildAppNavigationRow({
+        backCallback: 'menu:main',
+        refreshCallback: 'menu:anon_sessions',
+      })
+    );
+
+    return {
+      text:
+        `${renderBreadcrumb(['الرئيسية', 'جلسة مجهولة'])}\n` +
+        (notice ? `${notice}\n━━━━━━━━━━━━━━━━━━\n` : '') +
+        `🕵️ *غرفة الجلسات المجهولة الموحدة (Anonymous LID & tcToken Chat)*\n` +
+        `━━━━━━━━━━━━━━━━━━\n` +
+        `📡 *حساب الإرسال النشط:* \`${escapeMarkdown(senderInfo.label)}\`\n` +
+        `🔒 *حماية البروتوكول:* \`LID Addressing + tcToken + Signal E2EE\`\n\n` +
+        sessionDetails.join('\n\n'),
+      keyboard: rows,
+      toastText: `🕵️ الجلسات المجهولة (${sessions.length})`,
+      route: 'menu:anon_sessions',
+    };
+  }
+
+  /**
+   * Screen 2 — One-Step "Add New Anonymous Session" Prompt (`anon:add_prompt`)
+   */
+  public promptAddAnonymousSession(adminId: number): BotViewResponse {
+    this.activeAnonRoomByAdmin.delete(adminId);
+    this.inputStates.set(adminId, 'ANON_AWAITING_TARGET');
+    const senderInfo = this.resolveSelectedAnonSenderSession(adminId);
+
+    return {
+      text:
+        `${renderBreadcrumb(['الرئيسية', 'جلسة مجهولة', 'إضافة جلسة'])}\n` +
+        `🕵️ *بدء جلسة تواصل مجهولة جديدة*\n` +
+        `━━━━━━━━━━━━━━━━━━\n` +
+        `📡 *حساب الإرسال المحدد:* \`${escapeMarkdown(senderInfo.label)}\`\n\n` +
+        `أرسل الآن **رقم هاتف المستلم** (مثال: \`+967771234567\`) أو **معرف \`@lid\`** أو **\`@username\`**:\n\n` +
+        `⚡ *ما الذي سيقوم به البوت تلقائياً فور إرسال الرقم؟*\n` +
+        `1️⃣ استعلام USync بروتوكولي لاستخراج الهوية المقنّعة (\`@lid\`) وربطها بالرقم (\`PN ↔ LID\`).\n` +
+        `2️⃣ إصدار وتحميل رمز الخصوصية الموثوق (\`tcToken\`) وتفادي حظر \`Error 463\`.\n` +
+        `3️⃣ تهيئة جلسة تشفير Signal (\`assertSessions\`) والدخول مباشرة إلى غرفة المحادثة الحية.`,
+      keyboard: [
+        [
+          {
+            text: '🔙 العودة لقائمة الجلسات المجهولة',
+            callbackData: 'menu:anon_sessions',
+          },
+        ],
+        buildBackCancelRow('menu:anon_sessions'),
+      ],
+      toastText: '✍️ أرسل رقم الهاتف أو @lid أو @username',
+      route: 'anon:add_prompt',
+    };
+  }
+
+  /**
+   * Resolves target identity (`targetPnJid` & `targetLidJid`), warms up `tcToken` + Signal session,
+   * creates/re-opens the room in SQLite, and enters Screen 3 (`anon:room:<id>`).
+   */
+  public async createAndEnterAnonymousRoom(
+    adminId: number,
+    rawTargetInput: string
+  ): Promise<BotViewResponse> {
+    try {
+      const cleaned = String(rawTargetInput || '').trim();
+      if (!cleaned) {
+        return this.promptAddAnonymousSession(adminId);
+      }
+
+      const preferredId = this.selectedAnonSenderSessionByAdmin.get(adminId);
+      const { session, driver } = this.getPrimaryConnectedSessionAndDriver(
+        adminId,
+        preferredId
+      );
+
+      let targetPnJid: string | undefined;
+      let targetLidJid: string | undefined;
+      let targetDisplayLabel = cleaned;
+
+      // 1. Resolve via WhatsAppIdentityService (handles @username, @lid, and phone numbers)
+      if (typeof driver.resolveIdentity === 'function') {
+        const identityRes = await driver
+          .resolveIdentity(cleaned)
+          .catch(() => null);
+        if (identityRes) {
+          targetPnJid = identityRes.pnJid;
+          targetLidJid = identityRes.lidJid;
+          if (identityRes.username) {
+            targetDisplayLabel = `@${identityRes.username}`;
+          } else if (identityRes.phoneNumber) {
+            targetDisplayLabel = identityRes.phoneNumber;
+          }
+        }
+      }
+
+      // 2. Fallback / complement via driver.resolveLidForRecipient
+      if (!targetLidJid || !targetPnJid) {
+        try {
+          const lidRes = await driver.resolveLidForRecipient(cleaned);
+          targetLidJid = targetLidJid || lidRes.lidJid;
+          targetPnJid = targetPnJid || lidRes.pnJid;
+        } catch {
+          // If input is a valid phone number even when USync LID lookup is offline, normalize PN
+          if (!cleaned.startsWith('@') && /\d{7,15}/.test(cleaned)) {
+            const digits = cleaned.replace(/\D/g, '');
+            if (digits.length >= 7) {
+              targetPnJid = targetPnJid || `${digits}@s.whatsapp.net`;
+            }
+          } else if (cleaned.endsWith('@lid')) {
+            targetLidJid = targetLidJid || cleaned;
+          }
+        }
+      }
+
+      if (!targetPnJid && !targetLidJid) {
+        return {
+          text:
+            `⚠️ *تعذر العثور على هوية واتساب مطابقة للمدخل:* \`${escapeMarkdown(cleaned)}\`\n` +
+            `يرجى التأكد من صحة رقم الهاتف الدولي (مع رمز الدولة) أو معرف \`@lid\` أو \`@username\`.`,
+          keyboard: [
+            [
+              {
+                text: '🔄 إعادة المحاولة',
+                callbackData: 'anon:add_prompt',
+              },
+              {
+                text: '🔙 قائمة الجلسات المجهولة',
+                callbackData: 'menu:anon_sessions',
+              },
+            ],
+          ],
+        };
+      }
+
+      // 3. Ensure privacy token (tcToken) is warmed up
+      const tokenTarget = targetPnJid || targetLidJid!;
+      if (typeof driver.ensurePrivacyToken === 'function') {
+        await driver.ensurePrivacyToken(tokenTarget, false).catch(() => null);
+      }
+
+      if (targetPnJid && targetDisplayLabel === cleaned) {
+        targetDisplayLabel = `+${targetPnJid.split('@')[0]}`;
+      }
+
+      const anonSession = this.anonymousEngine.createOrOpenRoomSession({
+        sessionId: session.id,
+        ownerTelegramId: adminId,
+        senderJid: session.jid || undefined,
+        targetPnJid,
+        targetLidJid,
+        targetDisplayLabel,
+      });
+
+      this.auditRepo.record({
+        actorTelegramId: adminId,
+        action: 'ANON_ROOM_CREATED',
+        targetId: anonSession.id,
+        outcome: 'SUCCESS',
+        metadata: {
+          sessionId: session.id,
+          hasPn: Boolean(targetPnJid),
+          hasLid: Boolean(targetLidJid),
+        },
+      });
+
+      return this.renderAnonymousSessionRoom(
+        adminId,
+        anonSession.id,
+        `✅ *تم تجهيز الهوية المقنّعة (\`@lid\`) وفتح غرفة الجلسة المجهولة بنجاح!*`
+      );
+    } catch (err) {
+      const safeErr = toSafeArabicError(err);
+      return {
+        text: `⚠️ *تعذر إنشاء الجلسة المجهولة:*\n${safeErr.userMessage}`,
+        keyboard: [
+          [
+            { text: '🔄 إعادة المحاولة', callbackData: 'anon:add_prompt' },
+            { text: '🔙 قائمة الجلسات', callbackData: 'menu:anon_sessions' },
+          ],
+        ],
+      };
+    }
+  }
+
+  private formatTranscriptTime(timestampMs: number): string {
+    const d = new Date(timestampMs);
+    const hh = String(d.getHours()).padStart(2, '0');
+    const mm = String(d.getMinutes()).padStart(2, '0');
+    return `${hh}:${mm}`;
+  }
+
+  /**
+   * Screen 3 — Live Session Room View (`anon:room:<sessionId>`)
+   */
+  public renderAnonymousSessionRoom(
+    adminId: number,
+    anonSessionId: string,
+    notice?: string
+  ): BotViewResponse {
+    const ownerFilter = this.sessionManager.isOwner(adminId) ? undefined : adminId;
+    const sess = this.anonymousEngine.getAnonymousSessionById(
+      anonSessionId,
+      ownerFilter
+    );
+    if (!sess) {
+      return this.renderAnonymousSessionsHub(
+        adminId,
+        `⚠️ الجلسة المجهولة (\`${escapeMarkdown(anonSessionId)}\`) غير موجودة أو تم حذفها.`
+      );
+    }
+
+    // Enter active room mode (`ANON_IN_ROOM`) and clear unread badge
+    this.anonymousEngine.markSessionRead(sess.id);
+    this.activeAnonRoomByAdmin.set(adminId, sess.id);
+    this.activeAnonSessionByAdmin.set(adminId, sess.id);
+    this.inputStates.set(adminId, 'ANON_IN_ROOM');
+
+    const messages = this.anonymousEngine.getSessionMessages(sess.id, 15);
+    const transcriptLines =
+      messages.length > 0
+        ? messages.map((m) => {
+            const timeStr = this.formatTranscriptTime(m.createdAt);
+            const prefix =
+              m.direction === 'OUTBOUND'
+                ? `📤 *أنت* \`[${timeStr}]\`:`
+                : `📥 *المستلم* \`[${timeStr}]\`:`;
+            const body = escapeMarkdown(
+              (m.textContent || `[${m.mediaKind}]`).slice(0, 220)
+            );
+            return `${prefix} ${body}`;
+          })
+        : [
+            'ℹ️ _لا توجد رسائل بعد في هذه الجلسة. اكتب أي رسالة نصية الآن وسيتم إرسالها فوراً للمستلم بهوية مجهولة (`@lid`)!_',
+          ];
+
+    const targetPnDisplay = sess.receiverJid.endsWith('@s.whatsapp.net')
+      ? `+${sess.receiverJid.split('@')[0]} (${sess.receiverJid})`
+      : sess.receiverJid;
+    const targetLidDisplay =
+      sess.receiverLidJid ||
+      (sess.receiverJid.endsWith('@lid') ? sess.receiverJid : 'سيتم استخراجه تلقائياً عند الإرسال');
+
+    return {
+      text:
+        `${renderBreadcrumb(['الرئيسية', 'جلسة مجهولة', sess.id])}\n` +
+        (notice ? `${notice}\n━━━━━━━━━━━━━━━━━━\n` : '') +
+        `🕵️ *غرفة المحادثة المجهولة الحية (\`${sess.id}\`)*\n` +
+        `━━━━━━━━━━━━━━━━━━\n` +
+        `📱 *هاتف المستلم (PN):* \`${escapeMarkdown(targetPnDisplay)}\`\n` +
+        `🎭 *الهوية المقنّعة (LID):* \`${escapeMarkdown(targetLidDisplay)}\`\n` +
+        `📡 *جلسة الإرسال:* \`${escapeMarkdown(sess.sessionId)}\`\n` +
+        `🔒 *حالة التشفير:* \`🔒 LID + tcToken + Signal E2EE\`\n` +
+        `━━━━━━━━━━━━━━━━━━\n` +
+        `📜 *سجل رسائل الجلسة (آخر ${messages.length} رسائل):*\n` +
+        transcriptLines.join('\n') +
+        `\n━━━━━━━━━━━━━━━━━━\n` +
+        `✍️ *أنت الآن داخل الجلسة.* أي رسالة نصية تكتبها هنا سيتم إرسالها فوراً للمستلم بهوية مجهولة (\`@lid\`)، وأي رد منه سيظهر لك هنا لحظياً.`,
+      keyboard: [
+        [
+          {
+            text: '🔄 تحديث السجل',
+            callbackData: `anon:room:${sess.id}`,
+          },
+          {
+            text: '🚪 الخروج من الجلسة (العودة للقائمة)',
+            callbackData: 'anon:exit_room',
+          },
+        ],
+        [
+          {
+            text: '🛑 إنهاء وحذف الجلسة',
+            callbackData: `anon:del:${sess.id}`,
+          },
+        ],
+      ],
+      toastText: `🕵️ داخل الجلسة ${sess.id}`,
+      route: `anon:room:${sess.id}`,
+    };
+  }
+
+  /**
+   * Sends a live outbound message while the user is inside `ANON_IN_ROOM`,
+   * records it in SQLite, and keeps the user inside the updated Room View.
+   */
+  public async sendAnonymousRoomMessage(
+    adminId: number,
+    rawText: string
+  ): Promise<BotViewResponse> {
+    const activeRoomId = this.activeAnonRoomByAdmin.get(adminId);
+    if (!activeRoomId) {
+      this.cancel(adminId);
+      return this.renderAnonymousSessionsHub(adminId);
+    }
+
+    const cleanText = String(rawText || '').trim();
+    if (!cleanText) {
+      return this.renderAnonymousSessionRoom(adminId, activeRoomId);
+    }
+
+    const ownerFilter = this.sessionManager.isOwner(adminId) ? undefined : adminId;
+    const sess = this.anonymousEngine.getAnonymousSessionById(
+      activeRoomId,
+      ownerFilter
+    );
+    if (!sess) {
+      this.cancel(adminId);
+      return this.renderAnonymousSessionsHub(
+        adminId,
+        '⚠️ الجلسة المجهولة لم تعد موجودة.'
+      );
+    }
+
+    try {
+      const { session, driver } = this.getPrimaryConnectedSessionAndDriver(
+        adminId,
+        sess.sessionId
+      );
+
+      const recipientTarget = sess.receiverLidJid || sess.receiverJid;
+      const sendRes = await driver.sendAnonymousLidMessage({
+        recipient: recipientTarget,
+        text: cleanText,
+      });
+
+      this.anonymousEngine.recordRoomOutboundMessage({
+        anonSessionId: sess.id,
+        sessionId: session.id,
+        messageId: sendRes.messageId,
+        text: cleanText,
+        mediaKind: 'text',
+        deliveredLidJid: sendRes.usedLid ? sendRes.targetLid : undefined,
+        resolvedPnJid: sendRes.resolvedPn,
+      });
+
+      this.auditRepo.record({
+        actorTelegramId: adminId,
+        action: 'ANON_ROOM_MESSAGE_SENT',
+        targetId: sess.id,
+        outcome: 'SUCCESS',
+        metadata: {
+          sessionId: session.id,
+          messageId: sendRes.messageId,
+          usedLid: sendRes.usedLid,
+        },
+      });
+
+      return this.renderAnonymousSessionRoom(
+        adminId,
+        sess.id,
+        `✅ *تم إرسال رسالتك بهوية مجهولة (\`${sendRes.targetLid}\`) بنجاح!*`
+      );
+    } catch (err) {
+      const safeErr = toSafeArabicError(err);
+      return this.renderAnonymousSessionRoom(
+        adminId,
+        sess.id,
+        `⚠️ *تعذر إرسال الرسالة:* ${safeErr.userMessage}`
+      );
+    }
+  }
+
+  public exitAnonymousSessionRoom(adminId: number): BotViewResponse {
+    this.activeAnonRoomByAdmin.delete(adminId);
+    this.inputStates.delete(adminId);
+    return this.renderAnonymousSessionsHub(
+      adminId,
+      '🚪 *تم الخروج من غرفة المحادثة والعودة لقائمة الجلسات المجهولة.*'
+    );
+  }
+
+  public deleteAnonymousRoomSession(
+    adminId: number,
+    anonSessionId: string
+  ): BotViewResponse {
+    const ownerFilter = this.sessionManager.isOwner(adminId) ? undefined : adminId;
+    const deleted = this.anonymousEngine.deleteAnonymousSession(
+      anonSessionId,
+      ownerFilter
+    );
+    if (this.activeAnonRoomByAdmin.get(adminId) === anonSessionId) {
+      this.activeAnonRoomByAdmin.delete(adminId);
+      this.inputStates.delete(adminId);
+    }
+    if (this.activeAnonSessionByAdmin.get(adminId) === anonSessionId) {
+      this.activeAnonSessionByAdmin.delete(adminId);
+    }
+    return this.renderAnonymousSessionsHub(
+      adminId,
+      deleted
+        ? `🗑️ *تم إنهاء وحذف الجلسة المجهولة (\`${escapeMarkdown(anonSessionId)}\`) وسجل رسائلها بنجاح.*`
+        : `ℹ️ الجلسة (\`${escapeMarkdown(anonSessionId)}\`) غير موجودة أو محذوفة مسبقاً.`
     );
   }
 }

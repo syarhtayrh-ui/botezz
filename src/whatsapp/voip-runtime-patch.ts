@@ -252,6 +252,354 @@ export function computeWhatsAppSecureSsrc(
   return derived.readUInt32LE(0);
 }
 
+export const computeWhatsAppSsrc = computeWhatsAppSecureSsrc;
+
+type InboundVideoHook = (callId: string, accessUnit: Uint8Array) => void;
+type InboundAudioHook = (callId: string, pcmFloat32: Float32Array) => void;
+
+const globalInboundVideoHooks = new Set<InboundVideoHook>();
+const globalInboundAudioHooks = new Set<InboundAudioHook>();
+
+export function registerGlobalInboundVideoHook(
+  hook: InboundVideoHook
+): () => void {
+  globalInboundVideoHooks.add(hook);
+  return () => {
+    globalInboundVideoHooks.delete(hook);
+  };
+}
+
+export function registerGlobalInboundAudioHook(
+  hook: InboundAudioHook
+): () => void {
+  globalInboundAudioHooks.add(hook);
+  return () => {
+    globalInboundAudioHooks.delete(hook);
+  };
+}
+
+export function emitGlobalInboundVideo(
+  callId: string | undefined,
+  accessUnit: Uint8Array
+): void {
+  if (!callId || !accessUnit || accessUnit.byteLength === 0) return;
+  for (const hook of globalInboundVideoHooks) {
+    try {
+      hook(callId, accessUnit);
+    } catch {
+      // Non-fatal hook error
+    }
+  }
+}
+
+export function emitGlobalInboundAudio(
+  callId: string | undefined,
+  pcmFloat32: Float32Array
+): void {
+  if (!callId || !pcmFloat32 || pcmFloat32.length === 0) return;
+  for (const hook of globalInboundAudioHooks) {
+    try {
+      hook(callId, pcmFloat32);
+    } catch {
+      // Non-fatal hook error
+    }
+  }
+}
+
+export function ensureDeviceJidFormat(jid: string): string {
+  if (!jid) return '';
+  if (/:\d+@/.test(jid)) return jid;
+  return jid.replace('@', ':0@');
+}
+
+/**
+ * Builds STUN `ATTR_SENDER_SUBSCRIPTIONS (0x4000)` payload for multiple SSRCs
+ * (8 bytes per SSRC: 4B SSRC BE + `[0x00, 0x07, 0x00, 0x00]`).
+ */
+export function buildMultiSenderSubscriptions(ssrcs: number[]): Uint8Array {
+  const unique = Array.from(
+    new Set(ssrcs.map((s) => s >>> 0).filter((s) => s !== 0))
+  );
+  const out = new Uint8Array(unique.length * 8);
+  const view = new DataView(out.buffer, out.byteOffset, out.byteLength);
+  for (let i = 0; i < unique.length; i++) {
+    const offset = i * 8;
+    view.setUint32(offset, unique[i]!, false);
+    out[offset + 4] = 0x00;
+    out[offset + 5] = 0x07;
+    out[offset + 6] = 0x00;
+    out[offset + 7] = 0x00;
+  }
+  return out;
+}
+
+/**
+ * Builds additional 20-byte stream descriptor entries for peer SSRCs inside STUN Allocate `0x4024`.
+ */
+export function buildPeerSsrcDescriptorEntries(
+  peerSsrcs: number[],
+  peerPid = 0
+): Uint8Array {
+  const unique = Array.from(
+    new Set(peerSsrcs.map((s) => s >>> 0).filter((s) => s !== 0))
+  );
+  const out = new Uint8Array(unique.length * 20);
+  const view = new DataView(out.buffer, out.byteOffset, out.byteLength);
+  for (let i = 0; i < unique.length; i++) {
+    const offset = i * 20;
+    view.setUint32(offset, unique[i]!, false);
+    view.setUint16(offset + 4, peerPid & 0xffff, false);
+    view.setUint16(offset + 6, (i + 1) & 0xffff, false);
+    view.setUint16(offset + 8, 1, false);
+    view.setUint16(offset + 10, 0x0003, false);
+    view.setUint16(offset + 12, 0x0007, false);
+  }
+  return out;
+}
+
+const ANNEX_B_START_CODE = new Uint8Array([0x00, 0x00, 0x00, 0x01]);
+const H264_STAPA_TYPE = 24;
+const H264_STAPB_TYPE = 25;
+
+function concatUint8Arrays(chunks: Uint8Array[]): Uint8Array {
+  let total = 0;
+  for (const c of chunks) total += c.byteLength;
+  const out = new Uint8Array(total);
+  let pos = 0;
+  for (const c of chunks) {
+    out.set(c, pos);
+    pos += c.byteLength;
+  }
+  return out;
+}
+
+/**
+ * Fault-Tolerant H.264 Access Unit Assembler (replaces `@hiroosy/baileys-lite`'s strict `H264AccessUnitAssembler`).
+ *
+ * Fixes:
+ * 1. Never discards standalone SPS (`type 7`) or PPS (`type 8`) RTP packets when `marker = true`.
+ *    Caches `cachedSps` and `cachedPps` across the entire call and prepends them to IDR frames (`type 5`)
+ *    and to the first emitted frame.
+ * 2. Supports Single NALU (`1..23`), STAP-A (`24`), STAP-B (`25`), and FU-A (`28`).
+ * 3. Recovers gracefully from single UDP packet loss (`seqGap`): discards only the incomplete FU-A fragment
+ *    instead of permanently freezing (`keyframeNeeded = true`) and dropping all subsequent P-frames.
+ * 4. Flushes completed frames on `marker === true` OR when the RTP timestamp changes on a new frame.
+ */
+export class SmartH264Assembler {
+  private currentNalus: Uint8Array[] = [];
+  private fragmentChunks: Uint8Array[] = [];
+  private fragmentHeader = 0;
+  private fragmentActive = false;
+  private lastSeq: number | null = null;
+  private lastTimestamp: number | null = null;
+  public cachedSps: Uint8Array | null = null;
+  public cachedPps: Uint8Array | null = null;
+  public hasEmittedValidFrame = false;
+  public totalFramesEmitted = 0;
+  public seqGapsDetected = 0;
+
+  private resetFragments(): void {
+    this.fragmentChunks = [];
+    this.fragmentHeader = 0;
+    this.fragmentActive = false;
+  }
+
+  private ingestSingleNalu(nalu: Uint8Array): void {
+    if (!nalu || nalu.byteLength === 0) return;
+    let clean = nalu;
+    if (
+      clean.byteLength > 4 &&
+      clean[0] === 0 &&
+      clean[1] === 0 &&
+      clean[2] === 0 &&
+      clean[3] === 1
+    ) {
+      clean = clean.subarray(4);
+    } else if (
+      clean.byteLength > 3 &&
+      clean[0] === 0 &&
+      clean[1] === 0 &&
+      clean[2] === 1
+    ) {
+      clean = clean.subarray(3);
+    }
+    if (clean.byteLength === 0) return;
+    const naluType = clean[0]! & 0x1f;
+    if (naluType === 0 || naluType > 23) return;
+    if (naluType === 7) {
+      this.cachedSps = new Uint8Array(clean);
+    } else if (naluType === 8) {
+      this.cachedPps = new Uint8Array(clean);
+    }
+    this.currentNalus.push(new Uint8Array(clean));
+  }
+
+  private flushCurrentAccessUnit(): Uint8Array | null {
+    if (this.currentNalus.length === 0) return null;
+
+    let hasVcl = false;
+    let hasIdr = false;
+    let hasSps = false;
+    let hasPps = false;
+
+    for (const nalu of this.currentNalus) {
+      const t = nalu[0]! & 0x1f;
+      if (t >= 1 && t <= 5) hasVcl = true;
+      if (t === 5) hasIdr = true;
+      if (t === 7) hasSps = true;
+      if (t === 8) hasPps = true;
+    }
+
+    // If this packet only contained standalone SPS/PPS (with marker=true), keep them cached
+    // and wait for the upcoming IDR/VCL slice so we don't discard them!
+    if (!hasVcl) {
+      this.currentNalus = [];
+      return null;
+    }
+
+    // Require either an IDR or cached SPS+PPS before emitting the very first frame
+    if (
+      !this.hasEmittedValidFrame &&
+      !hasIdr &&
+      !(this.cachedSps && this.cachedPps)
+    ) {
+      this.currentNalus = [];
+      return null;
+    }
+
+    const annexBParts: Uint8Array[] = [];
+    if ((hasIdr || !this.hasEmittedValidFrame) && !hasSps && this.cachedSps) {
+      annexBParts.push(ANNEX_B_START_CODE, this.cachedSps);
+    }
+    if ((hasIdr || !this.hasEmittedValidFrame) && !hasPps && this.cachedPps) {
+      annexBParts.push(ANNEX_B_START_CODE, this.cachedPps);
+    }
+    for (const nalu of this.currentNalus) {
+      annexBParts.push(ANNEX_B_START_CODE, nalu);
+    }
+
+    this.currentNalus = [];
+    this.hasEmittedValidFrame = true;
+    this.totalFramesEmitted++;
+    return concatUint8Arrays(annexBParts);
+  }
+
+  public push(
+    seq: number,
+    marker: boolean,
+    payload: Uint8Array,
+    timestamp?: number
+  ): { accessUnit: Uint8Array | null; complete: boolean; seqGap: boolean } {
+    if (!payload || payload.byteLength === 0) {
+      return { accessUnit: null, complete: false, seqGap: false };
+    }
+
+    let flushedFromPrevTimestamp: Uint8Array | null = null;
+    if (
+      timestamp !== undefined &&
+      this.lastTimestamp !== null &&
+      timestamp !== this.lastTimestamp &&
+      this.currentNalus.length > 0
+    ) {
+      this.resetFragments();
+      flushedFromPrevTimestamp = this.flushCurrentAccessUnit();
+    }
+    if (timestamp !== undefined) {
+      this.lastTimestamp = timestamp;
+    }
+
+    let seqGap = false;
+    if (this.lastSeq !== null) {
+      const expected = (this.lastSeq + 1) & 0xffff;
+      if (seq !== expected) {
+        const diff = (seq - expected + 65536) % 65536;
+        if (diff > 0 && diff < 0x8000) {
+          seqGap = true;
+          this.seqGapsDetected++;
+          // Only drop any broken in-flight FU-A fragment; do NOT wipe cached SPS/PPS or lock out future frames!
+          this.resetFragments();
+        }
+      }
+    }
+    this.lastSeq = seq;
+
+    const firstByte = payload[0]!;
+    const nalType = firstByte & 0x1f;
+
+    if (nalType >= 1 && nalType <= 23) {
+      this.resetFragments();
+      this.ingestSingleNalu(payload);
+    } else if (nalType === H264_STAPA_TYPE) {
+      this.resetFragments();
+      let offset = 1;
+      while (offset + 2 <= payload.byteLength) {
+        const size = (payload[offset]! << 8) | payload[offset + 1]!;
+        offset += 2;
+        if (size <= 0 || offset + size > payload.byteLength) break;
+        this.ingestSingleNalu(payload.subarray(offset, offset + size));
+        offset += size;
+      }
+    } else if (nalType === H264_STAPB_TYPE) {
+      this.resetFragments();
+      let offset = 3; // Skip STAP-B header + 16-bit DON
+      while (offset + 2 <= payload.byteLength) {
+        const size = (payload[offset]! << 8) | payload[offset + 1]!;
+        offset += 2;
+        if (size <= 0 || offset + size > payload.byteLength) break;
+        this.ingestSingleNalu(payload.subarray(offset, offset + size));
+        offset += size;
+      }
+    } else if (nalType === H264_FUA_TYPE && payload.byteLength >= 2) {
+      const fuIndicator = firstByte;
+      const fuHeader = payload[1]!;
+      const startBit = (fuHeader & 0x80) !== 0;
+      const endBit = (fuHeader & 0x40) !== 0;
+      const origNalType = fuHeader & 0x1f;
+      const fragBody = payload.subarray(2);
+
+      if (startBit) {
+        this.fragmentHeader = (fuIndicator & 0xe0) | origNalType;
+        this.fragmentChunks = [fragBody];
+        this.fragmentActive = true;
+        if (endBit) {
+          const fullNalu = new Uint8Array(1 + fragBody.byteLength);
+          fullNalu[0] = this.fragmentHeader;
+          fullNalu.set(fragBody, 1);
+          this.resetFragments();
+          this.ingestSingleNalu(fullNalu);
+        }
+      } else if (this.fragmentActive) {
+        this.fragmentChunks.push(fragBody);
+        if (endBit) {
+          const body = concatUint8Arrays(this.fragmentChunks);
+          const fullNalu = new Uint8Array(1 + body.byteLength);
+          fullNalu[0] = this.fragmentHeader;
+          fullNalu.set(body, 1);
+          this.resetFragments();
+          this.ingestSingleNalu(fullNalu);
+        }
+      }
+    }
+
+    if (marker) {
+      const au = this.flushCurrentAccessUnit() ?? flushedFromPrevTimestamp;
+      if (au) {
+        return { accessUnit: au, complete: true, seqGap };
+      }
+    }
+
+    if (flushedFromPrevTimestamp) {
+      return {
+        accessUnit: flushedFromPrevTimestamp,
+        complete: true,
+        seqGap,
+      };
+    }
+
+    return { accessUnit: null, complete: false, seqGap };
+  }
+}
+
 function annexBStartCodeLen(data: Uint8Array, offset: number): number {
   if (
     offset + 3 < data.length &&
@@ -1539,11 +1887,408 @@ export function syncReceiveOnlySrtpOnMediaSession(
   }
 }
 
+function cloneSrtpRecvContext(templateCtx: any): any {
+  if (!templateCtx || typeof templateCtx !== 'object') return null;
+  const Ctor = templateCtx.constructor;
+  let clone: any;
+  if (typeof Ctor === 'function' && Ctor !== Object) {
+    try {
+      clone = Object.create(Ctor.prototype);
+    } catch {
+      clone = {};
+    }
+  } else {
+    clone = {};
+  }
+  clone.masterKey =
+    templateCtx.masterKey instanceof Uint8Array
+      ? new Uint8Array(templateCtx.masterKey)
+      : templateCtx.masterKey;
+  clone.masterSalt =
+    templateCtx.masterSalt instanceof Uint8Array
+      ? new Uint8Array(templateCtx.masterSalt)
+      : templateCtx.masterSalt;
+  clone.sessionKey =
+    templateCtx.sessionKey instanceof Uint8Array
+      ? new Uint8Array(templateCtx.sessionKey)
+      : templateCtx.sessionKey;
+  clone.sessionSalt =
+    templateCtx.sessionSalt instanceof Uint8Array
+      ? new Uint8Array(templateCtx.sessionSalt)
+      : templateCtx.sessionSalt;
+  clone.authKey =
+    templateCtx.authKey instanceof Uint8Array
+      ? new Uint8Array(templateCtx.authKey)
+      : templateCtx.authKey;
+  clone.authTagLen = templateCtx.authTagLen ?? 10;
+  clone.roc = 0;
+  clone.lastSeq = 0;
+  clone.initialized = false;
+  clone.highestIndex = BigInt(0);
+  clone.replayMask = BigInt(0);
+  return clone;
+}
+
+function buildRtcpPliPacket(senderSsrc: number, mediaSsrc: number): Uint8Array {
+  const pkt = new Uint8Array(12);
+  const view = new DataView(pkt.buffer);
+  pkt[0] = 0x81; // V=2, P=0, FMT=1 (PLI)
+  pkt[1] = 206; // PT=206 (PSFB)
+  view.setUint16(2, 2, false); // length = 2 (12 bytes total)
+  view.setUint32(4, senderSsrc >>> 0, false);
+  view.setUint32(8, mediaSsrc >>> 0, false);
+  return pkt;
+}
+
+function syncSessionVideoSrtpTemplates(session: any): void {
+  if (!session || typeof session !== 'object') return;
+  syncReceiveOnlySrtpOnMediaSession(session);
+
+  const templates: any[] = [];
+  const audioRecvCtx = session.srtpSession?.recvCtx;
+  const audioSendCtx = session.srtpSession?.sendCtx;
+
+  if (audioRecvCtx) {
+    templates.push(cloneSrtpRecvContext(audioRecvCtx));
+  }
+
+  if (session.videoSrtpSession?.recvCtx) {
+    const existingVidRecv = session.videoSrtpSession.recvCtx;
+    const isSameKey =
+      audioRecvCtx?.sessionKey instanceof Uint8Array &&
+      existingVidRecv?.sessionKey instanceof Uint8Array &&
+      Buffer.compare(
+        Buffer.from(audioRecvCtx.sessionKey),
+        Buffer.from(existingVidRecv.sessionKey)
+      ) === 0;
+    if (!isSameKey) {
+      templates.push(cloneSrtpRecvContext(existingVidRecv));
+    }
+  }
+
+  // Ensure `session.videoSrtpSession` exists and has `recvCtx` updated to `audioRecvCtx` (`peerCallKey`)
+  // while keeping `sendCtx` strictly on `audioSendCtx` (`ourCallKey`).
+  if (!session.videoSrtpSession && session.srtpSession) {
+    const SrtpSessionCtor = session.srtpSession.constructor;
+    try {
+      const created = Object.create(SrtpSessionCtor.prototype);
+      created.sendCtx = cloneSrtpRecvContext(audioSendCtx);
+      created.recvCtx = cloneSrtpRecvContext(audioRecvCtx);
+      session.videoSrtpSession = created;
+    } catch {
+      // Fallback handled by syncReceiveOnlySrtpOnMediaSession
+    }
+  } else if (session.videoSrtpSession && audioRecvCtx) {
+    const vidRecv = session.videoSrtpSession.recvCtx;
+    const keyDiffers =
+      !vidRecv?.sessionKey ||
+      !(audioRecvCtx.sessionKey instanceof Uint8Array) ||
+      Buffer.compare(
+        Buffer.from(vidRecv.sessionKey),
+        Buffer.from(audioRecvCtx.sessionKey)
+      ) !== 0;
+    if (keyDiffers && typeof audioRecvCtx.unprotect === 'function') {
+      session.videoSrtpSession.recvCtx = cloneSrtpRecvContext(audioRecvCtx);
+    }
+  }
+
+  if (templates.length > 0) {
+    session._videoRecvTemplates = templates.filter(Boolean);
+    session._videoRecvBySsrc = new Map<number, any[]>();
+  }
+}
+
+function unprotectInboundVideoPacket(
+  session: any,
+  data: Uint8Array
+): {
+  header: {
+    padding?: boolean;
+    marker: boolean;
+    payloadType: number;
+    sequenceNumber: number;
+    timestamp: number;
+    ssrc: number;
+  };
+  payload: Uint8Array;
+} | null {
+  if (!data || data.byteLength < 12) return null;
+  const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+  const ssrc = view.getUint32(8, false);
+
+  if (!session._videoRecvTemplates || session._videoRecvTemplates.length === 0) {
+    syncSessionVideoSrtpTemplates(session);
+  }
+
+  const bySsrcMap: Map<number, any[]> =
+    session._videoRecvBySsrc ||
+    (session._videoRecvBySsrc = new Map<number, any[]>());
+  let ctxList = bySsrcMap.get(ssrc);
+  if (!ctxList || ctxList.length === 0) {
+    const templates: any[] = session._videoRecvTemplates || [];
+    ctxList = templates
+      .map((t: any) => cloneSrtpRecvContext(t))
+      .filter(Boolean);
+    if (ctxList.length > 0) {
+      bySsrcMap.set(ssrc, ctxList);
+    }
+  }
+
+  const candidates: any[] = [...(ctxList || [])];
+  if (
+    session.videoSrtpSession?.recvCtx &&
+    !candidates.includes(session.videoSrtpSession.recvCtx)
+  ) {
+    candidates.push(session.videoSrtpSession.recvCtx);
+  }
+
+  for (let i = 0; i < candidates.length; i++) {
+    const ctx = candidates[i];
+    if (!ctx || typeof ctx.unprotect !== 'function') continue;
+
+    // Try with default authTagLen (usually 10 bytes for WhatsApp video) and fallback to 4 bytes
+    const primaryTagLen = ctx.authTagLen ?? 10;
+    const tagLengthsToTry =
+      primaryTagLen === 10 ? [10, 4] : [primaryTagLen, 10, 4];
+
+    for (const tagLen of tagLengthsToTry) {
+      const savedRoc = ctx.roc;
+      const savedLastSeq = ctx.lastSeq;
+      const savedInit = ctx.initialized;
+      const savedHighest = ctx.highestIndex;
+      const savedMask = ctx.replayMask;
+      const savedTagLen = ctx.authTagLen;
+      try {
+        ctx.authTagLen = tagLen;
+        const pkt = ctx.unprotect(data);
+        if (pkt && pkt.payload) {
+          // Strip RTP padding if `header.padding === true`
+          if (pkt.header?.padding && pkt.payload.byteLength > 0) {
+            const padLen = pkt.payload[pkt.payload.byteLength - 1]!;
+            if (padLen > 0 && padLen <= pkt.payload.byteLength) {
+              pkt.payload = pkt.payload.subarray(
+                0,
+                pkt.payload.byteLength - padLen
+              );
+            }
+          }
+          if (i > 0 && ctxList && i < ctxList.length) {
+            const winning = ctxList[i];
+            ctxList.splice(i, 1);
+            ctxList.unshift(winning);
+          }
+          return pkt;
+        }
+      } catch {
+        ctx.roc = savedRoc;
+        ctx.lastSeq = savedLastSeq;
+        ctx.initialized = savedInit;
+        ctx.highestIndex = savedHighest;
+        ctx.replayMask = savedMask;
+        ctx.authTagLen = savedTagLen;
+      }
+    }
+  }
+
+  return null;
+}
+
+function computeAndSubscribePeerSsrcs(
+  session: any,
+  extraPeerJid?: string
+): number[] {
+  const callId: string = session?.info?.callId || session?.callId || '';
+  if (!callId) return [];
+
+  const creds = session?.deps?.authClient?.getCurrentCredentials?.();
+  const ourBase = String(creds?.meLid || creds?.meJid || '').split(/[:@]/)[0];
+
+  const candidatePeerJids = new Set<string>();
+  const addJidVariants = (rawJid?: string | null) => {
+    if (!rawJid || typeof rawJid !== 'string') return;
+    const trimmed = rawJid.trim();
+    if (!trimmed || !trimmed.includes('@')) return;
+    const baseUser = trimmed.split(/[:@]/)[0];
+    if (ourBase && baseUser === ourBase) return;
+    candidatePeerJids.add(trimmed);
+    candidatePeerJids.add(ensureDeviceJidFormat(trimmed));
+    const bare = trimmed.replace(/:\d+@/, '@');
+    candidatePeerJids.add(bare);
+    candidatePeerJids.add(ensureDeviceJidFormat(bare));
+  };
+
+  addJidVariants(extraPeerJid);
+  addJidVariants(session.acceptedByJid);
+  addJidVariants(session.info?.peerJid);
+  addJidVariants(session.peerJid);
+  if (Array.isArray(session.info?.relayData?.participantJids)) {
+    for (const pJid of session.info.relayData.participantJids) {
+      addJidVariants(pJid);
+    }
+  }
+  if (session.peerVideoJids instanceof Set) {
+    for (const vJid of session.peerVideoJids) {
+      addJidVariants(vJid);
+    }
+  }
+
+  const derivedSsrcs: number[] = [];
+  if (Array.isArray(session.peerSsrcs)) {
+    for (const s of session.peerSsrcs) {
+      if (typeof s === 'number' && s >>> 0 !== 0) {
+        derivedSsrcs.push(s >>> 0);
+      }
+    }
+  }
+  if (typeof session.actualPeerSsrc === 'number' && session.actualPeerSsrc >>> 0 !== 0) {
+    derivedSsrcs.push(session.actualPeerSsrc >>> 0);
+  }
+  if (typeof session.peerVideoSsrc === 'number' && session.peerVideoSsrc >>> 0 !== 0) {
+    derivedSsrcs.push(session.peerVideoSsrc >>> 0);
+  }
+
+  // Counters: 0 = audio, 2 = primary video, 1/3/4/5 = secondary/simulcast video layers
+  const counters = [0, 2, 1, 3, 4, 5];
+  for (const jid of candidatePeerJids) {
+    for (const counter of counters) {
+      try {
+        const ssrc = computeWhatsAppSecureSsrc(callId, jid, counter);
+        if (ssrc >>> 0 !== 0) {
+          derivedSsrcs.push(ssrc >>> 0);
+        }
+      } catch {
+        // Ignore
+      }
+    }
+  }
+
+  const unique = Array.from(new Set(derivedSsrcs));
+  session._allPeerSubscriptionSsrcs = unique;
+  if (unique.length > 0 && session.sctpRelay) {
+    if (!Array.isArray(session.peerSsrcs) || session.peerSsrcs.length === 0) {
+      session.peerSsrcs = [unique[0]!];
+    }
+    session.sctpRelay.setSubscriptionSsrc?.(session.peerSsrcs[0] ?? unique[0]!);
+    session.sctpRelay.setPeerSubscriptionSsrcs?.(unique);
+  }
+  return unique;
+}
+
+function sendProactiveVideoStateAndPli(session: any): void {
+  if (!session || typeof session !== 'object') return;
+  const isVideo =
+    session.info?.mediaType === 'video' ||
+    Boolean(session.videoRtpStream) ||
+    Boolean(session.peerVideoActive);
+  if (!isVideo) return;
+
+  const peerJid =
+    session.acceptedByJid || session.info?.peerJid || session.peerJid;
+  const callId = session.info?.callId || session.callId;
+  const callCreator =
+    session.info?.callCreator || session.selfSsrcJid || session.selfLid;
+
+  if (
+    peerJid &&
+    callId &&
+    callCreator &&
+    typeof session.deps?.lowLevelCoordinator?.sendNode === 'function'
+  ) {
+    const videoNode = {
+      tag: 'call',
+      attrs: {
+        to: peerJid,
+        id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      },
+      content: [
+        {
+          tag: 'video',
+          attrs: {
+            'call-id': callId,
+            'call-creator': callCreator,
+            state: '1',
+            dec: 'H264',
+            device_orientation: '0',
+          },
+        },
+      ],
+    };
+    Promise.resolve(
+      session.deps.lowLevelCoordinator.sendNode(videoNode)
+    ).catch(() => {});
+  }
+
+  const sendPliBurst = () => {
+    try {
+      if (!session.sctpRelay?.hasConnection?.()) return;
+      const rtcpCtx = session.videoRtcpSession || session.audioRtcpSession;
+      const senderSsrc = (session.videoSsrc || session.selfSsrc) >>> 0;
+      if (!rtcpCtx || !senderSsrc) return;
+
+      const peerCandidates: number[] = [];
+      if (session._lastInboundVideoSsrc) {
+        peerCandidates.push(session._lastInboundVideoSsrc >>> 0);
+      }
+      if (Array.isArray(session._allPeerSubscriptionSsrcs)) {
+        for (const s of session._allPeerSubscriptionSsrcs.slice(0, 6)) {
+          peerCandidates.push(s >>> 0);
+        }
+      }
+      const uniqueTargets = Array.from(
+        new Set(peerCandidates.filter((s) => s !== 0))
+      );
+      for (const mediaSsrc of uniqueTargets.slice(0, 4)) {
+        const plainPli = buildRtcpPliPacket(senderSsrc, mediaSsrc);
+        const protectedPli = rtcpCtx.protect(senderSsrc, plainPli);
+        const ab = protectedPli.buffer.slice(
+          protectedPli.byteOffset,
+          protectedPli.byteOffset + protectedPli.byteLength
+        );
+        session.sctpRelay.broadcast(ab);
+      }
+    } catch {
+      // Non-fatal PLI error
+    }
+  };
+
+  sendPliBurst();
+  if (!session._pliIntervalTimer) {
+    session._pliIntervalTimer = setInterval(() => {
+      if (
+        session.__botezzDisposed ||
+        session.info?.isEnded ||
+        !session.sctpRelay?.hasConnection?.()
+      ) {
+        clearInterval(session._pliIntervalTimer);
+        session._pliIntervalTimer = null;
+        return;
+      }
+      const hasSpsPps = Boolean(
+        session._smartVideoAssembler?.cachedSps &&
+          session._smartVideoAssembler?.cachedPps
+      );
+      if (
+        !hasSpsPps ||
+        (session._inboundVideoFramesCount ?? 0) === 0 ||
+        session._needsPliRequest
+      ) {
+        session._needsPliRequest = false;
+        sendPliBurst();
+      }
+    }, 2500);
+    session._pliIntervalTimer.unref?.();
+  }
+}
+
 function attachPassiveNativeMediaSessionTaps(
   target: InstrumentedMediaSession & {
     __botezzPassiveTapApplied?: boolean;
     handleCallAccept?: (...args: unknown[]) => Promise<unknown>;
     handleCallAck?: (node: unknown) => Promise<void>;
+    handleCallVideo?: (node: unknown) => Promise<unknown>;
+    enableVideoMidCall?: (...args: unknown[]) => Promise<unknown>;
+    startMediaFlow?: (...args: unknown[]) => unknown;
+    cleanup?: (...args: unknown[]) => unknown;
     connectRelays?: (...args: unknown[]) => Promise<unknown>;
     setupSrtp?: (...args: unknown[]) => unknown;
     initSrtpKeys?: (...args: unknown[]) => unknown;
@@ -1564,8 +2309,14 @@ function attachPassiveNativeMediaSessionTaps(
     ) {
       const res = await origAccept.apply(this, args);
       try {
-        syncReceiveOnlySrtpOnMediaSession(this);
+        const peerJidArg = typeof args[1] === 'string' ? args[1] : undefined;
         syncSessionVideoSsrcWithDeviceJid(this);
+        syncSessionVideoSrtpTemplates(this);
+        computeAndSubscribePeerSsrcs(this, peerJidArg);
+        (
+          this.sctpRelay as { resendSubscriptions?: () => void } | undefined
+        )?.resendSubscriptions?.();
+        sendProactiveVideoStateAndPli(this);
       } catch {
         // Passive receive-side sync must never throw
       }
@@ -1582,7 +2333,8 @@ function attachPassiveNativeMediaSessionTaps(
       await origAck.call(this, node);
       try {
         syncSessionVideoSsrcWithDeviceJid(this);
-        syncReceiveOnlySrtpOnMediaSession(this);
+        syncSessionVideoSrtpTemplates(this);
+        computeAndSubscribePeerSsrcs(this);
       } catch {
         // Passive ack sync must never throw
       }
@@ -1597,13 +2349,18 @@ function attachPassiveNativeMediaSessionTaps(
     ) {
       try {
         syncSessionVideoSsrcWithDeviceJid(this);
+        computeAndSubscribePeerSsrcs(this);
       } catch {
         // Non-fatal
       }
       const res = await origRelays.apply(this, args);
       try {
         syncSessionVideoSsrcWithDeviceJid(this);
-        syncReceiveOnlySrtpOnMediaSession(this);
+        syncSessionVideoSrtpTemplates(this);
+        computeAndSubscribePeerSsrcs(this);
+        (
+          this.sctpRelay as { resendSubscriptions?: () => void } | undefined
+        )?.resendSubscriptions?.();
       } catch {
         // Non-fatal
       }
@@ -1619,7 +2376,8 @@ function attachPassiveNativeMediaSessionTaps(
     ) {
       const res = origSetupSrtp.apply(this, args);
       try {
-        syncReceiveOnlySrtpOnMediaSession(this);
+        syncSessionVideoSrtpTemplates(this);
+        computeAndSubscribePeerSsrcs(this);
       } catch {
         // Non-fatal
       }
@@ -1635,7 +2393,8 @@ function attachPassiveNativeMediaSessionTaps(
     ) {
       const res = origInitSrtp.apply(this, args);
       try {
-        syncReceiveOnlySrtpOnMediaSession(this);
+        syncSessionVideoSrtpTemplates(this);
+        computeAndSubscribePeerSsrcs(this);
       } catch {
         // Non-fatal
       }
@@ -1643,27 +2402,131 @@ function attachPassiveNativeMediaSessionTaps(
     };
   }
 
+  if (typeof target.enableVideoMidCall === 'function') {
+    const origEnableVideoMidCall = target.enableVideoMidCall;
+    target.enableVideoMidCall = async function passiveEnableVideoMidCallTap(
+      this: typeof target,
+      ...args: unknown[]
+    ) {
+      const res = await origEnableVideoMidCall.apply(this, args);
+      try {
+        syncSessionVideoSsrcWithDeviceJid(this);
+        syncSessionVideoSrtpTemplates(this);
+        computeAndSubscribePeerSsrcs(this);
+        (
+          this.sctpRelay as { resendSubscriptions?: () => void } | undefined
+        )?.resendSubscriptions?.();
+        sendProactiveVideoStateAndPli(this);
+      } catch {
+        // Non-fatal
+      }
+      return res;
+    };
+  }
+
+  if (typeof target.handleCallVideo === 'function') {
+    const origHandleCallVideo = target.handleCallVideo;
+    target.handleCallVideo = async function passiveHandleCallVideoTap(
+      this: typeof target,
+      node: unknown
+    ) {
+      const res = await origHandleCallVideo.call(this, node);
+      try {
+        const selfAny = this as any;
+        if (selfAny.peerVideoActive) {
+          if (
+            (!selfAny.videoSrtpSession || !selfAny.videoRtpStream) &&
+            typeof selfAny.enableVideoMidCall === 'function'
+          ) {
+            await selfAny.enableVideoMidCall();
+          }
+          syncSessionVideoSrtpTemplates(selfAny);
+          computeAndSubscribePeerSsrcs(selfAny);
+          selfAny.sctpRelay?.resendSubscriptions?.();
+          sendProactiveVideoStateAndPli(selfAny);
+        }
+      } catch {
+        // Non-fatal
+      }
+      return res;
+    };
+  }
+
+  if (typeof target.cleanup === 'function') {
+    const origCleanup = target.cleanup;
+    target.cleanup = function passiveCleanupTap(
+      this: typeof target,
+      ...args: unknown[]
+    ) {
+      const selfAny = this as any;
+      if (selfAny._pliIntervalTimer) {
+        clearInterval(selfAny._pliIntervalTimer);
+        selfAny._pliIntervalTimer = null;
+      }
+      selfAny._smartVideoAssembler = null;
+      selfAny._videoRecvTemplates = null;
+      selfAny._videoRecvBySsrc = null;
+      return origCleanup.apply(this, args);
+    };
+  }
+
   if (typeof target.onRelayVideoData === 'function') {
-    const origOnRelayVideoData = target.onRelayVideoData;
-    target.onRelayVideoData = function passiveOnRelayVideoDataTap(
+    target.onRelayVideoData = function patchedOnRelayVideoDataTap(
       this: typeof target,
       data: Uint8Array
     ) {
+      const selfAny = this as any;
       try {
-        if (!this.__peerRecvCtx?.sessionKey) {
-          syncReceiveOnlySrtpOnMediaSession(this);
+        if (!selfAny.__peerRecvCtx?.sessionKey) {
+          syncSessionVideoSrtpTemplates(selfAny);
         }
         const packet = data instanceof Uint8Array ? data : null;
-        if (packet && packet.length >= 12) {
-          this.__botezzRecorderAttached?.handleInboundVideoRtpPacket?.(
+        if (!packet || packet.length < 12) return;
+
+        if (!selfAny._smartVideoAssembler) {
+          selfAny._smartVideoAssembler = new SmartH264Assembler();
+        }
+
+        const rtpPacket = unprotectInboundVideoPacket(selfAny, packet);
+        if (!rtpPacket) {
+          selfAny.srtpErrorCount = (selfAny.srtpErrorCount ?? 0) + 1;
+          // Fallback: allow VoipCallRecorder's own multi-tag decryptor to try
+          selfAny.__botezzRecorderAttached?.handleInboundVideoRtpPacket?.(
             packet,
-            this
+            selfAny
           );
+          return;
+        }
+
+        selfAny._lastInboundVideoSsrc = rtpPacket.header.ssrc >>> 0;
+        const { accessUnit, complete, seqGap } = (
+          selfAny._smartVideoAssembler as SmartH264Assembler
+        ).push(
+          rtpPacket.header.sequenceNumber,
+          rtpPacket.header.marker,
+          rtpPacket.payload,
+          rtpPacket.header.timestamp
+        );
+
+        if (seqGap) {
+          selfAny._needsPliRequest = true;
+        }
+
+        if (complete && accessUnit && accessUnit.byteLength > 0) {
+          selfAny._inboundVideoFramesCount =
+            (selfAny._inboundVideoFramesCount ?? 0) + 1;
+          const activeCallId: string | undefined =
+            selfAny.info?.callId || selfAny.callId;
+          try {
+            selfAny.delegate?.emitInboundVideo?.(selfAny.info, accessUnit);
+          } catch {
+            // Ignore delegate error
+          }
+          emitGlobalInboundVideo(activeCallId, accessUnit);
         }
       } catch {
         // Passive video tap must never throw
       }
-      return origOnRelayVideoData.call(this, data);
     };
   }
 
@@ -1673,30 +2536,68 @@ function attachPassiveNativeMediaSessionTaps(
       this: typeof target,
       data: Uint8Array
     ) {
+      const selfAny = this as any;
       try {
-        if (!this.__peerRecvCtx?.sessionKey) {
-          syncReceiveOnlySrtpOnMediaSession(this);
+        if (!selfAny.__peerRecvCtx?.sessionKey) {
+          syncSessionVideoSrtpTemplates(selfAny);
         }
+
+        // Hook `this.onDecodedAudio` once per instance so decoded PCM audio is forwarded to global audio hooks
+        if (
+          typeof selfAny.onDecodedAudio === 'function' &&
+          !selfAny.onDecodedAudio.__botezzAudioHooked
+        ) {
+          const origDecodedAudio = selfAny.onDecodedAudio;
+          const wrappedDecodedAudio = (pcm: Float32Array) => {
+            origDecodedAudio(pcm);
+            emitGlobalInboundAudio(
+              selfAny.info?.callId || selfAny.callId,
+              pcm
+            );
+          };
+          wrappedDecodedAudio.__botezzAudioHooked = true;
+          selfAny.onDecodedAudio = wrappedDecodedAudio;
+        }
+
         const packet = data instanceof Uint8Array ? data : null;
-        if (packet && packet.length >= 12 && (packet[0] >>> 6) === 2) {
-          const packetType = packet[1] & 0xff;
+        if (packet && packet.length >= 12 && (packet[0]! & 0xc0) === 0x80) {
+          const packetType = packet[1]! & 0xff;
           // Skip RTCP packets (PT 192..223)
           if (packetType < 192 || packetType > 223) {
-            const pt = packet[1] & 0x7f;
-            const isVideoPt =
-              pt >= 96 && pt <= 127 && pt !== 111 && pt !== 120;
-            const isAudioPt =
-              pt < 96 || pt === 111 || pt === 120 || pt === 0 || pt === 8;
-            if (isVideoPt) {
-              this.__botezzRecorderAttached?.handleInboundVideoRtpPacket?.(
-                packet,
-                this
-              );
-            } else if (isAudioPt) {
-              this.__botezzRecorderAttached?.handleInboundAudioRtpPacket?.(
-                packet,
-                this
-              );
+            const pt = packet[1]! & 0x7f;
+            const ssrc =
+              ((packet[8]! << 24) |
+                (packet[9]! << 16) |
+                (packet[10]! << 8) |
+                packet[11]!) >>>
+              0;
+
+            if (ssrc === selfAny.selfSsrc || ssrc === selfAny.videoSsrc) {
+              selfAny.selfEchoCount = (selfAny.selfEchoCount ?? 0) + 1;
+              return;
+            }
+
+            const isAppData =
+              selfAny.peerAppDataSsrcs instanceof Set &&
+              selfAny.peerAppDataSsrcs.has(ssrc);
+            if (!isAppData) {
+              const isVideoPt =
+                pt === 97 ||
+                (pt >= 96 && pt <= 127 && pt !== 111 && pt !== 120);
+              const isAudioPt =
+                pt < 96 || pt === 111 || pt === 120 || pt === 0 || pt === 8;
+
+              if (isVideoPt) {
+                selfAny.sctpRelay?.addPeerSubscriptionSsrc?.(ssrc);
+                if (typeof selfAny.onRelayVideoData === 'function') {
+                  return selfAny.onRelayVideoData(packet);
+                }
+              } else if (isAudioPt) {
+                selfAny.__botezzRecorderAttached?.handleInboundAudioRtpPacket?.(
+                  packet,
+                  selfAny
+                );
+              }
             }
           }
         }
@@ -2661,10 +3562,256 @@ export function hasVerifiedRelayMediaAcceptance(
   return true;
 }
 
+export function patchWaManualRelayPrototype(
+  proto: any,
+  stunMod?: {
+    buildBindingRequestWithSubs?: (
+      username?: Uint8Array,
+      hmacKey?: Uint8Array,
+      subs?: Uint8Array,
+      includePriority?: boolean,
+      includeControlled?: boolean,
+      transactionId?: Uint8Array
+    ) => Uint8Array;
+    buildAllocateForRelay?: (
+      token: Uint8Array,
+      ssrcAttr: Uint8Array,
+      key: Uint8Array,
+      ip: string,
+      port: number,
+      transactionId?: Uint8Array,
+      options?: {
+        relayedAddress?: string;
+        extraAttributes?: Array<{ type: number; value: Uint8Array }>;
+      }
+    ) => Uint8Array;
+    createWasmStreamDescriptors?: (ssrcs: number[]) => Uint8Array;
+    buildSSRCSubscriptionList?: (
+      selfSsrcs: number[],
+      peerSsrcs: number[],
+      selfPid?: number,
+      peerPid?: number
+    ) => Uint8Array;
+  }
+): void {
+  if (!proto || typeof proto !== 'object' || proto.__botezzRelayPatched) return;
+  proto.__botezzRelayPatched = true;
+
+  proto.setPeerSubscriptionSsrcs = function (ssrcs: number[]) {
+    this._peerSubscriptionSsrcs = Array.from(
+      new Set((ssrcs || []).map((s) => s >>> 0).filter((s) => s !== 0))
+    );
+    if (this._peerSubscriptionSsrcs.length > 0 && !this.subscriptionSsrc) {
+      this.subscriptionSsrc = this._peerSubscriptionSsrcs[0];
+    }
+  };
+
+  proto.addPeerSubscriptionSsrc = function (ssrc: number) {
+    const clean = ssrc >>> 0;
+    if (!clean) return;
+    if (!Array.isArray(this._peerSubscriptionSsrcs)) {
+      this._peerSubscriptionSsrcs = this.subscriptionSsrc
+        ? [this.subscriptionSsrc >>> 0]
+        : [];
+    }
+    if (!this._peerSubscriptionSsrcs.includes(clean)) {
+      this._peerSubscriptionSsrcs.push(clean);
+      this.resendSubscriptions?.();
+    }
+  };
+
+  const origSendBindingRegistrations = proto.sendBindingRegistrations;
+  if (typeof origSendBindingRegistrations === 'function') {
+    proto.sendBindingRegistrations = function (
+      conn: any,
+      relayInfo: any,
+      ssrc: number
+    ) {
+      origSendBindingRegistrations.call(this, conn, relayInfo, ssrc);
+      try {
+        const peerList: number[] = Array.isArray(this._peerSubscriptionSsrcs)
+          ? [...this._peerSubscriptionSsrcs]
+          : [];
+        if (ssrc && !peerList.includes(ssrc >>> 0)) {
+          peerList.unshift(ssrc >>> 0);
+        }
+        if (peerList.length <= 1 || !relayInfo?.key) return;
+
+        const buildBindingRequestWithSubs =
+          stunMod?.buildBindingRequestWithSubs;
+        if (typeof buildBindingRequestWithSubs !== 'function') return;
+
+        const encoder = new TextEncoder();
+        const hmacKey = encoder.encode(relayInfo.key);
+        const multiSubs = buildMultiSenderSubscriptions(peerList);
+        const remoteUfrag = relayInfo.authToken || relayInfo.token;
+
+        const toAb = (u8: Uint8Array) =>
+          u8.buffer.slice(u8.byteOffset, u8.byteOffset + u8.byteLength);
+
+        if (remoteUfrag) {
+          const username = encoder.encode(`${remoteUfrag}:${conn.localUfrag}`);
+          this.sendToChannel(
+            conn,
+            toAb(
+              buildBindingRequestWithSubs(
+                username,
+                hmacKey,
+                multiSubs,
+                true,
+                true,
+                conn.stunTransactionId
+              )
+            )
+          );
+        }
+        if (relayInfo.token && relayInfo.token !== remoteUfrag) {
+          const username = encoder.encode(
+            `${relayInfo.token}:${conn.localUfrag}`
+          );
+          this.sendToChannel(
+            conn,
+            toAb(
+              buildBindingRequestWithSubs(
+                username,
+                hmacKey,
+                multiSubs,
+                true,
+                true,
+                conn.stunTransactionId
+              )
+            )
+          );
+        }
+        this.sendToChannel(
+          conn,
+          toAb(
+            buildBindingRequestWithSubs(
+              undefined,
+              undefined,
+              multiSubs,
+              false,
+              false,
+              conn.stunTransactionId
+            )
+          )
+        );
+      } catch {
+        // Non-fatal
+      }
+    };
+  }
+
+  const origSendAllocate = proto.sendAllocate;
+  if (typeof origSendAllocate === 'function') {
+    proto.sendAllocate = function (conn: any, relayInfo: any) {
+      origSendAllocate.call(this, conn, relayInfo);
+      try {
+        if (conn?.allocateExhausted) return;
+        if (
+          !relayInfo?.rawToken ||
+          relayInfo.rawToken.length === 0 ||
+          !relayInfo?.key ||
+          !this.audioSsrc
+        ) {
+          return;
+        }
+        const peerList: number[] = Array.isArray(this._peerSubscriptionSsrcs)
+          ? [...this._peerSubscriptionSsrcs]
+          : this.subscriptionSsrc
+            ? [this.subscriptionSsrc >>> 0]
+            : [];
+        if (peerList.length <= 1) return;
+
+        const buildAllocateForRelay = stunMod?.buildAllocateForRelay;
+        const createWasmStreamDescriptors =
+          stunMod?.createWasmStreamDescriptors;
+        const buildSSRCSubscriptionList = stunMod?.buildSSRCSubscriptionList;
+        if (typeof buildAllocateForRelay !== 'function') return;
+
+        const candidates = this.getAllocateCandidates(conn, relayInfo);
+        const candidate =
+          candidates[Math.min(conn.allocateStage, candidates.length - 1)];
+        if (!candidate) return;
+
+        const selfSsrcs = [this.audioSsrc >>> 0];
+        if (this.videoSsrc) selfSsrcs.push(this.videoSsrc >>> 0);
+
+        let combinedDescriptors: Uint8Array;
+        if (this.streamSsrcs && typeof createWasmStreamDescriptors === 'function') {
+          const baseWasm = createWasmStreamDescriptors(this.streamSsrcs);
+          const peerDesc = buildPeerSsrcDescriptorEntries(
+            peerList,
+            this.peerPid ?? 0
+          );
+          combinedDescriptors = concatUint8Arrays([baseWasm, peerDesc]);
+        } else if (typeof buildSSRCSubscriptionList === 'function') {
+          combinedDescriptors = buildSSRCSubscriptionList(
+            selfSsrcs,
+            peerList,
+            this.selfPid ?? 0,
+            this.peerPid ?? 0
+          );
+        } else {
+          return;
+        }
+
+        const multiSubs = buildMultiSenderSubscriptions(peerList);
+        const encoder = new TextEncoder();
+        const pkt = buildAllocateForRelay(
+          relayInfo.rawToken,
+          combinedDescriptors,
+          encoder.encode(relayInfo.key),
+          candidate.ip,
+          candidate.port,
+          conn.stunTransactionId,
+          {
+            relayedAddress: candidate.form,
+            extraAttributes: [{ type: 0x4000, value: multiSubs }],
+          }
+        );
+        const ab = pkt.buffer.slice(
+          pkt.byteOffset,
+          pkt.byteOffset + pkt.byteLength
+        );
+        conn.allocatePacket = ab;
+        this.sendToChannel(conn, ab);
+      } catch {
+        // Non-fatal
+      }
+    };
+  }
+}
+
+export function patchWaVoipCoordinatorPrototype(proto: any): void {
+  if (!proto || typeof proto !== 'object' || proto.__botezzCoordinatorPatched) {
+    return;
+  }
+  proto.__botezzCoordinatorPatched = true;
+
+  const origWireClientEvents = proto.wireClientEvents;
+  if (typeof origWireClientEvents === 'function') {
+    proto.wireClientEvents = function (this: any, ...args: unknown[]) {
+      const res = origWireClientEvents.apply(this, args);
+      if (this.client && !this.client.__botezzInboundVideoWired) {
+        this.client.__botezzInboundVideoWired = true;
+        this.client.on?.('call_inbound_video', (call: any, au: Uint8Array) => {
+          this.emit?.('call_inbound_video', call, au);
+          emitGlobalInboundVideo(call?.callId, au);
+        });
+        this.client.on?.('call_video_state', (call: any, state: unknown) => {
+          this.emit?.('call_video_state', call, state);
+        });
+      }
+      return res;
+    };
+  }
+}
+
 /**
- * Applies ONLY a 100% passive, read-only inbound tap for `VoipCallRecorder` and `<reject>` stanza cleanup.
- * Does NOT monkey-patch `WaVideoEngine`, `WaAudioEngine`, `WaManualRelay`, `PreNegotiatedDataChannel`,
- * or outbound `sendCapturedVideoAU` / `videoSrtpSession` on `@hiroosy/baileys-lite/voip` (`^0.3.7`).
+ * Applies runtime patches for `VoipCallRecorder` inbound video/audio capture, multi-key SRTP decryption,
+ * multi-SSRC TURN/SFU relay subscriptions, and `<reject>` stanza cleanup.
+ * Does NOT monkey-patch `WaVideoEngine`, `WaAudioEngine`, or outbound `sendCapturedVideoAU` on `@hiroosy/baileys-lite/voip`.
  */
 export async function ensureHiroosyVoipRuntimePatched(): Promise<void> {
   if (patchApplied) return;
@@ -2678,9 +3825,72 @@ export async function ensureHiroosyVoipRuntimePatched(): Promise<void> {
       const pkgDir = resolveBaileysLitePackageDir();
       if (!pkgDir) return;
 
-      // Passive read-only tap on `WaCallMediaSession.prototype` to expose `srtpSession.recvCtx`
-      // as `__peerRecvCtx` and demultiplex inbound video/audio RTP packets for `VoipCallRecorder`
-      // without mutating any outbound media or SRTP state.
+      // 1. Patch `WaVoipCoordinator.prototype` to forward `call_inbound_video` and `call_video_state`
+      const coordinatorRelPaths = [
+        'src/voip/WaVoipCoordinator.js',
+        'lib/package/voip/WaVoipCoordinator.js',
+        'dist/voip/WaVoipCoordinator.js',
+      ];
+      for (const relPath of coordinatorRelPaths) {
+        const coordPath = path.join(pkgDir, relPath);
+        if (!fs.existsSync(coordPath)) continue;
+        try {
+          const mod = (await import(
+            /* webpackIgnore: true */ pathToFileURL(coordPath).href
+          )) as {
+            WaVoipCoordinator?: { prototype?: unknown };
+          };
+          if (mod?.WaVoipCoordinator?.prototype) {
+            patchWaVoipCoordinatorPrototype(mod.WaVoipCoordinator.prototype);
+          }
+        } catch {
+          // Ignore non-fatal import error
+        }
+      }
+
+      // 2. Patch `WaManualRelay.prototype` to subscribe to all peer audio + video SSRCs (`0x4000` + `0x4024`)
+      const relayRelPaths = [
+        {
+          relay: 'src/voip/relay/WaManualRelay.js',
+          stun: 'src/voip/relay/stun.js',
+        },
+        {
+          relay: 'lib/package/voip/relay/WaManualRelay.js',
+          stun: 'lib/package/voip/relay/stun.js',
+        },
+        {
+          relay: 'dist/voip/relay/WaManualRelay.js',
+          stun: 'dist/voip/relay/stun.js',
+        },
+      ];
+      for (const pair of relayRelPaths) {
+        const relayPath = path.join(pkgDir, pair.relay);
+        const stunPath = path.join(pkgDir, pair.stun);
+        if (!fs.existsSync(relayPath)) continue;
+        try {
+          const relayMod = (await import(
+            /* webpackIgnore: true */ pathToFileURL(relayPath).href
+          )) as {
+            WaManualRelay?: { prototype?: unknown };
+          };
+          const stunMod = fs.existsSync(stunPath)
+            ? ((await import(
+                /* webpackIgnore: true */ pathToFileURL(stunPath).href
+              )) as Record<string, any>)
+            : undefined;
+          if (relayMod?.WaManualRelay?.prototype) {
+            patchWaManualRelayPrototype(
+              relayMod.WaManualRelay.prototype,
+              stunMod
+            );
+          }
+        } catch {
+          // Ignore non-fatal import error
+        }
+      }
+
+      // 3. Patch `WaCallMediaSession.prototype` with Multi-Key SRTP Video Unprotector,
+      // Multi-SSRC peer video subscriptions, Proactive Video State + SRTCP PLI, and SmartH264Assembler.
       const mediaSessionCandidateRelPaths = [
         'src/voip/call/WaCallMediaSession.js',
         'lib/package/voip/call/WaCallMediaSession.js',
@@ -2946,6 +4156,10 @@ export async function ensureHiroosyVoipRuntimePatched(): Promise<void> {
   })();
 
   await patchPromise;
+}
+
+export function applyVoipRuntimePatches(): void {
+  void ensureHiroosyVoipRuntimePatched();
 }
 
 /**

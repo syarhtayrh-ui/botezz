@@ -84,8 +84,23 @@ import {
   SendLidAddressedParams,
   SendLidAddressedResult,
   emitIdentityTelemetry,
+  storeTcTokensFromNode,
+  buildTcTokenNodeForJid,
+  extractAddressingContext,
+  USERNAME_QUERY_IDS,
+  resolveTcTokenStorageJid,
+  extractCleanLid,
+  extractCleanPn,
 } from './identity-privacy-service';
 import type { ReachoutTimelockInfo } from './baileys-compat';
+
+export {
+  storeTcTokensFromNode,
+  buildTcTokenNodeForJid,
+  extractAddressingContext,
+  USERNAME_QUERY_IDS,
+  resolveTcTokenStorageJid,
+};
 
 export type {
   PresenceWatchReport,
@@ -2365,6 +2380,34 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
                       iqNode: bNode,
                       fallbackJid: bNode.attrs?.from,
                     })
+                    .then(() => this.flushAuthWrites())
+                    .catch(() => undefined);
+                } else if (
+                  evt === 'CB:notification' &&
+                  (bNode.attrs?.type === 'privacy_token' ||
+                    Boolean(getBinaryNodeChild(bNode, 'tokens')))
+                ) {
+                  void storeTcTokensFromNode({
+                    node: bNode,
+                    authStateKeys: sock.authState?.keys,
+                    getLIDForPN: (pn: string) =>
+                      sock.signalRepository?.lidMapping?.getLIDForPN?.(pn) ||
+                      this.memoryStore.getLidForPn(pn),
+                    fallbackJid:
+                      bNode.attrs?.sender_lid ||
+                      bNode.attrs?.participant_lid ||
+                      bNode.attrs?.from,
+                  })
+                    .then(() =>
+                      this.identityService.privacyTokens.captureIncomingPrivacyToken({
+                        iqNode: bNode,
+                        fallbackJid:
+                          bNode.attrs?.sender_lid ||
+                          bNode.attrs?.participant_lid ||
+                          bNode.attrs?.from,
+                      })
+                    )
+                    .then(() => this.flushAuthWrites())
                     .catch(() => undefined);
                 }
                 void this.forensicAnalyzer
@@ -2943,6 +2986,8 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
         rawParticipant?: string;
         senderPn?: string;
         senderLid?: string;
+        senderAlt?: string;
+        recipientAlt?: string;
         addressingMode?: string;
         notify?: string;
         encType?: string;
@@ -2953,6 +2998,7 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
     >();
 
     const rawMessageStanzaListener = (node: {
+      tag?: string;
       attrs?: Record<string, string | undefined>;
       content?: unknown;
     }) => {
@@ -2960,11 +3006,46 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
         const attrs = node?.attrs || {};
         const msgId = attrs.id;
         if (!msgId) return;
-        rawStanzaNodeByMsgId.set(msgId, node as unknown as BinaryNode);
+        const binaryNode: BinaryNode = {
+          tag: node.tag || 'message',
+          attrs: attrs as Record<string, string>,
+          content: node.content as BinaryNode['content'],
+        };
+        rawStanzaNodeByMsgId.set(msgId, binaryNode);
         if (rawStanzaNodeByMsgId.size > 500) {
           const oldestNodeKey = rawStanzaNodeByMsgId.keys().next().value;
           if (oldestNodeKey) rawStanzaNodeByMsgId.delete(oldestNodeKey);
         }
+
+        const addressingCtx = extractAddressingContext(binaryNode);
+        const extractedPn =
+          extractCleanPn(
+            attrs.sender_pn ||
+              attrs.participant_pn ||
+              attrs.peer_recipient_pn ||
+              addressingCtx.senderAlt ||
+              (attrs.from?.endsWith('@s.whatsapp.net') ? attrs.from : undefined)
+          ) || undefined;
+        const extractedLid =
+          extractCleanLid(
+            attrs.sender_lid ||
+              attrs.participant_lid ||
+              attrs.peer_recipient_lid ||
+              addressingCtx.senderAlt ||
+              (attrs.from?.endsWith('@lid') ? attrs.from : undefined)
+          ) || undefined;
+
+        if (extractedLid && extractedPn) {
+          this.memoryStore.recordLidMapping(extractedLid, extractedPn);
+          if (typeof sock.signalRepository?.lidMapping?.storeLIDPNMappings === 'function') {
+            void Promise.resolve(
+              sock.signalRepository.lidMapping.storeLIDPNMappings([
+                { lid: extractedLid, pn: extractedPn },
+              ])
+            ).catch(() => undefined);
+          }
+        }
+
         let encType: string | undefined;
         let encVersion: string | undefined;
         let retryCount: number | undefined;
@@ -2986,12 +3067,18 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
           rawFrom: attrs.from,
           rawParticipant: attrs.participant,
           senderPn:
-            attrs.sender_pn || attrs.participant_pn || attrs.peer_recipient_pn,
+            extractedPn ||
+            attrs.sender_pn ||
+            attrs.participant_pn ||
+            attrs.peer_recipient_pn,
           senderLid:
+            extractedLid ||
             attrs.sender_lid ||
             attrs.participant_lid ||
             attrs.peer_recipient_lid,
-          addressingMode: attrs.addressing_mode,
+          senderAlt: addressingCtx.senderAlt,
+          recipientAlt: addressingCtx.recipientAlt,
+          addressingMode: addressingCtx.addressingMode || attrs.addressing_mode,
           notify: attrs.notify,
           encType,
           encVersion,
@@ -3007,6 +3094,39 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
       }
     };
 
+    const privacyTokenNotificationListener = (rawNode: unknown) => {
+      try {
+        if (!rawNode || typeof rawNode !== 'object' || !('tag' in (rawNode as object))) {
+          return;
+        }
+        const bNode = rawNode as BinaryNode;
+        void storeTcTokensFromNode({
+          node: bNode,
+          authStateKeys: sock.authState?.keys,
+          getLIDForPN: (pn: string) =>
+            sock.signalRepository?.lidMapping?.getLIDForPN?.(pn) ||
+            this.memoryStore.getLidForPn(pn),
+          fallbackJid:
+            bNode.attrs?.sender_lid ||
+            bNode.attrs?.participant_lid ||
+            bNode.attrs?.from,
+        })
+          .then(() =>
+            this.identityService.privacyTokens.captureIncomingPrivacyToken({
+              iqNode: bNode,
+              fallbackJid:
+                bNode.attrs?.sender_lid ||
+                bNode.attrs?.participant_lid ||
+                bNode.attrs?.from,
+            })
+          )
+          .then(() => this.flushAuthWrites())
+          .catch(() => undefined);
+      } catch {
+        // Ignore
+      }
+    };
+
     const wsEmitter = (
       sock as unknown as {
         ws?: {
@@ -3017,6 +3137,10 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
     ).ws;
     if (typeof wsEmitter?.on === 'function') {
       wsEmitter.on('CB:message', rawMessageStanzaListener as never);
+      wsEmitter.on(
+        'CB:notification,type:privacy_token',
+        privacyTokenNotificationListener as never
+      );
     }
     const unbindSocketTelemetry = this.instrumentSocketForTelemetry(sock);
 
@@ -3117,12 +3241,45 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
           };
           const msgId = String(msgKey.id || '');
           const rawMeta = msgId ? rawStanzaMetaByMsgId.get(msgId) : undefined;
+          if (rawMeta) {
+            if (!msgKey.remoteJidAlt && rawMeta.senderAlt) {
+              msgKey.remoteJidAlt = rawMeta.senderAlt;
+            }
+            if (!msgKey.remoteJidAlt && rawMeta.senderPn && msgKey.remoteJid?.endsWith('@lid')) {
+              msgKey.remoteJidAlt = rawMeta.senderPn;
+            }
+            if (!msgKey.remoteJidAlt && rawMeta.senderLid && msgKey.remoteJid?.endsWith('@s.whatsapp.net')) {
+              msgKey.remoteJidAlt = rawMeta.senderLid;
+            }
+          }
+
+          // Cross-link any LID <-> PN pair present on the message key
+          const candidateLid = extractCleanLid(
+            msgKey.participant ||
+              msgKey.participantAlt ||
+              msgKey.remoteJid ||
+              msgKey.remoteJidAlt ||
+              rawMeta?.senderLid
+          );
+          const candidatePn = extractCleanPn(
+            msgKey.participant ||
+              msgKey.participantAlt ||
+              msgKey.remoteJid ||
+              msgKey.remoteJidAlt ||
+              rawMeta?.senderPn
+          );
+          if (candidateLid && candidatePn) {
+            this.memoryStore.recordLidMapping(candidateLid, candidatePn);
+          }
+
           const lookupJids = [
             msgKey.participant,
             msgKey.participantAlt,
             msgKey.remoteJid,
             msgKey.remoteJidAlt,
             rawMeta?.senderPn,
+            rawMeta?.senderLid,
+            rawMeta?.senderAlt,
             rawMeta?.rawParticipant,
             rawMeta?.rawFrom,
           ].filter((j): j is string => typeof j === 'string' && j.length > 0);
@@ -3175,6 +3332,10 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
       try {
         if (typeof wsEmitter?.off === 'function') {
           wsEmitter.off('CB:message', rawMessageStanzaListener as never);
+          wsEmitter.off(
+            'CB:notification,type:privacy_token',
+            privacyTokenNotificationListener as never
+          );
         }
         sock.ev.off('creds.update', credsListener);
         sock.ev.off('connection.update', connectionListener);
@@ -4550,34 +4711,52 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
     let source = 'ON_WHATSAPP_USYNC';
     let usedLid = true;
 
-    try {
-      const resolved = await this.resolveLidForRecipient(trimmedRecipient);
-      pnJid = resolved.pnJid;
-      lidJid = resolved.lidJid;
-      source = resolved.source;
-    } catch (err) {
-      const normalizedCheck = validateRecipient(
-        trimmedRecipient.endsWith('@lid')
-          ? `+${trimmedRecipient.slice(0, -4).replace(/\D/g, '')}`
-          : trimmedRecipient
-      );
-      if (
-        normalizedCheck.jid.endsWith('@s.whatsapp.net') &&
-        typeof sock.onWhatsApp === 'function'
-      ) {
-        const waCheck = await sock.onWhatsApp(normalizedCheck.jid).catch(() => []);
-        const waEntry = Array.isArray(waCheck) ? waCheck[0] : undefined;
-        if (waEntry && waEntry.exists === false) {
+    const isUsernameInput =
+      trimmedRecipient.startsWith('@') ||
+      (!trimmedRecipient.includes('@') && /[a-zA-Z_]/.test(trimmedRecipient));
+
+    if (isUsernameInput) {
+      const identityRes = await this.identityService
+        .resolveIdentity(trimmedRecipient)
+        .catch(() => null);
+      if (identityRes?.lidJid || identityRes?.pnJid) {
+        pnJid = identityRes.pnJid;
+        lidJid = identityRes.lidJid || identityRes.pnJid;
+        source = identityRes.source || 'USERNAME_LOOKUP';
+        usedLid = Boolean(identityRes.lidJid && identityRes.lidJid.endsWith('@lid'));
+      }
+    }
+
+    if (!lidJid) {
+      try {
+        const resolved = await this.resolveLidForRecipient(trimmedRecipient);
+        pnJid = resolved.pnJid;
+        lidJid = resolved.lidJid;
+        source = resolved.source;
+      } catch (err) {
+        const normalizedCheck = validateRecipient(
+          trimmedRecipient.endsWith('@lid')
+            ? `+${trimmedRecipient.slice(0, -4).replace(/\D/g, '')}`
+            : trimmedRecipient
+        );
+        if (
+          normalizedCheck.jid.endsWith('@s.whatsapp.net') &&
+          typeof sock.onWhatsApp === 'function'
+        ) {
+          const waCheck = await sock.onWhatsApp(normalizedCheck.jid).catch(() => []);
+          const waEntry = Array.isArray(waCheck) ? waCheck[0] : undefined;
+          if (waEntry && waEntry.exists === false) {
+            throw err;
+          }
+        }
+        if (normalizedCheck.jid.endsWith('@s.whatsapp.net')) {
+          pnJid = jidNormalizedUser(normalizedCheck.jid);
+          lidJid = pnJid;
+          source = 'PN_FALLBACK';
+          usedLid = false;
+        } else {
           throw err;
         }
-      }
-      if (normalizedCheck.jid.endsWith('@s.whatsapp.net')) {
-        pnJid = jidNormalizedUser(normalizedCheck.jid);
-        lidJid = pnJid;
-        source = 'PN_FALLBACK';
-        usedLid = false;
-      } else {
-        throw err;
       }
     }
 
@@ -4588,11 +4767,13 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
       await this.persistLidPnMappingOnSocket(sock, deliveryJid, pnJid);
     }
 
-    // 2. Official Baileys session migration from PN -> LID + assertSessions
+    // 2. Official Baileys session migration from PN -> LID + assertSessions(force=true)
     try {
       if (typeof sock.getUSyncDevices === 'function') {
         const jidsToFetch = Array.from(
-          new Set([pnJid, deliveryJid].filter((j): j is string => Boolean(j)))
+          new Set(
+            [senderJid, pnJid, deliveryJid].filter((j): j is string => Boolean(j))
+          )
         );
         await sock.getUSyncDevices(jidsToFetch, false, false).catch(() => []);
       }
@@ -4606,10 +4787,36 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
           .catch(() => undefined);
       }
       if (typeof sock.assertSessions === 'function') {
-        await sock.assertSessions([deliveryJid], false).catch(() => false);
+        await sock.assertSessions([deliveryJid], true).catch(() => false);
       }
     } catch {
       // Best-effort session preparation before sending
+    }
+
+    // 3. Issue/resolve Trusted Contact Privacy Token (<tctoken>) for 1:1 delivery
+    let tcTokenNode: BinaryNode | null = null;
+    try {
+      const tokenTargetJid = pnJid || deliveryJid;
+      await this.identityService.privacyTokens
+        .ensurePrivacyToken(tokenTargetJid, { forceRefresh: false })
+        .catch(() => ({ record: null, refreshed: false }));
+      const builtTc = await buildTcTokenNodeForJid({
+        jid: deliveryJid,
+        authStateKeys: sock.authState?.keys,
+        getLIDForPN: (pn: string) =>
+          sock.signalRepository?.lidMapping?.getLIDForPN?.(pn) ||
+          this.memoryStore.getLidForPn(pn),
+      });
+      tcTokenNode = builtTc.tcTokenNode || null;
+      if (!tcTokenNode) {
+        const injectedRes = await this.identityService.privacyTokens
+          .injectPrivacyTokenNodes(tokenTargetJid)
+          .catch(() => ({ nodes: undefined, injected: false }));
+        tcTokenNode =
+          injectedRes.nodes?.find((n) => n.tag === 'tctoken') || null;
+      }
+    } catch {
+      tcTokenNode = null;
     }
 
     const previousName = sock.user?.name;
@@ -4620,15 +4827,19 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
     let msgId = `lid_msg_${Date.now()}`;
     try {
       if (typeof sock.sendMessage === 'function') {
+        const sendOptions: Record<string, unknown> = usedLid
+          ? {
+              addressingMode: 'lid',
+              additionalAttributes: { addressing_mode: 'lid' },
+              ...(tcTokenNode ? { additionalNodes: [tcTokenNode] } : {}),
+            }
+          : tcTokenNode
+            ? { additionalNodes: [tcTokenNode] }
+            : {};
         const sent = await sock.sendMessage(
           deliveryJid,
           { text: validText },
-          usedLid
-            ? ({
-                addressingMode: 'lid',
-                additionalAttributes: { addressing_mode: 'lid' },
-              } as unknown as Record<string, unknown>)
-            : undefined
+          Object.keys(sendOptions).length > 0 ? sendOptions : undefined
         );
         if (sent?.key?.id) {
           msgId = sent.key.id;
@@ -4663,9 +4874,11 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
                 messageId: msgId,
                 addressingMode: 'lid',
                 additionalAttributes: { addressing_mode: 'lid' },
+                ...(tcTokenNode ? { additionalNodes: [tcTokenNode] } : {}),
               }
             : {
                 messageId: msgId,
+                ...(tcTokenNode ? { additionalNodes: [tcTokenNode] } : {}),
               }
         );
       }
@@ -6568,7 +6781,10 @@ export class MockWhatsAppSessionDriver implements WhatsAppSessionDriver {
    * Simulates the user entering the pairing code on their WhatsApp phone
    * (`pair-success` -> `AUTHENTICATING` -> `CONNECTED`).
    */
-  public completeSimulatedPairing(): void {
+  public completeSimulatedPairing(simulatedJid?: string): void {
+    if (simulatedJid) {
+      this.currentJid = simulatedJid;
+    }
     this.socketOpen = true;
     this.handshakeComplete = true;
     this.registered = true;
@@ -7690,4 +7906,6 @@ export class MockWhatsAppSessionDriver implements WhatsAppSessionDriver {
 }
 
 export type DriverFactory = (sessionId: string, authDir: string) => WhatsAppSessionDriver;
+
+
 

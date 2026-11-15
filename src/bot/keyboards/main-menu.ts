@@ -71,6 +71,7 @@ export function buildMainMenuKeyboard(
       { text: '⭕ تحميلات الحالات', callbackData: 'menu:stories:page:1' },
     ],
     [
+      { text: '🕵️ جلسة مجهولة (تواصل مخفي)', callbackData: 'menu:anon_sessions' },
       { text: '🛠️ الأدوات ومختبر الدوال', callbackData: 'menu:tools' },
     ],
   ];

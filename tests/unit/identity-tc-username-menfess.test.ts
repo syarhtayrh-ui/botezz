@@ -10,6 +10,10 @@ import {
   MockWhatsAppSessionDriver,
   BinaryNode,
   WhatsAppIdentityService,
+  extractAddressingContext,
+  storeTcTokensFromNode,
+  buildTcTokenNodeForJid,
+  USERNAME_QUERY_IDS,
 } from '../../src/whatsapp/connection-manager';
 import { AnonymousSessionEngine } from '../../src/whatsapp/anonymous-session-engine';
 import { createAtomicMultiFileAuthState } from '../../src/whatsapp/atomic-auth-state';
@@ -1054,8 +1058,242 @@ test('TelegramBotController end-to-end executes /lid, /reachout, /username, /ano
     // /anonstop closes session cleanly
     const stopView = await controller.handleTextMessage(999999, `/anonstop ${anonId}`);
     assert.ok(stopView.text.includes('تم إغلاق'));
+
+    // =========================================================================
+    // Unified Interactive "Anonymous Chat Session" Room (`🕵️ جلسة مجهولة`) E2E
+    // =========================================================================
+    const allToolsButtons = toolsMenu.keyboard.flat().map((b) => b.callbackData);
+    assert.ok(
+      allToolsButtons.includes('menu:anon_sessions'),
+      'Tools menu should include unified menu:anon_sessions button'
+    );
+    assert.equal(
+      allToolsButtons.includes('tools:prompt_lid_lookup'),
+      false,
+      'Scattered tools:prompt_lid_lookup button should be replaced by unified room button'
+    );
+
+    // 1. Open Screen 1 (Sessions Hub)
+    const hubView1 = await controller.handleCallbackQuery(
+      999999,
+      'menu:anon_sessions'
+    );
+    assert.ok(hubView1.text.includes('غرفة الجلسات المجهولة الموحدة'));
+
+    // 2. Tap `➕ إضافة جلسة مجهولة جديدة` (`anon:add_prompt`) -> Screen 2
+    const addPromptView = await controller.handleCallbackQuery(
+      999999,
+      'anon:add_prompt'
+    );
+    assert.ok(addPromptView.text.includes('بدء جلسة تواصل مجهولة جديدة'));
+    assert.equal(controller.toolsHandler.getStep(999999), 'ANON_AWAITING_TARGET');
+
+    // 3. Enter recipient phone number -> creates session and transitions straight into Screen 3 (`ANON_IN_ROOM`)
+    const roomView1 = await controller.handleTextMessage(
+      999999,
+      '+967771234535'
+    );
+    assert.ok(roomView1.text.includes('غرفة المحادثة المجهولة الحية'));
+    assert.ok(roomView1.text.includes('967771234535@s.whatsapp.net'));
+    assert.ok(roomView1.text.includes('@lid'));
+    assert.equal(controller.toolsHandler.getStep(999999), 'ANON_IN_ROOM');
+
+    const activeRoomId = controller.toolsHandler.getActiveAnonRoom(999999);
+    assert.ok(activeRoomId, 'Expected active room ID in ANON_IN_ROOM');
+
+    // 4. Send outbound message directly inside the room (no command needed!)
+    const roomView2 = await controller.handleTextMessage(
+      999999,
+      'مرحباً، كيف حالك من الجلسة المجهولة؟'
+    );
+    assert.equal(
+      controller.toolsHandler.getStep(999999),
+      'ANON_IN_ROOM',
+      'User must remain in ANON_IN_ROOM after sending a message'
+    );
+    assert.ok(roomView2.text.includes('مرحباً، كيف حالك من الجلسة المجهولة؟'));
+    assert.ok(roomView2.text.includes('أنت'));
+
+    // 5. Simulate incoming reply from recipient's `@lid` JID (unquoted!) -> should match room and update live transcript!
+    const roomSess = controller.toolsHandler.anonymousEngine.getAnonymousSessionById(
+      activeRoomId!
+    )!;
+    assert.ok(roomSess.receiverLidJid, 'Expected resolved receiverLidJid on room session');
+
+    let liveUpdateCount = 0;
+    controller.onAnonRoomLiveUpdate = () => {
+      liveUpdateCount++;
+    };
+
+    mockDriver.simulateIncomingMessage({
+      key: {
+        remoteJid: roomSess.receiverLidJid,
+        fromMe: false,
+        id: 'INCOMING_LID_ROOM_REPLY_1',
+      },
+      message: {
+        conversation: 'أهلاً! وصلتني رسالتك عبر الهوية المجهولة.',
+      },
+    });
+
+    await new Promise((r) => setTimeout(r, 20));
+    assert.equal(liveUpdateCount >= 1, true, 'Expected live room update on incoming @lid reply');
+
+    // Refresh room view (`anon:room:<id>`) and verify both outbound and inbound messages appear in transcript
+    const refreshedRoom = await controller.handleCallbackQuery(
+      999999,
+      `anon:room:${activeRoomId}`
+    );
+    assert.ok(refreshedRoom.text.includes('مرحباً، كيف حالك من الجلسة المجهولة؟'));
+    assert.ok(refreshedRoom.text.includes('أهلاً! وصلتني رسالتك عبر الهوية المجهولة.'));
+    assert.ok(refreshedRoom.text.includes('المستلم'));
+
+    // 6. Simulate incoming reply from recipient's `@s.whatsapp.net` PN JID -> should also match the same room!
+    mockDriver.simulateIncomingMessage({
+      key: {
+        remoteJid: '967771234535@s.whatsapp.net',
+        fromMe: false,
+        id: 'INCOMING_PN_ROOM_REPLY_2',
+      },
+      message: {
+        conversation: 'وهذا رد ثانٍ من رقم الهاتف مباشرة.',
+      },
+    });
+    await new Promise((r) => setTimeout(r, 20));
+
+    const refreshedRoom2 = await controller.handleCallbackQuery(
+      999999,
+      `anon:room:${activeRoomId}`
+    );
+    assert.ok(refreshedRoom2.text.includes('وهذا رد ثانٍ من رقم الهاتف مباشرة.'));
+
+    // 7. Exit room (`anon:exit_room`) -> returns to Screen 1 (`menu:anon_sessions`) and clears active input
+    const exitedView = await controller.handleCallbackQuery(
+      999999,
+      'anon:exit_room'
+    );
+    assert.ok(exitedView.text.includes('تم الخروج من غرفة المحادثة'));
+    assert.equal(controller.toolsHandler.getStep(999999), 'NONE');
+    assert.equal(controller.toolsHandler.getActiveAnonRoom(999999), undefined);
+
+    // 8. Delete room (`anon:del:<id>`) -> removes room cleanly
+    const deletedView = await controller.handleCallbackQuery(
+      999999,
+      `anon:del:${activeRoomId}`
+    );
+    assert.ok(deletedView.text.includes('تم إنهاء وحذف الجلسة المجهولة'));
+    assert.equal(
+      controller.toolsHandler.anonymousEngine.getAnonymousSessionById(activeRoomId!),
+      null
+    );
   } finally {
     fs.rmSync(tmpAuthDir, { recursive: true, force: true });
     db.close();
   }
 });
+
+test('extractAddressingContext, storeTcTokensFromNode, and buildTcTokenNodeForJid follow official WhiskeySockets/Baileys stanza semantics', async () => {
+  assert.equal(typeof HiroosyBaileysSessionDriver, 'function');
+  assert.equal(USERNAME_QUERY_IDS.CHECK, '26124072630599520');
+  assert.equal(USERNAME_QUERY_IDS.SET, '27108705368767936');
+
+  // 1. extractAddressingContext on LID-addressed incoming DM stanza
+  const lidStanza: BinaryNode = {
+    tag: 'message',
+    attrs: {
+      id: 'MSG_LID_1',
+      from: '123456789012345@lid',
+      sender_pn: '967771234535@s.whatsapp.net',
+      recipient_pn: '966500000001@s.whatsapp.net',
+    },
+  };
+  const ctxLid = extractAddressingContext(lidStanza);
+  assert.equal(ctxLid.addressingMode, 'lid');
+  assert.equal(ctxLid.senderAlt, '967771234535@s.whatsapp.net');
+  assert.equal(ctxLid.recipientAlt, '966500000001@s.whatsapp.net');
+
+  // 2. extractAddressingContext on PN-addressed incoming DM stanza
+  const pnStanza: BinaryNode = {
+    tag: 'message',
+    attrs: {
+      id: 'MSG_PN_1',
+      from: '967771234535@s.whatsapp.net',
+      sender_lid: '123456789012345@lid',
+      recipient_lid: '99887766554433@lid',
+    },
+  };
+  const ctxPn = extractAddressingContext(pnStanza);
+  assert.equal(ctxPn.addressingMode, 'pn');
+  assert.equal(ctxPn.senderAlt, '123456789012345@lid');
+  assert.equal(ctxPn.recipientAlt, '99887766554433@lid');
+
+  // 3. storeTcTokensFromNode + buildTcTokenNodeForJid with <notification type="privacy_token">
+  const tokenStore = new Map<string, unknown>();
+  const authStateKeys = {
+    get: async (type: string, ids: string[]) => {
+      const out: Record<string, unknown> = {};
+      if (type === 'tctoken') {
+        for (const id of ids) {
+          if (tokenStore.has(id)) out[id] = tokenStore.get(id);
+        }
+      }
+      return out;
+    },
+    set: async (data: Record<string, Record<string, unknown>>) => {
+      if (data.tctoken) {
+        for (const [k, v] of Object.entries(data.tctoken)) {
+          tokenStore.set(k, v);
+        }
+      }
+    },
+  };
+
+  const nowSec = Math.floor(Date.now() / 1000);
+  const rawTokenBytes = Buffer.from('baileys_trusted_contact_token_bytes');
+  const notificationNode: BinaryNode = {
+    tag: 'notification',
+    attrs: {
+      type: 'privacy_token',
+      from: '967771234535@s.whatsapp.net',
+      sender_lid: '123456789012345@lid',
+    },
+    content: [
+      {
+        tag: 'tokens',
+        attrs: {},
+        content: [
+          {
+            tag: 'token',
+            attrs: {
+              type: 'trusted_contact',
+              t: String(nowSec),
+            },
+            content: rawTokenBytes,
+          },
+        ],
+      },
+    ],
+  };
+
+  const storedCount = await storeTcTokensFromNode({
+    node: notificationNode,
+    authStateKeys,
+    getLIDForPN: (pn) =>
+      pn.startsWith('967771234535') ? '123456789012345@lid' : undefined,
+  });
+  assert.equal(storedCount, 1);
+  assert.equal(tokenStore.has('123456789012345@lid'), true);
+
+  // Building tctoken node for PN JID resolves to bare LID JID and attaches attrs.t + binary content
+  const { tcTokenNode: tcNode } = await buildTcTokenNodeForJid({
+    jid: '967771234535@s.whatsapp.net',
+    authStateKeys,
+    getLIDForPN: (pn) =>
+      pn.startsWith('967771234535') ? '123456789012345@lid' : undefined,
+  });
+  assert.ok(tcNode, 'Expected non-null <tctoken> BinaryNode');
+  assert.equal(tcNode!.tag, 'tctoken');
+  assert.equal(tcNode!.attrs?.t, String(nowSec));
+  assert.deepEqual(Buffer.from(tcNode!.content as Uint8Array), rawTokenBytes);
+});
+

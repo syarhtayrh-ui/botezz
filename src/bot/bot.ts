@@ -164,6 +164,11 @@ export class TelegramBotController {
     summaryMessageArabic: string,
     documentAttachments: TelegramMediaAttachment[]
   ) => void;
+  public onAnonRoomLiveUpdate?: (
+    ownerTelegramId: number,
+    view: BotViewResponse,
+    inActiveRoom: boolean
+  ) => void | Promise<void>;
 
   public readonly activeCallTelegramMonitorByCallId = new Map<
     string,
@@ -501,6 +506,16 @@ export class TelegramBotController {
       deps.settingsRepo,
       deps.auditRepo
     );
+
+    deps.sessionManager.addIncomingMessageListener(
+      ({ sessionId, rawMessage }) => {
+        try {
+          this.handleIncomingAnonRoomMessage(sessionId, rawMessage);
+        } catch {
+          // Never disrupt incoming message pipeline
+        }
+      }
+    );
     this.networkHandler = new NetworkTrafficHandler(
       deps.sessionManager,
       deps.auditRepo
@@ -542,6 +557,180 @@ export class TelegramBotController {
         );
       }
     };
+  }
+
+  private handleIncomingAnonRoomMessage(
+    sessionId: string,
+    rawMessage: Record<string, unknown>
+  ): void {
+    const key = (rawMessage?.key || {}) as {
+      id?: string;
+      fromMe?: boolean;
+      remoteJid?: string;
+      remoteJidAlt?: string;
+      participant?: string;
+      participantAlt?: string;
+    };
+    if (key.fromMe) return;
+    if (String(key.remoteJid || '') === 'status@broadcast') return;
+
+    const rawMeta = (rawMessage?.__rawStanzaMeta || {}) as {
+      senderPn?: string;
+      senderLid?: string;
+      senderAlt?: string;
+      rawFrom?: string;
+      rawParticipant?: string;
+    };
+
+    let msg = rawMessage?.message as Record<string, unknown> | undefined;
+    if (msg?.ephemeralMessage && typeof msg.ephemeralMessage === 'object') {
+      msg = (msg.ephemeralMessage as { message?: Record<string, unknown> }).message;
+    } else if (msg?.viewOnceMessage && typeof msg.viewOnceMessage === 'object') {
+      msg = (msg.viewOnceMessage as { message?: Record<string, unknown> }).message;
+    } else if (msg?.viewOnceMessageV2 && typeof msg.viewOnceMessageV2 === 'object') {
+      msg = (msg.viewOnceMessageV2 as { message?: Record<string, unknown> }).message;
+    }
+
+    let text = '';
+    let quotedMessageId: string | undefined;
+    if (msg && typeof msg === 'object') {
+      if (typeof msg.conversation === 'string') {
+        text = msg.conversation;
+      } else if (msg.extendedTextMessage && typeof msg.extendedTextMessage === 'object') {
+        const ext = msg.extendedTextMessage as {
+          text?: string;
+          contextInfo?: { stanzaId?: string };
+        };
+        text = typeof ext.text === 'string' ? ext.text : '';
+        quotedMessageId = ext.contextInfo?.stanzaId;
+      } else {
+        const mediaObj =
+          (msg.imageMessage as Record<string, unknown> | undefined) ||
+          (msg.videoMessage as Record<string, unknown> | undefined) ||
+          (msg.documentMessage as Record<string, unknown> | undefined);
+        if (mediaObj) {
+          text =
+            typeof mediaObj.caption === 'string' && mediaObj.caption.trim()
+              ? mediaObj.caption
+              : '[وسائط واردة]';
+          const ci = mediaObj.contextInfo as { stanzaId?: string } | undefined;
+          quotedMessageId = ci?.stanzaId;
+        }
+      }
+    }
+
+    if (!text.trim()) return;
+
+    const candidateJids: Array<string | undefined> = [
+      key.remoteJid,
+      key.remoteJidAlt,
+      key.participant,
+      key.participantAlt,
+      rawMeta.senderPn,
+      rawMeta.senderLid,
+      rawMeta.senderAlt,
+      rawMeta.rawFrom,
+      rawMeta.rawParticipant,
+    ];
+
+    // Also include any mapped PN/LID from the active driver's memoryStore / signalRepository
+    try {
+      const driver = this.deps.sessionManager.getDriver(sessionId);
+      const idSvc = driver.getIdentityService?.();
+      if (idSvc) {
+        for (const c of [...candidateJids]) {
+          if (!c) continue;
+          if (c.endsWith('@lid')) {
+            const mappedPn = idSvc.getCachedPnForLid(c);
+            if (typeof mappedPn === 'string' && mappedPn) {
+              candidateJids.push(mappedPn);
+            }
+          } else if (c.endsWith('@s.whatsapp.net')) {
+            const mappedLid = idSvc.getCachedLidForPn(c);
+            if (typeof mappedLid === 'string' && mappedLid) {
+              candidateJids.push(mappedLid);
+            }
+          }
+        }
+      }
+    } catch {
+      // Ignore if driver is not connected
+    }
+
+    const activeSessions = this.toolsHandler.anonymousEngine.listAnonymousSessions({
+      includeClosed: false,
+    });
+    if (activeSessions.length === 0) return;
+
+    const matchRes =
+      this.toolsHandler.anonymousEngine.matchAndRecordIncomingRoomReply({
+        sessionId,
+        candidateJids,
+        messageId: key.id,
+        text: text.trim(),
+        quotedMessageId,
+        fromMe: Boolean(key.fromMe),
+      });
+
+    if (!matchRes.matched || !matchRes.session) return;
+
+    const matchedSession = matchRes.session;
+    const targetAdminId =
+      matchedSession.ownerTelegramId > 0
+        ? matchedSession.ownerTelegramId
+        : this.deps.config.TELEGRAM_ADMIN_ID;
+    if (!targetAdminId || targetAdminId <= 0) return;
+
+    const isUserInThisRoom =
+      this.toolsHandler.getActiveAnonRoom(targetAdminId) === matchedSession.id &&
+      this.toolsHandler.getStep(targetAdminId) === 'ANON_IN_ROOM';
+
+    if (isUserInThisRoom) {
+      this.toolsHandler.anonymousEngine.markSessionRead(matchedSession.id);
+      const roomView = this.toolsHandler.renderAnonymousSessionRoom(
+        targetAdminId,
+        matchedSession.id,
+        `📥 *وصل رد جديد من المستلم الآن!*`
+      );
+      const uiSess = this.uiState.getOrCreateSession(targetAdminId);
+      uiSess.lastView = roomView;
+      uiSess.lastText = roomView.text;
+      if (this.onAnonRoomLiveUpdate) {
+        void Promise.resolve(
+          this.onAnonRoomLiveUpdate(targetAdminId, roomView, true)
+        ).catch(() => undefined);
+      }
+    } else {
+      const senderLabel = matchedSession.receiverJid.endsWith('@s.whatsapp.net')
+        ? `+${matchedSession.receiverJid.split('@')[0]}`
+        : matchedSession.senderAlias || matchedSession.receiverJid;
+      const notifyView: BotViewResponse = {
+        text:
+          `🔔 *رد جديد في الجلسة المجهولة (\`${matchedSession.id}\`)*\n` +
+          `━━━━━━━━━━━━━━━━━━\n` +
+          `👤 *من المستلم:* \`${senderLabel}\`\n` +
+          `💬 *الرسالة:* ${text.trim().slice(0, 300)}`,
+        keyboard: [
+          [
+            {
+              text: '💬 فتح الجلسة والرد الآن',
+              callbackData: `anon:room:${matchedSession.id}`,
+            },
+          ],
+          [
+            {
+              text: '🕵️ كل الجلسات المجهولة',
+              callbackData: 'menu:anon_sessions',
+            },
+          ],
+        ],
+      };
+      if (this.onAnonRoomLiveUpdate) {
+        void Promise.resolve(
+          this.onAnonRoomLiveUpdate(targetAdminId, notifyView, false)
+        ).catch(() => undefined);
+      }
+    }
   }
 
   public isOwnerUser(userId: number): boolean {
@@ -1682,6 +1871,42 @@ export class TelegramBotController {
     if (callbackData === 'tools:uname_delete') {
       this.activateInputOwner(actorUserId, 'NONE');
       return this.toolsHandler.executeUsernameCommand(actorUserId, 'delete');
+    }
+    if (
+      callbackData === 'menu:anon_sessions' ||
+      callbackData === 'tools:anon_hub'
+    ) {
+      this.activateInputOwner(actorUserId, 'NONE');
+      return this.toolsHandler.renderAnonymousSessionsHub(actorUserId);
+    }
+    if (callbackData === 'anon:add_prompt') {
+      this.activateInputOwner(actorUserId, 'TOOLS');
+      return this.toolsHandler.promptAddAnonymousSession(actorUserId);
+    }
+    if (callbackData.startsWith('anon:room:')) {
+      const anonId = callbackData.slice('anon:room:'.length).trim();
+      this.activateInputOwner(actorUserId, 'TOOLS');
+      const view = this.toolsHandler.renderAnonymousSessionRoom(
+        actorUserId,
+        anonId
+      );
+      if (this.toolsHandler.getStep(actorUserId) === 'NONE') {
+        this.activateInputOwner(actorUserId, 'NONE');
+      }
+      return view;
+    }
+    if (callbackData === 'anon:exit_room') {
+      this.activateInputOwner(actorUserId, 'NONE');
+      return this.toolsHandler.exitAnonymousSessionRoom(actorUserId);
+    }
+    if (callbackData.startsWith('anon:del:')) {
+      const anonId = callbackData.slice('anon:del:'.length).trim();
+      this.activateInputOwner(actorUserId, 'NONE');
+      return this.toolsHandler.deleteAnonymousRoomSession(actorUserId, anonId);
+    }
+    if (callbackData === 'anon:cycle_sender') {
+      this.activateInputOwner(actorUserId, 'NONE');
+      return this.toolsHandler.cycleAnonymousSenderSession(actorUserId);
     }
     if (callbackData === 'tools:prompt_menfess_start') {
       this.activateInputOwner(actorUserId, 'TOOLS');
@@ -3262,15 +3487,74 @@ export function createGrammyBot(
             safeCaption ? { caption: safeCaption } : {}
           );
         }
-        controller.uiState.markPanelBuried(targetChatId);
-        await reanchorControlPanelToBottom(targetChatId, targetChatId);
-      } catch (err) {
-        log.warn('Failed auto-uploading forensic capture bundle to Telegram', {
-          captureId: record.captureId,
-          error: err instanceof Error ? err.message : String(err),
-        });
-      }
+      controller.uiState.markPanelBuried(targetChatId);
+      await reanchorControlPanelToBottom(targetChatId, targetChatId);
+    } catch (err) {
+      log.warn('Failed auto-uploading forensic capture bundle to Telegram', {
+        captureId: record.captureId,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
     })();
+  };
+
+  controller.onAnonRoomLiveUpdate = async (
+    ownerTelegramId,
+    view,
+    inActiveRoom
+  ) => {
+    const targetChatId =
+      ownerTelegramId && ownerTelegramId > 0
+        ? ownerTelegramId
+        : config.TELEGRAM_ADMIN_ID;
+    if (!targetChatId || targetChatId <= 0) return;
+
+    const sess = controller.uiState.getOrCreateSession(targetChatId);
+    if (inActiveRoom) {
+      if (sess.activeMessageId) {
+        try {
+          await bot.api.editMessageText(
+            targetChatId,
+            sess.activeMessageId,
+            view.text,
+            {
+              parse_mode: 'Markdown',
+              reply_markup: toGrammyInlineKeyboard(view.keyboard),
+            }
+          );
+          return;
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          if (msg.includes('message is not modified')) {
+            return;
+          }
+        }
+      }
+      await reanchorControlPanelToBottom(targetChatId, targetChatId);
+    } else {
+      try {
+        const sent = await bot.api.sendMessage(targetChatId, view.text, {
+          parse_mode: 'Markdown',
+          reply_markup: toGrammyInlineKeyboard(view.keyboard),
+        });
+        controller.uiState.recordChatActivityMessageId(
+          targetChatId,
+          sent.message_id
+        );
+      } catch {
+        const sent = await bot.api
+          .sendMessage(targetChatId, view.text.replace(/[*_`]/g, ''), {
+            reply_markup: toGrammyInlineKeyboard(view.keyboard),
+          })
+          .catch(() => null);
+        if (sent) {
+          controller.uiState.recordChatActivityMessageId(
+            targetChatId,
+            sent.message_id
+          );
+        }
+      }
+    }
   };
 
   const downloadTelegramFileBuffer = async (fileId: string): Promise<Buffer> => {

@@ -45,7 +45,18 @@ export interface AnonymousSession {
   expiresAt: number;
   messagesRelayedCount: number;
   repliesRelayedCount: number;
+  unreadCount: number;
   state: AnonymousSessionState;
+}
+
+export interface AnonymousRoomMessage {
+  messageId: string;
+  anonSessionId: string;
+  sessionId: string;
+  direction: 'OUTBOUND' | 'INBOUND';
+  mediaKind: AnonymousMediaKind;
+  textContent: string;
+  createdAt: number;
 }
 
 export interface CreateAnonymousSessionParams {
@@ -143,6 +154,7 @@ interface AnonymousSessionRow {
   expires_at: number;
   messages_relayed_count: number;
   replies_relayed_count: number;
+  unread_count?: number;
   state: string;
 }
 
@@ -152,6 +164,7 @@ interface AnonymousMessageRow {
   session_id: string;
   direction: string;
   media_kind: string;
+  text_content?: string;
   created_at: number;
 }
 
@@ -181,6 +194,7 @@ function rowToSession(row: AnonymousSessionRow): AnonymousSession {
     expiresAt: row.expires_at,
     messagesRelayedCount: row.messages_relayed_count ?? 0,
     repliesRelayedCount: row.replies_relayed_count ?? 0,
+    unreadCount: row.unread_count ?? 0,
     state: validState,
   };
 }
@@ -222,7 +236,39 @@ function matchesPartyIdentity(
 export class AnonymousSessionEngine {
   private readonly sessionLocks = new Map<string, Promise<void>>();
 
-  constructor(private readonly db: AppDatabase) {}
+  constructor(private readonly db: AppDatabase) {
+    this.ensureRoomSchemaColumns();
+  }
+
+  private ensureRoomSchemaColumns(): void {
+    try {
+      const sessionCols = this.db.sqlite
+        .prepare('PRAGMA table_info(anonymous_relay_sessions)')
+        .all() as Array<{ name: string }>;
+      if (
+        sessionCols.length > 0 &&
+        !sessionCols.some((c) => c.name === 'unread_count')
+      ) {
+        this.db.sqlite.exec(
+          'ALTER TABLE anonymous_relay_sessions ADD COLUMN unread_count INTEGER NOT NULL DEFAULT 0'
+        );
+      }
+
+      const msgCols = this.db.sqlite
+        .prepare('PRAGMA table_info(anonymous_relay_messages)')
+        .all() as Array<{ name: string }>;
+      if (
+        msgCols.length > 0 &&
+        !msgCols.some((c) => c.name === 'text_content')
+      ) {
+        this.db.sqlite.exec(
+          "ALTER TABLE anonymous_relay_messages ADD COLUMN text_content TEXT NOT NULL DEFAULT ''"
+        );
+      }
+    } catch {
+      // Ignore if table not yet initialized
+    }
+  }
 
   private runWithSessionLock<T>(
     sessionId: string,
@@ -454,13 +500,14 @@ export class AnonymousSessionEngine {
     sessionId: string;
     direction: 'OUTBOUND' | 'REPLY';
     mediaKind: AnonymousMediaKind;
+    textContent?: string;
   }): void {
     const now = Date.now();
     this.db.sqlite
       .prepare(
         `INSERT OR REPLACE INTO anonymous_relay_messages (
-          relayed_wa_message_id, anon_session_id, session_id, direction, media_kind, created_at
-        ) VALUES (?, ?, ?, ?, ?, ?)`
+          relayed_wa_message_id, anon_session_id, session_id, direction, media_kind, text_content, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)`
       )
       .run(
         params.messageId,
@@ -468,6 +515,7 @@ export class AnonymousSessionEngine {
         params.sessionId,
         params.direction,
         params.mediaKind,
+        params.textContent || '',
         now
       );
 
@@ -483,7 +531,7 @@ export class AnonymousSessionEngine {
       this.db.sqlite
         .prepare(
           `UPDATE anonymous_relay_sessions
-           SET state = 'active', last_activity_at = ?, replies_relayed_count = replies_relayed_count + 1
+           SET state = 'active', last_activity_at = ?, replies_relayed_count = replies_relayed_count + 1, unread_count = COALESCE(unread_count, 0) + 1
            WHERE id = ? AND session_id = ?`
         )
         .run(now, params.anonSessionId, params.sessionId);
@@ -537,6 +585,7 @@ export class AnonymousSessionEngine {
       sessionId: params.sessionId,
       direction: 'OUTBOUND',
       mediaKind: 'text',
+      textContent: cleanText,
     });
 
     emitIdentityTelemetry({
@@ -739,6 +788,7 @@ export class AnonymousSessionEngine {
       sessionId: params.sessionId,
       direction: fromIsReceiver ? 'REPLY' : 'OUTBOUND',
       mediaKind: 'text',
+      textContent: cleanText,
     });
 
     emitIdentityTelemetry({
@@ -889,6 +939,409 @@ export class AnonymousSessionEngine {
       ...existing,
       lastActivityAt: now,
       state: 'closed',
+    };
+  }
+
+  /**
+   * Looks up an anonymous session by its ID across all WhatsApp sessions (optionally scoped by ownerTelegramId).
+   */
+  public getAnonymousSessionById(
+    anonSessionId: string,
+    ownerTelegramId?: number
+  ): AnonymousSession | null {
+    this.purgeExpiredSessions();
+    const cleanId = String(anonSessionId || '').trim();
+    if (!cleanId) return null;
+
+    if (ownerTelegramId && ownerTelegramId > 0) {
+      const row = this.db.sqlite
+        .prepare(
+          `SELECT * FROM anonymous_relay_sessions WHERE id = ? AND (owner_telegram_id = ? OR owner_telegram_id = 0) LIMIT 1`
+        )
+        .get(cleanId, ownerTelegramId) as AnonymousSessionRow | undefined;
+      return row ? rowToSession(row) : null;
+    }
+
+    const row = this.db.sqlite
+      .prepare(`SELECT * FROM anonymous_relay_sessions WHERE id = ? LIMIT 1`)
+      .get(cleanId) as AnonymousSessionRow | undefined;
+    return row ? rowToSession(row) : null;
+  }
+
+  /**
+   * Creates or re-opens an interactive Anonymous Chat Room session for a recipient (`targetPnJid` and/or `targetLidJid`).
+   */
+  public createOrOpenRoomSession(params: {
+    sessionId: string;
+    ownerTelegramId: number;
+    senderJid?: string;
+    senderLidJid?: string;
+    targetPnJid?: string;
+    targetLidJid?: string;
+    targetDisplayLabel?: string;
+    ttlMs?: number;
+  }): AnonymousSession {
+    this.purgeExpiredSessions();
+    const now = Date.now();
+    const ttlMs = Math.max(
+      60_000,
+      Math.min(7 * 24 * 60 * 60 * 1000, params.ttlMs ?? 7 * 24 * 60 * 60 * 1000)
+    );
+    const expiresAt = now + ttlMs;
+
+    const cleanPn = extractCleanPn(params.targetPnJid) || undefined;
+    const cleanLid = extractCleanLid(params.targetLidJid) || undefined;
+    const primaryReceiverJid =
+      cleanPn || cleanLid || jidNormalizedUser(params.targetPnJid || params.targetLidJid || '');
+    if (!primaryReceiverJid) {
+      throw new ValidationError('تعذر تحديد معرف المستلم لبدء الجلسة المجهولة.');
+    }
+
+    // Check if an active room already exists for this admin & recipient
+    const existingList = this.listAnonymousSessions({
+      ownerTelegramId: params.ownerTelegramId,
+      includeClosed: false,
+    });
+    const matchedExisting = existingList.find((s) => {
+      if (cleanPn && matchesPartyIdentity(cleanPn, s.receiverJid, s.receiverLidJid)) {
+        return true;
+      }
+      if (cleanLid && matchesPartyIdentity(cleanLid, s.receiverJid, s.receiverLidJid)) {
+        return true;
+      }
+      return matchesPartyIdentity(primaryReceiverJid, s.receiverJid, s.receiverLidJid);
+    });
+
+    if (matchedExisting) {
+      const updatedReceiverJid = cleanPn || matchedExisting.receiverJid;
+      const updatedReceiverLid = cleanLid || matchedExisting.receiverLidJid || null;
+      const updatedAlias =
+        params.targetDisplayLabel?.trim() || matchedExisting.senderAlias;
+      this.db.sqlite
+        .prepare(
+          `UPDATE anonymous_relay_sessions
+           SET session_id = ?, receiver_jid = ?, receiver_lid_jid = ?, sender_alias = ?,
+               state = 'active', last_activity_at = ?, expires_at = ?
+           WHERE id = ?`
+        )
+        .run(
+          params.sessionId,
+          updatedReceiverJid,
+          updatedReceiverLid,
+          updatedAlias,
+          now,
+          expiresAt,
+          matchedExisting.id
+        );
+      return this.getAnonymousSessionById(matchedExisting.id)!;
+    }
+
+    const id = this.generateAnonId();
+    const senderPrimary =
+      extractCleanPn(params.senderJid) ||
+      extractCleanLid(params.senderLidJid) ||
+      params.senderJid ||
+      'self@s.whatsapp.net';
+    const senderLid = extractCleanLid(params.senderLidJid) || null;
+    const aliasLabel =
+      (params.targetDisplayLabel || '').trim().slice(0, 64) ||
+      (cleanPn ? `+${cleanPn.split('@')[0]}` : cleanLid || primaryReceiverJid);
+
+    this.db.sqlite
+      .prepare(
+        `INSERT INTO anonymous_relay_sessions (
+          id, session_id, owner_telegram_id, sender_jid, sender_lid_jid,
+          receiver_jid, receiver_lid_jid, sender_alias,
+          mask_phone_presentation, prefer_lid_delivery,
+          created_at, last_activity_at, expires_at,
+          messages_relayed_count, replies_relayed_count, unread_count, state
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 1, ?, ?, ?, 0, 0, 0, 'active')`
+      )
+      .run(
+        id,
+        params.sessionId,
+        params.ownerTelegramId || 0,
+        senderPrimary,
+        senderLid,
+        primaryReceiverJid,
+        cleanLid || null,
+        aliasLabel,
+        now,
+        now,
+        expiresAt
+      );
+
+    return this.getAnonymousSessionById(id)!;
+  }
+
+  /**
+   * Records an outbound message sent from the interactive Anonymous Chat Room.
+   */
+  public recordRoomOutboundMessage(params: {
+    anonSessionId: string;
+    sessionId: string;
+    messageId: string;
+    text: string;
+    mediaKind?: AnonymousMediaKind;
+    deliveredLidJid?: string;
+    resolvedPnJid?: string;
+  }): AnonymousSession | null {
+    const sess = this.getAnonymousSessionById(params.anonSessionId);
+    if (!sess) return null;
+
+    const now = Date.now();
+    const cleanText = String(params.text || '').trim();
+    const cleanLid = extractCleanLid(params.deliveredLidJid) || sess.receiverLidJid || null;
+    const cleanPn = extractCleanPn(params.resolvedPnJid) || undefined;
+    const receiverJid = cleanPn || sess.receiverJid;
+
+    this.db.sqlite
+      .prepare(
+        `INSERT OR REPLACE INTO anonymous_relay_messages (
+          relayed_wa_message_id, anon_session_id, session_id, direction, media_kind, text_content, created_at
+        ) VALUES (?, ?, ?, 'OUTBOUND', ?, ?, ?)`
+      )
+      .run(
+        params.messageId,
+        sess.id,
+        params.sessionId,
+        params.mediaKind || 'text',
+        cleanText,
+        now
+      );
+
+    this.db.sqlite
+      .prepare(
+        `UPDATE anonymous_relay_sessions
+         SET session_id = ?, receiver_jid = ?, receiver_lid_jid = ?,
+             state = 'active', last_activity_at = ?, messages_relayed_count = messages_relayed_count + 1
+         WHERE id = ?`
+      )
+      .run(params.sessionId, receiverJid, cleanLid, now, sess.id);
+
+    return this.getAnonymousSessionById(sess.id);
+  }
+
+  /**
+   * Returns chronological message history for an Anonymous Chat Room.
+   */
+  public getSessionMessages(
+    anonSessionId: string,
+    limit = 15
+  ): AnonymousRoomMessage[] {
+    const safeLimit = Math.max(1, Math.min(100, limit));
+    const rows = this.db.sqlite
+      .prepare(
+        `SELECT * FROM anonymous_relay_messages
+         WHERE anon_session_id = ?
+         ORDER BY created_at DESC
+         LIMIT ?`
+      )
+      .all(anonSessionId.trim(), safeLimit) as unknown as AnonymousMessageRow[];
+
+    return rows.reverse().map((r) => ({
+      messageId: r.relayed_wa_message_id,
+      anonSessionId: r.anon_session_id,
+      sessionId: r.session_id,
+      direction: r.direction === 'OUTBOUND' ? 'OUTBOUND' : 'INBOUND',
+      mediaKind: (r.media_kind as AnonymousMediaKind) || 'text',
+      textContent: r.text_content || '',
+      createdAt: r.created_at,
+    }));
+  }
+
+  /**
+   * Resets unread replies count to 0 when the user enters or refreshes the room.
+   */
+  public markSessionRead(anonSessionId: string): void {
+    this.db.sqlite
+      .prepare(
+        `UPDATE anonymous_relay_sessions SET unread_count = 0 WHERE id = ?`
+      )
+      .run(anonSessionId.trim());
+  }
+
+  /**
+   * Permanently deletes an anonymous session and its transcript history.
+   */
+  public deleteAnonymousSession(
+    anonSessionId: string,
+    ownerTelegramId?: number
+  ): boolean {
+    const existing = this.getAnonymousSessionById(anonSessionId, ownerTelegramId);
+    if (!existing) return false;
+
+    this.db.sqlite
+      .prepare(`DELETE FROM anonymous_relay_messages WHERE anon_session_id = ?`)
+      .run(existing.id);
+    const info = this.db.sqlite
+      .prepare(`DELETE FROM anonymous_relay_sessions WHERE id = ?`)
+      .run(existing.id);
+    return Number(info.changes ?? 0) > 0;
+  }
+
+  /**
+   * Matches an incoming WhatsApp message (whether addressed from `@lid` or `@s.whatsapp.net`)
+   * against active Anonymous Chat Sessions and records the reply in `anonymous_relay_messages`.
+   */
+  public matchAndRecordIncomingRoomReply(params: {
+    sessionId: string;
+    candidateJids: Array<string | undefined | null>;
+    messageId?: string;
+    text: string;
+    quotedMessageId?: string;
+    fromMe?: boolean;
+    markReadImmediately?: boolean;
+  }): {
+    matched: boolean;
+    session?: AnonymousSession;
+    message?: AnonymousRoomMessage;
+  } {
+    if (params.fromMe) {
+      return { matched: false };
+    }
+    const cleanText = String(params.text || '').trim();
+    if (!cleanText) {
+      return { matched: false };
+    }
+
+    const normalizedCandidates = new Set<string>();
+    let discoveredPn: string | undefined;
+    let discoveredLid: string | undefined;
+
+    for (const raw of params.candidateJids) {
+      if (!raw || typeof raw !== 'string') continue;
+      const trimmed = raw.trim();
+      if (!trimmed || trimmed.endsWith('@g.us') || trimmed === 'status@broadcast') {
+        continue;
+      }
+      normalizedCandidates.add(jidNormalizedUser(trimmed));
+      const pn = extractCleanPn(trimmed);
+      if (pn) {
+        normalizedCandidates.add(pn);
+        if (!discoveredPn) discoveredPn = pn;
+      }
+      const lid = extractCleanLid(trimmed);
+      if (lid) {
+        normalizedCandidates.add(lid);
+        if (!discoveredLid) discoveredLid = lid;
+      }
+    }
+
+    if (normalizedCandidates.size === 0) {
+      return { matched: false };
+    }
+
+    this.purgeExpiredSessions();
+
+    let matchedSession: AnonymousSession | null = null;
+
+    // 1. Check quoted message ID first
+    if (params.quotedMessageId) {
+      const msgRow = this.db.sqlite
+        .prepare(
+          `SELECT * FROM anonymous_relay_messages WHERE relayed_wa_message_id = ? LIMIT 1`
+        )
+        .get(params.quotedMessageId) as AnonymousMessageRow | undefined;
+      if (msgRow) {
+        const s = this.getAnonymousSessionById(msgRow.anon_session_id);
+        if (s && (s.state === 'active' || s.state === 'pending')) {
+          matchedSession = s;
+        }
+      }
+    }
+
+    // 2. Match against active sessions by EITHER receiverJid (PN) OR receiverLidJid (LID)
+    if (!matchedSession) {
+      const activeSessions = this.listAnonymousSessions({ includeClosed: false });
+      // Prefer sessions bound to the same WhatsApp sessionId first, then any active session
+      const sortedSessions = [
+        ...activeSessions.filter((s) => s.sessionId === params.sessionId),
+        ...activeSessions.filter((s) => s.sessionId !== params.sessionId),
+      ];
+
+      for (const s of sortedSessions) {
+        for (const cand of normalizedCandidates) {
+          if (matchesPartyIdentity(cand, s.receiverJid, s.receiverLidJid)) {
+            matchedSession = s;
+            break;
+          }
+        }
+        if (matchedSession) break;
+      }
+    }
+
+    if (!matchedSession) {
+      return { matched: false };
+    }
+
+    const msgId =
+      params.messageId?.trim() ||
+      `in_${matchedSession.id}_${Date.now()}_${crypto.randomBytes(2).toString('hex')}`;
+
+    // Deduplicate if this exact messageId was already recorded for this session
+    const existingMsg = this.db.sqlite
+      .prepare(
+        `SELECT * FROM anonymous_relay_messages WHERE relayed_wa_message_id = ? AND anon_session_id = ? LIMIT 1`
+      )
+      .get(msgId, matchedSession.id) as AnonymousMessageRow | undefined;
+
+    const now = Date.now();
+    const updatedReceiverLid =
+      discoveredLid || matchedSession.receiverLidJid || null;
+    const updatedReceiverPn =
+      discoveredPn && matchedSession.receiverJid.endsWith('@lid')
+        ? discoveredPn
+        : matchedSession.receiverJid;
+
+    if (!existingMsg) {
+      this.db.sqlite
+        .prepare(
+          `INSERT INTO anonymous_relay_messages (
+            relayed_wa_message_id, anon_session_id, session_id, direction, media_kind, text_content, created_at
+          ) VALUES (?, ?, ?, 'REPLY', 'text', ?, ?)`
+        )
+        .run(msgId, matchedSession.id, matchedSession.sessionId, cleanText, now);
+
+      const unreadIncrement = params.markReadImmediately ? 0 : 1;
+      this.db.sqlite
+        .prepare(
+          `UPDATE anonymous_relay_sessions
+           SET receiver_jid = ?, receiver_lid_jid = ?, state = 'active',
+               last_activity_at = ?,
+               replies_relayed_count = replies_relayed_count + 1,
+               unread_count = COALESCE(unread_count, 0) + ?
+           WHERE id = ?`
+        )
+        .run(
+          updatedReceiverPn,
+          updatedReceiverLid,
+          now,
+          unreadIncrement,
+          matchedSession.id
+        );
+    } else if (existingMsg && !existingMsg.text_content && cleanText) {
+      this.db.sqlite
+        .prepare(
+          `UPDATE anonymous_relay_messages SET text_content = ? WHERE relayed_wa_message_id = ? AND anon_session_id = ?`
+        )
+        .run(cleanText, msgId, matchedSession.id);
+    }
+
+    const refreshed =
+      this.getAnonymousSessionById(matchedSession.id) || matchedSession;
+    return {
+      matched: true,
+      session: refreshed,
+      message: {
+        messageId: msgId,
+        anonSessionId: refreshed.id,
+        sessionId: refreshed.sessionId,
+        direction: 'INBOUND',
+        mediaKind: 'text',
+        textContent: cleanText,
+        createdAt: existingMsg?.created_at ?? now,
+      },
     };
   }
 }

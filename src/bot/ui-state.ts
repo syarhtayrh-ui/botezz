@@ -193,6 +193,10 @@ export function isNavigableRoute(callbackData: string): boolean {
     callbackData === 'menu:sec_analyzer' ||
     callbackData.startsWith('sec:page:') ||
     callbackData.startsWith('sec:download:') ||
+    callbackData === 'menu:anon_sessions' ||
+    callbackData === 'tools:anon_hub' ||
+    callbackData === 'anon:add_prompt' ||
+    callbackData.startsWith('anon:room:') ||
     callbackData === 'tools:prompt_anon_lid' ||
     callbackData === 'tools:prompt_lid_lookup' ||
     callbackData === 'tools:reachout_status' ||

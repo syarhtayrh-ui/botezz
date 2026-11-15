@@ -15,18 +15,238 @@ import {
   getBinaryNodeChild,
   getBinaryNodeChildren,
   generateWAMessageFromContent,
-  isTcTokenExpired,
+  isTcTokenExpired as baileysIsTcTokenExpired,
   shouldSendNewTcToken,
   resolveTcTokenJid,
   resolveIssuanceJid,
   buildTcTokenFromJid,
   storeTcTokensFromIqResult,
+  isHostedPnUser,
+  isHostedLidUser,
   NACK_REASONS,
   SERVER_ERROR_CODES,
   normalizeUsername,
   isValidUsername,
   isValidUsernameKey,
 } from './baileys-compat';
+
+export const USERNAME_QUERY_IDS = {
+  CHECK: '26124072630599520',
+  CHECK_MULTI: '27134626522840290',
+  SET: '27108705368767936',
+  GET: '32618050064506056',
+  GET_RECOMMENDATIONS: '26077456248616956',
+  PIN_SET: '25529696019976770',
+} as const;
+
+export const TC_TOKEN_EXPIRY_SECONDS = 7 * 24 * 60 * 60; // 7 days
+
+export function isTcTokenExpired(timestamp?: number | string | null): boolean {
+  if (timestamp === null || timestamp === undefined) return false;
+  const ts = typeof timestamp === 'string' ? parseInt(timestamp, 10) : timestamp;
+  if (Number.isNaN(ts) || ts <= 0) return true;
+  if (typeof baileysIsTcTokenExpired === 'function') {
+    try {
+      return baileysIsTcTokenExpired(ts);
+    } catch {
+      // Fall through
+    }
+  }
+  return Math.floor(Date.now() / 1000) - ts >= TC_TOKEN_EXPIRY_SECONDS;
+}
+
+export async function resolveTcTokenStorageJid(
+  rawJid: string,
+  getLIDForPN?: (
+    pnJid: string
+  ) => Promise<string | undefined | null> | string | undefined | null
+): Promise<string> {
+  const bareJid = jidNormalizedUser(rawJid);
+  if (!bareJid) return '';
+  if (isPnUser(bareJid) && getLIDForPN) {
+    try {
+      const lid = await getLIDForPN(bareJid);
+      if (lid) return jidNormalizedUser(lid);
+    } catch {
+      // Fallback to bareJid
+    }
+  }
+  return bareJid;
+}
+
+export async function storeTcTokensFromNode(params: {
+  node?: BinaryNode;
+  fallbackJid?: string;
+  keys?: {
+    get: (type: string, ids: string[]) => Promise<Record<string, any>>;
+    set: (data: Record<string, Record<string, any>>) => Promise<void>;
+  };
+  authStateKeys?: {
+    get: (type: string, ids: string[]) => Promise<Record<string, any>>;
+    set: (data: Record<string, Record<string, any>>) => Promise<void>;
+  };
+  getLIDForPN?: (
+    pnJid: string
+  ) => Promise<string | undefined | null> | string | undefined | null;
+}): Promise<number> {
+  const { node, fallbackJid, getLIDForPN } = params;
+  const keyStore = params.keys || params.authStateKeys;
+  if (!node || !keyStore) return 0;
+  const tokensNode = getBinaryNodeChild(node, 'tokens');
+  if (!tokensNode) return 0;
+
+  const tokenNodes = getBinaryNodeChildren(tokensNode, 'token');
+  if (!tokenNodes.length) return 0;
+
+  const defaultJid = fallbackJid || node.attrs?.from;
+  const updates: Record<string, { token: Uint8Array; timestamp?: number }> = {};
+
+  for (const tokenNode of tokenNodes) {
+    if (
+      tokenNode.attrs?.type !== 'trusted_contact' ||
+      !(
+        tokenNode.content instanceof Uint8Array ||
+        Buffer.isBuffer(tokenNode.content)
+      ) ||
+      !tokenNode.content.length
+    ) {
+      continue;
+    }
+
+    const rawJid = tokenNode.attrs?.jid || defaultJid;
+    if (!rawJid) continue;
+
+    const storageJid = await resolveTcTokenStorageJid(rawJid, getLIDForPN);
+    if (!storageJid) continue;
+
+    const existingData: Record<string, any> = await keyStore
+      .get('tctoken', [storageJid])
+      .catch(() => ({} as Record<string, any>));
+    const existingEntry = existingData[storageJid];
+    const timestamp = tokenNode.attrs?.t
+      ? parseInt(tokenNode.attrs.t, 10)
+      : undefined;
+
+    if (
+      existingEntry?.timestamp &&
+      timestamp &&
+      !Number.isNaN(timestamp) &&
+      existingEntry.timestamp > timestamp
+    ) {
+      continue;
+    }
+
+    updates[storageJid] = {
+      token: Buffer.from(tokenNode.content),
+      ...(timestamp && !Number.isNaN(timestamp) ? { timestamp } : {}),
+    };
+  }
+
+  const count = Object.keys(updates).length;
+  if (count > 0) {
+    await keyStore.set({ tctoken: updates });
+  }
+  return count;
+}
+
+export async function buildTcTokenNodeForJid(params: {
+  jid: string;
+  keys?: {
+    get: (type: string, ids: string[]) => Promise<Record<string, any>>;
+    set: (data: Record<string, Record<string, any>>) => Promise<void>;
+  };
+  authStateKeys?: {
+    get: (type: string, ids: string[]) => Promise<Record<string, any>>;
+    set: (data: Record<string, Record<string, any>>) => Promise<void>;
+  };
+  getLIDForPN?: (
+    pnJid: string
+  ) => Promise<string | undefined | null> | string | undefined | null;
+}): Promise<{
+  tcTokenNode?: BinaryNode;
+  storageJid?: string;
+  tokenTimestamp?: number;
+}> {
+  const keyStore = params.keys || params.authStateKeys;
+  if (!keyStore) return {};
+
+  const storageJid = await resolveTcTokenStorageJid(
+    params.jid,
+    params.getLIDForPN
+  );
+  if (!storageJid) return {};
+
+  const tcTokenData: Record<string, any> = await keyStore
+    .get('tctoken', [storageJid])
+    .catch(() => ({} as Record<string, any>));
+  const entry = tcTokenData[storageJid];
+
+  if (!entry?.token) return { storageJid };
+
+  if (isTcTokenExpired(entry.timestamp)) {
+    await keyStore.set({ tctoken: { [storageJid]: null } }).catch(() => {});
+    return { storageJid };
+  }
+
+  const buf = Buffer.isBuffer(entry.token)
+    ? entry.token
+    : entry.token instanceof Uint8Array
+      ? Buffer.from(entry.token)
+      : typeof entry.token === 'string'
+        ? Buffer.from(entry.token, 'base64')
+        : undefined;
+
+  if (!buf || buf.length === 0) return { storageJid };
+
+  const tcTokenNode: BinaryNode = {
+    tag: 'tctoken',
+    attrs: entry.timestamp ? { t: String(entry.timestamp) } : {},
+    content: buf,
+  };
+
+  return {
+    tcTokenNode,
+    storageJid,
+    tokenTimestamp: entry.timestamp,
+  };
+}
+
+export function extractAddressingContext(stanza: BinaryNode): {
+  addressingMode: string;
+  senderAlt?: string;
+  recipientAlt?: string;
+  altSender?: string;
+  altRecipient?: string;
+} {
+  let senderAlt: string | undefined;
+  let recipientAlt: string | undefined;
+  const sender = stanza?.attrs?.participant || stanza?.attrs?.from;
+  const addressingMode =
+    stanza?.attrs?.addressing_mode ||
+    (sender?.endsWith('lid') ? 'lid' : 'pn');
+
+  if (addressingMode === 'lid') {
+    senderAlt =
+      stanza?.attrs?.participant_pn ||
+      stanza?.attrs?.sender_pn ||
+      stanza?.attrs?.peer_recipient_pn;
+    recipientAlt = stanza?.attrs?.recipient_pn;
+  } else {
+    senderAlt =
+      stanza?.attrs?.participant_lid ||
+      stanza?.attrs?.sender_lid ||
+      stanza?.attrs?.peer_recipient_lid;
+    recipientAlt = stanza?.attrs?.recipient_lid;
+  }
+
+  return {
+    addressingMode,
+    senderAlt,
+    recipientAlt,
+    altSender: senderAlt,
+    altRecipient: recipientAlt,
+  };
+}
 
 export interface SessionMemoryStoreLike {
   getLidForPn(pnJid: string): string | undefined;
@@ -981,6 +1201,14 @@ export class WhatsAppIdentityService {
     return sock;
   }
 
+  public getCachedPnForLid(lidJid: string): string | undefined {
+    return this.memoryStore.getPnForLid(lidJid);
+  }
+
+  public getCachedLidForPn(pnJid: string): string | undefined {
+    return this.memoryStore.getLidForPn(pnJid);
+  }
+
   /**
    * Atomically persists a validated PN <-> LID mapping into `signalRepository.lidMapping`
    * and `SessionMemoryStore`.
@@ -1118,32 +1346,66 @@ export class WhatsAppIdentityService {
           }
         }
 
-        // 4. Native USync Query (Contact + LID + Username)
+        // 4. Native USync Query (Primary: context='message' + Device + LID protocol from WhiskeySockets/Baileys/src/Socket/messages-send.ts)
         let resolvedLid: string | undefined;
         let resolvedUsername: string | undefined;
 
         if (typeof sock.executeUSyncQuery === 'function' && typeof USyncQuery === 'function') {
           try {
-            const uQuery = new USyncQuery()
-              .withContext('interactive')
-              .withMode('query')
-              .withContactProtocol()
-              .withLIDProtocol();
-            if (typeof uQuery.withUsernameProtocol === 'function') {
-              uQuery.withUsernameProtocol();
-            }
-            const uUser = new USyncUser().withPhone(`+${phoneDigits}`).withId(pnJid);
-            uQuery.withUser(uUser);
-            const res = await sock.executeUSyncQuery(uQuery);
-            const item = res?.list?.[0];
-            if (item) {
-              resolvedLid = extractCleanLid(item.lid || item.id);
-              if (typeof item.username === 'string' && item.username) {
-                resolvedUsername = normalizeUsername(item.username);
+            const msgQuery = new USyncQuery()
+              .withContext('message' as any)
+              .withDeviceProtocol()
+              .withLIDProtocol()
+              .withUser(new USyncUser().withId(pnJid));
+            const msgRes = await sock.executeUSyncQuery(msgQuery);
+            const firstItem = msgRes?.list?.[0];
+            if (firstItem) {
+              resolvedLid = extractCleanLid(firstItem.lid || firstItem.id);
+              if (typeof firstItem.username === 'string' && firstItem.username) {
+                resolvedUsername = normalizeUsername(firstItem.username);
               }
             }
           } catch {
-            // Fall through to onWhatsApp / direct IQ
+            // Fall through to interactive USync
+          }
+
+          if (!resolvedLid) {
+            try {
+              const uQuery = new USyncQuery()
+                .withContext('interactive')
+                .withMode('query')
+                .withContactProtocol()
+                .withLIDProtocol();
+              if (typeof uQuery.withUsernameProtocol === 'function') {
+                uQuery.withUsernameProtocol();
+              }
+              const uUser = new USyncUser().withPhone(`+${phoneDigits}`).withId(pnJid);
+              uQuery.withUser(uUser);
+              const res = await sock.executeUSyncQuery(uQuery);
+              const item = res?.list?.[0];
+              if (item) {
+                resolvedLid = extractCleanLid(item.lid || item.id);
+                if (typeof item.username === 'string' && item.username) {
+                  resolvedUsername = normalizeUsername(item.username);
+                }
+              }
+            } catch {
+              // Fall through to getUSyncDevices / onWhatsApp / direct IQ
+            }
+          }
+        }
+
+        if (!resolvedLid && typeof sock.getUSyncDevices === 'function') {
+          try {
+            await sock.getUSyncDevices([pnJid], false, false).catch(() => []);
+            const mappedAfterDevices =
+              (await sock.signalRepository?.lidMapping
+                ?.getLIDForPN?.(pnJid)
+                .catch(() => undefined)) ||
+              this.memoryStore.getLidForPn(pnJid);
+            resolvedLid = extractCleanLid(mappedAfterDevices);
+          } catch {
+            // Fall through
           }
         }
 
@@ -1212,6 +1474,9 @@ export class WhatsAppIdentityService {
 
         if (resolvedLid) {
           await this.ensureLidMapping(pnJid, resolvedLid);
+          if (typeof sock.assertSessions === 'function') {
+            await sock.assertSessions([resolvedLid], true).catch(() => false);
+          }
           emitIdentityTelemetry({
             sessionId: this.sessionId,
             event: 'LID_RESOLUTION_SUCCESS',
@@ -1499,6 +1764,52 @@ export class WhatsAppIdentityService {
               };
         }
       }
+      // Minimal USyncQuery from innovatorssoft/Baileys/lib/Socket/username.js (contact + username only)
+      if (typeof sock.executeUSyncQuery === 'function' && typeof USyncQuery === 'function') {
+        try {
+          const uUser = new USyncUser().withUsername(handle);
+          if (options?.usernameKey && typeof uUser.withUsernameKey === 'function') {
+            uUser.withUsernameKey(options.usernameKey);
+          }
+          const usyncQuery = new USyncQuery()
+            .withContactProtocol()
+            .withUser(uUser);
+          const result = await sock.executeUSyncQuery(usyncQuery);
+          const entry = result?.list?.[0];
+          if (entry && (entry.contact || entry.id || entry.lid)) {
+            const entryJid =
+              typeof entry.id === 'string'
+                ? entry.id
+                : extractCleanLid(entry.lid) || '';
+            const lidCandidate =
+              extractCleanLid(entry.lid) ||
+              (isLidUser(entryJid) ? entryJid : undefined);
+            const pnCandidate = extractCleanPn(
+              isPnUser(entryJid) ? entryJid : undefined
+            );
+            if (lidCandidate && !pnCandidate) {
+              const lidRes = await this.resolveLidToPn(lidCandidate).catch(() => null);
+              return lidRes
+                ? { ...lidRes, username: handle, source: 'usync' }
+                : { lidJid: lidCandidate, username: handle, source: 'usync' };
+            }
+            if (pnCandidate) {
+              const pnRes = await this.resolvePnToLid(pnCandidate).catch(() => null);
+              return pnRes
+                ? { ...pnRes, username: handle, source: 'usync' }
+                : {
+                    pnJid: pnCandidate,
+                    phoneNumber: `+${pnCandidate.split('@')[0]}`,
+                    lidJid: lidCandidate,
+                    username: handle,
+                    source: 'usync',
+                  };
+            }
+          }
+        } catch {
+          // Fall through
+        }
+      }
       return null;
     }
 
@@ -1714,22 +2025,18 @@ export class WhatsAppIdentityService {
         }
       }
 
-      // 2. Fallback via USyncQuery + withUsernameProtocol()
+      // 2. Fallback via minimal USyncQuery (from innovatorssoft/Baileys/lib/Socket/username.js)
       if (typeof sock.executeUSyncQuery === 'function' && typeof USyncQuery === 'function') {
         const uUser = new USyncUser().withUsername(username);
-        if (usernameKey) uUser.withUsernameKey(usernameKey);
-        const uQuery = new USyncQuery()
-          .withContext('interactive')
-          .withMode('query')
-          .withContactProtocol()
-          .withLIDProtocol();
-        if (typeof uQuery.withUsernameProtocol === 'function') {
-          uQuery.withUsernameProtocol();
+        if (usernameKey && typeof uUser.withUsernameKey === 'function') {
+          uUser.withUsernameKey(usernameKey);
         }
-        uQuery.withUser(uUser);
+        const uQuery = new USyncQuery()
+          .withContactProtocol()
+          .withUser(uUser);
         const usyncRes = await sock.executeUSyncQuery(uQuery);
         const first = usyncRes?.list?.[0];
-        if (!first || !first.contact) {
+        if (!first || (!first.contact && !first.id && !first.lid)) {
           return {
             username,
             available: true,
@@ -1740,10 +2047,15 @@ export class WhatsAppIdentityService {
           };
         }
         const lidJid = extractCleanLid(first.lid || first.id);
+        let resolvedPnJid = extractCleanPn(first.id);
+        if (lidJid && !resolvedPnJid) {
+          const rev = await this.resolveLidToPn(lidJid).catch(() => null);
+          resolvedPnJid = rev?.pnJid;
+        }
         return {
           username,
           available: false,
-          jid: first.id,
+          jid: resolvedPnJid || first.id || lidJid,
           lidJid,
           supported: true,
           status: 'taken',
@@ -2150,5 +2462,7 @@ export {
   extractLidAttrFromBinaryNode,
   extractPnAttrFromBinaryNode,
   extractUsernameAttrFromBinaryNode,
+  isHostedPnUser,
+  isHostedLidUser,
 };
 export type { InspectableBinaryNode };

@@ -2081,8 +2081,137 @@ describe('@hiroosy/baileys-lite & Real WhatsApp VoIP Video Call Suite', () => {
       assert.equal(dlView.mediaAttachments?.length, 1);
       assert.equal(dlView.mediaAttachments?.[0]?.kind, 'video');
     });
+
+    it('Fixes Bugs #1–#5: SmartH264Assembler caches standalone marker=true SPS/PPS, recovers from UDP sequence gaps, strips RTP padding, registers multi-SSRC peer video subscriptions, and records remote camera via global hooks', async () => {
+      const {
+        SmartH264Assembler,
+        computeWhatsAppSsrc,
+        buildMultiSenderSubscriptions,
+        buildPeerSsrcDescriptorEntries,
+        patchWaManualRelayPrototype,
+        emitGlobalInboundVideo,
+        emitGlobalInboundAudio,
+      } = await import('../../src/whatsapp/voip-runtime-patch');
+      const { VoipCallRecorder } = await import(
+        '../../src/whatsapp/voip-call-recorder'
+      );
+
+      // 1. SmartH264Assembler: standalone SPS (NALU 7) and PPS (NALU 8) sent with marker=true MUST NOT be discarded
+      const assembler = new SmartH264Assembler();
+      const spsNalu = new Uint8Array([0x67, 0x42, 0xc0, 0x1f, 0xda, 0x02]);
+      const ppsNalu = new Uint8Array([0x68, 0xce, 0x3c, 0x80]);
+      const idrNalu = new Uint8Array([0x65, 0x88, 0x84, 0x21, 0xa0, 0xff]);
+      const pFrame1 = new Uint8Array([0x41, 0x9a, 0x22, 0x11, 0x33]);
+      const pFrame2 = new Uint8Array([0x41, 0x9a, 0x44, 0x55, 0x66]);
+
+      const rSps = assembler.push(100, true, spsNalu, 9000);
+      assert.equal(rSps.complete, false, 'Standalone SPS with marker=true should be cached, not emitted alone');
+      assert.ok(assembler.cachedSps);
+
+      const rPps = assembler.push(101, true, ppsNalu, 9000);
+      assert.equal(rPps.complete, false, 'Standalone PPS with marker=true should be cached, not emitted alone');
+      assert.ok(assembler.cachedPps);
+
+      const rIdr = assembler.push(102, true, idrNalu, 9000);
+      assert.equal(rIdr.complete, true, 'IDR frame must complete and include cached SPS + PPS');
+      assert.ok(rIdr.accessUnit);
+      // Verify Annex-B start codes + SPS (0x67) + PPS (0x68) + IDR (0x65) are all present
+      assert.equal(rIdr.accessUnit[4], 0x67);
+
+      // Simulate a UDP sequence gap (seq 103 dropped, seq 104 arrives as a valid P-frame)
+      const rGapPFrame = assembler.push(104, true, pFrame1, 12000);
+      assert.equal(rGapPFrame.seqGap, true, 'Sequence gap 102 -> 104 must be detected');
+      assert.equal(
+        rGapPFrame.complete,
+        true,
+        'SmartH264Assembler must NOT permanently freeze on sequence gap; subsequent complete P-frame must emit'
+      );
+      assert.ok(rGapPFrame.accessUnit);
+
+      const rNextPFrame = assembler.push(105, true, pFrame2, 15000);
+      assert.equal(rNextPFrame.complete, true);
+      assert.equal(assembler.totalFramesEmitted, 3);
+
+      // 2. Multi-SSRC derivation & WaManualRelay multi-subscription patching
+      const callId = 'WA_VIDEO_CALL_99';
+      const peerDeviceJid = '966501234567:0@s.whatsapp.net';
+      const audioSsrc = computeWhatsAppSsrc(callId, peerDeviceJid, 0);
+      const videoSsrc = computeWhatsAppSsrc(callId, peerDeviceJid, 2);
+      assert.notEqual(audioSsrc, videoSsrc);
+
+      const multiSubs = buildMultiSenderSubscriptions([audioSsrc, videoSsrc]);
+      assert.equal(multiSubs.byteLength, 16, '8 bytes per unique SSRC');
+      const peerDesc = buildPeerSsrcDescriptorEntries([audioSsrc, videoSsrc], 1);
+      assert.equal(peerDesc.byteLength, 40, '20 bytes per unique SSRC');
+
+      const sentRelayBuffers: ArrayBuffer[] = [];
+      const fakeRelayProto: Record<string, any> = {
+        sendBindingRegistrations() {},
+        sendAllocate() {},
+      };
+      patchWaManualRelayPrototype(fakeRelayProto, {
+        buildBindingRequestWithSubs: (
+          _u?: Uint8Array,
+          _k?: Uint8Array,
+          subs?: Uint8Array
+        ) => subs ?? new Uint8Array(0),
+      });
+      const relayInst = Object.assign(Object.create(fakeRelayProto), {
+        subscriptionSsrc: audioSsrc,
+        sendToChannel(_conn: unknown, ab: ArrayBuffer) {
+          sentRelayBuffers.push(ab);
+        },
+        resendSubscriptions() {},
+      });
+      relayInst.setPeerSubscriptionSsrcs([audioSsrc, videoSsrc]);
+      relayInst.sendBindingRegistrations(
+        { localUfrag: 'abcd1234', stunTransactionId: new Uint8Array(12) },
+        { key: 'relaykey', authToken: 'ufrag' },
+        audioSsrc
+      );
+      assert.ok(
+        sentRelayBuffers.some((b) => b.byteLength === 16),
+        'Patched WaManualRelay must send multi-SSRC binding subscriptions (16 bytes for audio+video)'
+      );
+
+      // 3. End-to-End Global Hook -> VoipCallRecorder H.264 + Audio capture and MP4 muxing
+      const recorder = new VoipCallRecorder({
+        callId: 'vcall_global_hook_test',
+        sessionId: 'sess_global_hook',
+        recipientJid: peerDeviceJid,
+        outboundVideoPath: validLandscapeMp4,
+        recordingsDir: tmpDir,
+        isMockMode: false,
+      });
+      recorder.setVoipCallId(callId);
+
+      // Emit assembled SPS+PPS+IDR and P-frames via global inbound video hook
+      emitGlobalInboundVideo(callId, rIdr.accessUnit!);
+      emitGlobalInboundVideo(callId, rGapPFrame.accessUnit!);
+      emitGlobalInboundVideo(callId, rNextPFrame.accessUnit!);
+
+      // Emit decoded PCM Float32 audio via global inbound audio hook
+      const pcmSamples = new Float32Array(1600);
+      for (let i = 0; i < pcmSamples.length; i++) {
+        pcmSamples[i] = Math.sin((2 * Math.PI * 440 * i) / 16000) * 0.25;
+      }
+      emitGlobalInboundAudio(callId, pcmSamples);
+
+      assert.ok(
+        recorder.inboundVideoFramesRecorded >= 3,
+        `Expected >= 3 recorded video frames from global hook, got ${recorder.inboundVideoFramesRecorded}`
+      );
+      assert.ok(recorder.inboundAudioPacketsRecorded >= 1);
+
+      const summary = await recorder.finalizeRecording();
+      assert.equal(
+        summary.recordingStatus,
+        'READY',
+        'VoipCallRecorder must produce READY status (never NO_REMOTE_CAMERA) when remote camera frames arrive via global hook'
+      );
+      assert.equal(summary.remoteCameraCaptured, true);
+      assert.ok(summary.recordedVideoPath && fs.existsSync(summary.recordedVideoPath));
+      assert.ok((summary.recordedVideoSizeBytes ?? 0) > 0);
+    });
   });
 });
-
-
-

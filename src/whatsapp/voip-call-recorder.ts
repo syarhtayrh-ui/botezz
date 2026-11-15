@@ -7,6 +7,10 @@ import type { WaCallMediaSessionLike } from '@hiroosy/baileys-lite/voip';
 import { createMinimalMp4Buffer } from '../function-lab/media-sticker-toolkit';
 import { createLogger } from '../logging/logger';
 import { getNetworkTrafficMonitor } from '../network/network-traffic-monitor';
+import {
+  registerGlobalInboundAudioHook,
+  registerGlobalInboundVideoHook,
+} from './voip-runtime-patch';
 
 const execFileAsync = promisify(execFile);
 const log = createLogger('voip-call-recorder');
@@ -1275,6 +1279,9 @@ export class VoipCallRecorder {
   private lastNativeVideoSig = '';
   private lastNativeAudioSig = '';
   private explicitPeerSrtpKeys: SrtpKeyMaterial | null = null;
+  private voipCallId?: string;
+  private unregisterGlobalVideoHook: (() => void) | null = null;
+  private unregisterGlobalAudioHook: (() => void) | null = null;
 
   constructor(options: VoipCallRecorderOptions) {
     this.callId = options.callId;
@@ -1308,6 +1315,81 @@ export class VoipCallRecorder {
         callId: this.callId,
         error: err instanceof Error ? err.message : String(err),
       });
+    }
+
+    this.unregisterGlobalVideoHook = registerGlobalInboundVideoHook(
+      (hookCallId, accessUnit) => {
+        if (this.status !== 'RECORDING' || !this.matchesHookCallId(hookCallId)) {
+          return;
+        }
+        if (this.inVideoWriteHook) return;
+        const sig = `${accessUnit.byteLength}:${accessUnit[0] ?? 0}:${accessUnit[Math.min(4, accessUnit.byteLength - 1)] ?? 0}:${accessUnit[accessUnit.byteLength - 1] ?? 0}:${Math.floor(Date.now() / 10)}`;
+        if (sig === this.lastNativeVideoSig) return;
+        this.lastNativeVideoSig = sig;
+        this.receivingNativeDecodedVideo = true;
+        this.inVideoWriteHook = true;
+        try {
+          this.writeDepacketizedInboundVideoH264(accessUnit);
+        } finally {
+          this.inVideoWriteHook = false;
+        }
+      }
+    );
+
+    this.unregisterGlobalAudioHook = registerGlobalInboundAudioHook(
+      (hookCallId, pcmFloat32) => {
+        if (this.status !== 'RECORDING' || !this.matchesHookCallId(hookCallId)) {
+          return;
+        }
+        if (this.inAudioWriteHook) return;
+        const pcmBuf = convertSampleValueToBuffer(pcmFloat32);
+        if (!pcmBuf) return;
+        const sig = `${pcmBuf.length}:${pcmBuf[0] ?? 0}:${pcmBuf[pcmBuf.length - 1] ?? 0}:${Math.floor(Date.now() / 10)}`;
+        if (sig === this.lastNativeAudioSig) return;
+        this.lastNativeAudioSig = sig;
+        this.receivingNativeDecodedAudio = true;
+        this.inAudioWriteHook = true;
+        try {
+          this.writeDecodedInboundAudioPcm(pcmBuf);
+        } finally {
+          this.inAudioWriteHook = false;
+        }
+      }
+    );
+  }
+
+  public setVoipCallId(voipCallId: string): void {
+    if (voipCallId) {
+      this.voipCallId = voipCallId;
+    }
+  }
+
+  private matchesHookCallId(hookCallId: string): boolean {
+    if (!hookCallId) return false;
+    if (hookCallId === this.callId || hookCallId === this.voipCallId) {
+      return true;
+    }
+    const attachedSessionCallId =
+      (this.attachedSession?.info as { callId?: string } | undefined)?.callId ||
+      (this.attachedSession as { callId?: string } | null)?.callId;
+    if (attachedSessionCallId && hookCallId === attachedSessionCallId) {
+      return true;
+    }
+    // If voipCallId has not yet been assigned on this recorder instance, accept the active call's frames
+    if (!this.voipCallId && !attachedSessionCallId) {
+      return true;
+    }
+    return false;
+  }
+
+  private cleanupGlobalHooks(): void {
+    if (this.unregisterGlobalVideoHook) {
+      this.unregisterGlobalVideoHook();
+      this.unregisterGlobalVideoHook = null;
+    }
+    if (this.unregisterGlobalAudioHook) {
+      this.unregisterGlobalAudioHook();
+      this.unregisterGlobalAudioHook = null;
     }
   }
 
@@ -1381,6 +1463,7 @@ export class VoipCallRecorder {
    * Cancels and disposes temporary recording files when a call aborts before connecting.
    */
   public dispose(): void {
+    this.cleanupGlobalHooks();
     this.stopPliWatchdog();
     this.status = 'DISABLED';
     this.closeTempDescriptors();
@@ -2677,6 +2760,7 @@ export class VoipCallRecorder {
   }
 
   private async executeFinalizeRecording(): Promise<VoipCallRecordingSummary> {
+    this.cleanupGlobalHooks();
     this.stopPliWatchdog();
     this.status = 'FINALIZING';
     this.closeTempDescriptors();

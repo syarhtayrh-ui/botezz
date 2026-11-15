@@ -130,25 +130,50 @@ export const getDevice: (
             ? 'desktop'
             : 'unknown');
 
-export const extractAddressingContext: (
-  stanza: BinaryNode
-) => {
+export function isHostedPnUser(jid: string | undefined): boolean {
+  return Boolean(jid && jid.endsWith('@hosted'));
+}
+
+export function isHostedLidUser(jid: string | undefined): boolean {
+  return Boolean(jid && jid.endsWith('@hosted.lid'));
+}
+
+export function extractAddressingContext(stanza: BinaryNode): {
   addressingMode: string;
+  senderAlt?: string;
+  recipientAlt?: string;
   altSender?: string;
   altRecipient?: string;
-} =
-  (
-    BaileysNamespace as unknown as {
-      extractAddressingContext?: (stanza: BinaryNode) => {
-        addressingMode: string;
-        altSender?: string;
-        altRecipient?: string;
-      };
-    }
-  ).extractAddressingContext ||
-  ((stanza: BinaryNode) => ({
-    addressingMode: stanza?.attrs?.addressing_mode || 'pn',
-  }));
+} {
+  let senderAlt: string | undefined;
+  let recipientAlt: string | undefined;
+  const sender = stanza?.attrs?.participant || stanza?.attrs?.from;
+  const addressingMode =
+    stanza?.attrs?.addressing_mode ||
+    (sender?.endsWith('lid') ? 'lid' : 'pn');
+
+  if (addressingMode === 'lid') {
+    senderAlt =
+      stanza?.attrs?.participant_pn ||
+      stanza?.attrs?.sender_pn ||
+      stanza?.attrs?.peer_recipient_pn;
+    recipientAlt = stanza?.attrs?.recipient_pn;
+  } else {
+    senderAlt =
+      stanza?.attrs?.participant_lid ||
+      stanza?.attrs?.sender_lid ||
+      stanza?.attrs?.peer_recipient_lid;
+    recipientAlt = stanza?.attrs?.recipient_lid;
+  }
+
+  return {
+    addressingMode,
+    senderAlt,
+    recipientAlt,
+    altSender: senderAlt,
+    altRecipient: recipientAlt,
+  };
+}
 
 export async function getUSyncDevices(
   sock: Partial<WASocket> | CompatibleWhatsAppSocket,

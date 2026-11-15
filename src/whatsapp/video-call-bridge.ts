@@ -1846,6 +1846,7 @@ export class RealVideoCallService extends EventEmitter {
     const recordVoipCallId = (cid?: string | null) => {
       if (!cid) return;
       stream.voipCallId = cid;
+      stream.recorder?.setVoipCallId(cid);
       if (!stream.nativeStanzaCallIds.includes(cid)) {
         stream.nativeStanzaCallIds.push(cid);
       }
