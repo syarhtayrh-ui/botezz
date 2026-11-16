@@ -1382,6 +1382,10 @@ export interface WhatsAppSessionDriver {
     caption?: string;
     ptv?: boolean;
     gifPlayback?: boolean;
+    viewOnce?: boolean;
+    ptt?: boolean;
+    waveform?: Uint8Array;
+    isSticker?: boolean;
   }): Promise<{ messageId: string }>;
   sendNode?(node: BinaryNode): Promise<void>;
   query?(node: BinaryNode, timeoutMs?: number): Promise<unknown>;
@@ -1401,7 +1405,36 @@ export interface WhatsAppSessionDriver {
   listParticipatingGroups(): Promise<GroupSummary[]>;
   getGroupMetadata(groupJid: string): Promise<GroupSummary>;
   getGroupInviteCode(groupJid: string): Promise<string>;
+  revokeGroupInvite?(groupJid: string): Promise<string>;
+  inspectGroupInvite?(inviteCode: string): Promise<{
+    id: string;
+    subject: string;
+    size: number;
+    owner?: string;
+    creation?: number;
+    desc?: string;
+  }>;
   acceptGroupInvite(inviteCode: string): Promise<string>;
+  createGroup?(subject: string, participantJids: string[]): Promise<GroupSummary>;
+  updateGroupSubject?(groupJid: string, subject: string): Promise<void>;
+  updateGroupDescription?(groupJid: string, description: string): Promise<void>;
+  updateGroupSetting?(
+    groupJid: string,
+    setting: 'announcement' | 'not_announcement' | 'locked' | 'unlocked'
+  ): Promise<void>;
+  toggleGroupEphemeral?(groupJid: string, expirationSeconds: number): Promise<void>;
+  listGroupJoinRequests?(
+    groupJid: string
+  ): Promise<Array<{ jid: string; requestedAt?: string }>>;
+  updateGroupJoinRequests?(
+    groupJid: string,
+    participantJids: string[],
+    action: 'approve' | 'reject'
+  ): Promise<void>;
+  sendGroupHidetagMessage?(
+    groupJid: string,
+    text: string
+  ): Promise<{ messageId: string; mentionedCount: number }>;
   updateGroupParticipants(
     groupJid: string,
     participantJids: string[],
@@ -3575,6 +3608,10 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
     caption?: string;
     ptv?: boolean;
     gifPlayback?: boolean;
+    viewOnce?: boolean;
+    ptt?: boolean;
+    waveform?: Uint8Array;
+    isSticker?: boolean;
   }): Promise<{ messageId: string }> {
     const sock = this.ensureSocket();
     if (this.connectionState !== 'CONNECTED' || !this.wsOpen) {
@@ -3583,11 +3620,17 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
     const fileBuffer = fs.readFileSync(params.filePath);
 
     let content: AnyMessageContent;
-    if (params.kind === 'image') {
+    if (params.isSticker || (params.mimeType === 'image/webp' && params.fileName.toLowerCase().endsWith('.webp'))) {
+      content = {
+        sticker: fileBuffer,
+        mimetype: 'image/webp',
+      };
+    } else if (params.kind === 'image') {
       content = {
         image: fileBuffer,
         mimetype: params.mimeType,
         caption: params.caption,
+        ...(params.viewOnce ? { viewOnce: true } : {}),
       };
     } else if (params.kind === 'video') {
       content = {
@@ -3596,12 +3639,15 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
         caption: params.caption,
         ...(params.ptv ? { ptv: true } : {}),
         ...(params.gifPlayback ? { gifPlayback: true } : {}),
+        ...(params.viewOnce ? { viewOnce: true } : {}),
       };
     } else if (params.kind === 'audio') {
       content = {
         audio: fileBuffer,
         mimetype: params.mimeType,
-        ptt: false,
+        ptt: Boolean(params.ptt),
+        ...(params.waveform ? { waveform: params.waveform } : {}),
+        ...(params.viewOnce ? { viewOnce: true } : {}),
       };
     } else {
       content = {
@@ -3700,6 +3746,47 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
     return code;
   }
 
+  public async revokeGroupInvite(groupJid: string): Promise<string> {
+    const sock = this.ensureSocket() as unknown as {
+      groupRevokeInvite: (jid: string) => Promise<string | undefined>;
+    };
+    const code = await sock.groupRevokeInvite(groupJid);
+    if (!code) {
+      throw new UnsupportedOperationError('تعذر إلغاء وإعادة توليد رابط الدعوة لهذه المجموعة.');
+    }
+    return code;
+  }
+
+  public async inspectGroupInvite(inviteCode: string): Promise<{
+    id: string;
+    subject: string;
+    size: number;
+    owner?: string;
+    creation?: number;
+    desc?: string;
+  }> {
+    const sock = this.ensureSocket() as unknown as {
+      groupGetInviteInfo: (code: string) => Promise<{
+        id: string;
+        subject?: string;
+        size?: number;
+        participants?: unknown[];
+        owner?: string;
+        creation?: number;
+        desc?: string;
+      }>;
+    };
+    const meta = await sock.groupGetInviteInfo(inviteCode);
+    return {
+      id: meta.id,
+      subject: meta.subject || meta.id,
+      size: meta.size || (meta.participants?.length ?? 0),
+      owner: meta.owner,
+      creation: meta.creation,
+      desc: meta.desc,
+    };
+  }
+
   public async acceptGroupInvite(inviteCode: string): Promise<string> {
     const sock = this.ensureSocket();
     const groupJid = await sock.groupAcceptInvite(inviteCode);
@@ -3707,6 +3794,120 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
       throw new WhatsAppConnectionError('تعذر الانضمام إلى المجموعة باستخدام الرابط المرفق.');
     }
     return groupJid;
+  }
+
+  public async createGroup(
+    subject: string,
+    participantJids: string[]
+  ): Promise<GroupSummary> {
+    const sock = this.ensureSocket();
+    const groupSock = sock as unknown as {
+      groupCreate: (
+        title: string,
+        participants: string[]
+      ) => Promise<GroupMetadata>;
+    };
+    const meta = await groupSock.groupCreate(subject, participantJids);
+    return this.mapGroupMetadata(sock, meta);
+  }
+
+  public async updateGroupSubject(groupJid: string, subject: string): Promise<void> {
+    const sock = this.ensureSocket() as unknown as {
+      groupUpdateSubject: (jid: string, title: string) => Promise<void>;
+    };
+    await sock.groupUpdateSubject(groupJid, subject);
+    this.groupMetadataCache.delete(groupJid);
+  }
+
+  public async updateGroupDescription(
+    groupJid: string,
+    description: string
+  ): Promise<void> {
+    const sock = this.ensureSocket() as unknown as {
+      groupUpdateDescription: (jid: string, desc?: string) => Promise<void>;
+    };
+    await sock.groupUpdateDescription(groupJid, description || undefined);
+    this.groupMetadataCache.delete(groupJid);
+  }
+
+  public async updateGroupSetting(
+    groupJid: string,
+    setting: 'announcement' | 'not_announcement' | 'locked' | 'unlocked'
+  ): Promise<void> {
+    const sock = this.ensureSocket() as unknown as {
+      groupSettingUpdate: (
+        jid: string,
+        mode: 'announcement' | 'not_announcement' | 'locked' | 'unlocked'
+      ) => Promise<void>;
+    };
+    await sock.groupSettingUpdate(groupJid, setting);
+    this.groupMetadataCache.delete(groupJid);
+  }
+
+  public async toggleGroupEphemeral(
+    groupJid: string,
+    expirationSeconds: number
+  ): Promise<void> {
+    const sock = this.ensureSocket() as unknown as {
+      groupToggleEphemeral: (jid: string, seconds: number) => Promise<void>;
+    };
+    await sock.groupToggleEphemeral(groupJid, expirationSeconds);
+    this.groupMetadataCache.delete(groupJid);
+  }
+
+  public async listGroupJoinRequests(
+    groupJid: string
+  ): Promise<Array<{ jid: string; requestedAt?: string }>> {
+    const sock = this.ensureSocket() as unknown as {
+      groupRequestParticipantsList: (
+        jid: string
+      ) => Promise<Array<Record<string, unknown>>>;
+    };
+    const list = await sock.groupRequestParticipantsList(groupJid);
+    if (!Array.isArray(list)) return [];
+    return list
+      .map((entry: Record<string, unknown>) => ({
+        jid: String(entry.jid || entry.id || ''),
+        requestedAt: entry.request_time ? String(entry.request_time) : undefined,
+      }))
+      .filter((item) => Boolean(item.jid));
+  }
+
+  public async updateGroupJoinRequests(
+    groupJid: string,
+    participantJids: string[],
+    action: 'approve' | 'reject'
+  ): Promise<void> {
+    const sock = this.ensureSocket() as unknown as {
+      groupRequestParticipantsUpdate: (
+        jid: string,
+        participants: string[],
+        mode: 'approve' | 'reject'
+      ) => Promise<unknown>;
+    };
+    await sock.groupRequestParticipantsUpdate(groupJid, participantJids, action);
+    this.groupMetadataCache.delete(groupJid);
+  }
+
+  public async sendGroupHidetagMessage(
+    groupJid: string,
+    text: string
+  ): Promise<{ messageId: string; mentionedCount: number }> {
+    const sock = this.ensureSocket();
+    const meta = await sock.groupMetadata(groupJid);
+    const mentions = (meta.participants || [])
+      .map((p) => p.id || p.lid || '')
+      .filter(Boolean);
+    const res = await sock.sendMessage(groupJid, {
+      text,
+      mentions,
+    });
+    const msgId = res?.key?.id || `hidetag_${Date.now()}`;
+    if (res?.message) {
+      this.memoryStore.cacheSentMessage(groupJid, msgId, res.message);
+    }
+    await Promise.allSettled([this.credsSaveChain, this.flushAuthWrites()]);
+    return { messageId: msgId, mentionedCount: mentions.length };
   }
 
   public async updateGroupParticipants(
@@ -7264,6 +7465,10 @@ export class MockWhatsAppSessionDriver implements WhatsAppSessionDriver {
     caption?: string;
     ptv?: boolean;
     gifPlayback?: boolean;
+    viewOnce?: boolean;
+    ptt?: boolean;
+    waveform?: Uint8Array;
+    isSticker?: boolean;
   }): Promise<{ messageId: string }> {
     if (this.simulatedDelayMs > 0) {
       await new Promise((r) => setTimeout(r, this.simulatedDelayMs));
@@ -7275,7 +7480,15 @@ export class MockWhatsAppSessionDriver implements WhatsAppSessionDriver {
       throw new WhatsAppConnectionError('الملف المؤقت غير موجود لإرساله.');
     }
     this.sentMessagesCount++;
-    const prefix = params.ptv ? 'sim_ptv' : 'sim_media';
+    const prefix = params.ptv
+      ? 'sim_ptv'
+      : params.isSticker
+        ? 'sim_stk'
+        : params.ptt
+          ? 'sim_ptt'
+          : params.viewOnce
+            ? 'sim_vo'
+            : 'sim_media';
     return { messageId: `${prefix}_${this.sessionId}_${Date.now()}` };
   }
 
@@ -7307,6 +7520,37 @@ export class MockWhatsAppSessionDriver implements WhatsAppSessionDriver {
     return `AbCdEfGhIjKlMnOpQrSt12`;
   }
 
+  public async revokeGroupInvite(groupJid: string): Promise<string> {
+    const group = await this.getGroupMetadata(groupJid);
+    if (!group.isBotAdmin) {
+      throw new UnsupportedOperationError(
+        'لا يمكن إلغاء رابط الدعوة لهذه المجموعة لأن الحساب ليس مشرفاً (Admin).'
+      );
+    }
+    return `RvKd${Date.now().toString(36).slice(-8)}OpQrSt12`;
+  }
+
+  public async inspectGroupInvite(inviteCode: string): Promise<{
+    id: string;
+    subject: string;
+    size: number;
+    owner?: string;
+    creation?: number;
+    desc?: string;
+  }> {
+    if (!this.connected || !this.registered) {
+      throw new WhatsAppConnectionError('الجلسة غير متصلة حالياً.');
+    }
+    return {
+      id: `120363099${inviteCode.slice(0, 4)}@g.us`,
+      subject: `مجموعة واتساب (${inviteCode.slice(0, 6)})`,
+      size: 28,
+      owner: '966501112233@s.whatsapp.net',
+      creation: Math.floor(Date.now() / 1000) - 86400 * 14,
+      desc: 'مجموعة رسمية تمت معاينتها عبر بروتوكول واتساب.',
+    };
+  }
+
   public async acceptGroupInvite(inviteCode: string): Promise<string> {
     if (!this.connected || !this.registered) {
       throw new WhatsAppConnectionError('الجلسة غير متصلة حالياً.');
@@ -7326,6 +7570,92 @@ export class MockWhatsAppSessionDriver implements WhatsAppSessionDriver {
       });
     }
     return newGroupJid;
+  }
+
+  public async createGroup(
+    subject: string,
+    participantJids: string[]
+  ): Promise<GroupSummary> {
+    if (!this.connected || !this.registered) {
+      throw new WhatsAppConnectionError('الجلسة غير متصلة حالياً.');
+    }
+    const newJid = `120363088${Date.now().toString().slice(-6)}@g.us`;
+    const participants: GroupParticipantSummary[] = [
+      { jid: this.currentJid, isAdmin: true, isSuperAdmin: true },
+      ...participantJids.map((jid) => ({ jid, isAdmin: false, isSuperAdmin: false })),
+    ];
+    const summary: GroupSummary = {
+      jid: newJid,
+      subject,
+      size: participants.length,
+      owner: this.currentJid,
+      creation: Math.floor(Date.now() / 1000),
+      desc: '',
+      addressingMode: 'pn',
+      isBotAdmin: true,
+      participants,
+    };
+    this.simulatedGroups.set(newJid, summary);
+    return summary;
+  }
+
+  public async updateGroupSubject(groupJid: string, subject: string): Promise<void> {
+    const group = await this.getGroupMetadata(groupJid);
+    group.subject = subject;
+  }
+
+  public async updateGroupDescription(
+    groupJid: string,
+    description: string
+  ): Promise<void> {
+    const group = await this.getGroupMetadata(groupJid);
+    group.desc = description;
+  }
+
+  public async updateGroupSetting(
+    groupJid: string,
+    _setting: 'announcement' | 'not_announcement' | 'locked' | 'unlocked'
+  ): Promise<void> {
+    const group = await this.getGroupMetadata(groupJid);
+    if (!group.isBotAdmin) {
+      throw new UnsupportedOperationError(
+        'هذه العملية تتطلب صلاحية مشرف المجموعة (Group Admin).'
+      );
+    }
+  }
+
+  public async toggleGroupEphemeral(
+    groupJid: string,
+    _expirationSeconds: number
+  ): Promise<void> {
+    await this.getGroupMetadata(groupJid);
+  }
+
+  public async listGroupJoinRequests(
+    groupJid: string
+  ): Promise<Array<{ jid: string; requestedAt?: string }>> {
+    await this.getGroupMetadata(groupJid);
+    return [];
+  }
+
+  public async updateGroupJoinRequests(
+    groupJid: string,
+    _participantJids: string[],
+    _action: 'approve' | 'reject'
+  ): Promise<void> {
+    await this.getGroupMetadata(groupJid);
+  }
+
+  public async sendGroupHidetagMessage(
+    groupJid: string,
+    _text: string
+  ): Promise<{ messageId: string; mentionedCount: number }> {
+    const group = await this.getGroupMetadata(groupJid);
+    this.sentMessagesCount++;
+    return {
+      messageId: `sim_hidetag_${this.sessionId}_${Date.now()}`,
+      mentionedCount: group.participants.length,
+    };
   }
 
   public async updateGroupParticipants(

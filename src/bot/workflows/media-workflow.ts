@@ -2,7 +2,10 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { SessionManager } from '../../whatsapp/session-manager';
 import { TaskManager } from '../../tasks/task-manager';
-import { SendMediaOperation } from '../../whatsapp/operations/send-media';
+import {
+  SendMediaOperation,
+  OutboundMediaDeliveryMode,
+} from '../../whatsapp/operations/send-media';
 import {
   validateRecipient,
   validateMediaUpload,
@@ -34,7 +37,16 @@ export interface MediaWorkflowState {
   mediaFile?: ValidatedMediaFile;
   caption?: string;
   selectedSessionIds: string[];
+  deliveryMode?: OutboundMediaDeliveryMode;
 }
+
+const DELIVERY_MODE_LABELS: Record<OutboundMediaDeliveryMode, string> = {
+  STANDARD: '📦 إرسال قياسي (Standard)',
+  VIEW_ONCE: '👁️‍🗨️ عرض لمرة واحدة (View-Once)',
+  PTT_WAVEFORM: '🎙️ بصمة صوتية (PTT + Waveform)',
+  PTV_NOTE: '⭕ فيديو دائري فوري (PTV Note)',
+  STICKER_WEBP: '🎨 تحويل إلى ملصق (Sticker WebP)',
+};
 
 export class MediaWorkflow {
   private readonly states = new Map<number, MediaWorkflowState>();
@@ -69,6 +81,7 @@ export class MediaWorkflow {
     this.states.set(adminId, {
       step: 'AWAITING_RECIPIENT',
       selectedSessionIds: [],
+      deliveryMode: 'STANDARD',
     });
 
     const recentRows = buildRecentRecipientsRows(adminId, 'wf_media:recent:');
@@ -77,7 +90,7 @@ export class MediaWorkflow {
       text:
         `${renderBreadcrumb(['🏠 الرئيسية', '📎 إرسال وسائط أو ملف'])}\n` +
         `${renderStepProgressBar(1, 4, 'تحديد المستلم')}\n\n` +
-        `📎 *إرسال وسائط أو ملف (صورة / مستند / فيديو / صوت)*\n\n` +
+        `📎 *إرسال وسائط أو ملف (صورة / مستند / فيديو / صوت / ملصق)*\n\n` +
         `الخطوة 1 من 4: الرجاء إرسال رقم هاتف المستلم مع رمز الدولة (مثال: \`+966559876543\`) أو معرف المجموعة:`,
       keyboard: [...recentRows, buildBackCancelRow('menu:main')],
       toastText: '📎 أرسل رقم المستلم أو اختر من القائمة',
@@ -115,20 +128,8 @@ export class MediaWorkflow {
         `${renderStepProgressBar(2, 4, 'رفع الملف الجديد')}\n\n` +
         `📎 *تغيير الملف المرفق*\n` +
         `المستلم: \`${state.recipientDisplay}\`\n\n` +
-        `الرجاء رفع الملف الجديد (أو اختيار ملف تجريبي من الأزرار أدناه):`,
-      keyboard: [
-        [
-          {
-            text: '📄 إرفاق مستند PDF تجريبي (تقرير.pdf)',
-            callbackData: 'wf_media:sample:pdf',
-          },
-          {
-            text: '🖼️ إرفاق صورة PNG تجريبية (شعار.png)',
-            callbackData: 'wf_media:sample:png',
-          },
-        ],
-        buildBackCancelRow('menu:main'),
-      ],
+        `الرجاء رفع الملف الجديد مباشرة في المحادثة (صورة، فيديو، مقطع صوتي، ملصق، أو مستند):`,
+      keyboard: [buildBackCancelRow('menu:main')],
       toastText: '📎 ارفع الملف الجديد الآن',
     };
   }
@@ -154,21 +155,9 @@ export class MediaWorkflow {
           `${renderBreadcrumb(['🏠 الرئيسية', '📎 إرسال وسائط أو ملف'])}\n` +
           `${renderStepProgressBar(2, 4, 'رفع الملف المطلوب')}\n\n` +
           `✅ *تم تحديد المستلم:* \`${normalized.displayTarget}\`\n\n` +
-          `الخطوة 2 من 4: الرجاء رفع الملف المطلوب (أو اختيار ملف تجريبي آمن من الأزرار أدناه للاختبار الفوري).\n` +
+          `الخطوة 2 من 4: الرجاء رفع الملف المطلوب مباشرة في المحادثة (صورة، فيديو، صوت، ملصق، أو مستند).\n` +
           `الحد الأقصى المسموح به: *${this.maxUploadSizeMb} ميجابايت*.`,
-        keyboard: [
-          [
-            {
-              text: '📄 إرفاق مستند PDF تجريبي (تقرير.pdf)',
-              callbackData: 'wf_media:sample:pdf',
-            },
-            {
-              text: '🖼️ إرفاق صورة PNG تجريبية (شعار.png)',
-              callbackData: 'wf_media:sample:png',
-            },
-          ],
-          buildBackCancelRow('menu:main'),
-        ],
+        keyboard: [buildBackCancelRow('menu:main')],
       };
     } catch (err) {
       const safeErr = toSafeArabicError(err);
@@ -267,6 +256,18 @@ export class MediaWorkflow {
     return this.renderSessionSelection(adminId);
   }
 
+  public setDeliveryMode(
+    adminId: number,
+    mode: OutboundMediaDeliveryMode
+  ): BotViewResponse {
+    const state = this.states.get(adminId);
+    if (!state || !state.recipientJid || !state.mediaFile) {
+      return this.start(adminId);
+    }
+    state.deliveryMode = mode;
+    return this.proceedToConfirmation(adminId);
+  }
+
   public renderSessionSelection(adminId: number): BotViewResponse {
     const state = this.states.get(adminId);
     if (!state || !state.mediaFile) return this.start(adminId);
@@ -306,8 +307,12 @@ export class MediaWorkflow {
     }
 
     state.step = 'AWAITING_CONFIRMATION';
+    const currentMode: OutboundMediaDeliveryMode = state.deliveryMode ?? 'STANDARD';
     const sizeKb = Math.max(1, Math.round(state.mediaFile.sizeBytes / 1024));
     const safeCaption = state.caption ? escapeMarkdown(state.caption) : 'بدون';
+
+    const mark = (m: OutboundMediaDeliveryMode, label: string) =>
+      currentMode === m ? `✅ ${label}` : label;
 
     return {
       text:
@@ -317,10 +322,37 @@ export class MediaWorkflow {
         `👤 *المستلم:* \`${state.recipientDisplay}\`\n` +
         `📎 *اسم الملف:* \`${escapeMarkdown(state.mediaFile.safeOriginalName)}\`\n` +
         `🏷️ *النوع والحجم:* \`${state.mediaFile.mimeType}\` (${sizeKb} KB)\n` +
+        `🎛️ *نمط الإرسال البروتوكولي:* ${DELIVERY_MODE_LABELS[currentMode]}\n` +
         `📝 *التسمية التوضيحية:* ${safeCaption}\n` +
         `🔢 *عدد الجلسات:* ${state.selectedSessionIds.length}\n\n` +
         `_سيتم حذف النسخة المؤقتة من الخادم تلقائياً فور انتهاء المهمة._`,
       keyboard: [
+        [
+          {
+            text: mark('STANDARD', '📦 قياسي'),
+            callbackData: 'wf_media:mode:STANDARD',
+          },
+          {
+            text: mark('VIEW_ONCE', '👁️‍🗨️ عرض لمرة واحدة'),
+            callbackData: 'wf_media:mode:VIEW_ONCE',
+          },
+        ],
+        [
+          {
+            text: mark('PTT_WAVEFORM', '🎙️ بصمة صوتية PTT'),
+            callbackData: 'wf_media:mode:PTT_WAVEFORM',
+          },
+          {
+            text: mark('PTV_NOTE', '⭕ فيديو دائري PTV'),
+            callbackData: 'wf_media:mode:PTV_NOTE',
+          },
+        ],
+        [
+          {
+            text: mark('STICKER_WEBP', '🎨 تحويل لملصق WebP'),
+            callbackData: 'wf_media:mode:STICKER_WEBP',
+          },
+        ],
         [
           { text: '✅ تأكيد إرسال الملف', callbackData: 'wf_media:confirm_execute' },
           { text: '❌ إلغاء وحذف الملف المؤقت', callbackData: 'workflow:cancel' },
@@ -344,6 +376,7 @@ export class MediaWorkflow {
     const recipientDisplay = state.recipientDisplay || recipientJid;
     const mediaFile = state.mediaFile;
     const caption = state.caption;
+    const deliveryMode = state.deliveryMode ?? 'STANDARD';
     const selectedSessionIds = [...state.selectedSessionIds];
     this.states.delete(adminId);
 
@@ -359,6 +392,7 @@ export class MediaWorkflow {
             recipient: recipientJid,
             mediaFile,
             caption,
+            deliveryMode,
           }),
         onCompleteCleanup: () => {
           this.sendMediaOp.cleanupTempFile(mediaFile.safeFilePath);

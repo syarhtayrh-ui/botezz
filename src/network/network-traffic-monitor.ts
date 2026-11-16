@@ -146,6 +146,15 @@ export function formatBinaryNodePreview(
   const openTag = attrPairs ? `<${node.tag} ${attrPairs}>` : `<${node.tag}>`;
 
   const lowerTag = node.tag.toLowerCase();
+  if (lowerTag === 'enc') {
+    const byteLen = getNodeContentByteLength(node.content);
+    const encMetaAttrs = ['v', 'type', 'count', 'mediatype', 'decrypt-status']
+      .filter((k) => rawAttrs[k] !== undefined && rawAttrs[k] !== '')
+      .map((k) => `${k}="${redactText(String(rawAttrs[k]))}"`)
+      .join(' ');
+    const encOpenTag = encMetaAttrs ? `<${node.tag} ${encMetaAttrs}>` : openTag;
+    return `${pad}${encOpenTag}[Encrypted ${byteLen}B]</${node.tag}>`;
+  }
   if (ENCRYPTED_OR_BINARY_TAGS.has(lowerTag)) {
     const byteLen = getNodeContentByteLength(node.content);
     return `${pad}${openTag}[Encrypted ${byteLen}B]</${node.tag}>`;
@@ -911,9 +920,13 @@ export class NetworkTrafficMonitor {
         : attrs.from || attrs.participant || 's.whatsapp.net';
 
     let computedRttMs = params.durationMs ?? 0;
-    if (tag === 'iq' && stanzaId) {
+    if (stanzaId) {
       const mapKey = `${sessionId}:${stanzaId}`;
-      if (direction === 'OUTBOUND' && !responseNode) {
+      if (
+        direction === 'OUTBOUND' &&
+        !responseNode &&
+        (tag === 'iq' || tag === 'message' || tag === 'call' || tag === 'presence')
+      ) {
         this.pendingIqBySessionAndId.set(mapKey, {
           timestampMs: Date.now(),
           tag,
@@ -924,10 +937,14 @@ export class NetworkTrafficMonitor {
           const firstKey = this.pendingIqBySessionAndId.keys().next().value;
           if (firstKey) this.pendingIqBySessionAndId.delete(firstKey);
         }
-      } else if (direction === 'INBOUND' && computedRttMs === 0) {
+      } else if (
+        direction === 'INBOUND' &&
+        computedRttMs === 0 &&
+        (tag === 'iq' || tag === 'ack' || tag === 'receipt' || tag === 'call')
+      ) {
         const pending = this.pendingIqBySessionAndId.get(mapKey);
         if (pending) {
-          computedRttMs = Math.max(0, Date.now() - pending.timestampMs);
+          computedRttMs = Math.max(1, Date.now() - pending.timestampMs);
           this.pendingIqBySessionAndId.delete(mapKey);
         }
       }

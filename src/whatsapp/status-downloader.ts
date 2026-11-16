@@ -1,7 +1,14 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { downloadMediaMessage, WASocket } from './baileys-compat';
+import {
+  downloadMediaMessage,
+  downloadContentFromMessage,
+  normalizeMessageContent,
+  extractMessageContent,
+  STORIES_JID,
+  WASocket,
+} from './baileys-compat';
 import {
   StatusRepository,
   CapturedStatusRecord,
@@ -213,8 +220,19 @@ export class StatusDownloaderService {
     dir: string;
   }): Promise<DeepStatusExtractionResult> {
     const { sessionId, rawMessage, sock, mediaKind, mimeType, shortId, caption, senderPhone, senderName, dir } = params;
-    const innerMsg = (rawMessage.message || {}) as Record<string, unknown>;
-    const targetPayload = (innerMsg.imageMessage || innerMsg.videoMessage || innerMsg.audioMessage || {}) as Record<string, unknown>;
+    const rawInner = (rawMessage.message || {}) as Record<string, unknown>;
+    const innerMsg = (
+      normalizeMessageContent(rawMessage.message as never) ||
+      extractMessageContent(rawMessage.message as never) ||
+      rawInner
+    ) as Record<string, unknown>;
+    const targetPayload = (innerMsg.imageMessage ||
+      innerMsg.videoMessage ||
+      innerMsg.audioMessage ||
+      rawInner.imageMessage ||
+      rawInner.videoMessage ||
+      rawInner.audioMessage ||
+      {}) as Record<string, unknown>;
 
     let rawBuffer: Buffer | null = null;
     let retrievalSource = 'none';
@@ -234,16 +252,20 @@ export class StatusDownloaderService {
       retrievalSource = 'local_device_storage';
     }
 
-    // 2. Try live Baileys media download from WhatsApp socket
-    if (!rawBuffer && sock) {
+    // 2A. Stage 1 live Baileys media download from WhatsApp socket
+    if (!rawBuffer && sock && mediaKind !== 'text') {
       try {
+        const reuploadFn =
+          typeof sock.updateMediaMessage === 'function'
+            ? sock.updateMediaMessage.bind(sock)
+            : undefined;
         const downloaded = await downloadMediaMessage(
           rawMessage as never,
           'buffer',
           {},
           {
             logger: undefined as never,
-            reuploadRequest: sock.updateMediaMessage,
+            ...(reuploadFn ? { reuploadRequest: reuploadFn } : {}),
           }
         );
         if (Buffer.isBuffer(downloaded) && downloaded.length > 0) {
@@ -251,10 +273,48 @@ export class StatusDownloaderService {
           retrievalSource = 'whatsapp_socket_live';
         }
       } catch (err) {
-        log.warn('Live status media download failed, attempting deep payload extraction', {
+        log.warn('Stage 1 status media download failed, attempting Stage 2 downloadContentFromMessage', {
           sessionId,
           error: err instanceof Error ? err.message : String(err),
         });
+      }
+    }
+
+    // 2B. Stage 2 unwrapped downloadContentFromMessage from mmg.whatsapp.net
+    if (
+      !rawBuffer &&
+      mediaKind !== 'text' &&
+      targetPayload.mediaKey &&
+      (targetPayload.directPath || targetPayload.url)
+    ) {
+      try {
+        const directPathStr =
+          typeof targetPayload.directPath === 'string'
+            ? targetPayload.directPath
+            : '';
+        const normalizedPayload = {
+          ...targetPayload,
+          url:
+            targetPayload.url ||
+            (directPathStr.startsWith('/')
+              ? `https://mmg.whatsapp.net${directPathStr}`
+              : undefined),
+        };
+        const stream = await downloadContentFromMessage(
+          normalizedPayload as never,
+          mediaKind
+        );
+        const chunks: Buffer[] = [];
+        for await (const chunk of stream) {
+          chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+        }
+        const combined = Buffer.concat(chunks);
+        if (combined.length > 0) {
+          rawBuffer = combined;
+          retrievalSource = 'whatsapp_mmg_cdn_stream';
+        }
+      } catch {
+        // Proceed to thumbnail check
       }
     }
 
@@ -262,6 +322,9 @@ export class StatusDownloaderService {
     if (!rawBuffer) {
       if (Buffer.isBuffer(targetPayload.jpegThumbnail) && targetPayload.jpegThumbnail.length > 0) {
         rawBuffer = targetPayload.jpegThumbnail;
+        retrievalSource = 'embedded_jpeg_thumbnail';
+      } else if (targetPayload.jpegThumbnail instanceof Uint8Array && targetPayload.jpegThumbnail.byteLength > 0) {
+        rawBuffer = Buffer.from(targetPayload.jpegThumbnail);
         retrievalSource = 'embedded_jpeg_thumbnail';
       } else if (typeof targetPayload.jpegThumbnail === 'string') {
         rawBuffer = Buffer.from(targetPayload.jpegThumbnail, 'base64');
@@ -278,19 +341,24 @@ export class StatusDownloaderService {
       mimeType.includes('corrupt') ||
       (Boolean(targetPayload.url) &&
         retrievalSource !== 'whatsapp_socket_live' &&
+        retrievalSource !== 'whatsapp_mmg_cdn_stream' &&
         retrievalSource !== 'local_device_storage')
     ) {
       hadIssue = true;
     }
 
-    // 4. Header validation & repair (do NOT discard raw bytes!)
+    // 4. Header validation & repair (never generate fake media on a live WhatsApp socket!)
     if (rawBuffer && rawBuffer.length > 0) {
       const repairOutcome = this.repairCorruptedBuffer(rawBuffer, mimeType);
       rawBuffer = repairOutcome.repaired;
       isRepaired = repairOutcome.isRepaired;
-    } else {
+    } else if (mediaKind === 'text' && sock) {
+      hadIssue = false;
+      rawBuffer = Buffer.from(caption || 'حالة واتساب نصية', 'utf8');
+      retrievalSource = 'whatsapp_text_story';
+    } else if (!sock) {
       hadIssue = true;
-      // Synthetic fallback only if absolutely zero bytes were retrievable
+      // Offline test harness fallback only when sock is not provided
       if (mediaKind === 'image') {
         rawBuffer = createGradientImagePng(320, 320, [15, 118, 110], [20, 184, 166]);
       } else if (mediaKind === 'video') {
@@ -300,10 +368,21 @@ export class StatusDownloaderService {
       } else {
         rawBuffer = createGradientImagePng(320, 320, [88, 28, 135], [219, 39, 119]);
       }
-      retrievalSource = 'synthetic_rescue_fallback';
+      retrievalSource = 'offline_test_fixture';
+    } else {
+      hadIssue = true;
+      rawBuffer = Buffer.from(
+        caption || `⚠️ تعذر تنزيل وسائط الحالة (${mediaKind}) من خوادم واتساب.`,
+        'utf8'
+      );
+      retrievalSource = 'unavailable_media_metadata';
     }
 
-    const ext = this.resolveExtension(mimeType, mediaKind, rawBuffer);
+    const ext =
+      retrievalSource === 'whatsapp_text_story' ||
+      retrievalSource === 'unavailable_media_metadata'
+        ? 'txt'
+        : this.resolveExtension(mimeType, mediaKind, rawBuffer);
     const stamp = Date.now();
     const mediaFileName = `status_${mediaKind}_${shortId}_${stamp}.${ext}`;
     const mediaFilePath = path.join(dir, mediaFileName);
@@ -638,4 +717,185 @@ export class StatusDownloaderService {
     }
     return created;
   }
+
+  /**
+   * Publishes a new outbound WhatsApp Story / Status (`status@broadcast`) with automatic
+   * `statusJidList` resolution, custom background ARGB theme, and font style (`0..5`).
+   */
+  public async publishStatusBroadcast(params: {
+    sessionId: string;
+    sock?: WASocket;
+    driver?: {
+      sendTextMessage?: (jid: string, text: string) => Promise<{ messageId?: string }>;
+      sendMediaMessage?: (
+        jid: string,
+        filePath: string,
+        mimeType: string,
+        caption?: string
+      ) => Promise<{ messageId?: string }>;
+      getRawSocket?: () => Record<string, unknown> | null;
+      getKnownRecipientJids?: () => string[];
+    };
+    kind: 'TEXT' | 'IMAGE' | 'VIDEO' | 'AUDIO';
+    textOrCaption?: string;
+    backgroundHex?: string;
+    font?: number;
+    mediaBuffer?: Buffer;
+    mediaFilePath?: string;
+    mimeType?: string;
+    statusJidList?: string[];
+  }): Promise<{
+    statusMessageId: string;
+    recipientsCount: number;
+    backgroundHex: string;
+    font: number;
+  }> {
+    const rawSock =
+      params.sock ||
+      (params.driver?.getRawSocket?.() as unknown as WASocket | undefined);
+
+    const statusJids = new Set<string>();
+    if (Array.isArray(params.statusJidList)) {
+      for (const j of params.statusJidList) {
+        if (j && j.endsWith('@s.whatsapp.net')) {
+          statusJids.add(j.replace(/:\d+@/, '@'));
+        }
+      }
+    }
+
+    // Gather known JIDs from captured statuses in SQLite
+    try {
+      const recentStatuses = this.statusRepo.listForOwner(0, true, undefined, 200);
+      for (const st of recentStatuses) {
+        if (st.sender_jid && st.sender_jid.endsWith('@s.whatsapp.net')) {
+          statusJids.add(st.sender_jid.replace(/:\d+@/, '@'));
+        }
+      }
+    } catch {
+      // Ignore repo lookup failure
+    }
+
+    // Gather known JIDs from driver / socket
+    try {
+      const driverKnown = params.driver?.getKnownRecipientJids?.() || [];
+      for (const j of driverKnown) {
+        if (j && j.endsWith('@s.whatsapp.net')) {
+          statusJids.add(j.replace(/:\d+@/, '@'));
+        }
+      }
+      const selfId =
+        (rawSock as unknown as { user?: { id?: string } })?.user?.id ||
+        (
+          rawSock as unknown as {
+            authState?: { creds?: { me?: { id?: string } } };
+          }
+        )?.authState?.creds?.me?.id;
+      if (typeof selfId === 'string' && selfId.includes('@s.whatsapp.net')) {
+        statusJids.add(selfId.replace(/:\d+@/, '@'));
+      }
+    } catch {
+      // Ignore socket lookup error
+    }
+
+    const statusJidList = Array.from(statusJids);
+    const backgroundHex = params.backgroundHex || '#075E54';
+    const font =
+      typeof params.font === 'number' && params.font >= 0 && params.font <= 5
+        ? params.font
+        : 1;
+
+    const sendOptions: Record<string, unknown> = {
+      backgroundColor: backgroundHex,
+      font,
+      ...(statusJidList.length > 0 ? { statusJidList } : {}),
+    };
+
+    let statusMessageId = `status_${crypto.randomBytes(6).toString('hex')}`;
+    const targetBroadcastJid = STORIES_JID || 'status@broadcast';
+
+    if (
+      rawSock &&
+      typeof (
+        rawSock as unknown as {
+          sendMessage?: (
+            jid: string,
+            content: Record<string, unknown>,
+            opts?: Record<string, unknown>
+          ) => Promise<{ key?: { id?: string } }>;
+        }
+      ).sendMessage === 'function'
+    ) {
+      const sendFn = (
+        rawSock as unknown as {
+          sendMessage: (
+            jid: string,
+            content: Record<string, unknown>,
+            opts?: Record<string, unknown>
+          ) => Promise<{ key?: { id?: string } }>;
+        }
+      ).sendMessage.bind(rawSock);
+
+      let content: Record<string, unknown>;
+      if (params.kind === 'TEXT') {
+        content = { text: params.textOrCaption || 'حالة واتساب جديدة ✨' };
+      } else {
+        const buf =
+          params.mediaBuffer ||
+          (params.mediaFilePath && fs.existsSync(params.mediaFilePath)
+            ? fs.readFileSync(params.mediaFilePath)
+            : Buffer.alloc(0));
+        if (params.kind === 'IMAGE') {
+          content = {
+            image: buf,
+            caption: params.textOrCaption || undefined,
+            mimetype: params.mimeType || 'image/jpeg',
+          };
+        } else if (params.kind === 'VIDEO') {
+          content = {
+            video: buf,
+            caption: params.textOrCaption || undefined,
+            mimetype: params.mimeType || 'video/mp4',
+          };
+        } else {
+          content = {
+            audio: buf,
+            ptt: true,
+            mimetype: params.mimeType || 'audio/ogg; codecs=opus',
+          };
+        }
+      }
+
+      const sent = await sendFn(targetBroadcastJid, content, sendOptions);
+      if (sent?.key?.id) {
+        statusMessageId = sent.key.id;
+      }
+    } else if (params.driver) {
+      if (params.kind === 'TEXT' && typeof params.driver.sendTextMessage === 'function') {
+        const res = await params.driver.sendTextMessage(
+          targetBroadcastJid,
+          params.textOrCaption || 'حالة واتساب جديدة ✨'
+        );
+        if (res?.messageId) statusMessageId = res.messageId;
+      } else if (
+        params.mediaFilePath &&
+        typeof params.driver.sendMediaMessage === 'function'
+      ) {
+        const res = await params.driver.sendMediaMessage(
+          targetBroadcastJid,
+          params.mediaFilePath,
+          params.mimeType || 'application/octet-stream',
+          params.textOrCaption
+        );
+        if (res?.messageId) statusMessageId = res.messageId;
+      }
+    }
+
+    return {
+      statusMessageId,
+      recipientsCount: statusJidList.length,
+      backgroundHex,
+      font,
+    };
+  }
 }
+

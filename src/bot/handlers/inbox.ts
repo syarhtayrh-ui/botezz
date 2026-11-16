@@ -16,10 +16,13 @@ import { BotViewResponse } from '../workflows/pairing-workflow';
 import { escapeMarkdown, truncateGraphemes } from '../../utils/markdown';
 
 export type InboxFilterKind = 'ALL' | 'MEDIA' | 'STICKERS' | 'TEXT';
+export type InboxForwardMode = 'CLEAN' | 'FORWARD_1' | 'FORWARD_999';
 
 export class InboxHandler {
   private readonly filterByAdmin = new Map<number, InboxFilterKind>();
   private readonly forwardDrafts = new Map<number, string>();
+  private readonly forwardModeByAdmin = new Map<number, InboxForwardMode>();
+  private readonly replyDrafts = new Map<number, string>();
 
   constructor(
     private readonly inboxRepo: InboxRepository,
@@ -29,10 +32,32 @@ export class InboxHandler {
 
   public cancel(adminId: number): void {
     this.forwardDrafts.delete(adminId);
+    this.replyDrafts.delete(adminId);
   }
 
   public hasPendingForward(adminId: number): boolean {
-    return this.forwardDrafts.has(adminId);
+    return this.forwardDrafts.has(adminId) || this.replyDrafts.has(adminId);
+  }
+
+  public hasPendingInput(adminId: number): boolean {
+    return this.hasPendingForward(adminId);
+  }
+
+  public hasPendingReply(adminId: number): boolean {
+    return this.replyDrafts.has(adminId);
+  }
+
+  public getForwardMode(adminId: number): InboxForwardMode {
+    return this.forwardModeByAdmin.get(adminId) || 'FORWARD_1';
+  }
+
+  public setForwardMode(
+    adminId: number,
+    recordId: string,
+    mode: InboxForwardMode
+  ): BotViewResponse {
+    this.forwardModeByAdmin.set(adminId, mode);
+    return this.promptForward(adminId, recordId);
   }
 
   private getFilter(adminId: number): InboxFilterKind {
@@ -145,7 +170,7 @@ export class InboxHandler {
           rec.sender_device_type || '📱 هاتف محمول (WhatsApp Mobile)'
         );
         const senderIp = escapeMarkdown(
-          rec.sender_ip || '157.240.20.60 (WhatsApp Edge Relay)'
+          rec.sender_ip || 'Signal Protocol E2EE (msg/pkmsg/skmsg)'
         );
         const preview = escapeMarkdown(
           truncateGraphemes(rec.text_content || rec.file_name || rec.kind, 48)
@@ -166,12 +191,16 @@ export class InboxHandler {
       const icon = this.kindIcon(rec.kind);
       const shortSender = truncateGraphemes(
         rec.sender_name || rec.sender_phone,
-        14
+        12
       );
       rows.push([
         {
-          text: `${icon} ${shortSender} (${rec.file_name || rec.kind})`,
+          text: `${icon} ${shortSender}`,
           callbackData: `inbox:view:${rec.id}`,
+        },
+        {
+          text: '↩️ رد مباشر',
+          callbackData: `inbox:reply:${rec.id}`,
         },
         {
           text: '⬇️ تحميل',
@@ -224,12 +253,8 @@ export class InboxHandler {
 
     rows.push([
       {
-        text: `🔔 التحويل التلقائي: ${autoForward ? 'مفعّل ✅' : 'معطّل ❌'}`,
+        text: `🔔 التحويل التلقائي لتيليجرام: ${autoForward ? 'مفعّل ✅' : 'معطّل ❌'}`,
         callbackData: 'inbox:toggle_autoforward',
-      },
-      {
-        text: '🧪 توليد رسائل واردة تجريبية',
-        callbackData: 'inbox:simulate_batch',
       },
     ]);
 
@@ -306,7 +331,7 @@ export class InboxHandler {
       '📱 *ثانياً: بصمة الجهاز والشبكة (Device & Network Forensics)*',
       `• *نوع جهاز المرسل:* ${escapeMarkdown(rec.sender_device_type || '📱 هاتف محمول (WhatsApp Mobile)')}`,
       `• *منفذ الجهاز (Device Slot):* \`${escapeMarkdown(companionSlot)}\``,
-      `• *عنوان IP المرسل:* \`${escapeMarkdown(rec.sender_ip || '157.240.20.60 (WhatsApp Edge Relay)')}\``,
+      `• *بصمة المظروف والشبكة:* \`${escapeMarkdown(rec.sender_ip || 'Signal Protocol E2EE (msg/pkmsg/skmsg)')}\``,
       '• *تشفير القناة:* `Signal Protocol E2EE (Curve25519 / AES-256-GCM)`',
       '',
       '📄 *ثالثاً: البيانات الجنائية للرسالة والملف (Message & File Telemetry)*',
@@ -330,7 +355,7 @@ export class InboxHandler {
 
     if (rec.is_edited) {
       detailLines.push(
-        '• *حالة التعديل:* ✏️ *تم تعديل هذه الرسالة من قبل المرسل*'
+        '• *حالة التعديل / الحذف:* ✏️ *تم تعديل هذه الرسالة من قبل المرسل مع الاحتفاظ بالنسخة الأصلية*'
       );
       if (rec.original_text) {
         detailLines.push(
@@ -341,13 +366,19 @@ export class InboxHandler {
 
     detailLines.push(
       '',
-      `📝 *محتوى / نص الرسالة${rec.is_edited ? ' (بعد التعديل)' : ''}:*`,
+      `📝 *محتوى / نص الرسالة${rec.is_edited ? ' (الحالي)' : ''}:*`,
       escapeMarkdown((rec.text_content || '(بدون نص)').slice(0, 800))
     );
 
     return {
       text: detailLines.join('\n'),
       keyboard: [
+        [
+          {
+            text: '↩️ رد مباشر (Quoted Reply)',
+            callbackData: `inbox:reply:${rec.id}`,
+          },
+        ],
         [
           {
             text: '⬇️ تحميل الملف في تيليجرام',
@@ -368,6 +399,219 @@ export class InboxHandler {
     };
   }
 
+  public promptReply(adminId: number, recordId: string): BotViewResponse {
+    const isOwner = this.sessionManager.isOwner(adminId);
+    const rec = this.inboxRepo.findById(recordId, adminId, isOwner);
+    if (!rec || !this.canAccessRecord(adminId, rec)) {
+      return {
+        text: '⚠️ لم يتم العثور على الرسالة المراد الرد عليها أو غير مصرح لك بالوصول إليها.',
+        keyboard: [
+          [
+            {
+              text: '🔙 العودة لقسم الرسائل الواردة',
+              callbackData: 'menu:inbox:page:1',
+            },
+          ],
+        ],
+      };
+    }
+
+    this.forwardDrafts.delete(adminId);
+    this.replyDrafts.set(adminId, recordId);
+    const preview = (rec.text_content || rec.file_name || rec.kind).slice(0, 150);
+
+    return {
+      text: [
+        '↩️ *الرد المباشر المقتبس عبر واتساب (Quoted Reply)*',
+        '━━━━━━━━━━━━━━━━━━━━━━',
+        `• *معرف الرسالة:* \`${escapeMarkdown(rec.id)}\``,
+        `• *المرسل:* ${escapeMarkdown(rec.sender_name || rec.sender_phone)} (\`${escapeMarkdown(rec.sender_phone)}\`)`,
+        `• *الجلسة المستقبِلة:* \`${escapeMarkdown(rec.session_id)}\``,
+        `• *الرسالة المقتبسة:* ${escapeMarkdown(preview)}`,
+        '',
+        '✍️ *الرجاء كتابة نص الرد وإرساله الآن:*',
+        '*(سيتم إرساله كرد رسمي مقتبس `quoted` على نفس رسالة المرسل في واتساب)*',
+      ].join('\n'),
+      keyboard: [
+        [
+          {
+            text: '❌ إلغاء الرد',
+            callbackData: `inbox:view:${rec.id}`,
+          },
+        ],
+        buildAppNavigationRow({
+          backCallback: 'menu:inbox:page:1',
+          refreshCallback: `inbox:reply:${rec.id}`,
+        }),
+      ],
+      toastText: '↩️ اكتب نص الرد لإرساله مقتبساً',
+    };
+  }
+
+  public async executeReply(
+    adminId: number,
+    replyText: string
+  ): Promise<BotViewResponse> {
+    const recordId = this.replyDrafts.get(adminId);
+    if (!recordId) {
+      return this.renderInboxMenu(adminId, 1);
+    }
+
+    const trimmed = replyText.trim();
+    if (!trimmed) {
+      return {
+        text: '⚠️ نص الرد لا يمكن أن يكون فارغاً. الرجاء إرسال نص الرد:',
+        keyboard: [
+          [
+            {
+              text: '❌ إلغاء الرد',
+              callbackData: `inbox:view:${recordId}`,
+            },
+          ],
+        ],
+      };
+    }
+
+    const isOwner = this.sessionManager.isOwner(adminId);
+    const rec = this.inboxRepo.findById(recordId, adminId, isOwner);
+    this.replyDrafts.delete(adminId);
+
+    if (!rec || !this.canAccessRecord(adminId, rec)) {
+      return {
+        text: '⚠️ لم يتم العثور على الرسالة الأصلية أو غير مصرح لك بالوصول إليها.',
+        keyboard: [
+          [
+            {
+              text: '🔙 العودة لصندوق الوارد',
+              callbackData: 'menu:inbox:page:1',
+            },
+          ],
+        ],
+      };
+    }
+
+    let driver = null;
+    try {
+      driver = this.sessionManager.getDriver(rec.session_id, adminId);
+    } catch {
+      const connected = this.sessionManager.listConnectedSessions(adminId);
+      if (connected.length > 0) {
+        try {
+          driver = this.sessionManager.getDriver(connected[0]!.id, adminId);
+        } catch {
+          driver = null;
+        }
+      }
+    }
+
+    if (!driver) {
+      return {
+        text: '⚠️ لا توجد جلسة واتساب متصلة حالياً لإرسال الرد المباشر.',
+        keyboard: [
+          [
+            {
+              text: '🔙 العودة للتفاصيل',
+              callbackData: `inbox:view:${rec.id}`,
+            },
+          ],
+        ],
+      };
+    }
+
+    let rawWaMessage: Record<string, unknown> = {
+      key: {
+        id: rec.wa_message_id,
+        remoteJid: rec.remote_jid || rec.sender_jid,
+        fromMe: false,
+      },
+      message: {
+        conversation: rec.text_content || '',
+      },
+    };
+    if (rec.raw_payload) {
+      try {
+        const parsed = JSON.parse(rec.raw_payload);
+        if (parsed && typeof parsed === 'object') {
+          rawWaMessage = parsed as Record<string, unknown>;
+        }
+      } catch {
+        // Keep fallback quoted structure
+      }
+    }
+
+    const targetJid = rec.remote_jid || rec.sender_jid;
+    try {
+      const rawSock = driver.getRawSocket?.() as
+        | {
+            sendMessage?: (
+              jid: string,
+              content: Record<string, unknown>,
+              options?: Record<string, unknown>
+            ) => Promise<{ key?: { id?: string } }>;
+          }
+        | undefined;
+
+      let sentMsgId = 'N/A';
+      if (rawSock && typeof rawSock.sendMessage === 'function') {
+        const res = await rawSock.sendMessage(
+          targetJid,
+          { text: trimmed },
+          { quoted: rawWaMessage }
+        );
+        sentMsgId = res?.key?.id || 'SENT_QUOTED';
+      } else {
+        const res = await driver.sendTextMessage(targetJid, trimmed);
+        sentMsgId = res.messageId || 'SENT_QUOTED';
+      }
+
+      return {
+        text: [
+          '✅ *تم إرسال الرد المباشر المقتبس (Quoted Reply) بنجاح!*',
+          '━━━━━━━━━━━━━━━━━━━━━━',
+          `• *المستلم:* \`${escapeMarkdown(rec.sender_phone || targetJid)}\``,
+          `• *نص الرد:* ${escapeMarkdown(trimmed.slice(0, 300))}`,
+          `• *معرف الرسالة المقتبسة:* \`${escapeMarkdown(rec.wa_message_id)}\``,
+          `• *معرف رسالة الرد:* \`${escapeMarkdown(sentMsgId)}\``,
+          `• *الجلسة المستخدمة:* \`${escapeMarkdown(driver.sessionId)}\``,
+        ].join('\n'),
+        keyboard: [
+          [
+            {
+              text: '📥 العودة لصندوق الوارد',
+              callbackData: 'menu:inbox:page:1',
+            },
+            {
+              text: '👁️ عرض تفاصيل الرسالة',
+              callbackData: `inbox:view:${rec.id}`,
+            },
+          ],
+          buildAppNavigationRow({
+            backCallback: 'menu:inbox:page:1',
+            refreshCallback: `inbox:view:${rec.id}`,
+          }),
+        ],
+        toastText: '✅ تم إرسال الرد المقتبس بنجاح',
+      };
+    } catch (err: unknown) {
+      const safeErr = toSafeArabicError(err);
+      return {
+        text: ['⚠️ *خطأ أثناء إرسال الرد المباشر:*', safeErr.userMessage].join('\n'),
+        keyboard: [
+          [
+            {
+              text: '🔄 إعادة المحاولة',
+              callbackData: `inbox:reply:${rec.id}`,
+            },
+            {
+              text: '🔙 العودة للتفاصيل',
+              callbackData: `inbox:view:${rec.id}`,
+            },
+          ],
+        ],
+      };
+    }
+  }
+
   public promptForward(adminId: number, recordId: string): BotViewResponse {
     const isOwner = this.sessionManager.isOwner(adminId);
     const rec = this.inboxRepo.findById(recordId, adminId, isOwner);
@@ -386,8 +630,17 @@ export class InboxHandler {
       };
     }
 
+    this.replyDrafts.delete(adminId);
     this.forwardDrafts.set(adminId, recordId);
+    const currentMode = this.getForwardMode(adminId);
     const preview = (rec.text_content || rec.file_name || rec.kind).slice(0, 150);
+
+    const modeLabel =
+      currentMode === 'CLEAN'
+        ? 'بدون علامة تحويل (Clean Copy)'
+        : currentMode === 'FORWARD_999'
+          ? 'محولة مرات كثيرة (Forwarded Many Times: 999)'
+          : 'مع علامة محولة (Forwarded: 1)';
 
     return {
       text: [
@@ -397,17 +650,32 @@ export class InboxHandler {
         `• *اسم المرسل الأصلي:* ${escapeMarkdown(rec.sender_name || rec.sender_phone)}`,
         `• *رقم المرسل الأصلي:* \`${escapeMarkdown(rec.sender_phone)}\``,
         `• *نوع جهاز المرسل:* ${escapeMarkdown(rec.sender_device_type || '📱 هاتف محمول')}`,
-        `• *عنوان IP المرسل:* \`${escapeMarkdown(rec.sender_ip || 'N/A')}\``,
+        `• *بصمة المظروف:* \`${escapeMarkdown(rec.sender_ip || 'Signal Protocol E2EE')}\``,
         `• *نوع الرسالة:* \`${escapeMarkdown(rec.kind)}\``,
         `• *المحتوى:* ${escapeMarkdown(preview)}`,
-        ...(rec.is_edited ? ['• *حالة الرسالة:* ✏️ تم تعديلها من قبل المرسل'] : []),
+        `• *وضع التوجيه المختار:* *${modeLabel}*`,
+        ...(rec.is_edited ? ['• *حالة الرسالة:* ✏️ تم تعديلها أو حذفها من قبل المرسل'] : []),
         '',
-        '💬 *الرجاء إدخال رقم هاتف المستلم الدولي الآن:*',
+        '💬 *الرجاء اختيار وضع التوجيه بالأسفل ثم إدخال رقم هاتف المستلم الدولي الآن:*',
         '*(مثال: `+966501234567` أو `966501234567` أو معرف مجموعة `...@g.us`)*',
-        '',
-        '🛡️ *ملاحظة البروتوكول:* سيتم إرسال الرسالة كرسالة مُعاد توجيهها رسمياً (`isForwarded: true` مع عداد التوجيه `forwardingScore`) باستخدام مقبس واتساب وليس كرسالة نصية عادية منسوخة.',
       ].join('\n'),
       keyboard: [
+        [
+          {
+            text: `${currentMode === 'CLEAN' ? '✅ ' : ''}بدون علامة تحويل (Clean)`,
+            callbackData: `inbox:fwd_mode:CLEAN:${rec.id}`,
+          },
+        ],
+        [
+          {
+            text: `${currentMode === 'FORWARD_1' ? '✅ ' : ''}مع علامة محولة (1)`,
+            callbackData: `inbox:fwd_mode:FORWARD_1:${rec.id}`,
+          },
+          {
+            text: `${currentMode === 'FORWARD_999' ? '✅ ' : ''}محولة مرات كثيرة (999)`,
+            callbackData: `inbox:fwd_mode:FORWARD_999:${rec.id}`,
+          },
+        ],
         [
           {
             text: '❌ إلغاء العملية',
@@ -421,6 +689,16 @@ export class InboxHandler {
       ],
       toastText: '↗️ أرسل رقم الهاتف لإعادة التوجيه',
     };
+  }
+
+  public async handleTextInput(
+    adminId: number,
+    text: string
+  ): Promise<BotViewResponse> {
+    if (this.replyDrafts.has(adminId)) {
+      return this.executeReply(adminId, text);
+    }
+    return this.executeForward(adminId, text);
   }
 
   public async executeForward(
@@ -547,13 +825,23 @@ export class InboxHandler {
         },
       };
 
+    const forwardMode = this.getForwardMode(adminId);
+    const forwardingScore =
+      forwardMode === 'CLEAN'
+        ? 0
+        : forwardMode === 'FORWARD_999'
+          ? 999
+          : 1;
+    const forceForward = forwardMode !== 'CLEAN';
+
     try {
       const fwdResult = await driver.forwardMessage(
         normalized.jid,
         forwardPayload,
         {
-          forceForward: true,
-        }
+          forceForward,
+          forwardingScore,
+        } as never
       );
 
       if (fwdResult.forwarded || (fwdResult as { success?: boolean }).success) {
@@ -561,6 +849,12 @@ export class InboxHandler {
           fwdResult.messageId ||
           (fwdResult as { forwardedMessageId?: string }).forwardedMessageId ||
           'N/A';
+        const scoreLabel =
+          forwardMode === 'CLEAN'
+            ? '⚪ بدون علامة تحويل (Clean Copy)'
+            : forwardMode === 'FORWARD_999'
+              ? '🔥 محولة مرات كثيرة (`forwardingScore: 999`)'
+              : '🟢 مع علامة محولة (`isForwarded: true`, `forwardingScore: 1`)';
         return {
           text: [
             '✅ *تمت إعادة توجيه الرسالة بنجاح عبر واتساب!*',
@@ -569,7 +863,7 @@ export class InboxHandler {
             `• *معرف الإرسال الجديد:* \`${escapeMarkdown(msgId)}\``,
             `• *نوع الرسالة المُعاد توجيهها:* \`${escapeMarkdown(rec.kind)}\``,
             `• *الجلسة المستخدمة:* \`${escapeMarkdown(driver.sessionId)}\``,
-            `• *علامة التوجيه:* 🟢 \`isForwarded: true\` (Forwarding Score: 1)`,
+            `• *علامة التوجيه:* ${scoreLabel}`,
           ].join('\n'),
           keyboard: [
             [

@@ -13,10 +13,34 @@ import {
 import { BotViewResponse } from '../workflows/pairing-workflow';
 import { escapeMarkdown, truncateGraphemes } from '../../utils/markdown';
 
+import path from 'node:path';
+
 export type StoriesFilterKind = 'ALL' | 'IMAGE' | 'VIDEO' | 'AUDIO' | 'TEXT';
+
+export interface StoryPublishDraft {
+  sessionId: string;
+  backgroundKey: string;
+  backgroundHex: string;
+  font: number;
+  awaitingInput: boolean;
+}
+
+export const STORY_COLOR_THEMES: ReadonlyArray<{
+  key: string;
+  label: string;
+  hex: string;
+}> = [
+  { key: 'EMERALD', label: '🟢 زمردي', hex: '#075E54' },
+  { key: 'MIDNIGHT', label: '🌑 ليلي داكن', hex: '#0F172A' },
+  { key: 'CRIMSON', label: '🔴 قرمزي', hex: '#881337' },
+  { key: 'ROYAL', label: '🟣 ملكي', hex: '#4C1D95' },
+  { key: 'GOLD', label: '🟡 ذهبي', hex: '#78350F' },
+  { key: 'OCEAN', label: '🔵 محيطي', hex: '#0C4A6E' },
+];
 
 export class StoriesHandler {
   private readonly filterByAdmin = new Map<number, StoriesFilterKind>();
+  private readonly publishDrafts = new Map<number, StoryPublishDraft>();
 
   constructor(
     private readonly statusRepo: StatusRepository,
@@ -30,6 +54,15 @@ export class StoriesHandler {
 
   public cancel(adminId: number): void {
     this.filterByAdmin.delete(adminId);
+    this.publishDrafts.delete(adminId);
+  }
+
+  public hasActivePublishDraft(adminId: number): boolean {
+    return Boolean(this.publishDrafts.get(adminId)?.awaitingInput);
+  }
+
+  public getStep(adminId: number): 'IDLE' | 'AWAITING_CONTENT' {
+    return this.hasActivePublishDraft(adminId) ? 'AWAITING_CONTENT' : 'IDLE';
   }
 
   public setFilter(adminId: number, filter: StoriesFilterKind): BotViewResponse {
@@ -155,6 +188,10 @@ export class StoriesHandler {
         callbackData: 'stories:filter:VIDEO',
       },
       {
+        text: `${currentFilter === 'AUDIO' ? '✅ ' : ''}🎵 صوتيات`,
+        callbackData: 'stories:filter:AUDIO',
+      },
+      {
         text: `${currentFilter === 'TEXT' ? '✅ ' : ''}نصوص`,
         callbackData: 'stories:filter:TEXT',
       },
@@ -181,12 +218,15 @@ export class StoriesHandler {
 
     rows.push([
       {
-        text: `🔔 التحميل التلقائي: ${autoForward ? 'مفعّل ✅' : 'معطّل ❌'}`,
-        callbackData: 'stories:toggle_autoforward',
+        text: '➕ نشر حالة واتساب جديدة (Story Publisher)',
+        callbackData: 'stories:pub_start',
       },
+    ]);
+
+    rows.push([
       {
-        text: '🧪 التقاط حالات تجريبية الآن',
-        callbackData: 'stories:simulate_batch',
+        text: `🔔 التحميل التلقائي للحالات: ${autoForward ? 'مفعّل ✅' : 'معطّل ❌'}`,
+        callbackData: 'stories:toggle_autoforward',
       },
     ]);
 
@@ -314,5 +354,279 @@ export class StoriesHandler {
       toastText: `✅ تم التقاط وحفظ ${created.length} حالات واتساب جديدة`,
       mediaAttachments: attachments,
     };
+  }
+
+  private getOrCreatePublishDraft(adminId: number): StoryPublishDraft {
+    let draft = this.publishDrafts.get(adminId);
+    if (!draft) {
+      const connected = this.sessionManager.listConnectedSessions(adminId);
+      const all = this.sessionManager.listSessions(adminId);
+      const defaultSess = connected[0]?.id || all[0]?.id || '';
+      draft = {
+        sessionId: defaultSess,
+        backgroundKey: 'EMERALD',
+        backgroundHex: '#075E54',
+        font: 1,
+        awaitingInput: true,
+      };
+      this.publishDrafts.set(adminId, draft);
+    }
+    return draft;
+  }
+
+  public startPublishStory(adminId: number): BotViewResponse {
+    const draft = this.getOrCreatePublishDraft(adminId);
+    draft.awaitingInput = true;
+    const connected = this.sessionManager.listConnectedSessions(adminId);
+    if (!draft.sessionId && connected.length > 0) {
+      draft.sessionId = connected[0]!.id;
+    }
+
+    const themeObj =
+      STORY_COLOR_THEMES.find((t) => t.key === draft.backgroundKey) ||
+      STORY_COLOR_THEMES[0]!;
+
+    const rows: InlineKeyboardRows = [];
+    if (connected.length > 1) {
+      rows.push(
+        connected.slice(0, 3).map((s) => ({
+          text: `${s.id === draft.sessionId ? '✅ ' : '📱 '}${s.label || s.id}`,
+          callbackData: `stories:pub_sess:${s.id}`,
+        }))
+      );
+    }
+
+    rows.push(
+      STORY_COLOR_THEMES.slice(0, 3).map((t) => ({
+        text: `${draft.backgroundKey === t.key ? '✅ ' : ''}${t.label}`,
+        callbackData: `stories:pub_color:${t.key}`,
+      })),
+      STORY_COLOR_THEMES.slice(3, 6).map((t) => ({
+        text: `${draft.backgroundKey === t.key ? '✅ ' : ''}${t.label}`,
+        callbackData: `stories:pub_color:${t.key}`,
+      })),
+      [
+        {
+          text: `🔤 نمط الخط (Font Style): #${draft.font} (تبديل 0..5)`,
+          callbackData: 'stories:pub_font',
+        },
+      ],
+      [
+        {
+          text: '🔙 إلغاء والعودة لقسم الحالات',
+          callbackData: 'menu:stories:page:1',
+        },
+      ]
+    );
+
+    return {
+      text: [
+        '➕ *نشر حالة واتساب جديدة (Story Publisher — `status@broadcast`)*',
+        '━━━━━━━━━━━━━━━━━━━━━━',
+        `• *الجلسة المختارة:* \`${escapeMarkdown(draft.sessionId || 'لا توجد جلسة متصلة')}\``,
+        `• *لون خلفية الحالة النصية:* ${themeObj.label} (\`${themeObj.hex}\`)`,
+        `• *نمط الخط (Font):* \`#${draft.font}\``,
+        '',
+        '📤 *طريقة النشر الفوري:*',
+        '1️⃣ *لنشر حالة نصية ملونة:* أرسل النص مباشرة الآن في المحادثة.',
+        '2️⃣ *لنشر حالة صورة / فيديو / صوت:* أرسل الصورة أو الفيديو أو المقطع الصوتي مباشرة الآن (مع إمكانية كتابة وصف تحت الوسائط).',
+      ].join('\n'),
+      keyboard: rows,
+      toastText: '➕ أرسل نصاً أو صورة/فيديو/صوت لنشره كحالة واتساب',
+    };
+  }
+
+  public setPublishColor(adminId: number, colorKey: string): BotViewResponse {
+    const draft = this.getOrCreatePublishDraft(adminId);
+    const theme = STORY_COLOR_THEMES.find((t) => t.key === colorKey);
+    if (theme) {
+      draft.backgroundKey = theme.key;
+      draft.backgroundHex = theme.hex;
+    }
+    return this.startPublishStory(adminId);
+  }
+
+  public cyclePublishFont(adminId: number): BotViewResponse {
+    const draft = this.getOrCreatePublishDraft(adminId);
+    draft.font = (draft.font + 1) % 6;
+    return this.startPublishStory(adminId);
+  }
+
+  public selectPublishSession(
+    adminId: number,
+    sessionId: string
+  ): BotViewResponse {
+    const draft = this.getOrCreatePublishDraft(adminId);
+    draft.sessionId = sessionId;
+    return this.startPublishStory(adminId);
+  }
+
+  public async handleTextInput(
+    adminId: number,
+    text: string
+  ): Promise<BotViewResponse> {
+    const draft = this.getOrCreatePublishDraft(adminId);
+    const trimmed = text.trim();
+    if (!trimmed) {
+      return this.startPublishStory(adminId);
+    }
+
+    const connected = this.sessionManager.listConnectedSessions(adminId);
+    const targetSessId = draft.sessionId || connected[0]?.id;
+    if (!targetSessId) {
+      return {
+        text: '⚠️ لا توجد جلسة واتساب متصلة حالياً لنشر الحالة.',
+        keyboard: [
+          [
+            {
+              text: '🔙 العودة لقسم الحالات',
+              callbackData: 'menu:stories:page:1',
+            },
+          ],
+        ],
+      };
+    }
+
+    try {
+      const driver = this.sessionManager.getDriver(targetSessId, adminId);
+      const res = await this.statusDownloader.publishStatusBroadcast({
+        sessionId: targetSessId,
+        driver: driver as never,
+        kind: 'TEXT',
+        textOrCaption: trimmed,
+        backgroundHex: draft.backgroundHex,
+        font: draft.font,
+      });
+      draft.awaitingInput = false;
+
+      return {
+        text: [
+          '✅ *تم نشر الحالة النصية على واتساب (`status@broadcast`) بنجاح!*',
+          '━━━━━━━━━━━━━━━━━━━━━━',
+          `• *الجلسة:* \`${escapeMarkdown(targetSessId)}\``,
+          `• *معرف الحالة (Message ID):* \`${escapeMarkdown(res.statusMessageId)}\``,
+          `• *لون الخلفية:* \`${escapeMarkdown(res.backgroundHex)}\` | *الخط:* \`#${res.font}\``,
+          `• *عدد جهات الاتصال المشمولة (statusJidList):* \`${res.recipientsCount}\``,
+          `• *النص المنشور:* ${escapeMarkdown(trimmed.slice(0, 300))}`,
+        ].join('\n'),
+        keyboard: [
+          [
+            {
+              text: '➕ نشر حالة أخرى',
+              callbackData: 'stories:pub_start',
+            },
+            {
+              text: '⭕ العودة لقسم الحالات',
+              callbackData: 'menu:stories:page:1',
+            },
+          ],
+        ],
+        toastText: '✅ تم نشر الحالة النصية بنجاح',
+      };
+    } catch (err) {
+      return {
+        text: `❌ تعذر نشر الحالة النصية: ${escapeMarkdown(err instanceof Error ? err.message : String(err))}`,
+        keyboard: [
+          [
+            {
+              text: '🔙 العودة لقسم الحالات',
+              callbackData: 'menu:stories:page:1',
+            },
+          ],
+        ],
+      };
+    }
+  }
+
+  public async handleMediaUpload(
+    adminId: number,
+    upload: {
+      originalFilename: string;
+      mimeType: string;
+      sizeBytes: number;
+      contentBuffer: Buffer;
+      caption?: string;
+    }
+  ): Promise<BotViewResponse> {
+    const draft = this.getOrCreatePublishDraft(adminId);
+    const connected = this.sessionManager.listConnectedSessions(adminId);
+    const targetSessId = draft.sessionId || connected[0]?.id;
+    if (!targetSessId) {
+      return {
+        text: '⚠️ لا توجد جلسة واتساب متصلة حالياً لنشر الحالة المرئية/الصوتية.',
+        keyboard: [
+          [
+            {
+              text: '🔙 العودة لقسم الحالات',
+              callbackData: 'menu:stories:page:1',
+            },
+          ],
+        ],
+      };
+    }
+
+    const m = (upload.mimeType || '').toLowerCase();
+    const kind: 'IMAGE' | 'VIDEO' | 'AUDIO' = m.startsWith('video/')
+      ? 'VIDEO'
+      : m.startsWith('audio/')
+        ? 'AUDIO'
+        : 'IMAGE';
+
+    const tmpDir = path.resolve(process.cwd(), 'data', 'temp_uploads');
+    fs.mkdirSync(tmpDir, { recursive: true });
+    const tmpPath = path.join(
+      tmpDir,
+      `story_pub_${Date.now()}_${path.basename(upload.originalFilename || 'media.bin')}`
+    );
+    fs.writeFileSync(tmpPath, upload.contentBuffer);
+
+    try {
+      const driver = this.sessionManager.getDriver(targetSessId, adminId);
+      const res = await this.statusDownloader.publishStatusBroadcast({
+        sessionId: targetSessId,
+        driver: driver as never,
+        kind,
+        textOrCaption: upload.caption,
+        backgroundHex: draft.backgroundHex,
+        font: draft.font,
+        mediaBuffer: upload.contentBuffer,
+        mediaFilePath: tmpPath,
+        mimeType: upload.mimeType,
+      });
+      draft.awaitingInput = false;
+
+      return {
+        text: [
+          `✅ *تم نشر حالة الوسائط (${kind}) على واتساب (\`status@broadcast\`) بنجاح!*`,
+          '━━━━━━━━━━━━━━━━━━━━━━',
+          `• *الجلسة:* \`${escapeMarkdown(targetSessId)}\``,
+          `• *معرف الحالة (Message ID):* \`${escapeMarkdown(res.statusMessageId)}\``,
+          `• *الملف:* \`${escapeMarkdown(upload.originalFilename)}\` (\`${upload.sizeBytes}\` بايت)`,
+          `• *عدد جهات الاتصال المشمولة (statusJidList):* \`${res.recipientsCount}\``,
+          ...(upload.caption ? [`• *الوصف:* ${escapeMarkdown(upload.caption.slice(0, 200))}`] : []),
+        ].join('\n'),
+        keyboard: [
+          [
+            {
+              text: '➕ نشر حالة أخرى',
+              callbackData: 'stories:pub_start',
+            },
+            {
+              text: '⭕ العودة لقسم الحالات',
+              callbackData: 'menu:stories:page:1',
+            },
+          ],
+        ],
+        toastText: '✅ تم نشر حالة الوسائط بنجاح',
+      };
+    } finally {
+      try {
+        if (fs.existsSync(tmpPath)) {
+          fs.unlinkSync(tmpPath);
+        }
+      } catch {
+        // Ignore temp file cleanup error
+      }
+    }
   }
 }

@@ -31,7 +31,7 @@ import { createLogger } from '../logging/logger';
 
 const log = createLogger('incoming-message-receiver');
 
-let cachedLiveWhatsappRelayIp = '157.240.20.60';
+let cachedLiveWhatsappRelayIp = 'web.whatsapp.com';
 let lastRelayDnsLookupAt = 0;
 
 function refreshLiveWhatsappRelayIp(): void {
@@ -297,6 +297,10 @@ export class IncomingMessageReceiver {
   private readonly baseInboxDir: string;
   private readonly baseDataDir: string;
   public onMessageArchived?: (
+    record: IncomingMessageRecord,
+    attachment: TelegramMediaAttachment
+  ) => void;
+  public onMessageRevoked?: (
     record: IncomingMessageRecord,
     attachment: TelegramMediaAttachment
   ) => void;
@@ -690,6 +694,9 @@ export class IncomingMessageReceiver {
       : isGroup
         ? 'Signal:skmsg'
         : 'Signal:msg/pkmsg';
+    const lidBadge =
+      rawStanzaMeta.senderLid ||
+      (rawSenderJid.endsWith('@lid') ? rawSenderJid : '');
 
     let senderIp = '';
     if (explicitIp) {
@@ -697,7 +704,7 @@ export class IncomingMessageReceiver {
         ? explicitIp
         : `${explicitIp} (الشبكة: ${carrierLabel} | Relay: ${liveRelayEndpoint})`;
     } else {
-      senderIp = `Relay: ${liveRelayEndpoint}:443 (WhatsApp Edge — ${encBadge}) | الشبكة: ${carrierLabel} [محجوب E2EE]`;
+      senderIp = `${encBadge}${lidBadge ? ` | LID: ${lidBadge}` : ''} | Relay: ${liveRelayEndpoint}:443 | الشبكة: ${carrierLabel}`;
     }
 
     return {
@@ -934,27 +941,31 @@ export class IncomingMessageReceiver {
     sock?: WASocket,
     mediaKindHint?: 'image' | 'video' | 'audio' | 'document' | 'sticker'
   ): Promise<Buffer | null> {
-    // 1. Primary path: @hiroosy/baileys-lite downloadMediaMessage (with reupload support if sock is present)
+    // Stage 1: @hiroosy/baileys-lite downloadMediaMessage (with reuploadRequest recovery if sock is present)
     if (sock) {
       try {
+        const reuploadFn =
+          typeof sock.updateMediaMessage === 'function'
+            ? sock.updateMediaMessage.bind(sock)
+            : undefined;
         const downloaded = await downloadMediaMessage(
           rawMessage as never,
           'buffer',
           {},
           {
             logger: undefined as never,
-            reuploadRequest: sock.updateMediaMessage,
+            ...(reuploadFn ? { reuploadRequest: reuploadFn } : {}),
           }
         );
         if (Buffer.isBuffer(downloaded) && downloaded.length > 0) {
           return downloaded;
         }
       } catch {
-        // Fallback to direct downloadContentFromMessage below
+        // Fallback to Stage 2 direct downloadContentFromMessage below
       }
     }
 
-    // 2. Unwrapped fallback: downloadContentFromMessage for View-Once / Ephemeral / nested media
+    // Stage 2: Unwrapped downloadContentFromMessage for View-Once / Ephemeral / nested media
     try {
       const unwrapped = (
         normalizeMessageContent(rawMessage.message as never) ||
@@ -969,6 +980,7 @@ export class IncomingMessageReceiver {
       }> = [
         { key: 'imageMessage', type: 'image' },
         { key: 'videoMessage', type: 'video' },
+        { key: 'ptvMessage', type: 'video' },
         { key: 'audioMessage', type: 'audio' },
         { key: 'documentMessage', type: 'document' },
         { key: 'stickerMessage', type: 'sticker' },
@@ -978,7 +990,20 @@ export class IncomingMessageReceiver {
         if (mediaKindHint && entry.type !== mediaKindHint) continue;
         const payload = unwrapped[entry.key] as Record<string, unknown> | undefined;
         if (payload && payload.mediaKey && (payload.directPath || payload.url)) {
-          const stream = await downloadContentFromMessage(payload as never, entry.type);
+          const directPathStr =
+            typeof payload.directPath === 'string' ? payload.directPath : '';
+          const normalizedPayload = {
+            ...payload,
+            url:
+              payload.url ||
+              (directPathStr.startsWith('/')
+                ? `https://mmg.whatsapp.net${directPathStr}`
+                : undefined),
+          };
+          const stream = await downloadContentFromMessage(
+            normalizedPayload as never,
+            entry.type
+          );
           const chunks: Buffer[] = [];
           for await (const chunk of stream) {
             chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
@@ -1052,12 +1077,53 @@ export class IncomingMessageReceiver {
     const protoMsg = (rawInnerMsg.protocolMessage || innerMsg.protocolMessage) as
       | Record<string, unknown>
       | undefined;
+    const isRevokeMessage =
+      norm.isRevoked ||
+      norm.category === 'message_revoke' ||
+      Boolean(
+        protoMsg && (protoMsg.type === 0 || protoMsg.type === 'REVOKE')
+      );
     const isEditMessage =
       deepText.isEdited ||
       norm.isEdited ||
       norm.category === 'message_edit' ||
       Boolean(rawMessage.__isLiveEditUpdate) ||
       Boolean(protoMsg && (protoMsg.type === 14 || protoMsg.type === 'MESSAGE_EDIT' || protoMsg.editedMessage));
+
+    // Handle Anti-Revoke (protocolMessage.type === 0 / REVOKE)
+    if (isRevokeMessage && protoMsg) {
+      const targetKey = protoMsg.key as { id?: string } | undefined;
+      const revokedTargetId = targetKey?.id ? String(targetKey.id) : '';
+      if (revokedTargetId) {
+        const originalRecord = this.inboxRepo.findByWaMessageId(
+          revokedTargetId,
+          sessionId
+        );
+        if (originalRecord) {
+          const updated = this.inboxRepo.markRevokedMessage(
+            originalRecord.id,
+            '[⚠️ محذوفة من المرسل - تم الاحتفاظ بالنسخة الأصلية]'
+          );
+          if (updated) {
+            const attachment = this.toTelegramAttachment(updated);
+            if (this.onMessageRevoked) {
+              this.onMessageRevoked(updated, attachment);
+            }
+            const sess = this.sessionRepo.findById(sessionId);
+            const ownerId = sess?.owner_telegram_id ?? 0;
+            if (
+              ownerId > 0 &&
+              this.isAutoForwardEnabled(ownerId) &&
+              this.onMessageArchived
+            ) {
+              this.onMessageArchived(updated, attachment);
+            }
+            return updated;
+          }
+        }
+      }
+      return null;
+    }
 
     if (protoMsg && !isEditMessage) {
       return null;
@@ -1316,13 +1382,19 @@ export class IncomingMessageReceiver {
       fileName = `sticker_${shortId}_${stamp}.webp`;
       filePath = path.join(dir, fileName);
       const liveBuf = localMediaBuf || (await this.tryDownloadLiveMedia(rawMessage, sock, 'sticker'));
-      const buf = liveBuf
-        ? repairOrWrapWebpBuffer(liveBuf)
-        : createWebpSticker({
+      if (liveBuf) {
+        fs.writeFileSync(filePath, repairOrWrapWebpBuffer(liveBuf));
+      } else if (!sock) {
+        fs.writeFileSync(
+          filePath,
+          createWebpSticker({
             packName: 'Inbox Sticker',
             authorName: senderName,
-          });
-      fs.writeFileSync(filePath, buf);
+          })
+        );
+      } else {
+        filePath = '';
+      }
       textContent = textContent || '🎨 ملصق واتساب وارد (.webp)';
     } else if (resolvedKind === 'image') {
       mimeType = norm.mediaMetadata?.mimeType || String(mediaPayload.mimetype || 'image/jpeg');
@@ -1330,28 +1402,49 @@ export class IncomingMessageReceiver {
       fileName = `image_${shortId}_${stamp}.${ext}`;
       filePath = path.join(dir, fileName);
       const liveBuf = localMediaBuf || (await this.tryDownloadLiveMedia(rawMessage, sock, 'image'));
-      const buf =
-        liveBuf ||
-        (Buffer.isBuffer(mediaPayload.jpegThumbnail)
-          ? mediaPayload.jpegThumbnail
-          : createGradientImagePng(320, 320, [20, 90, 190], [0, 200, 140]));
-      fs.writeFileSync(filePath, buf);
+      const thumbBuf = Buffer.isBuffer(mediaPayload.jpegThumbnail)
+        ? mediaPayload.jpegThumbnail
+        : mediaPayload.jpegThumbnail instanceof Uint8Array
+          ? Buffer.from(mediaPayload.jpegThumbnail)
+          : null;
+      if (liveBuf) {
+        fs.writeFileSync(filePath, liveBuf);
+      } else if (thumbBuf && thumbBuf.length > 0) {
+        fs.writeFileSync(filePath, thumbBuf);
+      } else if (!sock) {
+        fs.writeFileSync(
+          filePath,
+          createGradientImagePng(320, 320, [20, 90, 190], [0, 200, 140])
+        );
+      } else {
+        filePath = '';
+      }
       textContent = textContent || '🖼️ صورة واردة';
     } else if (resolvedKind === 'video') {
       mimeType = norm.mediaMetadata?.mimeType || String(mediaPayload.mimetype || 'video/mp4');
       fileName = `video_${shortId}_${stamp}.mp4`;
       filePath = path.join(dir, fileName);
       const liveBuf = localMediaBuf || (await this.tryDownloadLiveMedia(rawMessage, sock, 'video'));
-      const buf = liveBuf || createMinimalMp4Buffer();
-      fs.writeFileSync(filePath, buf);
+      if (liveBuf) {
+        fs.writeFileSync(filePath, liveBuf);
+      } else if (!sock) {
+        fs.writeFileSync(filePath, createMinimalMp4Buffer());
+      } else {
+        filePath = '';
+      }
       textContent = textContent || '🎬 مقطع فيديو وارد';
     } else if (resolvedKind === 'audio') {
       mimeType = norm.mediaMetadata?.mimeType || String(mediaPayload.mimetype || 'audio/ogg; codecs=opus');
       fileName = `voice_${shortId}_${stamp}.ogg`;
       filePath = path.join(dir, fileName);
       const liveBuf = localMediaBuf || (await this.tryDownloadLiveMedia(rawMessage, sock, 'audio'));
-      const buf = liveBuf || createSilentOggOpusBuffer(3);
-      fs.writeFileSync(filePath, buf);
+      if (liveBuf) {
+        fs.writeFileSync(filePath, liveBuf);
+      } else if (!sock) {
+        fs.writeFileSync(filePath, createSilentOggOpusBuffer(3));
+      } else {
+        filePath = '';
+      }
       textContent = textContent || '🎙️ رسالة صوتية واردة';
     } else if (resolvedKind === 'document') {
       mimeType = norm.mediaMetadata?.mimeType || String(mediaPayload.mimetype || 'application/pdf');
@@ -1363,12 +1456,18 @@ export class IncomingMessageReceiver {
       fileName = origName;
       filePath = path.join(dir, fileName);
       const liveBuf = localMediaBuf || (await this.tryDownloadLiveMedia(rawMessage, sock, 'document'));
-      const buf =
-        liveBuf ||
-        createMinimalPdfBuffer(
-          `Incoming Document from ${senderName} (${senderPhone})\nDevice: ${senderDeviceType}\nIP: ${senderIp}\nFilename: ${origName}`
+      if (liveBuf) {
+        fs.writeFileSync(filePath, liveBuf);
+      } else if (!sock) {
+        fs.writeFileSync(
+          filePath,
+          createMinimalPdfBuffer(
+            `Incoming Document from ${senderName} (${senderPhone})\nDevice: ${senderDeviceType}\nIP: ${senderIp}\nFilename: ${origName}`
+          )
         );
-      fs.writeFileSync(filePath, buf);
+      } else {
+        filePath = '';
+      }
       textContent = textContent || `📄 مستند وارد: ${fileName}`;
     } else if (resolvedKind === 'location') {
       mimeType = 'application/geo+json';
@@ -1468,7 +1567,11 @@ export class IncomingMessageReceiver {
       fs.writeFileSync(filePath, bodyLines.join('\n'), 'utf8');
     }
 
-    const fileSize = fs.existsSync(filePath) ? fs.statSync(filePath).size : 0;
+    if (norm.isViewOnce && !textContent.includes('عرض لمرة واحدة')) {
+      textContent = `[👁️‍🗨️ وسائط عرض لمرة واحدة تم كشفها وحفظها] ${textContent}`.trim();
+    }
+
+    const fileSize = filePath && fs.existsSync(filePath) ? fs.statSync(filePath).size : 0;
     let computedSha256 = fileSha256Hex || null;
     if (!computedSha256 && fs.existsSync(filePath)) {
       try {

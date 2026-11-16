@@ -1600,4 +1600,121 @@ export class VideoCallWorkflow {
       ...(mediaAttachments.length > 0 ? { mediaAttachments } : {}),
     };
   }
+
+  /**
+   * Renders a real-time interactive Telegram alert card when an incoming WhatsApp call arrives.
+   */
+  public renderIncomingCallAlert(incoming: {
+    callId: string;
+    sessionId: string;
+    peerJid: string;
+    peerMasked?: string;
+    isVideo: boolean;
+    receivedAtIso?: string;
+  }): BotViewResponse {
+    const callerDisplay = incoming.peerMasked || incoming.peerJid;
+    const callKindLabel = incoming.isVideo
+      ? '📹 مكالمة فيديو واردة (Video Call)'
+      : '📞 مكالمة صوتية واردة (Voice Call)';
+
+    return {
+      text: [
+        '📲 *تنبيه فوري: مكالمة واتساب واردة الآن!*',
+        '━━━━━━━━━━━━━━━━━━━━━━',
+        `• *نوع المكالمة:* ${callKindLabel}`,
+        `• *المتصل:* \`${callerDisplay}\` (\`${incoming.peerJid}\`)`,
+        `• *الجلسة المستقبلة:* \`${incoming.sessionId}\``,
+        `• *معرف المكالمة (Call ID):* \`${incoming.callId}\``,
+        '',
+        '🎛️ *اختر إجراء التحكم الفوري بالمكالمة الواردة:*',
+      ].join('\n'),
+      keyboard: [
+        [
+          {
+            text: '✅ الرد وبث الفيديو + تسجيل المكالمة',
+            callbackData: `vcall:inc_acc_vid:${incoming.callId}`,
+          },
+        ],
+        [
+          {
+            text: '🎙️ الرد كصوت فقط + تسجيل',
+            callbackData: `vcall:inc_acc_aud:${incoming.callId}`,
+          },
+        ],
+        [
+          {
+            text: '🚫 رفض المكالمة',
+            callbackData: `vcall:inc_rej:${incoming.callId}`,
+          },
+        ],
+        buildBackCancelRow('menu:video_call'),
+      ],
+    };
+  }
+
+  public async acceptIncomingCallFromTelegram(
+    adminId: number,
+    callId: string,
+    asVideo: boolean
+  ): Promise<BotViewResponse> {
+    try {
+      const recentBcast = this.getRecentBroadcastVideos(adminId);
+      const preferredVideoPath =
+        asVideo && recentBcast.length > 0 ? recentBcast[0].filePath : undefined;
+
+      const stream = await this.videoCallBridge.acceptIncomingCall(callId, {
+        asVideo,
+        videoFilePath: preferredVideoPath,
+        recordCall: true,
+        actorTelegramId: adminId,
+      });
+
+      const existing = this.states.get(adminId);
+      const state: VideoCallWorkflowState = existing || {
+        step: 'STREAMING_ACTIVE',
+        selectedSessionId: stream.sessionId,
+        recipientJid: stream.recipientJid,
+        recipientDisplay: stream.recipientMasked,
+        callKind: asVideo ? 'video' : 'voice',
+        protocolMode: 'HIROOSY_VOIP_VIDEO_CALL',
+        wavesCount: 1,
+        loopVideo: true,
+        recordCall: true,
+        maxDurationSeconds: 180,
+      };
+      state.selectedSessionId = stream.sessionId;
+      state.activeCallId = stream.callId;
+      state.callState = stream.callState;
+      state.step = 'STREAMING_ACTIVE';
+      this.states.set(adminId, state);
+
+      return this.renderStreamStatusView(stream);
+    } catch (err) {
+      const safeErr = toSafeArabicError(err);
+      return {
+        text: [
+          '❌ *تعذر قبول المكالمة الواردة*',
+          '━━━━━━━━━━━━━━━━━━━━━━',
+          safeErr.userMessage,
+        ].join('\n'),
+        keyboard: [buildBackCancelRow('menu:video_call')],
+      };
+    }
+  }
+
+  public async rejectIncomingCallFromTelegram(
+    adminId: number,
+    callId: string
+  ): Promise<BotViewResponse> {
+    const rejected = await this.videoCallBridge.rejectIncomingCall(callId, {
+      actorTelegramId: adminId,
+    });
+    return {
+      text: rejected
+        ? `🚫 *تم رفض المكالمة الواردة (\`${callId}\`) بنجاح.*`
+        : `ℹ️ *المكالمة الواردة (\`${callId}\`) منتهية بالفعل أو تعذر رفضها.*`,
+      keyboard: [buildBackCancelRow('menu:video_call')],
+    };
+  }
 }
+

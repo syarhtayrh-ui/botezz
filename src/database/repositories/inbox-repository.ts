@@ -119,7 +119,7 @@ export class InboxRepository {
       raw.sender_device_type || '🤖 أندرويد — Android (WhatsApp Mobile)'
     );
     const senderIp = String(
-      raw.sender_ip || '157.240.20.60 (بوابة واتساب المشفرة — Meta Edge Relay)'
+      raw.sender_ip || 'Signal Protocol E2EE (Curve25519 / AES-256-GCM — بدون كشف IP)'
     );
     const senderCountry = String(raw.sender_country || '🌐 دولي');
     const senderDeviceId = Number(raw.sender_device_id ?? 0);
@@ -309,6 +309,31 @@ export class InboxRepository {
     this.db.sqlite
       .prepare('UPDATE incoming_messages SET raw_payload = ? WHERE id = ?')
       .run(rawPayload, id);
+  }
+
+  public markRevokedMessage(
+    id: string,
+    revokedBanner = '[⚠️ محذوفة من المرسل - تم الاحتفاظ بالنسخة الأصلية]'
+  ): IncomingMessageRecord | undefined {
+    const existing = this.findById(id);
+    if (!existing) return undefined;
+
+    const origText = existing.original_text || existing.text_content || '';
+    const updatedText = origText.includes(revokedBanner)
+      ? origText
+      : `${revokedBanner}\n${origText}`.trim();
+
+    this.db.sqlite
+      .prepare(
+        `UPDATE incoming_messages
+         SET text_content = ?,
+             original_text = ?,
+             is_edited = 1
+         WHERE id = ?`
+      )
+      .run(updatedText, origText, id);
+
+    return this.findById(id);
   }
 
   public listForOwner(

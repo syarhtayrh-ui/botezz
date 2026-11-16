@@ -42,10 +42,11 @@ export class SendMessageOperation {
         sessionId: input.sessionId,
         targetJid,
         content: { text: validText },
-        maxRetries: 0,
+        maxRetries: 2,
+        retryDelayMs: 300,
       },
       {
-        isConnected: () => true,
+        isConnected: () => driver.getSocketDiagnostics().socketActive,
         sendMessage: async (jid) => {
           const { messageId } = await driver.sendTextMessage(jid, validText);
           return { key: { id: messageId } };

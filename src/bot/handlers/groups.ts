@@ -28,6 +28,10 @@ export class GroupsHandler {
           text: `👥 عرض مجموعات: ${sess.label} (${sess.masked_phone || sess.id})`,
           callbackData: `grp:list:${sess.id}`,
         },
+        {
+          text: `➕ إنشاء مجموعة (${sess.label})`,
+          callbackData: `grp:create:${sess.id}`,
+        },
       ]);
     }
 
@@ -44,9 +48,9 @@ export class GroupsHandler {
     return {
       text:
         `${renderBreadcrumb(['🏠 الرئيسية', '👥 إدارة المجموعات'])}\n` +
-        `👥 *إدارة المجموعات (Group Management)*\n\n` +
+        `👥 *مركز قيادة المجموعات والمجتمعات (Group Command Center)*\n\n` +
         (connected.length > 0
-          ? `اختر الجلسة المتصلة لعرض المجموعات المتاحة وإدارتها:`
+          ? `اختر الجلسة المتصلة لعرض المجموعات المتاحة، إنشاء مجموعة جديدة، أو تنفيذ إجراءات المشرفين المتقدمة:`
           : `⚠️ لا توجد جلسات متصلة حالياً. يرجى ربط جلسة أو إعادة اتصالها أولاً.`),
       keyboard: rows,
       toastText: '👥 إدارة المجموعات',

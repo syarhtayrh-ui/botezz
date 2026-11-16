@@ -1305,14 +1305,9 @@ export class ToolsHandler {
             candidateFn.createdBy === adminId)
         ) {
           this.selectedFunctionByAdmin.set(adminId, candidateFn.name);
-          const fallbackMode =
-            this.sessionManager.listConnectedSessions(adminId).length === 0 &&
-            effectiveMode === 'LIVE'
-              ? 'SIMULATION'
-              : effectiveMode;
           return this.executeTestFunction(
             adminId,
-            `+966501234567 1 ${candidateFn.name} --mode=${fallbackMode}`,
+            `+966501234567 1 ${candidateFn.name} --mode=${effectiveMode}`,
             candidateFn.sourceCode
           );
         }
@@ -1328,12 +1323,6 @@ export class ToolsHandler {
         )
       ) {
         positionalTokens.push('+966501234567', '1');
-        if (
-          this.sessionManager.listConnectedSessions(adminId).length === 0 &&
-          effectiveMode === 'LIVE'
-        ) {
-          effectiveMode = 'SIMULATION';
-        }
       }
 
       if (positionalTokens.length < 2) {
@@ -2082,7 +2071,8 @@ export class ToolsHandler {
   }
 
   /**
-   * Implements `/trackip <ip>` — validates IPv4/IPv6 and queries geolocation/ISP metadata.
+   * Implements `/trackip <ip>` — validates IPv4/IPv6 and queries geolocation/ISP metadata
+   * across a multi-provider chain (`ipwho.is` -> `ip-api.com` -> `ipwhois.app`) + reverse DNS (`PTR`).
    */
   public async executeIpLookup(
     adminId: number,
@@ -2091,35 +2081,144 @@ export class ToolsHandler {
     try {
       const ip = validateIpAddress(rawIp);
 
-      let data: Record<string, unknown> | null = null;
+      let ptrHostnames: string[] = [];
       try {
-        const res = await fetch(
-          `https://ipwhois.app/json/${encodeURIComponent(ip)}`,
-          {
-            signal: AbortSignal.timeout(7000),
-          }
-        );
+        const dnsPromises = await import('node:dns/promises');
+        ptrHostnames = await Promise.race([
+          dnsPromises.reverse(ip),
+          new Promise<string[]>((resolve) => setTimeout(() => resolve([]), 2500)),
+        ]);
+      } catch {
+        ptrHostnames = [];
+      }
+
+      let normalizedGeo: {
+        ip: string;
+        country?: string;
+        countryCode?: string;
+        region?: string;
+        city?: string;
+        timezone?: string;
+        isp?: string;
+        org?: string;
+        asn?: string;
+        latitude?: string;
+        longitude?: string;
+        provider?: string;
+      } | null = null;
+
+      // Provider 1: ipwho.is
+      try {
+        const res = await fetch(`https://ipwho.is/${encodeURIComponent(ip)}`, {
+          signal: AbortSignal.timeout(5000),
+        });
         if (res.ok) {
-          data = (await res.json()) as Record<string, unknown>;
+          const j = (await res.json()) as Record<string, unknown>;
+          if (j && j.success !== false) {
+            const conn = (j.connection as Record<string, unknown> | undefined) || {};
+            const tz = (j.timezone as Record<string, unknown> | undefined) || {};
+            normalizedGeo = {
+              ip: String(j.ip || ip),
+              country: String(j.country || ''),
+              countryCode: String(j.country_code || ''),
+              region: String(j.region || ''),
+              city: String(j.city || ''),
+              timezone: String(tz.utc || tz.id || ''),
+              isp: String(conn.isp || j.isp || ''),
+              org: String(conn.org || j.org || ''),
+              asn: conn.asn ? `AS${String(conn.asn)}` : String(j.asn || ''),
+              latitude: j.latitude !== undefined ? String(j.latitude) : undefined,
+              longitude: j.longitude !== undefined ? String(j.longitude) : undefined,
+              provider: 'ipwho.is',
+            };
+          }
         }
       } catch {
-        // Fallback when external lookup is unreachable in isolated network environments
+        // Continue to Provider 2
+      }
+
+      // Provider 2: ip-api.com
+      if (!normalizedGeo) {
+        try {
+          const res = await fetch(
+            `http://ip-api.com/json/${encodeURIComponent(ip)}?fields=status,message,country,countryCode,regionName,city,isp,org,as,lat,lon,timezone,query`,
+            { signal: AbortSignal.timeout(5000) }
+          );
+          if (res.ok) {
+            const j = (await res.json()) as Record<string, unknown>;
+            if (j && j.status === 'success') {
+              normalizedGeo = {
+                ip: String(j.query || ip),
+                country: String(j.country || ''),
+                countryCode: String(j.countryCode || ''),
+                region: String(j.regionName || ''),
+                city: String(j.city || ''),
+                timezone: String(j.timezone || ''),
+                isp: String(j.isp || ''),
+                org: String(j.org || ''),
+                asn: String(j.as || ''),
+                latitude: j.lat !== undefined ? String(j.lat) : undefined,
+                longitude: j.lon !== undefined ? String(j.lon) : undefined,
+                provider: 'ip-api.com',
+              };
+            }
+          }
+        } catch {
+          // Continue to Provider 3
+        }
+      }
+
+      // Provider 3: ipwhois.app
+      if (!normalizedGeo) {
+        try {
+          const res = await fetch(
+            `https://ipwhois.app/json/${encodeURIComponent(ip)}`,
+            { signal: AbortSignal.timeout(5000) }
+          );
+          if (res.ok) {
+            const j = (await res.json()) as Record<string, unknown>;
+            if (j && j.success !== false) {
+              normalizedGeo = {
+                ip: String(j.ip || ip),
+                country: String(j.country || ''),
+                countryCode: String(j.country_code || ''),
+                region: String(j.region || ''),
+                city: String(j.city || ''),
+                timezone: String(j.timezone_gmt || ''),
+                isp: String(j.isp || ''),
+                org: String(j.org || ''),
+                asn: String(j.asn || ''),
+                latitude: j.latitude !== undefined ? String(j.latitude) : undefined,
+                longitude: j.longitude !== undefined ? String(j.longitude) : undefined,
+                provider: 'ipwhois.app',
+              };
+            }
+          }
+        } catch {
+          // Handled below
+        }
       }
 
       this.auditRepo.record({
         actorTelegramId: adminId,
         action: 'TOOL_TRACK_IP',
         targetId: ip,
-        outcome: 'SUCCESS',
+        outcome: normalizedGeo ? 'SUCCESS' : 'FAILURE',
       });
 
-      if (!data || data.success === false) {
+      const ptrLine =
+        ptrHostnames.length > 0
+          ? `\n⫹⫺ *النطاق العكسي (PTR):* \`${escapeMarkdown(ptrHostnames.join(', '))}\``
+          : '';
+
+      if (!normalizedGeo) {
         return {
           text:
             `🌍 *نتيجة فحص عنوان IP:* \`${ip}\`\n` +
             `━━━━━━━━━━━━━━━━━━\n` +
-            `✅ *صيغة العنوان:* صحيحة (${ip.includes(':') ? 'IPv6' : 'IPv4'})\n` +
-            `ℹ️ *ملاحظة:* تعذر الوصول إلى خدمة الجغرافيا الخارجية (\`ipwhois.app\`) من بيئة الشبكة الحالية أو أن العنوان خاص/محجوز.`,
+            `✅ *صيغة العنوان:* صحيحة (${ip.includes(':') ? 'IPv6' : 'IPv4'})` +
+            ptrLine +
+            `\nℹ️ *ملاحظة:* تعذر الوصول إلى مزودي الجغرافيا الخارجيين (\`ipwho.is\` / \`ip-api.com\`) من بيئة الشبكة الحالية أو أن العنوان خاص/محجوز.`,
           keyboard: [
             [
               { text: '🌍 فحص عنوان آخر', callbackData: 'tools:prompt_ip' },
@@ -2129,8 +2228,8 @@ export class ToolsHandler {
         };
       }
 
-      const lat = String(data.latitude ?? '');
-      const lon = String(data.longitude ?? '');
+      const lat = normalizedGeo.latitude || '';
+      const lon = normalizedGeo.longitude || '';
       const mapsUrl =
         lat && lon
           ? `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(`${lat},${lon}`)}`
@@ -2140,14 +2239,15 @@ export class ToolsHandler {
         text:
           `🌍 *تقرير تتبع عنوان IP (/trackip)*\n` +
           `━━━━━━━━━━━━━━━━━━\n` +
-          `⫹⫺ *IP:* \`${String(data.ip || ip)}\`\n` +
-          `⫹⫺ *الدولة:* ${String(data.country || '—')} ${data.country_code ? `(${String(data.country_code)})` : ''}\n` +
-          `⫹⫺ *المنطقة / المدينة:* ${String(data.region || '—')} / ${String(data.city || '—')}\n` +
-          `⫹⫺ *المنطقة الزمنية:* \`${String(data.timezone_gmt || '—')}\`\n` +
-          `⫹⫺ *مزود الخدمة (ISP):* ${String(data.isp || '—')}\n` +
-          `⫹⫺ *المؤسسة (Org):* ${String(data.org || '—')}\n` +
-          `⫹⫺ *ASN:* \`${String(data.asn || '—')}\`\n` +
-          `⫹⫺ *الإحداثيات:* \`${lat || '—'}, ${lon || '—'}\`` +
+          `⫹⫺ *IP:* \`${normalizedGeo.ip}\`\n` +
+          `⫹⫺ *الدولة:* ${normalizedGeo.country || '—'} ${normalizedGeo.countryCode ? `(${normalizedGeo.countryCode})` : ''}\n` +
+          `⫹⫺ *المنطقة / المدينة:* ${normalizedGeo.region || '—'} / ${normalizedGeo.city || '—'}\n` +
+          `⫹⫺ *المنطقة الزمنية:* \`${normalizedGeo.timezone || '—'}\`\n` +
+          `⫹⫺ *مزود الخدمة (ISP):* ${normalizedGeo.isp || '—'}\n` +
+          `⫹⫺ *المؤسسة (Org):* ${normalizedGeo.org || '—'}\n` +
+          `⫹⫺ *ASN:* \`${normalizedGeo.asn || '—'}\`` +
+          ptrLine +
+          `\n⫹⫺ *الإحداثيات:* \`${lat || '—'}, ${lon || '—'}\`` +
           (mapsUrl ? `\n📍 *خريطة الموقع:* ${mapsUrl}` : ''),
         keyboard: [
           [
@@ -2171,7 +2271,7 @@ export class ToolsHandler {
   }
 
   /**
-   * Implements `/shortlink <url>` — validates URL and shortens via TinyURL API.
+   * Implements `/shortlink <url>` — validates URL and shortens via TinyURL -> is.gd fallback chain.
    */
   public async executeShortlink(
     adminId: number,
@@ -2181,10 +2281,11 @@ export class ToolsHandler {
       const validUrl = validateShortlinkTargetUrl(rawUrl);
       let shortUrl = '';
 
+      // Provider 1: TinyURL
       try {
         const res = await fetch(
           `https://tinyurl.com/api-create.php?url=${encodeURIComponent(validUrl)}`,
-          { signal: AbortSignal.timeout(7000) }
+          { signal: AbortSignal.timeout(6000) }
         );
         if (res.ok) {
           const text = (await res.text()).trim();
@@ -2193,21 +2294,39 @@ export class ToolsHandler {
           }
         }
       } catch {
-        // Network fallback handled below
+        // Fallback to Provider 2
+      }
+
+      // Provider 2: is.gd
+      if (!shortUrl) {
+        try {
+          const res = await fetch(
+            `https://is.gd/create.php?format=simple&url=${encodeURIComponent(validUrl)}`,
+            { signal: AbortSignal.timeout(6000) }
+          );
+          if (res.ok) {
+            const text = (await res.text()).trim();
+            if (text.startsWith('http')) {
+              shortUrl = text;
+            }
+          }
+        } catch {
+          // Handled below
+        }
       }
 
       this.auditRepo.record({
         actorTelegramId: adminId,
         action: 'TOOL_SHORTLINK',
         targetId: validUrl.slice(0, 80),
-        outcome: 'SUCCESS',
+        outcome: shortUrl ? 'SUCCESS' : 'FAILURE',
       });
 
       if (!shortUrl) {
         return {
           text:
             `🔗 *فحص الرابط:* \`${validUrl}\`\n\n` +
-            `✅ الرابط صالح، ولكن تعذر الوصول إلى خدمة \`tinyurl.com\` الخارجية من بيئة الشبكة الحالية.`,
+            `⚠️ الرابط صالح، ولكن تعذر الوصول إلى مزودي اختصار الروابط (\`tinyurl.com\` / \`is.gd\`) من بيئة الشبكة الحالية.`,
           keyboard: [
             [
               { text: '🔗 اختصار رابط آخر', callbackData: 'tools:prompt_shortlink' },

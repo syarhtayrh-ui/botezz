@@ -16,7 +16,10 @@ import { MessageWorkflow } from './workflows/message-workflow';
 import { MediaWorkflow } from './workflows/media-workflow';
 import { GroupWorkflow } from './workflows/group-workflow';
 import { VideoCallWorkflow } from './workflows/video-call-workflow';
-import { UbuntuVideoCallBridge } from '../whatsapp/video-call-bridge';
+import {
+  UbuntuVideoCallBridge,
+  PendingIncomingVoipCall,
+} from '../whatsapp/video-call-bridge';
 import { StartHandler } from './handlers/start';
 import { SessionsHandler } from './handlers/sessions';
 import { MessagingHandler } from './handlers/messaging';
@@ -36,7 +39,10 @@ import {
 import { SessionManager } from '../whatsapp/session-manager';
 import { TaskManager } from '../tasks/task-manager';
 import { SendMessageOperation } from '../whatsapp/operations/send-message';
-import { SendMediaOperation } from '../whatsapp/operations/send-media';
+import {
+  SendMediaOperation,
+  OutboundMediaDeliveryMode,
+} from '../whatsapp/operations/send-media';
 import {
   GroupOperations,
   GroupManagementActionType,
@@ -435,6 +441,25 @@ export class TelegramBotController {
             'ℹ️ انتهت المكالمة، ولم يتم إرسال فيديو تسجيل لأن الطرف المستقبل لم يفتح الكاميرا أثناء المكالمة.';
           if (this.onCallRecordingNoRemoteCamera && targetAdminId > 0) {
             this.onCallRecordingNoRemoteCamera(targetAdminId, notice);
+          }
+        });
+      }
+    );
+
+    this.videoCallBridge.on(
+      'call:incoming',
+      (call: PendingIncomingVoipCall) => {
+        setImmediate(() => {
+          const targetAdminId = deps.config.TELEGRAM_ADMIN_ID;
+          if (targetAdminId <= 0) return;
+          const view = this.videoCallWorkflow.renderIncomingCallAlert(call);
+          const sess = this.uiState.getOrCreateSession(targetAdminId);
+          sess.lastView = view;
+          sess.lastText = view.text;
+          if (this.onCallLiveViewUpdate) {
+            void Promise.resolve(
+              this.onCallLiveViewUpdate(targetAdminId, view)
+            ).catch(() => undefined);
           }
         });
       }
@@ -1290,6 +1315,13 @@ export class TelegramBotController {
       this.activateInputOwner(actorUserId, 'SEND_MEDIA');
       return this.mediaWorkflow.proceedToConfirmation(actorUserId);
     }
+    if (callbackData.startsWith('wf_media:mode:')) {
+      const mode = callbackData
+        .slice('wf_media:mode:'.length)
+        .trim() as OutboundMediaDeliveryMode;
+      this.activateInputOwner(actorUserId, 'SEND_MEDIA');
+      return this.mediaWorkflow.setDeliveryMode(actorUserId, mode);
+    }
     if (callbackData === 'wf_media:confirm_execute') {
       const view = this.mediaWorkflow.confirmAndExecute(actorUserId);
       this.activateInputOwner(actorUserId, 'NONE');
@@ -1481,6 +1513,32 @@ export class TelegramBotController {
       this.activeConversationMode.set(actorUserId, 'NONE');
       return res;
     }
+    if (callbackData.startsWith('vcall:inc_acc_vid:')) {
+      const callId = callbackData.slice('vcall:inc_acc_vid:'.length).trim();
+      this.activateInputOwner(actorUserId, 'NONE');
+      return this.videoCallWorkflow.acceptIncomingCallFromTelegram(
+        actorUserId,
+        callId,
+        true
+      );
+    }
+    if (callbackData.startsWith('vcall:inc_acc_aud:')) {
+      const callId = callbackData.slice('vcall:inc_acc_aud:'.length).trim();
+      this.activateInputOwner(actorUserId, 'NONE');
+      return this.videoCallWorkflow.acceptIncomingCallFromTelegram(
+        actorUserId,
+        callId,
+        false
+      );
+    }
+    if (callbackData.startsWith('vcall:inc_rej:')) {
+      const callId = callbackData.slice('vcall:inc_rej:'.length).trim();
+      this.activateInputOwner(actorUserId, 'NONE');
+      return this.videoCallWorkflow.rejectIncomingCallFromTelegram(
+        actorUserId,
+        callId
+      );
+    }
 
     // 5c: Incoming Messages Receiver & Archive (Inbox)
     if (callbackData === 'menu:inbox') {
@@ -1497,15 +1555,28 @@ export class TelegramBotController {
       this.activateInputOwner(actorUserId, 'NONE');
       return this.inboxHandler.viewMessage(actorUserId, id);
     }
-    if (
-      callbackData.startsWith('inbox:fwd:') ||
-      callbackData.startsWith('inbox:reply:')
-    ) {
-      const id = callbackData.startsWith('inbox:fwd:')
-        ? callbackData.slice('inbox:fwd:'.length)
-        : callbackData.slice('inbox:reply:'.length);
+    if (callbackData.startsWith('inbox:fwd:')) {
+      const id = callbackData.slice('inbox:fwd:'.length);
       this.activateInputOwner(actorUserId, 'INBOX');
       return this.inboxHandler.promptForward(actorUserId, id);
+    }
+    if (callbackData.startsWith('inbox:fwd_mode:')) {
+      const rest = callbackData.slice('inbox:fwd_mode:'.length);
+      const colonIdx = rest.indexOf(':');
+      const modeRaw = colonIdx >= 0 ? rest.slice(0, colonIdx) : 'CLEAN';
+      const id = colonIdx >= 0 ? rest.slice(colonIdx + 1) : rest;
+      const mode = (
+        modeRaw === 'FORWARD_1' || modeRaw === 'FORWARD_999'
+          ? modeRaw
+          : 'CLEAN'
+      ) as 'CLEAN' | 'FORWARD_1' | 'FORWARD_999';
+      this.activateInputOwner(actorUserId, 'INBOX');
+      return this.inboxHandler.setForwardMode(actorUserId, id, mode);
+    }
+    if (callbackData.startsWith('inbox:reply:')) {
+      const id = callbackData.slice('inbox:reply:'.length);
+      this.activateInputOwner(actorUserId, 'INBOX');
+      return this.inboxHandler.promptReply(actorUserId, id);
     }
     if (callbackData.startsWith('inbox:dl:')) {
       const id = callbackData.slice('inbox:dl:'.length);
@@ -1528,7 +1599,7 @@ export class TelegramBotController {
       return this.inboxHandler.simulateBatch(actorUserId);
     }
 
-    // 5d: WhatsApp Status / Stories Downloader
+    // 5d: WhatsApp Status / Stories Downloader & Publisher
     if (callbackData === 'menu:stories') {
       this.activateInputOwner(actorUserId, 'NONE');
       return this.storiesHandler.renderStoriesMenu(actorUserId, 1);
@@ -1537,6 +1608,24 @@ export class TelegramBotController {
       const page = Number(callbackData.split(':').pop() || '1');
       this.activateInputOwner(actorUserId, 'NONE');
       return this.storiesHandler.renderStoriesMenu(actorUserId, page);
+    }
+    if (callbackData === 'stories:pub_start') {
+      this.activateInputOwner(actorUserId, 'STORIES');
+      return this.storiesHandler.startPublishStory(actorUserId);
+    }
+    if (callbackData.startsWith('stories:pub_color:')) {
+      const colorKey = callbackData.slice('stories:pub_color:'.length);
+      this.activateInputOwner(actorUserId, 'STORIES');
+      return this.storiesHandler.setPublishColor(actorUserId, colorKey);
+    }
+    if (callbackData === 'stories:pub_font') {
+      this.activateInputOwner(actorUserId, 'STORIES');
+      return this.storiesHandler.cyclePublishFont(actorUserId);
+    }
+    if (callbackData.startsWith('stories:pub_sess:')) {
+      const sessId = callbackData.slice('stories:pub_sess:'.length);
+      this.activateInputOwner(actorUserId, 'STORIES');
+      return this.storiesHandler.selectPublishSession(actorUserId, sessId);
     }
     if (callbackData.startsWith('stories:dl:')) {
       const id = callbackData.slice('stories:dl:'.length);
@@ -1580,6 +1669,11 @@ export class TelegramBotController {
       const page = Number(parts[3] || '1');
       this.activateInputOwner(actorUserId, 'NONE');
       return this.groupsHandler.renderSessionGroups(sessionId, page, actorUserId);
+    }
+    if (callbackData.startsWith('grp:create:')) {
+      const sessionId = callbackData.slice('grp:create:'.length);
+      this.activateInputOwner(actorUserId, 'GROUP');
+      return this.groupWorkflow.startCreateGroup(actorUserId, sessionId);
     }
     if (callbackData.startsWith('gv:')) {
       const shortId = callbackData.slice('gv:'.length);
@@ -2284,6 +2378,12 @@ export class TelegramBotController {
         actorUserId,
         upload
       );
+      this.activateInputOwner(actorUserId, 'NONE');
+    } else if (
+      this.uiState.getActiveInputOwner(actorUserId) === 'STORIES' ||
+      this.storiesHandler.getStep(actorUserId) === 'AWAITING_CONTENT'
+    ) {
+      view = await this.storiesHandler.handleMediaUpload(actorUserId, upload);
       this.activateInputOwner(actorUserId, 'NONE');
     } else if (mode === 'VIDEO_CALL') {
       view = await this.videoCallWorkflow.handleVideoUpload(actorUserId, upload);
@@ -3167,8 +3267,21 @@ export class TelegramBotController {
             };
           }
         }
+        if (state.mode === 'CREATE_GROUP') {
+          const view = await this.groupWorkflow.handleCreateGroupInput(
+            actorUserId,
+            trimmed
+          );
+          if (!this.groupWorkflow.getState(actorUserId)) {
+            this.activateInputOwner(actorUserId, 'NONE');
+          }
+          return view;
+        }
         if (state.mode === 'MANAGE_GROUP') {
-          if (state.step === 'AWAITING_PARTICIPANT_PHONE') {
+          if (
+            state.step === 'AWAITING_PARTICIPANT_PHONE' ||
+            state.step === 'AWAITING_TEXT_PAYLOAD'
+          ) {
             return this.groupWorkflow.handleParticipantPhoneInput(
               actorUserId,
               trimmed
@@ -3239,8 +3352,26 @@ export class TelegramBotController {
 
     if (owner === 'INBOX' || (owner === 'NONE' && mode === 'INBOX_FORWARD')) {
       this.activateInputOwner(actorUserId, 'INBOX');
-      const response = await this.inboxHandler.executeForward(actorUserId, trimmed);
-      if (!this.inboxHandler.hasPendingForward(actorUserId)) {
+      const response = await this.inboxHandler.handleTextInput(
+        actorUserId,
+        trimmed
+      );
+      if (!this.inboxHandler.hasPendingInput(actorUserId)) {
+        this.activateInputOwner(actorUserId, 'NONE');
+      }
+      return response;
+    }
+
+    if (
+      owner === 'STORIES' ||
+      this.storiesHandler.getStep(actorUserId) === 'AWAITING_CONTENT'
+    ) {
+      this.activateInputOwner(actorUserId, 'STORIES');
+      const response = await this.storiesHandler.handleTextInput(
+        actorUserId,
+        trimmed
+      );
+      if (this.storiesHandler.getStep(actorUserId) === 'IDLE') {
         this.activateInputOwner(actorUserId, 'NONE');
       }
       return response;

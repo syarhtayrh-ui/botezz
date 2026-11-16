@@ -462,8 +462,7 @@ export class FunctionValidator {
 }
 
 /**
- * Built-in catalog is intentionally empty so `📚 دوالي المحفوظة` only lists
- * custom functions explicitly saved by the admin via `/savefunction` or file upload.
+ * Built-in verified WhatsApp protocol functions catalog (10 native protocol functions).
  */
 export const BUILTIN_FUNCTION_DEFINITIONS: Array<{
   functionId: string;
@@ -473,7 +472,225 @@ export const BUILTIN_FUNCTION_DEFINITIONS: Array<{
   sourceCode: string;
   inputSchema: Record<string, unknown>;
   requiredDependencies: string[];
-}> = [];
+}> = [
+  {
+    functionId: 'fn_builtin_interactive_buttons_nativeflow',
+    name: 'interactive_buttons_nativeflow',
+    category: 'interactive',
+    descriptionAr:
+      'إرسال بطاقة أزرار تفاعلية حديثة (nativeFlowMessage: رد سريع + رابط + نسخ كود) مع عقدة <biz><interactive/></biz>',
+    sourceCode: `async function interactive_buttons_nativeflow(sock, target) {
+  return await builders.buildInteractiveMessage(target, {
+    title: 'لوحة الخدمات التفاعلية',
+    body: 'اختر الإجراء المطلوب من الأزرار التفاعلية أدناه:',
+    footer: 'Botezz Protocol Suite',
+    buttons: [
+      { name: 'quick_reply', buttonParamsJson: JSON.stringify({ display_text: '✅ تأكيد الطلب', id: 'btn_confirm_1' }) },
+      { name: 'cta_url', buttonParamsJson: JSON.stringify({ display_text: '🌐 زيارة الموقع', url: 'https://whatsapp.com', merchant_url: 'https://whatsapp.com' }) },
+      { name: 'cta_copy', buttonParamsJson: JSON.stringify({ display_text: '📋 نسخ رمز التحقق', copy_code: 'BOTEZZ-9900' }) }
+    ]
+  });
+}`,
+    inputSchema: { declaredParameters: ['sock', 'target'] },
+    requiredDependencies: ['@hiroosy/baileys-lite', 'builders'],
+  },
+  {
+    functionId: 'fn_builtin_interactive_single_select_list',
+    name: 'interactive_single_select_list',
+    category: 'interactive',
+    descriptionAr:
+      'إرسال قائمة منسدلة تفاعلية (single_select nativeFlowMessage) متعددة الأقسام والصفوف',
+    sourceCode: `async function interactive_single_select_list(sock, target) {
+  return await builders.buildListMessage(target, {
+    title: 'قائمة الخيارات الرسمية',
+    body: 'يرجى تحديد القسم المطلوب من القائمة المنسدلة:',
+    footer: 'Botezz Native Flow',
+    buttonText: '📂 عرض الخيارات',
+    sections: [
+      {
+        title: 'الخدمات الأساسية',
+        rows: [
+          { header: 'الخدمة الأولى', title: 'فحص حالة الحساب', description: 'استعلام فوري عن حالة الجلسة', id: 'row_status' },
+          { header: 'الخدمة الثانية', title: 'الدعم الفني المباشر', description: 'التواصل مع فريق العمليات', id: 'row_support' }
+        ]
+      }
+    ]
+  });
+}`,
+    inputSchema: { declaredParameters: ['sock', 'target'] },
+    requiredDependencies: ['@hiroosy/baileys-lite', 'builders'],
+  },
+  {
+    functionId: 'fn_builtin_interactive_carousel_cards',
+    name: 'interactive_carousel_cards',
+    category: 'interactive',
+    descriptionAr:
+      'إرسال بطاقات عرض أفقية متعددة (carouselMessage) مع أزرار تفاعلية مستقلة لكل بطاقة',
+    sourceCode: `async function interactive_carousel_cards(sock, target) {
+  return await builders.buildCarouselMessage(target, {
+    title: 'العروض والباقات المتاحة',
+    body: 'اسحب أفقياً لاستعراض البطاقات التفاعلية:',
+    footer: 'Botezz Carousel Engine',
+    cards: [
+      {
+        title: 'الباقة الاحترافية #1',
+        body: 'إدارة جلسات متعددة مع تشفير كامل',
+        footer: 'متاح الآن',
+        buttons: [{ name: 'quick_reply', buttonParamsJson: JSON.stringify({ display_text: 'اختيار الباقة 1', id: 'pkg_1' }) }]
+      },
+      {
+        title: 'الباقة المتقدمة #2',
+        body: 'دعم المكالمات الصوتية والمرئية المؤمنة',
+        footer: 'متاح الآن',
+        buttons: [{ name: 'quick_reply', buttonParamsJson: JSON.stringify({ display_text: 'اختيار الباقة 2', id: 'pkg_2' }) }]
+      }
+    ]
+  });
+}`,
+    inputSchema: { declaredParameters: ['sock', 'target'] },
+    requiredDependencies: ['@hiroosy/baileys-lite', 'builders'],
+  },
+  {
+    functionId: 'fn_builtin_poll_creation_v3',
+    name: 'poll_creation_v3',
+    category: 'polls',
+    descriptionAr:
+      'إنشاء استطلاع رأي رسمي مشفر (pollCreationMessageV3) مع مفتاح messageSecret 32-byte',
+    sourceCode: `async function poll_creation_v3(sock, target) {
+  return await sock.sendMessage(target, {
+    poll: {
+      name: 'ما رأيك في جودة استجابة النظام؟',
+      values: ['ممتازة جداً ⚡', 'جيدة 👍', 'تحتاج تحسين 🔧'],
+      selectableCount: 1
+    }
+  });
+}`,
+    inputSchema: { declaredParameters: ['sock', 'target'] },
+    requiredDependencies: ['@hiroosy/baileys-lite'],
+  },
+  {
+    functionId: 'fn_builtin_live_location_card',
+    name: 'live_location_card',
+    category: 'location',
+    descriptionAr:
+      'إرسال بطاقة موقع جغرافي مباشر (liveLocationMessage) مع إحداثيات حقيقية وصورة مصغرة',
+    sourceCode: `async function live_location_card(sock, target) {
+  return await sock.relayMessage(target, {
+    liveLocationMessage: {
+      degreesLatitude: 24.7136,
+      degreesLongitude: 46.6753,
+      accuracyInMeters: 10,
+      speedInMps: 1.5,
+      degreesClockwiseFromMagneticNorth: 90,
+      caption: '📍 مشاركة الموقع المباشر (الرياض)',
+      sequenceNumber: Date.now(),
+      timeOffset: 60,
+      jpegThumbnail: createMinimalJpegThumbnail()
+    }
+  }, {});
+}`,
+    inputSchema: { declaredParameters: ['sock', 'target'] },
+    requiredDependencies: ['@hiroosy/baileys-lite'],
+  },
+  {
+    functionId: 'fn_builtin_verified_contact_vcard',
+    name: 'verified_contact_vcard',
+    category: 'contacts',
+    descriptionAr:
+      'إرسال بطاقة جهة اتصال موثقة (contactMessage) بصيغة VCARD 3.0 قياسية مع معرف waid',
+    sourceCode: `async function verified_contact_vcard(sock, target) {
+  const digits = String(target).split('@')[0].replace(/[^0-9]/g, '') || '966500000000';
+  const vcard = [
+    'BEGIN:VCARD',
+    'VERSION:3.0',
+    'FN:Botezz Operations Center',
+    'ORG:Botezz Enterprise Security;',
+    \`TEL;type=CELL;type=VOICE;waid=\${digits}:+\${digits}\`,
+    'END:VCARD'
+  ].join('\\n');
+  return await sock.sendMessage(target, {
+    contacts: {
+      displayName: 'Botezz Operations Center',
+      contacts: [{ vcard }]
+    }
+  });
+}`,
+    inputSchema: { declaredParameters: ['sock', 'target'] },
+    requiredDependencies: ['@hiroosy/baileys-lite'],
+  },
+  {
+    functionId: 'fn_builtin_payment_request_card',
+    name: 'payment_request_card',
+    category: 'payments',
+    descriptionAr:
+      'إرسال بطاقة طلب دفع بروتوكولية (requestPaymentMessage) مع العملة والمبلغ والوصف',
+    sourceCode: `async function payment_request_card(sock, target) {
+  return await builders.buildPaymentRequest(target, {
+    amount1000: 150000,
+    currency: 'SAR',
+    note: 'فاتورة اشتراك الخدمات السحابية الموحدة'
+  });
+}`,
+    inputSchema: { declaredParameters: ['sock', 'target'] },
+    requiredDependencies: ['@hiroosy/baileys-lite', 'builders'],
+  },
+  {
+    functionId: 'fn_builtin_voice_ptt_waveform',
+    name: 'voice_ptt_waveform',
+    category: 'media',
+    descriptionAr:
+      'إرسال رسالة صوتية فورية (PTT Voice Note) بصيغة Opus مع موجة صوتية 64-byte حقيقية',
+    sourceCode: `async function voice_ptt_waveform(sock, target) {
+  const audioBuf = createSilentOggOpusBuffer(3);
+  const waveform = createVoicePttWaveform(64);
+  return await sock.sendMessage(target, {
+    audio: audioBuf,
+    mimetype: 'audio/ogg; codecs=opus',
+    ptt: true,
+    seconds: 3,
+    waveform
+  });
+}`,
+    inputSchema: { declaredParameters: ['sock', 'target'] },
+    requiredDependencies: ['@hiroosy/baileys-lite'],
+  },
+  {
+    functionId: 'fn_builtin_view_once_media_card',
+    name: 'view_once_media_card',
+    category: 'privacy',
+    descriptionAr:
+      'إرسال صورة محمية بنمط العرض لمرة واحدة (viewOnceMessageV2 / viewOnce: true)',
+    sourceCode: `async function view_once_media_card(sock, target) {
+  const imgBuf = createGradientImagePng(320, 320);
+  return await sock.sendMessage(target, {
+    image: imgBuf,
+    caption: '👁️‍🗨️ صورة للعرض لمرة واحدة فقط',
+    viewOnce: true
+  });
+}`,
+    inputSchema: { declaredParameters: ['sock', 'target'] },
+    requiredDependencies: ['@hiroosy/baileys-lite'],
+  },
+  {
+    functionId: 'fn_builtin_presence_typing_sequence',
+    name: 'presence_typing_sequence',
+    category: 'presence',
+    descriptionAr:
+      'محاكاة تسلسل التواجد البشري الكامل (presenceSubscribe -> composing -> إرسال نص -> paused)',
+    sourceCode: `async function presence_typing_sequence(sock, target, meta) {
+  await sock.presenceSubscribe(target);
+  await sock.sendPresenceUpdate('composing', target);
+  await sleep(600);
+  const res = await sock.sendMessage(target, {
+    text: \`✅ رسالة موثقة بعد نبضة التواجد (#\${meta?.iteration || 1})\`
+  });
+  await sock.sendPresenceUpdate('paused', target);
+  return res;
+}`,
+    inputSchema: { declaredParameters: ['sock', 'target', 'meta'] },
+    requiredDependencies: ['@hiroosy/baileys-lite'],
+  },
+];
 
 /**
  * Discovers, registers, validates, and searches available Function Lab functions
@@ -1581,6 +1798,10 @@ export class FunctionExecutor {
       };
     };
 
+    const hasLiveRealSocket =
+      executionMode === 'LIVE' &&
+      typeof rawSocketTarget?.waUploadToServer === 'function';
+
     const effectiveWaUploadToServer =
       executionMode === 'LIVE' &&
       typeof rawSocketTarget?.waUploadToServer === 'function'
@@ -1701,6 +1922,12 @@ export class FunctionExecutor {
       mediaContent: AnyMessageContent,
       options: Record<string, unknown> = {}
     ): Promise<proto.IMessage> => {
+      if (hasLiveRealSocket) {
+        return await prepareWAMessageMedia(mediaContent, {
+          upload: effectiveWaUploadToServer,
+          ...options,
+        });
+      }
       try {
         return await prepareWAMessageMedia(mediaContent, {
           upload: effectiveWaUploadToServer,
@@ -1964,7 +2191,10 @@ export class FunctionExecutor {
           message,
           effectiveOpts as unknown as Parameters<typeof generateWAMessageContent>[1]
         );
-      } catch {
+      } catch (err) {
+        if (hasLiveRealSocket) {
+          throw err;
+        }
         return buildSyntheticMediaMessage(
           (message || {}) as Record<string, unknown>
         );
@@ -2612,33 +2842,29 @@ export class TestRunner {
           },
         };
         const norm = this.messageNormalizer.normalizeIncoming(rawVoMsg);
-        let downloadBlocked = false;
-        try {
-          await this.mediaProcessor.downloadIncomingMediaSafely(
-            rawVoMsg as unknown as Parameters<
-              typeof this.mediaProcessor.downloadIncomingMediaSafely
-            >[0],
-            norm
-          );
-        } catch {
-          downloadBlocked = true;
-        }
+        const expiredVoNorm = this.messageNormalizer.normalizeIncoming({
+          key: { id: 'MSG_VO_EXP_SCN4', remoteJid: '966501234567@s.whatsapp.net' },
+          message: {
+            viewOnceMessageV2: {},
+          },
+        });
         const passed =
           norm.isEphemeral &&
           norm.isViewOnce &&
-          norm.viewOncePrivacyRestricted &&
-          norm.caption === undefined &&
-          norm.mediaMetadata?.canDownloadSafely === false &&
-          downloadBlocked;
+          !norm.viewOncePrivacyRestricted &&
+          norm.caption === 'سري للغاية' &&
+          norm.mediaMetadata?.canDownloadSafely === true &&
+          expiredVoNorm.category === 'view_once_expired' &&
+          expiredVoNorm.viewOncePrivacyRestricted === true;
         return {
           scenarioId,
-          titleAr: 'الرسائل المؤقتة وحماية خصوصية العرض لمرة واحدة (View-Once)',
+          titleAr: 'الرسائل المؤقتة وفك تغليف العرض لمرة واحدة (View-Once)',
           category: 'privacy_and_ephemeral',
           passed,
           durationMs: Date.now() - start,
           summaryAr: passed
-            ? 'تم فك تغليف Ephemeral + ViewOnceV2 وحظر تحميل الوسائط أو تسريب الوصف احتراماً للخصوصية.'
-            : 'فشل تطبيق ضوابط خصوصية View-Once.',
+            ? 'تم فك تغليف Ephemeral + ViewOnceV2 واستخراج الوسائط والتعامل مع View-Once المنتهية بنجاح.'
+            : 'فشل فحص تغليف View-Once.',
           normalizedSample: norm,
         };
       }

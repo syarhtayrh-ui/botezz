@@ -724,14 +724,10 @@ export class MessageNormalizer {
       const hasMediaKey = Boolean(innerPayload.mediaKey);
       const hasDirectPathOrUrl = Boolean(innerPayload.directPath || innerPayload.url);
       const fileLength = Number(innerPayload.fileLength || 0);
-      const canDownloadSafely =
-        !isViewOnce && hasMediaKey && hasDirectPathOrUrl;
+      const canDownloadSafely = hasMediaKey && hasDirectPathOrUrl;
       let unavailableReasonAr: string | undefined;
 
-      if (isViewOnce) {
-        unavailableReasonAr =
-          'الرسالة محمية بخصوصية العرض لمرة واحدة (View-Once)؛ يمنع النظام استخراج أو حفظ الوسائط احتراماً لقواعد الخصوصية.';
-      } else if (!hasMediaKey || !hasDirectPathOrUrl) {
+      if (!hasMediaKey || !hasDirectPathOrUrl) {
         unavailableReasonAr =
           'مفتاح فك التشفير (mediaKey) أو مسار الوسائط غير متوفر أو منتهي الصلاحية.';
       }
@@ -992,11 +988,10 @@ export class MessageNormalizer {
       }
     }
 
-    // If view-once is active on any media message, strip any direct text/caption leak and mark privacy-restricted
+    // Tag non-expired View-Once media so the receiver unwraps, decrypts, and archives it with a clear badge
     if (isViewOnce) {
-      caption = undefined;
       warningsAr.push(
-        'تنبيه خصوصية: الرسالة من نوع العرض لمرة واحدة (View-Once). تم حجب تحميل الوسائط التزاماً بقواعد الخصوصية.'
+        '👁️‍🗨️ وسائط عرض لمرة واحدة تم كشفها وحفظها (View-Once Unwrapped).'
       );
     }
 
@@ -1016,7 +1011,7 @@ export class MessageNormalizer {
       isEphemeral,
       ephemeralExpirationSeconds,
       isViewOnce,
-      viewOncePrivacyRestricted: isViewOnce,
+      viewOncePrivacyRestricted: false,
       isEdited,
       isRevoked,
       isForwarded,

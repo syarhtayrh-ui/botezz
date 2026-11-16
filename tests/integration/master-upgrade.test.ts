@@ -1227,10 +1227,91 @@ test('Deep Status Downloader & Deep Message Inbox: all formats, zip fallback, ed
     assert.equal(forwardedEntry.targetJid, '966509988776@s.whatsapp.net');
     assert.equal(forwardedEntry.isForwarded, true);
     assert.ok(forwardedEntry.rawPayload);
+
+    // 7. Inbox Quoted Reply (inbox:reply:<id>) & Anti-Revoke (protocolMessage.type === 0)
+    await env.controller.handleCallbackQuery(ownerId, `inbox:reply:${deepMsg.id}`, {
+      skipDuplicateCheck: true,
+    });
+    const replyRes = await env.controller.handleTextMessage(
+      ownerId,
+      'هذا رد مقتبس رسمي على رسالتك!'
+    );
+    assert.ok(replyRes.text.includes('تم إرسال الرد المباشر المقتبس'));
+
+    const revokedRec = await env.controller.incomingMessageReceiver.processIncomingMessage({
+      sessionId: sess.id,
+      rawMessage: {
+        key: {
+          remoteJid: '966551122334@s.whatsapp.net',
+          id: 'wa_msg_revoke_protocol_1',
+          fromMe: false,
+        },
+        message: {
+          protocolMessage: {
+            key: {
+              remoteJid: '966551122334@s.whatsapp.net',
+              id: 'wa_msg_deep_long_1',
+              fromMe: false,
+            },
+            type: 0, // REVOKE
+          },
+        },
+      },
+    });
+    assert.ok(revokedRec);
+    assert.ok(revokedRec.text_content?.includes('محذوفة من المرسل'));
+
+    // 8. Outbound Story Publisher (status@broadcast)
+    const pubStartView = await env.controller.handleCallbackQuery(
+      ownerId,
+      'stories:pub_start',
+      { skipDuplicateCheck: true }
+    );
+    assert.ok(pubStartView.text.includes('نشر حالة واتساب جديدة'));
+    await env.controller.handleCallbackQuery(ownerId, 'stories:pub_color:PURPLE', {
+      skipDuplicateCheck: true,
+    });
+    const pubTextRes = await env.controller.handleTextMessage(
+      ownerId,
+      'حالة نصية رسمية من Botezz 🚀'
+    );
+    assert.ok(pubTextRes.text.includes('تم نشر الحالة النصية على واتساب'));
+
+    // 9. Group Command Center: Create Group & Admin Actions (SUB, ANN, HTG)
+    await env.controller.handleCallbackQuery(ownerId, `grp:create:${sess.id}`, {
+      skipDuplicateCheck: true,
+    });
+    const createStep1 = await env.controller.handleTextMessage(
+      ownerId,
+      'غرفة عمليات الاختبار'
+    );
+    assert.ok(createStep1.text.includes('الخطوة 2 من 2'));
+    const createStep2 = await env.controller.handleTextMessage(
+      ownerId,
+      '+966501112233, +966504445566'
+    );
+    assert.ok(createStep2.text.includes('تم إنشاء المجموعة بنجاح'));
+
+    // 10. Incoming VoIP Call Alert & Accept/Reject Flow
+    const incAlert = env.controller.videoCallWorkflow.renderIncomingCallAlert({
+      callId: 'inc_call_test_99',
+      sessionId: sess.id,
+      callerJid: '966509998877@s.whatsapp.net',
+      isVideo: true,
+      receivedAtIso: new Date().toISOString(),
+    });
+    assert.ok(incAlert.text.includes('مكالمة واتساب واردة الآن'));
+    const rejView = await env.controller.handleCallbackQuery(
+      ownerId,
+      'vcall:inc_rej:inc_call_test_99',
+      { skipDuplicateCheck: true }
+    );
+    assert.ok(rejView.text.includes('inc_call_test_99'));
   } finally {
     await env.cleanup();
   }
 });
+
 
 
 

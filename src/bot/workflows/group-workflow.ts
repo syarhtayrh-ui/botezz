@@ -30,26 +30,80 @@ export interface JoinGroupWorkflowState {
 
 export interface ManageGroupWorkflowState {
   mode: 'MANAGE_GROUP';
-  step: 'AWAITING_PARTICIPANT_PHONE' | 'AWAITING_ACTION_CONFIRMATION';
+  step:
+    | 'AWAITING_PARTICIPANT_PHONE'
+    | 'AWAITING_TEXT_PAYLOAD'
+    | 'AWAITING_ACTION_CONFIRMATION';
   sessionId: string;
   groupJid: string;
   groupSubject: string;
   action: GroupManagementActionType;
   targetPhone?: string;
+  textPayload?: string;
 }
 
-export type GroupWorkflowState = JoinGroupWorkflowState | ManageGroupWorkflowState;
+export interface CreateGroupWorkflowState {
+  mode: 'CREATE_GROUP';
+  step: 'AWAITING_SUBJECT' | 'AWAITING_PARTICIPANTS';
+  sessionId: string;
+  subject?: string;
+}
 
-export type CompactGroupActionCode = 'INV' | 'ADD' | 'PRO' | 'DEM' | 'REM' | 'LV';
+export type GroupWorkflowState =
+  | JoinGroupWorkflowState
+  | ManageGroupWorkflowState
+  | CreateGroupWorkflowState;
+
+export type CompactGroupActionCode =
+  | 'INV'
+  | 'REV'
+  | 'ADD'
+  | 'PRO'
+  | 'DEM'
+  | 'REM'
+  | 'SUB'
+  | 'DSC'
+  | 'ANN'
+  | 'NAN'
+  | 'EPH'
+  | 'APR'
+  | 'REJ'
+  | 'HTG'
+  | 'LV';
 
 const COMPACT_ACTION_TO_FULL: Record<CompactGroupActionCode, GroupManagementActionType> = {
   INV: 'GET_INVITE_LINK',
+  REV: 'REVOKE_INVITE_LINK',
   ADD: 'ADD_PARTICIPANT',
   PRO: 'PROMOTE_PARTICIPANT',
   DEM: 'DEMOTE_PARTICIPANT',
   REM: 'REMOVE_PARTICIPANT',
+  SUB: 'UPDATE_SUBJECT',
+  DSC: 'UPDATE_DESCRIPTION',
+  ANN: 'SET_ANNOUNCEMENT',
+  NAN: 'SET_NOT_ANNOUNCEMENT',
+  EPH: 'TOGGLE_EPHEMERAL',
+  APR: 'APPROVE_ALL_JOIN_REQUESTS',
+  REJ: 'REJECT_ALL_JOIN_REQUESTS',
+  HTG: 'SEND_HIDETAG',
   LV: 'LEAVE_GROUP',
 };
+
+const TEXT_INPUT_GROUP_ACTIONS = new Set<GroupManagementActionType>([
+  'UPDATE_SUBJECT',
+  'UPDATE_DESCRIPTION',
+  'TOGGLE_EPHEMERAL',
+  'SEND_HIDETAG',
+]);
+
+const IMMEDIATE_GROUP_ACTIONS = new Set<GroupManagementActionType>([
+  'GET_INVITE_LINK',
+  'REVOKE_INVITE_LINK',
+  'SET_ANNOUNCEMENT',
+  'SET_NOT_ANNOUNCEMENT',
+  'APPROVE_ALL_JOIN_REQUESTS',
+  'REJECT_ALL_JOIN_REQUESTS',
+]);
 
 export class GroupWorkflow {
   private readonly states = new Map<number, GroupWorkflowState>();
@@ -95,14 +149,7 @@ export class GroupWorkflow {
     if (upper in COMPACT_ACTION_TO_FULL) {
       return COMPACT_ACTION_TO_FULL[upper];
     }
-    const validActions: GroupManagementActionType[] = [
-      'GET_INVITE_LINK',
-      'ADD_PARTICIPANT',
-      'REMOVE_PARTICIPANT',
-      'PROMOTE_PARTICIPANT',
-      'DEMOTE_PARTICIPANT',
-      'LEAVE_GROUP',
-    ];
+    const validActions = Object.values(COMPACT_ACTION_TO_FULL);
     if (validActions.includes(codeOrAction as GroupManagementActionType)) {
       return codeOrAction as GroupManagementActionType;
     }
@@ -115,6 +162,26 @@ export class GroupWorkflow {
 
   public cancel(adminId: number): void {
     this.states.delete(adminId);
+  }
+
+  // --- Create New Group Workflow ---
+  public startCreateGroup(adminId: number, sessionId: string): BotViewResponse {
+    this.sessionManager.assertSessionAccess(sessionId, adminId);
+    this.states.set(adminId, {
+      mode: 'CREATE_GROUP',
+      step: 'AWAITING_SUBJECT',
+      sessionId,
+    });
+    return {
+      text:
+        `${renderBreadcrumb(['الرئيسية', 'المجموعات', 'إنشاء مجموعة جديدة'])}\n` +
+        `➕ *إنشاء مجموعة واتساب جديدة*\n` +
+        `الجلسة: \`${escapeMarkdown(sessionId)}\`\n\n` +
+        `الخطوة 1 من 2: أرسل الآن *عنوان (اسم) المجموعة الجديدة*:`,
+      keyboard: [buildBackCancelRow('menu:groups')],
+      route: 'menu:groups',
+      toastText: '✏️ أرسل اسم المجموعة الجديدة',
+    };
   }
 
   // --- Dedicated Join Group Workflow (Section 10) ---
@@ -353,8 +420,18 @@ export class GroupWorkflow {
             callbackData: `ga:${shortId}:INV`,
           },
           {
+            text: '🔄 إلغاء وتجديد الرابط',
+            callbackData: `ga:${shortId}:REV`,
+          },
+        ]);
+        rows.push([
+          {
             text: '➕ إضافة عضو',
             callbackData: `ga:${shortId}:ADD`,
+          },
+          {
+            text: '🚫 إزالة عضو',
+            callbackData: `ga:${shortId}:REM`,
           },
         ]);
         rows.push([
@@ -369,11 +446,48 @@ export class GroupWorkflow {
         ]);
         rows.push([
           {
-            text: '🚫 إزالة عضو من المجموعة',
-            callbackData: `ga:${shortId}:REM`,
+            text: '✏️ تعديل اسم المجموعة',
+            callbackData: `ga:${shortId}:SUB`,
+          },
+          {
+            text: '📝 تعديل الوصف',
+            callbackData: `ga:${shortId}:DSC`,
+          },
+        ]);
+        rows.push([
+          {
+            text: '🔒 قفل المحادثة (مشرفين)',
+            callbackData: `ga:${shortId}:ANN`,
+          },
+          {
+            text: '🔓 فتح المحادثة (للجميع)',
+            callbackData: `ga:${shortId}:NAN`,
+          },
+        ]);
+        rows.push([
+          {
+            text: '⏳ الرسائل المؤقتة (Ephemeral)',
+            callbackData: `ga:${shortId}:EPH`,
+          },
+        ]);
+        rows.push([
+          {
+            text: '✅ قبول طلبات الانضمام',
+            callbackData: `ga:${shortId}:APR`,
+          },
+          {
+            text: '❌ رفض طلبات الانضمام',
+            callbackData: `ga:${shortId}:REJ`,
           },
         ]);
       }
+
+      rows.push([
+        {
+          text: '📢 إشارة جماعية مخفية (Hidetag @All)',
+          callbackData: `ga:${shortId}:HTG`,
+        },
+      ]);
 
       rows.push([
         {
@@ -430,7 +544,7 @@ export class GroupWorkflow {
       this.activeGroupByAdmin.set(adminId, { sessionId, groupJid, shortId });
       const safeSubject = escapeMarkdown(group.subject || groupJid);
 
-      if (action === 'GET_INVITE_LINK') {
+      if (IMMEDIATE_GROUP_ACTIONS.has(action)) {
         const resultMsg = await this.groupOps.executeAdminGroupAction({
           sessionId,
           groupJid,
@@ -448,7 +562,7 @@ export class GroupWorkflow {
             ],
           ],
           route: `gv:${shortId}`,
-          toastText: '🔗 تم استخراج رابط الدعوة',
+          toastText: '✅ تم تنفيذ الإجراء بنجاح',
         };
       }
 
@@ -472,6 +586,41 @@ export class GroupWorkflow {
             [
               { text: '✅ تأكيد المغادرة', callbackData: 'wf_grp:confirm_action' },
               { text: '❌ إلغاء', callbackData: `gv:${shortId}` },
+            ],
+          ],
+          route: `gv:${shortId}`,
+        };
+      }
+
+      if (TEXT_INPUT_GROUP_ACTIONS.has(action)) {
+        this.states.set(adminId, {
+          mode: 'MANAGE_GROUP',
+          step: 'AWAITING_TEXT_PAYLOAD',
+          sessionId,
+          groupJid,
+          groupSubject: group.subject,
+          action,
+        });
+
+        const prompts: Record<string, string> = {
+          UPDATE_SUBJECT: 'أرسل الآن الاسم الجديد للمجموعة (حتى 100 حرف):',
+          UPDATE_DESCRIPTION: 'أرسل الآن الوصف الجديد للمجموعة:',
+          TOGGLE_EPHEMERAL:
+            'أرسل مدة الرسائل المؤقتة بالثواني (`0` للإيقاف، `86400` ليوم، `604800` لأسبوع، `7776000` لـ 90 يوماً):',
+          SEND_HIDETAG:
+            'أرسل الآن نص الرسالة ليتم بثها مع إشارة مخفية (@All Hidetag) لجميع أعضاء المجموعة:',
+        };
+
+        return {
+          text:
+            `👥 *إجراء على المجموعة:* *${safeSubject}*\n\n` +
+            `${prompts[action] || 'أرسل النص المطلوب:'}`,
+          keyboard: [
+            [
+              {
+                text: '🔙 إلغاء والعودة للمجموعة',
+                callbackData: `gv:${shortId}`,
+              },
             ],
           ],
           route: `gv:${shortId}`,
@@ -521,10 +670,100 @@ export class GroupWorkflow {
     }
   }
 
-  public handleParticipantPhoneInput(adminId: number, rawPhone: string): BotViewResponse {
+  public async handleCreateGroupInput(
+    adminId: number,
+    rawInput: string
+  ): Promise<BotViewResponse> {
     const state = this.states.get(adminId);
+    if (!state || state.mode !== 'CREATE_GROUP') {
+      return {
+        text: '⚠️ لا توجد عملية إنشاء مجموعة نشطة حالياً.',
+        keyboard: [
+          [{ text: '👥 إدارة المجموعات', callbackData: 'menu:groups' }],
+          buildBackCancelRow('menu:main'),
+        ],
+        route: 'menu:groups',
+      };
+    }
+
+    if (state.step === 'AWAITING_SUBJECT') {
+      const cleanSubject = rawInput.trim();
+      if (!cleanSubject || cleanSubject.length > 100) {
+        return {
+          text: '⚠️ الرجاء إدخال اسم صالح للمجموعة (1 إلى 100 حرف).',
+          keyboard: [buildBackCancelRow('menu:groups')],
+          route: 'menu:groups',
+        };
+      }
+      state.subject = cleanSubject;
+      state.step = 'AWAITING_PARTICIPANTS';
+      return {
+        text:
+          `✅ *اسم المجموعة:* \`${escapeMarkdown(cleanSubject)}\`\n\n` +
+          `الخطوة 2 من 2: أرسل أرقام الهواتف الدولية للأعضاء المراد إضافتهم مفصولة بفاصلة \`,\` (مثال: \`+966501112233, +966554445566\`) أو أرسل \`-\` لإنشائها بدون أعضاء إضافيين:`,
+        keyboard: [buildBackCancelRow('menu:groups')],
+        route: 'menu:groups',
+      };
+    }
+
+    const sessionId = state.sessionId;
+    const subject = state.subject || 'مجموعة جديدة';
+    this.states.delete(adminId);
+    const rawPhones =
+      rawInput.trim() === '-'
+        ? []
+        : rawInput
+            .split(/[,،\n]+/)
+            .map((s) => s.trim())
+            .filter(Boolean);
+    try {
+      const created = await this.groupOps.createGroupForSession({
+        sessionId,
+        subject,
+        participantPhones: rawPhones,
+        actorTelegramId: adminId,
+      });
+      const shortId = this.registerGroupRef(sessionId, created.jid);
+      return {
+        text:
+          `✅ *تم إنشاء المجموعة بنجاح!*\n\n` +
+          `👥 الاسم: *${escapeMarkdown(created.subject)}*\n` +
+          `🆔 المعرف: \`${created.jid}\`\n` +
+          `🔢 عدد الأعضاء: ${created.size}`,
+        keyboard: [
+          [{ text: '⚙️ فتح لوحة تحكم المجموعة', callbackData: `gv:${shortId}` }],
+          [{ text: '👥 قائمة المجموعات', callbackData: `grp:list:${sessionId}` }],
+        ],
+        route: `gv:${shortId}`,
+        toastText: '✅ تم إنشاء المجموعة',
+      };
+    } catch (err) {
+      const safeErr = toSafeArabicError(err);
+      return {
+        text: `❌ *تعذر إنشاء المجموعة:*\n${safeErr.userMessage}`,
+        keyboard: [[{ text: '🔙 العودة للمجموعات', callbackData: 'menu:groups' }]],
+        route: 'menu:groups',
+      };
+    }
+  }
+
+  public handleParticipantPhoneInput(
+    adminId: number,
+    rawInput: string
+  ): BotViewResponse {
+    const state = this.states.get(adminId);
+    if (!state) {
+      return {
+        text: '⚠️ لا توجد عملية إدارة مجموعة نشطة حالياً.',
+        keyboard: [
+          [{ text: '👥 إدارة المجموعات', callbackData: 'menu:groups' }],
+          buildBackCancelRow('menu:main'),
+        ],
+        route: 'menu:groups',
+      };
+    }
+
     if (
-      !state ||
       state.mode !== 'MANAGE_GROUP' ||
       !state.sessionId ||
       !state.groupJid ||
@@ -543,8 +782,29 @@ export class GroupWorkflow {
     const shortId = this.registerGroupRef(state.sessionId, state.groupJid);
     const safeSubject = escapeMarkdown(state.groupSubject || state.groupJid);
 
+    if (state.step === 'AWAITING_TEXT_PAYLOAD') {
+      state.textPayload = rawInput.trim();
+      state.step = 'AWAITING_ACTION_CONFIRMATION';
+      return {
+        text:
+          `⚠️ *تأكيد إجراء على المجموعة*\n\n` +
+          `📌 المجموعة: *${safeSubject}*\n` +
+          `🆔 الجلسة: \`${state.sessionId}\`\n` +
+          `⚡ الإجراء: \`${state.action}\`\n` +
+          `📝 القيمة المدخلة: \`${escapeMarkdown(state.textPayload.slice(0, 120))}\`\n\n` +
+          `هل تؤكد تنفيذ هذا الإجراء؟`,
+        keyboard: [
+          [
+            { text: '✅ تأكيد التنفيذ', callbackData: 'wf_grp:confirm_action' },
+            { text: '❌ إلغاء', callbackData: `gv:${shortId}` },
+          ],
+        ],
+        route: `gv:${shortId}`,
+      };
+    }
+
     try {
-      const normalized = normalizePhoneNumber(rawPhone);
+      const normalized = normalizePhoneNumber(rawInput);
       state.targetPhone = normalized.e164;
       state.step = 'AWAITING_ACTION_CONFIRMATION';
 
@@ -600,7 +860,7 @@ export class GroupWorkflow {
       };
     }
 
-    const { sessionId, groupJid, action, targetPhone } = state;
+    const { sessionId, groupJid, action, targetPhone, textPayload } = state;
     const shortId = this.registerGroupRef(sessionId, groupJid);
     this.states.delete(adminId);
 
@@ -610,12 +870,14 @@ export class GroupWorkflow {
         groupJid,
         action,
         targetPhone,
+        textPayload,
         actorTelegramId: adminId,
       });
 
       return {
         text: `✅ *تم تنفيذ العملية بنجاح:*\n${summary}`,
         keyboard: [
+          [{ text: '⚙️ العودة لتفاصيل المجموعة', callbackData: `gv:${shortId}` }],
           [{ text: '👥 العودة لقائمة المجموعات', callbackData: `grp:list:${sessionId}` }],
           [{ text: '🔙 القائمة الرئيسية', callbackData: 'menu:main' }],
         ],

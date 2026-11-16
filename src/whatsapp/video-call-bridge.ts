@@ -44,6 +44,7 @@ import {
   WhatsAppConnectionError,
   VoipFailureError,
   MediaValidationError,
+  ValidationError,
 } from '../utils/errors';
 import { createLogger } from '../logging/logger';
 
@@ -192,6 +193,16 @@ export interface ActiveVideoCallStream {
   detailsArabic: string;
 }
 
+export interface PendingIncomingVoipCall {
+  callId: string;
+  sessionId: string;
+  peerJid: string;
+  peerMasked: string;
+  isVideo: boolean;
+  receivedAtIso: string;
+  ownerTelegramId?: number;
+}
+
 interface AttachedSessionContext {
   sessionId: string;
   driver?: WhatsAppSessionDriver;
@@ -199,6 +210,7 @@ interface AttachedSessionContext {
   compatibleSocket?: CompatibleWhatsAppSocket;
   voipInstance?: InstanceType<typeof Voip>;
   voipListening?: boolean;
+  voipIncomingBound?: boolean;
   voipSocketCleanup?: () => void;
   cleanupFns: Array<() => void>;
   activeCallInstances: Map<string, VoipCallInstance>;
@@ -236,6 +248,10 @@ export class RealVideoCallService extends EventEmitter {
   private readonly completedStreamsHistory = new Map<
     string,
     ActiveVideoCallStream
+  >();
+  private readonly pendingIncomingCalls = new Map<
+    string,
+    PendingIncomingVoipCall
   >();
   private readonly stopTimers = new Map<string, NodeJS.Timeout>();
   private readonly ringingTimeoutTimers = new Map<string, NodeJS.Timeout>();
@@ -748,7 +764,464 @@ export class RealVideoCallService extends EventEmitter {
       ctx.connectionListener = listener;
     }
 
+    // Also listen on ws 'CB:call' for incoming <offer> stanzas so Voip instance is ready and alerts are emitted
+    const ws = rawSocket?.ws as
+      | {
+          on?: (event: string, cb: (node: unknown) => void) => void;
+          off?: (event: string, cb: (node: unknown) => void) => void;
+          removeListener?: (event: string, cb: (node: unknown) => void) => void;
+        }
+      | undefined;
+    if (ws && typeof ws.on === 'function') {
+      const onCbCall = (node: unknown) => {
+        try {
+          if (!node || typeof node !== 'object') return;
+          const n = node as {
+            attrs?: Record<string, string>;
+            content?: unknown[];
+          };
+          const children = Array.isArray(n.content)
+            ? (n.content as Array<{
+                tag?: string;
+                attrs?: Record<string, string>;
+                content?: unknown[];
+              }>)
+            : [];
+          const offerNode = children.find((c) => c?.tag === 'offer');
+          if (!offerNode) return;
+          const callId =
+            offerNode.attrs?.['call-id'] ||
+            n.attrs?.id ||
+            '';
+          const peerJid =
+            offerNode.attrs?.['call-creator'] ||
+            n.attrs?.from ||
+            '';
+          if (!callId || !peerJid) return;
+          // Check if offer contains a <video> child
+          const offerChildren = Array.isArray(offerNode.content)
+            ? (offerNode.content as Array<{ tag?: string }>)
+            : [];
+          const isVideo = offerChildren.some((c) => c?.tag === 'video');
+          // Ensure Voip instance is bound and record the incoming call
+          void this.ensureVoipInstanceForSession(sessionId).catch(() => undefined);
+          this.handleIncomingVoipCall(sessionId, {
+            callId,
+            jid: peerJid,
+            isVideo,
+          });
+        } catch {
+          // Non-fatal incoming call stanza hook error
+        }
+      };
+      ws.on('CB:call', onCbCall);
+      ctx.cleanupFns.push(() => {
+        try {
+          if (typeof ws.off === 'function') {
+            ws.off('CB:call', onCbCall);
+          } else if (typeof ws.removeListener === 'function') {
+            ws.removeListener('CB:call', onCbCall);
+          }
+        } catch {
+          // Ignore ws listener cleanup error
+        }
+      });
+    }
+
     this.attachedSessions.set(sessionId, ctx);
+  }
+
+  private bindVoipIncomingListener(
+    sessionId: string,
+    ctx: AttachedSessionContext | undefined,
+    voip: InstanceType<typeof Voip>
+  ): void {
+    if (ctx?.voipIncomingBound) return;
+    const voipAny = voip as unknown as {
+      onIncoming?: (
+        cb: (incoming: {
+          callId?: string;
+          id?: string;
+          jid?: string;
+          peerJid?: string;
+          from?: string;
+          isVideo?: boolean;
+        }) => void
+      ) => void;
+    };
+    if (typeof voipAny.onIncoming === 'function') {
+      if (ctx) {
+        ctx.voipIncomingBound = true;
+      }
+      try {
+        voipAny.onIncoming((incoming) => {
+          const callId = String(incoming?.callId || incoming?.id || '').trim();
+          const jid = String(
+            incoming?.jid || incoming?.peerJid || incoming?.from || ''
+          ).trim();
+          if (!callId || !jid) return;
+          this.handleIncomingVoipCall(sessionId, {
+            callId,
+            jid,
+            isVideo: Boolean(incoming?.isVideo),
+          });
+        });
+      } catch {
+        // Ignore if onIncoming is not supported by a custom mock
+      }
+    }
+  }
+
+  public async ensureVoipInstanceForSession(
+    sessionId: string
+  ): Promise<InstanceType<typeof Voip> | undefined> {
+    await ensureHiroosyVoipRuntimePatched();
+    let ctx = this.attachedSessions.get(sessionId);
+    if (!ctx && this.sessionManager) {
+      try {
+        const driver = this.sessionManager.getDriver(sessionId);
+        if (driver) {
+          this.attachSession(sessionId, driver);
+          ctx = this.attachedSessions.get(sessionId);
+        }
+      } catch {
+        // Ignore if session driver not available
+      }
+    }
+    const rawSocket = ctx?.rawSocket ?? ctx?.driver?.getRawSocket?.() ?? undefined;
+    if (!rawSocket) return undefined;
+
+    const tmpDir = path.resolve(
+      process.cwd(),
+      'data',
+      'temp_uploads',
+      'voip_cache'
+    );
+    fs.mkdirSync(tmpDir, { recursive: true });
+
+    let voip = ctx?.voipInstance ?? this.voipBySocket.get(rawSocket);
+    if (!voip) {
+      voip = new Voip(rawSocket as never, {
+        voipLogLevel: 'warn',
+        maxConcurrentCalls: 1,
+        tmpDir,
+      });
+      this.voipBySocket.set(rawSocket, voip);
+      if (ctx) {
+        ctx.voipInstance = voip;
+        ctx.voipListening = false;
+      }
+    } else if (ctx && !ctx.voipInstance) {
+      ctx.voipInstance = voip;
+    }
+
+    this.bindVoipIncomingListener(sessionId, ctx, voip);
+
+    if (!ctx || !ctx.voipListening) {
+      const cleanup = await listenWithTrackedSocketCleanup(
+        voip,
+        rawSocket as never
+      );
+      if (ctx) {
+        ctx.voipListening = true;
+        ctx.voipSocketCleanup = cleanup;
+        if (!ctx.cleanupFns.includes(cleanup)) {
+          ctx.cleanupFns.push(cleanup);
+        }
+      }
+    }
+    return voip;
+  }
+
+  public getPendingIncomingCall(
+    callId: string
+  ): PendingIncomingVoipCall | undefined {
+    return this.pendingIncomingCalls.get(callId);
+  }
+
+  public listPendingIncomingCalls(): PendingIncomingVoipCall[] {
+    return Array.from(this.pendingIncomingCalls.values());
+  }
+
+  public handleIncomingVoipCall(
+    sessionId: string,
+    incoming: {
+      callId: string;
+      jid: string;
+      isVideo?: boolean;
+      ownerTelegramId?: number;
+    }
+  ): PendingIncomingVoipCall {
+    const existing = this.pendingIncomingCalls.get(incoming.callId);
+    if (existing) {
+      return existing;
+    }
+    const cleanPhone = incoming.jid.split('@')[0]?.split(':')[0] || incoming.jid;
+    const peerMasked = incoming.jid.endsWith('@s.whatsapp.net')
+      ? `+${cleanPhone}`
+      : incoming.jid;
+    const ownerTelegramId =
+      incoming.ownerTelegramId ??
+      this.sessionManager?.getSession(sessionId)?.owner_telegram_id ??
+      0;
+    const record: PendingIncomingVoipCall = {
+      callId: incoming.callId,
+      sessionId,
+      peerJid: incoming.jid,
+      peerMasked,
+      isVideo: Boolean(incoming.isVideo),
+      receivedAtIso: new Date().toISOString(),
+      ownerTelegramId,
+    };
+    this.pendingIncomingCalls.set(incoming.callId, record);
+    this.emit('call:incoming', record);
+    return record;
+  }
+
+  /**
+   * Accepts an incoming WhatsApp VoIP call (`voip.accept(callId, mediaPath, resolution)`),
+   * attaches `VoipCallRecorder` immediately so inbound audio/video are recorded to `.mp4`,
+   * and returns the active call stream.
+   */
+  public async acceptIncomingCall(
+    callId: string,
+    options?: {
+      sessionId?: string;
+      asVideo?: boolean;
+      videoFilePath?: string;
+      recordCall?: boolean;
+      actorTelegramId?: number;
+    }
+  ): Promise<ActiveVideoCallStream> {
+    const pending = this.pendingIncomingCalls.get(callId);
+    const sessionId = options?.sessionId || pending?.sessionId;
+    if (!sessionId) {
+      throw new ValidationError(
+        'لم يتم العثور على المكالمة الواردة المطلوبة أو انتهت صلاحيتها.'
+      );
+    }
+    this.pendingIncomingCalls.delete(callId);
+
+    const voip = await this.ensureVoipInstanceForSession(sessionId);
+    if (!voip) {
+      throw new VoipFailureError(
+        'تعذر تهيئة محرك VoIP للرد على المكالمة الواردة (الجلسة غير متصلة).'
+      );
+    }
+
+    const asVideo = options?.asVideo ?? pending?.isVideo ?? false;
+    const actorTelegramId =
+      options?.actorTelegramId ?? pending?.ownerTelegramId ?? 0;
+
+    let resolvedMediaPath = options?.videoFilePath;
+    if (asVideo && (!resolvedMediaPath || !fs.existsSync(resolvedMediaPath))) {
+      const recentVideos = this.getRecentRecordedCalls(actorTelegramId);
+      if (recentVideos.length > 0 && fs.existsSync(recentVideos[0].filePath)) {
+        resolvedMediaPath = recentVideos[0].filePath;
+      }
+    }
+
+    let mediaPayload: string | Buffer;
+    let videoFileName = asVideo ? 'incoming-call-response.mp4' : 'voice-call-response.wav';
+    if (resolvedMediaPath && fs.existsSync(resolvedMediaPath)) {
+      mediaPayload = resolvedMediaPath;
+      videoFileName = path.basename(resolvedMediaPath);
+    } else {
+      const sampleRate = 16000;
+      const durationSec = 5;
+      const numSamples = sampleRate * durationSec;
+      const dataBytes = numSamples * 2;
+      const wavBuf = Buffer.alloc(44 + dataBytes);
+      wavBuf.write('RIFF', 0);
+      wavBuf.writeUInt32LE(36 + dataBytes, 4);
+      wavBuf.write('WAVE', 8);
+      wavBuf.write('fmt ', 12);
+      wavBuf.writeUInt32LE(16, 16);
+      wavBuf.writeUInt16LE(1, 20);
+      wavBuf.writeUInt16LE(1, 22);
+      wavBuf.writeUInt32LE(sampleRate, 24);
+      wavBuf.writeUInt32LE(sampleRate * 2, 28);
+      wavBuf.writeUInt16LE(2, 32);
+      wavBuf.writeUInt16LE(16, 34);
+      wavBuf.write('data', 36);
+      wavBuf.writeUInt32LE(dataBytes, 40);
+      mediaPayload = wavBuf;
+    }
+
+    const peerJid = pending?.peerJid || 'unknown@s.whatsapp.net';
+    const peerMasked = pending?.peerMasked || peerJid;
+    const resolutionPreset = asVideo ? '720p' : 'audio';
+    const recordingEnabled = options?.recordCall !== false;
+
+    const recorder = recordingEnabled
+      ? new VoipCallRecorder({
+          callId,
+          sessionId,
+          recipientJid: peerJid,
+          outboundVideoPath: resolvedMediaPath || '',
+          isMockMode: false,
+        })
+      : undefined;
+    recorder?.setVoipCallId(callId);
+
+    const streamRecord: ActiveVideoCallStream = {
+      callId,
+      voipCallId: callId,
+      sessionId,
+      recipientJid: peerJid,
+      recipientMasked: peerMasked,
+      videoFilePath: resolvedMediaPath || '',
+      videoFileName,
+      callKind: asVideo ? 'video' : 'voice',
+      protocolMode: 'HIROOSY_VOIP_VIDEO_CALL',
+      resolutionPreset: asVideo ? '720p' : '480p',
+      loopVideo: true,
+      maxDurationSeconds: 300,
+      mode: 'HIROOSY_VOIP_RTP_SRTP',
+      executionMode: 'REAL_VOIP',
+      status: 'CONNECTED',
+      callState: 'CONNECTED',
+      stateHistory: ['RINGING', 'CONNECTED'],
+      startedAt: new Date().toISOString(),
+      connectedAt: new Date().toISOString(),
+      hasConnected: true,
+      audioStarted: false,
+      videoStarted: false,
+      mediaStarted: false,
+      mediaFailed: false,
+      nativeStanzaCallIds: [callId],
+      detailsArabic: `🟢 تم قبول المكالمة الواردة من (${peerMasked}) وبدء التسجيل التلقائي (${asVideo ? 'فيديو + صوت' : 'صوت'}).`,
+      actorTelegramId,
+      initiatedByAdminId: actorTelegramId,
+      voipInstance: voip,
+      cleanupFns: [],
+      abortController: new AbortController(),
+      recordingEnabled,
+      recordingStatus: recordingEnabled ? 'RECORDING' : 'DISABLED',
+      inboundVideoPacketsReceived: 0,
+      inboundVideoFramesRecorded: 0,
+      inboundAudioPacketsReceived: 0,
+      remoteCameraCaptured: false,
+      recorder,
+    };
+
+    this.activeStreams.set(callId, streamRecord);
+
+    const voipAcceptFn = (
+      voip as unknown as {
+        accept?: (
+          cid: string,
+          media?: unknown,
+          res?: string,
+          opts?: Record<string, unknown>
+        ) => Promise<VoipCallInstance | string | void>;
+      }
+    ).accept;
+
+    let callInstance: VoipCallInstance | undefined;
+    if (typeof voipAcceptFn === 'function') {
+      const acceptRes = await voipAcceptFn.call(
+        voip,
+        callId,
+        mediaPayload,
+        resolutionPreset,
+        { loop: true, autoEndCall: false }
+      );
+      if (acceptRes && typeof acceptRes === 'object') {
+        callInstance = acceptRes as VoipCallInstance;
+        streamRecord.voipCallInstance = callInstance;
+      }
+    }
+
+    this.resolveWaCallMediaSession(streamRecord, voip, callInstance);
+
+    const coordinator = voip.coordinator;
+    if (coordinator && typeof coordinator.on === 'function') {
+      const onEnded = (info: Record<string, unknown>) => {
+        const cid = String(info?.callId || info?.id || '');
+        if (cid && cid !== callId) return;
+        if (this.isTerminalState(streamRecord.callState)) return;
+        this.transitionCallState(streamRecord, 'ENDED', 'remote_hangup');
+        this.archiveCompletedStream(streamRecord);
+        streamRecord.__terminalizePromise = (async () => {
+          await this.teardownSessionVoipInstance(sessionId, streamRecord);
+          await this.finalizeStreamRecording(streamRecord);
+          this.emitCallEndedSafely(streamRecord, {
+            callId: streamRecord.callId,
+            sessionId,
+            state: 'ENDED',
+            reason: 'remote_hangup',
+          });
+        })();
+      };
+      coordinator.on('call_ended', onEnded);
+      streamRecord.cleanupFns?.push(() => {
+        try {
+          coordinator.off?.('call_ended', onEnded);
+        } catch {
+          // Ignore listener removal error
+        }
+      });
+    }
+
+    this.emit('call:connected', {
+      callId: streamRecord.callId,
+      voipCallId: callId,
+      sessionId,
+      stream: streamRecord,
+    });
+
+    return streamRecord;
+  }
+
+  /**
+   * Rejects an incoming WhatsApp VoIP call (`voip.reject(callId)`).
+   */
+  public async rejectIncomingCall(
+    callId: string,
+    options?: {
+      sessionId?: string;
+      actorTelegramId?: number;
+    }
+  ): Promise<boolean> {
+    const pending = this.pendingIncomingCalls.get(callId);
+    const sessionId = options?.sessionId || pending?.sessionId;
+    this.pendingIncomingCalls.delete(callId);
+
+    if (!sessionId) {
+      return false;
+    }
+
+    const voip = await this.ensureVoipInstanceForSession(sessionId).catch(
+      () => undefined
+    );
+    if (!voip) {
+      return false;
+    }
+
+    const voipRejectFn = (
+      voip as unknown as {
+        reject?: (cid: string) => Promise<void>;
+        hangup?: (cid: string) => Promise<void>;
+      }
+    ).reject;
+
+    try {
+      if (typeof voipRejectFn === 'function') {
+        await voipRejectFn.call(voip, callId);
+      } else if (typeof voip.hangup === 'function') {
+        await Promise.resolve(voip.hangup(callId));
+      }
+      this.emit('call:incoming-rejected', {
+        callId,
+        sessionId,
+        peerJid: pending?.peerJid,
+        actorTelegramId: options?.actorTelegramId ?? pending?.ownerTelegramId,
+      });
+      return true;
+    } catch {
+      return false;
+    }
   }
 
   /**
@@ -1798,6 +2271,7 @@ export class RealVideoCallService extends EventEmitter {
         ctx.voipInstance = voip;
       }
       stream.voipInstance = voip;
+      this.bindVoipIncomingListener(stream.sessionId, ctx, voip);
 
       if (!ctx || !ctx.voipListening) {
         const cleanup = await listenWithTrackedSocketCleanup(
