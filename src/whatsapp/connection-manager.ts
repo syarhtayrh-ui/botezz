@@ -609,6 +609,7 @@ export class SessionMemoryStore {
     Set<(record: TrackedPresenceRecord) => void>
   >();
   private readonly messageByKey = new Map<string, proto.IMessage>();
+  private readonly messagesById = new Map<string, proto.IMessage>();
   private readonly normalizer = new MessageNormalizer();
 
   public recordLidMapping(lidRaw?: string | null, pnRaw?: string | null): void {
@@ -985,10 +986,23 @@ export class SessionMemoryStore {
       this.messageByKey.delete(lookupKey);
     }
     this.messageByKey.set(lookupKey, message);
-    if (this.messageByKey.size > 500) {
+    if (this.messageByKey.size > 1000) {
       const oldestKey = this.messageByKey.keys().next().value;
       if (oldestKey) {
         this.messageByKey.delete(oldestKey);
+      }
+    }
+  }
+
+  private setBoundedMessageById(id: string, message: proto.IMessage): void {
+    if (this.messagesById.has(id)) {
+      this.messagesById.delete(id);
+    }
+    this.messagesById.set(id, message);
+    if (this.messagesById.size > 1000) {
+      const oldestId = this.messagesById.keys().next().value;
+      if (oldestId) {
+        this.messagesById.delete(oldestId);
       }
     }
   }
@@ -1026,6 +1040,7 @@ export class SessionMemoryStore {
     }
 
     if (!messageId || !message) return;
+    this.setBoundedMessageById(messageId, message);
     this.setBoundedMessageKey(messageId, message);
     if (chatJid) {
       this.setBoundedMessageKey(`${chatJid}:${messageId}`, message);
@@ -1056,7 +1071,7 @@ export class SessionMemoryStore {
         // Ignore
       }
     }
-    return this.messageByKey.get(id);
+    return this.messagesById.get(id) ?? this.messageByKey.get(id);
   }
 
   public getCachedMessagesCount(): number {
@@ -4315,20 +4330,6 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
     } catch {
       // Best-effort
     }
-    try {
-      const pnUser = jidDecode(cleanPn)?.user || cleanPn.split('@')[0];
-      const lidUser = jidDecode(cleanLid)?.user || cleanLid.split('@')[0];
-      if (pnUser && lidUser && sock.authState?.keys?.set) {
-        await sock.authState.keys.set({
-          'lid-mapping': {
-            [pnUser]: lidUser,
-            [`${lidUser}_reverse`]: pnUser,
-          },
-        } as never);
-      }
-    } catch {
-      // Best-effort
-    }
   }
 
   public async syncLidPnMapping(pnJid?: string, lidJid?: string): Promise<void> {
@@ -4913,6 +4914,13 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
   ): Promise<boolean> {
     try {
       const targetUser = jidDecode(jid)?.user || jid.split('@')[0];
+      const mappedPn = jid.endsWith('@lid')
+        ? this.memoryStore.getPnForLid(jid)
+        : undefined;
+      const pnUser = mappedPn
+        ? jidDecode(mappedPn)?.user || mappedPn.split('@')[0]
+        : undefined;
+
       if (typeof sock.getUSyncDevices === 'function') {
         const devices = await sock.getUSyncDevices([jid], false, false).catch(() => []);
         if (Array.isArray(devices)) {
@@ -4926,15 +4934,14 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
               const u =
                 devObj.user ||
                 (devObj.jid ? jidDecode(devObj.jid)?.user : undefined);
-              return !u || u === targetUser;
+              return !u || u === targetUser || (pnUser !== undefined && u === pnUser);
             });
             if (!hasTargetDevice) return false;
           }
         }
       }
       if (typeof sock.assertSessions === 'function') {
-        const asserted = await sock.assertSessions([jid], true);
-        if (asserted === false) return false;
+        await sock.assertSessions([jid], false);
       }
       return true;
     } catch {
@@ -4947,14 +4954,14 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
     getMsgId: () => string | undefined,
     timeoutMs?: number
   ): {
-    promise: Promise<{ ok: boolean; errorCode?: number }>;
+    promise: Promise<{ ok: boolean; errorCode?: number; timedOut?: boolean }>;
     notifyMsgIdKnown: (msgId: string) => void;
   } {
     const effectiveTimeoutMs =
       timeoutMs ??
       (sock as unknown as { __ackVerifyTimeoutMs?: number }).__ackVerifyTimeoutMs ??
       (typeof (sock.ws as unknown as { send?: unknown })?.send === 'function'
-        ? 4500
+        ? 1200
         : 60);
 
     let knownMsgId = getMsgId();
@@ -4964,11 +4971,20 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
       ok?: boolean;
     }> = [];
     let resolved = false;
-    let resolvePromise!: (res: { ok: boolean; errorCode?: number }) => void;
+    let resolvePromise!: (res: {
+      ok: boolean;
+      errorCode?: number;
+      timedOut?: boolean;
+    }) => void;
 
     const cleanup = (
       timer: ReturnType<typeof setTimeout>,
-      onUpdate: (updates: Array<{ key?: { id?: string | null }; update?: { status?: number | null; error?: number | string } }>) => void,
+      onUpdate: (
+        updates: Array<{
+          key?: { id?: string | null };
+          update?: { status?: number | null; error?: number | string };
+        }>
+      ) => void,
       onAckNode: (node: BinaryNode) => void
     ) => {
       clearTimeout(timer);
@@ -4987,7 +5003,9 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
       }
     };
 
-    let finishFn: ((res: { ok: boolean; errorCode?: number }) => void) | undefined;
+    let finishFn:
+      | ((res: { ok: boolean; errorCode?: number; timedOut?: boolean }) => void)
+      | undefined;
 
     const checkPending = () => {
       if (resolved || !knownMsgId || !finishFn) return;
@@ -5005,7 +5023,11 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
       }
     };
 
-    const promise = new Promise<{ ok: boolean; errorCode?: number }>((resolve) => {
+    const promise = new Promise<{
+      ok: boolean;
+      errorCode?: number;
+      timedOut?: boolean;
+    }>((resolve) => {
       resolvePromise = resolve;
       const onUpdate = (
         updates: Array<{
@@ -5039,7 +5061,7 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
       };
 
       const timer = setTimeout(() => {
-        if (finishFn) finishFn({ ok: true });
+        if (finishFn) finishFn({ ok: true, timedOut: true });
       }, effectiveTimeoutMs);
 
       finishFn = (res) => {
@@ -5074,12 +5096,13 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
   }
 
   /**
-   * Sends a protocol-verified anonymous message via `@hiroosy/baileys-lite`,
-   * syncing the `PN <-> LID` mapping in `signalRepository.lidMapping`, migrating and
-   * asserting E2E Signal sessions, stripping invalid `addressing_mode="lid"` from 1-to-1
-   * stanzas, protecting against 0-byte `<tctoken>` nodes, verifying server `<ack class="message"/>`,
-   * and automatically falling back to `@s.whatsapp.net` (`PN_FALLBACK`) if `@lid` delivery
-   * fails or returns error `479` / `463`.
+   * Sends a protocol-verified message from the Anonymous Room or `/anonmsg` via `@hiroosy/baileys-lite`.
+   * - Never calls `migrateSession(pnJid, lidJid)` (which deletes the working `pnJid` Signal session).
+   * - Never calls `assertSessions(..., true)` with `force = true` (which overwrites valid Signal ratchets).
+   * - Never injects duplicate `additionalNodes: [tcTokenNode]` into `sock.sendMessage`.
+   * - Caches the outgoing `proto.IMessage` in `this.memoryStore` and flushes auth state immediately
+   *   when `sock.sendMessage` resolves (before awaiting `ackTracker.promise`) so `<receipt type="retry"/>`
+   *   packets arriving within the first 50–800ms are always answered by `sendMessagesAgain`.
    */
   public async sendAnonymousLidMessage(params: AnonymousLidSendParams): Promise<{
     messageId: string;
@@ -5153,7 +5176,7 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
         : undefined;
     let lidJid: string | undefined;
     let source = 'ON_WHATSAPP_USYNC';
-    let usedLid = true;
+    let usedLid = false;
     let fallbackTriggered = false;
 
     if (trimmedRecipient.endsWith('@s.whatsapp.net')) {
@@ -5189,20 +5212,17 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
             ? jidNormalizedUser(identityRes.lidJid)
             : undefined;
         source = identityRes.source || 'USERNAME_LOOKUP';
-        usedLid = Boolean(lidJid);
       }
     }
 
-    if (!lidJid) {
+    if (!lidJid && !pnJid) {
       try {
         const resolved = await this.resolveLidForRecipient(trimmedRecipient);
         pnJid = resolved.pnJid || pnJid;
         if (resolved.lidJid && resolved.lidJid.endsWith('@lid')) {
           lidJid = jidNormalizedUser(resolved.lidJid);
-          usedLid = true;
         } else if (resolved.lidJid && resolved.lidJid.endsWith('@s.whatsapp.net')) {
           pnJid = jidNormalizedUser(resolved.lidJid);
-          usedLid = false;
         }
         source = resolved.source;
       } catch (err) {
@@ -5225,89 +5245,32 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
           pnJid = jidNormalizedUser(normalizedCheck.jid);
           lidJid = undefined;
           source = 'PN_FALLBACK';
-          usedLid = false;
-        } else if (pnJid) {
-          lidJid = undefined;
-          source = 'PN_FALLBACK';
-          usedLid = false;
         } else {
           throw err;
         }
       }
+    } else if (pnJid && !lidJid) {
+      // Best-effort non-destructive LID lookup for metadata/mappings without migrating sessions
+      const cachedLid = this.memoryStore.getLidForPn(pnJid);
+      if (cachedLid && cachedLid.endsWith('@lid')) {
+        lidJid = cachedLid;
+        source = 'LID_MAPPING_STORE';
+      } else {
+        try {
+          const resolved = await this.resolveLidForRecipient(pnJid);
+          if (resolved.lidJid && resolved.lidJid.endsWith('@lid')) {
+            lidJid = jidNormalizedUser(resolved.lidJid);
+            source = resolved.source;
+          }
+        } catch {
+          source = 'PN_FALLBACK';
+        }
+      }
     }
 
-    // 1. Register LID <-> PN mapping in Baileys' internal Signal repository
+    // Record LID <-> PN mapping in memoryStore & lidMapping without touching Signal sessions
     if (pnJid && lidJid) {
       await this.syncLidPnMappingToSocket(sock, pnJid, lidJid);
-    }
-
-    // 2. Migrate PN -> LID session and verify LID Signal session readiness
-    if (usedLid && lidJid) {
-      if (pnJid && typeof sock.signalRepository?.migrateSession === 'function') {
-        await sock.signalRepository
-          .migrateSession(pnJid, lidJid)
-          .catch(() => undefined);
-      }
-      const lidReady = await this.canAssertSessionForJid(sock, lidJid);
-      if (!lidReady && pnJid) {
-        usedLid = false;
-        fallbackTriggered = true;
-        source = `${source}_PN_FALLBACK`;
-        if (typeof sock.getUSyncDevices === 'function') {
-          await sock.getUSyncDevices([pnJid], false, false).catch(() => []);
-        }
-        if (typeof sock.assertSessions === 'function') {
-          await sock.assertSessions([pnJid], true).catch(() => false);
-        }
-      }
-    } else if (pnJid) {
-      usedLid = false;
-      if (typeof sock.getUSyncDevices === 'function') {
-        await sock.getUSyncDevices([pnJid], false, false).catch(() => []);
-      }
-      if (typeof sock.assertSessions === 'function') {
-        await sock.assertSessions([pnJid], true).catch(() => false);
-      }
-    }
-
-    // 3. Build non-empty <tctoken> node ONLY when a valid non-zero-byte token exists
-    let tcTokenNode: BinaryNode | null = null;
-    try {
-      const tokenLookupJid = (usedLid && lidJid ? lidJid : pnJid) || lidJid || pnJid;
-      if (tokenLookupJid) {
-        const validToken = await this.identityService.privacyTokens
-          .getValidPrivacyToken(tokenLookupJid)
-          .catch(() => null);
-        if (
-          validToken?.hasToken &&
-          !validToken.expired &&
-          validToken.token &&
-          validToken.token.byteLength > 0
-        ) {
-          tcTokenNode = {
-            tag: 'tctoken',
-            attrs: validToken.timestampSec ? { t: String(validToken.timestampSec) } : {},
-            content: validToken.token,
-          };
-        } else {
-          const builtTc = await buildTcTokenNodeForJid({
-            jid: tokenLookupJid,
-            authStateKeys: sock.authState?.keys,
-            getLIDForPN: (pn: string) =>
-              sock.signalRepository?.lidMapping?.getLIDForPN?.(pn) ||
-              this.memoryStore.getLidForPn(pn),
-          });
-          if (
-            builtTc.tcTokenNode &&
-            Buffer.isBuffer(builtTc.tcTokenNode.content) &&
-            builtTc.tcTokenNode.content.byteLength > 0
-          ) {
-            tcTokenNode = builtTc.tcTokenNode;
-          }
-        }
-      }
-    } catch {
-      tcTokenNode = null;
     }
 
     const contentPayload: AnyMessageContent = params.mediaContent
@@ -5320,167 +5283,131 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
         : params.mediaContent
       : { text: finalText };
 
-    const selfLid = sock.user?.lid || sock.authState?.creds?.me?.lid;
-    const senderJid = selfLid
-      ? jidNormalizedUser(selfLid)
-      : sock.user?.id
-        ? jidNormalizedUser(sock.user.id)
-        : undefined;
-
-    const sendSingleAttempt = async (
-      targetJid: string
-    ): Promise<{
-      id: string;
-      message?: proto.IMessage;
-      ack: { ok: boolean; errorCode?: number };
-    }> => {
-      let attemptMsgId: string | undefined;
-      const ackTracker = this.waitForServerMessageAck(sock, () => attemptMsgId);
-
-      // NEVER attach addressing_mode="lid" to 1-to-1 stanzas (causes smax-invalid Error 479)
-      const sendOptions: Record<string, unknown> = {};
-      if (tcTokenNode) {
-        sendOptions.additionalNodes = [tcTokenNode];
-      }
-
-      if (typeof sock.sendMessage === 'function') {
-        const sent = await sock.sendMessage(
-          targetJid,
-          contentPayload,
-          Object.keys(sendOptions).length > 0 ? sendOptions : undefined
-        );
-        attemptMsgId =
-          sent?.key?.id ||
-          SmartProtocolWrapper.generateStandardMessageId(sock.user?.id);
-        ackTracker.notifyMsgIdKnown(attemptMsgId);
-        const ack = await ackTracker.promise;
-        return {
-          id: attemptMsgId,
-          message: sent?.message || undefined,
-          ack,
-        };
-      }
-
-      const waMsg = generateWAMessageFromContent(
-        targetJid,
-        finalText
-          ? { extendedTextMessage: { text: finalText } }
-          : (contentPayload as Record<string, unknown>),
-        {
-          userJid: targetJid.endsWith('@lid')
-            ? senderJid
-            : sock.user?.id
-              ? jidNormalizedUser(sock.user.id)
-              : senderJid,
-        }
-      );
-      attemptMsgId =
-        waMsg.key?.id ||
-        SmartProtocolWrapper.generateStandardMessageId(sock.user?.id);
-      ackTracker.notifyMsgIdKnown(attemptMsgId);
-      await sock.relayMessage(targetJid, waMsg.message!, {
-        messageId: attemptMsgId,
-        ...(tcTokenNode ? { additionalNodes: [tcTokenNode] } : {}),
-      });
-      const ack = await ackTracker.promise;
-      return {
-        id: attemptMsgId,
-        message: waMsg.message || undefined,
-        ack,
-      };
-    };
-
     const previousName = sock.user?.name;
     if (sock.user && params.customPushName !== undefined) {
       sock.user.name = params.customPushName;
     }
 
-    const primaryJid = usedLid && lidJid ? lidJid : (pnJid || lidJid)!;
-    let finalDeliveredJid = primaryJid;
-    let msgId = `lid_msg_${Date.now()}`;
-    let sentMessageProto: proto.IMessage | undefined;
-    let ackVerified = false;
+    const sendAndCacheImmediately = async (
+      targetJid: string
+    ): Promise<{
+      id: string;
+      message: proto.IMessage;
+      ack: { ok: boolean; errorCode?: number; timedOut?: boolean };
+    }> => {
+      let attemptMsgId: string | undefined;
+      const ackTracker = this.waitForServerMessageAck(sock, () => attemptMsgId);
+
+      let sentMessage: proto.IMessage | undefined;
+      if (typeof sock.sendMessage === 'function') {
+        const sent = await sock.sendMessage(targetJid, contentPayload);
+        attemptMsgId =
+          sent?.key?.id ||
+          SmartProtocolWrapper.generateStandardMessageId(sock.user?.id);
+        sentMessage = sent?.message || undefined;
+      } else {
+        const selfLid = sock.user?.lid || sock.authState?.creds?.me?.lid;
+        const senderJid = selfLid
+          ? jidNormalizedUser(selfLid)
+          : sock.user?.id
+            ? jidNormalizedUser(sock.user.id)
+            : undefined;
+        const waMsg = generateWAMessageFromContent(
+          targetJid,
+          finalText
+            ? { extendedTextMessage: { text: finalText } }
+            : (contentPayload as Record<string, unknown>),
+          {
+            userJid: targetJid.endsWith('@lid')
+              ? senderJid
+              : sock.user?.id
+                ? jidNormalizedUser(sock.user.id)
+                : senderJid,
+          }
+        );
+        attemptMsgId =
+          waMsg.key?.id ||
+          SmartProtocolWrapper.generateStandardMessageId(sock.user?.id);
+        sentMessage = waMsg.message || undefined;
+        await sock.relayMessage(targetJid, waMsg.message!, {
+          messageId: attemptMsgId,
+        });
+      }
+
+      const protoToCache =
+        sentMessage ||
+        ({
+          extendedTextMessage: { text: finalText || '[Media]' },
+        } as unknown as proto.IMessage);
+
+      // CRITICAL: Cache message in memoryStore and flush auth writes IMMEDIATELY
+      // BEFORE awaiting ackTracker.promise so `<receipt type="retry"/>` is served within 50-300ms
+      this.memoryStore.cacheSentMessage(targetJid, attemptMsgId, protoToCache);
+      if (lidJid && lidJid !== targetJid) {
+        this.memoryStore.cacheSentMessage(lidJid, attemptMsgId, protoToCache);
+      }
+      if (pnJid && pnJid !== targetJid) {
+        this.memoryStore.cacheSentMessage(pnJid, attemptMsgId, protoToCache);
+      }
+      await Promise.allSettled([this.credsSaveChain, this.flushAuthWrites()]);
+
+      ackTracker.notifyMsgIdKnown(attemptMsgId);
+      const ack = await ackTracker.promise;
+      return {
+        id: attemptMsgId,
+        message: protoToCache,
+        ack,
+      };
+    };
 
     try {
-      try {
-        const firstTry = await sendSingleAttempt(primaryJid);
-        msgId = firstTry.id;
-        sentMessageProto = firstTry.message;
-        ackVerified = firstTry.ack.ok;
-
-        if (
-          !firstTry.ack.ok &&
-          primaryJid.endsWith('@lid') &&
-          pnJid &&
-          pnJid !== primaryJid
-        ) {
-          usedLid = false;
-          fallbackTriggered = true;
-          source = `${source}_ACK_${firstTry.ack.errorCode || 'ERR'}_PN_FALLBACK`;
-          if (typeof sock.getUSyncDevices === 'function') {
-            await sock.getUSyncDevices([pnJid], false, false).catch(() => []);
-          }
-          if (typeof sock.assertSessions === 'function') {
-            await sock.assertSessions([pnJid], true).catch(() => false);
-          }
-          const secondTry = await sendSingleAttempt(pnJid);
-          finalDeliveredJid = pnJid;
-          msgId = secondTry.id;
-          sentMessageProto = secondTry.message;
-          ackVerified = secondTry.ack.ok;
-        }
-      } catch (primaryErr) {
-        if (primaryJid.endsWith('@lid') && pnJid && pnJid !== primaryJid) {
-          usedLid = false;
-          fallbackTriggered = true;
-          source = `${source}_ERR_PN_FALLBACK`;
-          if (typeof sock.getUSyncDevices === 'function') {
-            await sock.getUSyncDevices([pnJid], false, false).catch(() => []);
-          }
-          if (typeof sock.assertSessions === 'function') {
-            await sock.assertSessions([pnJid], true).catch(() => false);
-          }
-          const secondTry = await sendSingleAttempt(pnJid);
-          finalDeliveredJid = pnJid;
-          msgId = secondTry.id;
-          sentMessageProto = secondTry.message;
-          ackVerified = secondTry.ack.ok;
-        } else {
-          throw primaryErr;
-        }
+      // Case A: Recipient's phone JID (`<phone>@s.whatsapp.net`) is known
+      if (pnJid) {
+        const verifiedPnJid = await this.resolveDirectRecipientJid(sock, pnJid);
+        await this.simulateHumanPresenceBeforeSend(
+          sock,
+          verifiedPnJid,
+          finalText.length || 12
+        );
+        const sentAttempt = await sendAndCacheImmediately(verifiedPnJid);
+        usedLid = false;
+        return {
+          messageId: sentAttempt.id,
+          targetLid: lidJid || verifiedPnJid,
+          deliveredJid: verifiedPnJid,
+          resolvedPn: verifiedPnJid,
+          resolutionSource: source,
+          usedLid: false,
+          ackVerified: sentAttempt.ack.ok,
+          fallbackTriggered,
+        };
       }
+
+      // Case B: Only `<id>@lid` is known (no `pnJid` available)
+      if (lidJid) {
+        await this.canAssertSessionForJid(sock, lidJid);
+        const sentAttempt = await sendAndCacheImmediately(lidJid);
+        usedLid = true;
+        return {
+          messageId: sentAttempt.id,
+          targetLid: lidJid,
+          deliveredJid: lidJid,
+          resolvedPn: undefined,
+          resolutionSource: source,
+          usedLid: true,
+          ackVerified: sentAttempt.ack.ok,
+          fallbackTriggered: false,
+        };
+      }
+
+      throw new WhatsAppConnectionError(
+        'تعذر تحديد وجهة الإرسال الصالحة للجلسة المجهولة.'
+      );
     } finally {
       if (sock.user && params.customPushName !== undefined) {
         sock.user.name = previousName;
       }
     }
-
-    const messageToCache =
-      sentMessageProto ||
-      ({
-        extendedTextMessage: { text: finalText || '[Media]' },
-      } as unknown as proto.IMessage);
-
-    this.memoryStore.cacheSentMessage(finalDeliveredJid, msgId, messageToCache);
-    if (lidJid && lidJid !== finalDeliveredJid) {
-      this.memoryStore.cacheSentMessage(lidJid, msgId, messageToCache);
-    }
-    if (pnJid && pnJid !== finalDeliveredJid) {
-      this.memoryStore.cacheSentMessage(pnJid, msgId, messageToCache);
-    }
-
-    await Promise.allSettled([this.credsSaveChain, this.flushAuthWrites()]);
-
-    return {
-      messageId: msgId,
-      targetLid: finalDeliveredJid,
-      deliveredJid: finalDeliveredJid,
-      resolvedPn: pnJid,
-      resolutionSource: source,
-      usedLid,
-      ackVerified,
-      fallbackTriggered,
-    };
   }
 
   public async resolveIdentity(

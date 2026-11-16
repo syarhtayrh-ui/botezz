@@ -230,35 +230,43 @@ test('1. validateRecipient & LID Resolution + sendAnonymousLidMessage across all
   assert.equal(direct.lidJid, '11223344556677@lid');
   assert.equal(direct.source, 'DIRECT_LID');
 
-  // Layer 3: USync onWhatsApp (object lid format) -> also populates lidMapping & authState.keys
+  // Layer 3: USync onWhatsApp (object lid format) -> populates lidMapping & memoryStore without corrupting authState.keys
   const viaUsync = await driver.resolveLidForRecipient('+966501234567');
   assert.equal(viaUsync.pnJid, '966501234567@s.whatsapp.net');
   assert.equal(viaUsync.lidJid, '99887766554433@lid');
   assert.equal(viaUsync.source, 'ON_WHATSAPP_USYNC');
-  assert.ok(fake.storedKeyMappings.length > 0);
+  assert.equal(
+    driver.memoryStore.getLidForPn('966501234567@s.whatsapp.net'),
+    '99887766554433@lid'
+  );
 
   // Layer 2: Subsequent lookup hits LID_MAPPING_STORE directly
   const viaStore = await driver.resolveLidForRecipient('+966501234567');
   assert.equal(viaStore.lidJid, '99887766554433@lid');
   assert.equal(viaStore.source, 'LID_MAPPING_STORE');
 
-  // Send anonymous LID message and verify session migration + addressingMode: 'lid' + message cache
+  // Send anonymous message when pnJid is known: must NOT call migrateSession or forced assertSessions,
+  // and must deliver via verifiedPnJid while caching under both PN and LID and messagesById
   const sendRes = await driver.sendAnonymousLidMessage({
     recipient: '+966501234567',
     text: 'رسالة سرية عبر بروتوكول LID',
   });
   assert.equal(sendRes.targetLid, '99887766554433@lid');
+  assert.equal(sendRes.deliveredJid, '966501234567@s.whatsapp.net');
   assert.equal(sendRes.resolvedPn, '966501234567@s.whatsapp.net');
-  assert.equal(fake.migratedSessions.length, 1);
-  assert.deepEqual(fake.migratedSessions[0], {
-    fromJid: '966501234567@s.whatsapp.net',
-    toJid: '99887766554433@lid',
-  });
-  assert.equal(fake.assertedSessions.length, 1);
-  assert.deepEqual(fake.assertedSessions[0], ['99887766554433@lid']);
+  assert.equal(
+    fake.migratedSessions.length,
+    0,
+    'sendAnonymousLidMessage must never call migrateSession(pnJid, lidJid) and destroy the pnJid Signal session'
+  );
+  assert.equal(
+    fake.assertedSessions.length,
+    0,
+    'sendAnonymousLidMessage must not call assertSessions(..., true) when pnJid is known'
+  );
 
   assert.equal(fake.sentMessages.length, 1);
-  assert.equal(fake.sentMessages[0].jid, '99887766554433@lid');
+  assert.equal(fake.sentMessages[0].jid, '966501234567@s.whatsapp.net');
   const sentBody =
     (fake.sentMessages[0].content as { text?: string })?.text ||
     (
@@ -278,6 +286,19 @@ test('1. validateRecipient & LID Resolution + sendAnonymousLidMessage across all
       remoteJid: '99887766554433@lid',
       id: sendRes.messageId,
     })
+  );
+  assert.ok(
+    driver.memoryStore.getMessage({
+      remoteJid: '966501234567:0@s.whatsapp.net',
+      id: sendRes.messageId,
+    })
+  );
+  assert.ok(
+    driver.memoryStore.getMessage({
+      remoteJid: 'unrelated_retry_jid@lid',
+      id: sendRes.messageId,
+    }),
+    'getMessage must fall back to messagesById(key.id) regardless of remoteJid'
   );
 
   // Layer 3c: Direct USync IQ <user jid="..."><lid val="..."/></user> fallback when onWhatsApp omits lid

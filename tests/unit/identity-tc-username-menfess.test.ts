@@ -1347,10 +1347,9 @@ test('Zero-byte tctoken protection & 1-to-1 stanza attribute hygiene in sendAnon
     const checkZero = await svc.privacyTokens.getValidPrivacyToken('77771111222233@lid');
     assert.equal(checkZero?.hasToken, false);
 
-    // 3. sendAnonymousLidMessage never attaches a 0-byte <tctoken> node and never sets addressing_mode="lid" on 1-to-1 stanzas
+    // 3. Pure @lid send (when no fallbackPnJid is provided) never attaches a 0-byte <tctoken> node and never sets addressing_mode="lid" on 1-to-1 stanzas
     const sendRes = await driver.sendAnonymousLidMessage({
       recipient: '77771111222233@lid',
-      fallbackPnJid: '967771234535@s.whatsapp.net',
       text: 'Ghost message without 0-byte tctoken',
       customPushName: 'Ghost Alias',
       ghostHeaderMode: 'plain',
@@ -1376,81 +1375,116 @@ test('Zero-byte tctoken protection & 1-to-1 stanza attribute hygiene in sendAnon
   }
 });
 
-test('sendAnonymousLidMessage dual-path failover: retries via fallbackPnJid on server ACK error 479 or LID session assertion failure', async () => {
-  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'botezz_dual_path_'));
+test('sendAnonymousLidMessage forensic guarantees: pre-ACK memoryStore caching, JID-agnostic getMessage retry lookup, no migrateSession/forced assertSessions, and direct delivery to +967775224395', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'botezz_forensic_anon_'));
   try {
-    // Case A: Server returns <ack class="message" error="479"/> on @lid -> automatically retries via @s.whatsapp.net
-    const driverAckFallback = new HiroosyBaileysSessionDriver('sess_ack_fb', tmpDir);
-    const fakeAck = createFakeIdentitySocket();
+    const driver = new HiroosyBaileysSessionDriver('sess_forensic_anon', tmpDir);
+    const fake = createFakeIdentitySocket();
     const wsEmitter = new EventEmitter();
-    (fakeAck.sock as unknown as { ws: EventEmitter }).ws = wsEmitter;
+    (fake.sock as unknown as { ws: EventEmitter; __ackVerifyTimeoutMs?: number }).ws =
+      wsEmitter;
+    (
+      fake.sock as unknown as { __ackVerifyTimeoutMs?: number }
+    ).__ackVerifyTimeoutMs = 250;
 
-    const origSendMessage = fakeAck.sock.sendMessage.bind(fakeAck.sock);
-    (fakeAck.sock as unknown as { sendMessage: typeof origSendMessage }).sendMessage = async (
-      jid,
-      content,
-      opts
-    ) => {
-      const sent = await origSendMessage(jid, content, opts);
-      const msgId = sent?.key?.id || 'msg_1';
-      setImmediate(() => {
-        if (jid.endsWith('@lid')) {
-          wsEmitter.emit('CB:ack,class:message', {
-            tag: 'ack',
-            attrs: { class: 'message', id: msgId, error: '479' },
+    let cachedBeforeAckResolved = false;
+    let cachedCrossJidLookupBeforeAck = false;
+    let migrateSessionCalled = false;
+    const assertSessionsCalls: Array<{ jids: string[]; force?: boolean }> = [];
+
+    (
+      fake.sock.signalRepository as unknown as {
+        migrateSession: () => Promise<void>;
+      }
+    ).migrateSession = async () => {
+      migrateSessionCalled = true;
+    };
+
+    (
+      fake.sock as unknown as {
+        assertSessions: (jids: string[], force?: boolean) => Promise<boolean>;
+      }
+    ).assertSessions = async (jids: string[], force?: boolean) => {
+      assertSessionsCalls.push({ jids, force });
+      return false; // false means session already exists locally!
+    };
+
+    const origSendMessage = fake.sock.sendMessage.bind(fake.sock);
+    (fake.sock as unknown as { sendMessage: typeof origSendMessage }).sendMessage =
+      async (jid, content, opts) => {
+        const sent = await origSendMessage(jid, content, opts);
+        const msgId = sent?.key?.id || 'msg_forensic_1';
+        // Simulate recipient phone sending <receipt type="retry"/> 10ms after sendMessage resolves
+        // (well BEFORE the 250ms ACK timeout expires)
+        setTimeout(() => {
+          const msgByExactJid = driver.memoryStore.getMessage({
+            remoteJid: '967775224395@s.whatsapp.net',
+            id: msgId,
           });
-        } else {
+          const msgByDeviceOrLidJid = driver.memoryStore.getMessage({
+            remoteJid: '967775224395:0@s.whatsapp.net',
+            id: msgId,
+          });
+          const msgByPureLidRetry = driver.memoryStore.getMessage({
+            remoteJid: '15938472910283:0@lid',
+            id: msgId,
+          });
+          cachedBeforeAckResolved = Boolean(msgByExactJid);
+          cachedCrossJidLookupBeforeAck = Boolean(
+            msgByDeviceOrLidJid && msgByPureLidRetry
+          );
           wsEmitter.emit('CB:ack,class:message', {
             tag: 'ack',
             attrs: { class: 'message', id: msgId },
           });
-        }
-      });
-      return sent;
-    };
-
-    attachFakeSocketToDriver(driverAckFallback, fakeAck.sock);
-
-    const resAck = await driverAckFallback.sendAnonymousLidMessage({
-      recipient: '77771111222233@lid',
-      fallbackPnJid: '967771234535@s.whatsapp.net',
-      text: 'Failover on ACK 479',
-      ghostHeaderMode: 'plain',
-    });
-
-    assert.equal(resAck.fallbackTriggered, true);
-    assert.equal(resAck.usedLid, false);
-    assert.equal(resAck.deliveredJid, '967771234535@s.whatsapp.net');
-    assert.equal(resAck.ackVerified, true);
-    assert.equal(fakeAck.sentMessages.length, 2);
-    assert.equal(fakeAck.sentMessages[0]!.jid, '77771111222233@lid');
-    assert.equal(fakeAck.sentMessages[1]!.jid, '967771234535@s.whatsapp.net');
-
-    // Case B: assertSessions([targetLid]) returns false -> immediately falls back to fallbackPnJid
-    const driverAssertFallback = new HiroosyBaileysSessionDriver('sess_assert_fb', tmpDir);
-    const fakeAssert = createFakeIdentitySocket();
-    (fakeAssert.sock as unknown as { assertSessions: (jids: string[]) => Promise<boolean> }).assertSessions =
-      async (jids: string[]) => {
-        fakeAssert.assertedSessions.push(jids);
-        if (jids.some((j) => j.endsWith('@lid'))) {
-          return false;
-        }
-        return true;
+        }, 15);
+        return sent;
       };
-    attachFakeSocketToDriver(driverAssertFallback, fakeAssert.sock);
 
-    const resAssert = await driverAssertFallback.sendAnonymousLidMessage({
-      recipient: '77771111222233@lid',
-      fallbackPnJid: '967771234535@s.whatsapp.net',
-      text: 'Failover on LID assertSessions failure',
+    attachFakeSocketToDriver(driver, fake.sock);
+
+    const res = await driver.sendAnonymousLidMessage({
+      recipient: '+967775224395',
+      fallbackPnJid: '967775224395@s.whatsapp.net',
+      text: 'اختبار وصول الرسالة الفوري إلى +967775224395',
+      customPushName: '🕵️ جلسة مجهولة',
       ghostHeaderMode: 'plain',
     });
 
-    assert.equal(resAssert.fallbackTriggered, true);
-    assert.equal(resAssert.usedLid, false);
-    assert.equal(resAssert.deliveredJid, '967771234535@s.whatsapp.net');
-    assert.equal(fakeAssert.sentMessages.length, 1);
-    assert.equal(fakeAssert.sentMessages[0]!.jid, '967771234535@s.whatsapp.net');
+    assert.equal(res.deliveredJid, '967775224395@s.whatsapp.net');
+    assert.equal(res.resolvedPn, '967775224395@s.whatsapp.net');
+    assert.equal(res.usedLid, false);
+    assert.equal(res.ackVerified, true);
+    assert.equal(
+      migrateSessionCalled,
+      false,
+      'sendAnonymousLidMessage must NEVER call migrateSession(pnJid, lidJid)'
+    );
+    assert.equal(
+      assertSessionsCalls.some((c) => c.force === true),
+      false,
+      'sendAnonymousLidMessage must NEVER call assertSessions(..., true)'
+    );
+    assert.equal(
+      cachedBeforeAckResolved,
+      true,
+      'Outgoing message must be cached in memoryStore BEFORE waitForServerMessageAck finishes'
+    );
+    assert.equal(
+      cachedCrossJidLookupBeforeAck,
+      true,
+      'SessionMemoryStore.getMessage must return the cached message by key.id regardless of retry remoteJid'
+    );
+    assert.equal(fake.sentMessages.length, 1);
+    assert.equal(fake.sentMessages[0]!.jid, '967775224395@s.whatsapp.net');
+    assert.deepEqual(fake.sentMessages[0]!.content, {
+      text: 'اختبار وصول الرسالة الفوري إلى +967775224395',
+    });
+    assert.equal(
+      fake.sentMessages[0]!.opts,
+      undefined,
+      'sock.sendMessage must be invoked with clean options identical to sendTextMessage'
+    );
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }

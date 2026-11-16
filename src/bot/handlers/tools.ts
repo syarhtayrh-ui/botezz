@@ -5427,7 +5427,9 @@ export class ToolsHandler {
         sess.sessionId
       );
 
-      const recipientTarget = sess.receiverLidJid || sess.receiverJid;
+      const recipientTarget = sess.receiverJid.endsWith('@s.whatsapp.net')
+        ? sess.receiverJid
+        : sess.receiverLidJid || sess.receiverJid;
       const fallbackPnJid = sess.receiverJid.endsWith('@s.whatsapp.net')
         ? sess.receiverJid
         : undefined;
@@ -5450,7 +5452,9 @@ export class ToolsHandler {
         mediaKind: 'text',
         deliveredLidJid: deliveredJid.endsWith('@lid')
           ? deliveredJid
-          : sess.receiverLidJid,
+          : sendRes.targetLid?.endsWith('@lid')
+            ? sendRes.targetLid
+            : sess.receiverLidJid,
         resolvedPnJid:
           sendRes.resolvedPn ||
           (deliveredJid.endsWith('@s.whatsapp.net') ? deliveredJid : fallbackPnJid),
@@ -5470,9 +5474,7 @@ export class ToolsHandler {
         },
       });
 
-      const deliveryBadge = sendRes.fallbackTriggered
-        ? `✅ *تم إرسال الرسالة وتأكيد استلام خادم واتساب عبر المسار البديل المضمون (\`${escapeMarkdown(deliveredJid)}\`)!*`
-        : `✅ *تم إرسال رسالتك بهوية مجهولة (\`${escapeMarkdown(deliveredJid)}\`) وتأكيد استلام الخادم بنجاح!*`;
+      const deliveryBadge = '✅ *تم إرسال الرسالة بنجاح إلى المستلم!*';
 
       return this.renderAnonymousSessionRoom(adminId, sess.id, deliveryBadge);
     } catch (err) {
@@ -5523,7 +5525,9 @@ export class ToolsHandler {
         sess.sessionId
       );
 
-      const recipientTarget = sess.receiverLidJid || sess.receiverJid;
+      const recipientTarget = sess.receiverJid.endsWith('@s.whatsapp.net')
+        ? sess.receiverJid
+        : sess.receiverLidJid || sess.receiverJid;
       const fallbackPnJid = sess.receiverJid.endsWith('@s.whatsapp.net')
         ? sess.receiverJid
         : undefined;
@@ -5623,7 +5627,9 @@ export class ToolsHandler {
         mediaKind,
         deliveredLidJid: deliveredJid.endsWith('@lid')
           ? deliveredJid
-          : sess.receiverLidJid,
+          : sendRes.targetLid?.endsWith('@lid')
+            ? sendRes.targetLid
+            : sess.receiverLidJid,
         resolvedPnJid:
           sendRes.resolvedPn ||
           (deliveredJid.endsWith('@s.whatsapp.net') ? deliveredJid : fallbackPnJid),
