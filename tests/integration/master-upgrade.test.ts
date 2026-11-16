@@ -1307,12 +1307,87 @@ test('Deep Status Downloader & Deep Message Inbox: all formats, zip fallback, ed
       { skipDuplicateCheck: true }
     );
     assert.ok(rejView.text.includes('inc_call_test_99'));
+
+    // 11. Cyber Forensics OSINT Engine & Menu Routing (menu:whatsapp_tools & menu:cyber_forensics)
+    const waToolsMenu = await env.controller.handleCallbackQuery(
+      ownerId,
+      'menu:whatsapp_tools',
+      { skipDuplicateCheck: true }
+    );
+    assert.ok(waToolsMenu.text.includes('قسم أدوات وإدارة واتساب الشامل'));
+    assert.equal(waToolsMenu.route, 'menu:whatsapp_tools');
+
+    const cyberDash = await env.controller.handleCallbackQuery(
+      ownerId,
+      'menu:cyber_forensics',
+      { skipDuplicateCheck: true }
+    );
+    assert.ok(
+      cyberDash.text.includes('قسم التحليل الجنائي السيبراني واستخبارات الأرقام')
+    );
+    assert.equal(cyberDash.route, 'menu:cyber_forensics');
+
+    // Settings configuration for Truecaller, Eyecon, and Numverify
+    await env.controller.handleCallbackQuery(ownerId, 'cyber:settings', {
+      skipDuplicateCheck: true,
+    });
+    await env.controller.handleCallbackQuery(ownerId, 'cyber:tc_set_token', {
+      skipDuplicateCheck: true,
+    });
+    assert.equal(env.controller.uiState.getActiveInputOwner(ownerId), 'CYBER_FORENSICS');
+    const tcSavedView = await env.controller.handleTextMessage(
+      ownerId,
+      'a1i0n--test-installation-id-998877'
+    );
+    assert.ok(tcSavedView.text.includes('تم حفظ مفتاح Truecaller'));
+    assert.equal(
+      env.controller.cyberForensicsEngine.getTruecallerInstallationId(),
+      'a1i0n--test-installation-id-998877'
+    );
+
+    // Local alias vault and PhoneInfoga Dorks verification
+    const savedAliases = env.controller.cyberForensicsEngine.saveDiscoveredNamesForPhone(
+      '+967775224395',
+      [
+        {
+          name: 'المهندس عبدالله اليماني',
+          source: 'Truecaller Global Directory',
+          confidence: 'HIGH',
+          observedAtIso: new Date().toISOString(),
+        },
+      ]
+    );
+    assert.equal(savedAliases.length, 1);
+    assert.equal(savedAliases[0]?.name, 'المهندس عبدالله اليماني');
+
+    const dorks = env.controller.cyberForensicsEngine.buildPhoneInfogaDorks({
+      rawInput: '775224395',
+      digitsOnly: '967775224395',
+      e164: '+967775224395',
+      internationalFormatted: '+967 775 224 395',
+      countryCode: '967',
+      isoCountry2: 'YE',
+      countryNameArabic: 'اليمن 🇾🇪',
+      countryNameEnglish: 'Yemen',
+      significantNumber: '775224395',
+      localWithZero: '0775224395',
+      inferredCarrier: 'Yemen Mobile (يمن موبايل - 4G/CDMA)',
+      lineType: 'MOBILE',
+      isValidLength: true,
+    });
+    assert.equal(dorks.length, 12);
+    assert.ok(dorks.some((d) => d.category === 'SOCIAL_MEDIA'));
+    assert.ok(dorks.some((d) => d.category === 'CALLER_DIRECTORY'));
+
+    // Prompt phone lookup and verify exclusive ActiveInputOwner
+    const lookupPrompt = await env.controller.handleCallbackQuery(
+      ownerId,
+      'cyber:phone_lookup',
+      { skipDuplicateCheck: true }
+    );
+    assert.ok(lookupPrompt.text.includes('قسم البحث عن رقم الهاتف وكشف الأسماء المرتبطة'));
+    assert.equal(env.controller.uiState.getActiveInputOwner(ownerId), 'CYBER_FORENSICS');
   } finally {
     await env.cleanup();
   }
 });
-
-
-
-
-

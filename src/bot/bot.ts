@@ -63,6 +63,8 @@ import {
   ForensicCaptureRecord,
   setForensicPayloadAnalyzer,
 } from '../security/forensic-payload-analyzer';
+import { CyberForensicsOsintEngine } from '../security/cyber-forensics-osint-engine';
+import { CyberForensicsHandler } from './handlers/cyber-forensics';
 import { TelegramMediaAttachment } from './workflows/pairing-workflow';
 import { toSafeArabicError } from '../utils/errors';
 import { createLogger } from '../logging/logger';
@@ -78,7 +80,8 @@ export type ConversationMode =
   | 'GROUP'
   | 'TOOLS'
   | 'SETTINGS'
-  | 'INBOX_FORWARD';
+  | 'INBOX_FORWARD'
+  | 'CYBER_FORENSICS';
 
 export interface TelegramControllerDeps {
   config: AppConfig;
@@ -147,6 +150,8 @@ export class TelegramBotController {
   public readonly networkHandler: NetworkTrafficHandler;
   public readonly forensicAnalyzer: ForensicPayloadAnalyzer;
   public readonly securityAnalyzerHandler: SecurityAnalyzerHandler;
+  public readonly cyberForensicsEngine: CyberForensicsOsintEngine;
+  public readonly cyberForensicsHandler: CyberForensicsHandler;
   public onCallRecordingReady?: (
     ownerTelegramId: number,
     attachment: {
@@ -558,6 +563,14 @@ export class TelegramBotController {
       deps.auditRepo,
       this.forensicAnalyzer
     );
+    this.cyberForensicsEngine = new CyberForensicsOsintEngine(
+      deps.settingsRepo,
+      deps.sessionManager
+    );
+    this.cyberForensicsHandler = new CyberForensicsHandler(
+      this.cyberForensicsEngine,
+      deps.auditRepo
+    );
     this.forensicAnalyzer.onForensicCaptureReady = (
       record,
       summaryMessageArabic,
@@ -839,6 +852,7 @@ export class TelegramBotController {
         STORIES: 'NONE',
         SETTINGS: 'SETTINGS',
         SUBSCRIPTIONS: 'SETTINGS',
+        CYBER_FORENSICS: 'CYBER_FORENSICS',
       };
       return modeMap[owner] || 'NONE';
     }
@@ -847,7 +861,7 @@ export class TelegramBotController {
 
   /**
    * Enforces a single exclusive active input owner per user.
-   * Immediately cancels all other 9 workflows/handlers so stale states from earlier
+   * Immediately cancels all other workflows/handlers so stale states from earlier
    * interactions can NEVER collide with the newly activated workflow.
    */
   public activateInputOwner(adminId: number, owner: ActiveInputOwner): void {
@@ -878,6 +892,9 @@ export class TelegramBotController {
     if (owner !== 'SETTINGS' && owner !== 'SUBSCRIPTIONS') {
       this.settingsHandler.cancel(adminId);
     }
+    if (owner !== 'CYBER_FORENSICS') {
+      this.cyberForensicsHandler.cancelWorkflow(adminId);
+    }
 
     this.uiState.setActiveInputOwner(adminId, owner);
     const modeMap: Record<ActiveInputOwner, ConversationMode> = {
@@ -892,11 +909,13 @@ export class TelegramBotController {
       STORIES: 'NONE',
       SETTINGS: 'SETTINGS',
       SUBSCRIPTIONS: 'SETTINGS',
+      CYBER_FORENSICS: 'CYBER_FORENSICS',
     };
     this.activeConversationMode.set(adminId, modeMap[owner] || 'NONE');
   }
 
   private cancelAllWorkflowsForAdmin(adminId: number): void {
+    this.cyberForensicsHandler.cancelWorkflow(adminId);
     this.activateInputOwner(adminId, 'NONE');
   }
 
@@ -1132,6 +1151,141 @@ export class TelegramBotController {
 
     if (isNavigableRoute(callbackData)) {
       this.uiState.recordRouteTransition(actorUserId, callbackData);
+    }
+
+    if (callbackData === 'menu:whatsapp_tools') {
+      this.cancelAllWorkflowsForAdmin(actorUserId);
+      this.activateInputOwner(actorUserId, 'NONE');
+      this.uiState.recordRouteTransition(actorUserId, 'menu:whatsapp_tools');
+      return this.startHandler.renderWhatsAppToolsMenu({
+        isAdmin: isOwner,
+        actorUserId,
+      });
+    }
+
+    if (callbackData === 'menu:cyber_forensics') {
+      this.cancelAllWorkflowsForAdmin(actorUserId);
+      this.activateInputOwner(actorUserId, 'NONE');
+      this.uiState.recordRouteTransition(actorUserId, 'menu:cyber_forensics');
+      return this.cyberForensicsHandler.renderDashboard();
+    }
+
+    if (callbackData === 'cyber:phone_lookup') {
+      this.cancelAllWorkflowsForAdmin(actorUserId);
+      this.activateInputOwner(actorUserId, 'CYBER_FORENSICS');
+      return this.cyberForensicsHandler.promptPhoneLookup(actorUserId);
+    }
+
+    if (callbackData === 'cyber:social_lookup') {
+      this.cancelAllWorkflowsForAdmin(actorUserId);
+      this.activateInputOwner(actorUserId, 'CYBER_FORENSICS');
+      return this.cyberForensicsHandler.promptSocialLookup(actorUserId);
+    }
+
+    if (callbackData === 'cyber:full_scan') {
+      this.cancelAllWorkflowsForAdmin(actorUserId);
+      this.activateInputOwner(actorUserId, 'CYBER_FORENSICS');
+      return this.cyberForensicsHandler.promptFullScan(actorUserId);
+    }
+
+    if (callbackData === 'cyber:settings') {
+      this.cancelAllWorkflowsForAdmin(actorUserId);
+      this.activateInputOwner(actorUserId, 'NONE');
+      return this.cyberForensicsHandler.renderSettingsMenu();
+    }
+
+    if (callbackData === 'cyber:tc_login_otp') {
+      this.cyberForensicsHandler.setInputStep(
+        actorUserId,
+        'AWAITING_TRUECALLER_LOGIN_PHONE'
+      );
+      this.activateInputOwner(actorUserId, 'CYBER_FORENSICS');
+      return {
+        text:
+          `📲 *تسجيل الدخول المباشر في Truecaller عبر رمز OTP*\n` +
+          `────────────────────────\n` +
+          `أرسل رقم هاتفك المسجل في Truecaller بالصيغة الدولية (مثال: \`+967775224395\`) ليتم إرسال رمز التحقق المكون من 6 أرقام إليك وتوليد مفتاح \`installationId\` تلقائياً:`,
+        keyboard: [buildBackCancelRow('cyber:settings')],
+      };
+    }
+
+    if (callbackData === 'cyber:tc_set_token') {
+      this.cyberForensicsHandler.setInputStep(
+        actorUserId,
+        'AWAITING_TRUECALLER_TOKEN_MANUAL'
+      );
+      this.activateInputOwner(actorUserId, 'CYBER_FORENSICS');
+      return {
+        text: `🔑 *أرسل الآن مفتاح Truecaller (\`installationId\`) لحفظه في قاعدة البيانات:*`,
+        keyboard: [buildBackCancelRow('cyber:settings')],
+      };
+    }
+
+    if (callbackData === 'cyber:eyecon_set') {
+      this.cyberForensicsHandler.setInputStep(
+        actorUserId,
+        'AWAITING_EYECON_AUTH'
+      );
+      this.activateInputOwner(actorUserId, 'CYBER_FORENSICS');
+      return {
+        text:
+          `👁️ *إعداد مصادقة Eyecon Caller-ID*\n` +
+          `أرسل قيمة \`e-auth\` (ويمكنك اختيارياً إرسال \`e-auth e-auth-v e-auth-c\` مفصولة بمسافة):`,
+        keyboard: [buildBackCancelRow('cyber:settings')],
+      };
+    }
+
+    if (callbackData === 'cyber:numverify_set') {
+      this.cyberForensicsHandler.setInputStep(
+        actorUserId,
+        'AWAITING_NUMVERIFY_KEY'
+      );
+      this.activateInputOwner(actorUserId, 'CYBER_FORENSICS');
+      return {
+        text: `📡 *أرسل الآن مفتاح Numverify API (Apilayer) لحفظه:*`,
+        keyboard: [buildBackCancelRow('cyber:settings')],
+      };
+    }
+
+    if (callbackData.startsWith('cyber:history:page:')) {
+      const page = Number(callbackData.split(':').pop() || '1') || 1;
+      this.activateInputOwner(actorUserId, 'NONE');
+      return this.cyberForensicsHandler.renderHistoryPage(page);
+    }
+
+    if (callbackData.startsWith('cyber:run_phone:')) {
+      const digits = callbackData.slice('cyber:run_phone:'.length);
+      this.activateInputOwner(actorUserId, 'NONE');
+      return this.cyberForensicsHandler.executeInvestigationAndFormatView(
+        actorUserId,
+        digits,
+        'PHONE_NAMES_ONLY'
+      );
+    }
+
+    if (callbackData.startsWith('cyber:run_social:')) {
+      const digits = callbackData.slice('cyber:run_social:'.length);
+      this.activateInputOwner(actorUserId, 'NONE');
+      return this.cyberForensicsHandler.executeInvestigationAndFormatView(
+        actorUserId,
+        digits,
+        'SOCIAL_ONLY'
+      );
+    }
+
+    if (callbackData.startsWith('cyber:rescan:')) {
+      const digits = callbackData.slice('cyber:rescan:'.length);
+      this.activateInputOwner(actorUserId, 'NONE');
+      return this.cyberForensicsHandler.executeInvestigationAndFormatView(
+        actorUserId,
+        digits,
+        'FULL_DOSSIER'
+      );
+    }
+
+    if (callbackData.startsWith('cyber:export:')) {
+      const digits = callbackData.slice('cyber:export:'.length);
+      return this.cyberForensicsHandler.exportReportJsonAttachment(digits);
     }
 
     // 1 & 2: Link WhatsApp Account / Add Another Account / Session Naming
@@ -3375,6 +3529,22 @@ export class TelegramBotController {
         this.activateInputOwner(actorUserId, 'NONE');
       }
       return response;
+    }
+
+    if (owner === 'CYBER_FORENSICS') {
+      const step = this.cyberForensicsHandler.getInputStep(actorUserId);
+      if (step === 'IDLE') {
+        this.activateInputOwner(actorUserId, 'NONE');
+      } else {
+        const res = await this.cyberForensicsHandler.handleTextInput(
+          actorUserId,
+          trimmed
+        );
+        if (this.cyberForensicsHandler.getInputStep(actorUserId) === 'IDLE') {
+          this.activateInputOwner(actorUserId, 'NONE');
+        }
+        return res;
+      }
     }
 
     // Requirement 3: Do not interpret arbitrary messages as workflow inputs unless a workflow state is active.

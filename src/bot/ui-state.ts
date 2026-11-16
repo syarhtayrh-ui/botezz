@@ -26,7 +26,8 @@ export type ActiveInputOwner =
   | 'INBOX'
   | 'STORIES'
   | 'SETTINGS'
-  | 'SUBSCRIPTIONS';
+  | 'SUBSCRIPTIONS'
+  | 'CYBER_FORENSICS';
 
 export type ActiveWorkflowOwner = ActiveInputOwner;
 
@@ -105,6 +106,7 @@ const WORKFLOW_OWNER_BANNER_ARABIC: Record<ActiveInputOwner, string> = {
   STORIES: '⭕ إدارة وتحميل حالات واتساب',
   SETTINGS: '⚙️ تحديث إعدادات النظام والأمان',
   SUBSCRIPTIONS: '⭐ إدارة الاشتراكات ومجموعات التفعيل',
+  CYBER_FORENSICS: '🕵️‍♂️ وضع التحليل الجنائي السيبراني وفحص الأرقام نشط',
 };
 
 export function formatActiveInputOwnerArabic(owner: ActiveInputOwner): string {
@@ -204,7 +206,12 @@ export function isNavigableRoute(callbackData: string): boolean {
     callbackData.startsWith('tools:uname_mode:') ||
     callbackData === 'tools:prompt_menfess_start' ||
     callbackData === 'tools:menfess_list' ||
-    callbackData.startsWith('tools:menfess_relay:')
+    callbackData.startsWith('tools:menfess_relay:') ||
+    callbackData === 'cyber:settings' ||
+    callbackData.startsWith('cyber:history:page:') ||
+    callbackData === 'cyber:phone_lookup' ||
+    callbackData === 'cyber:social_lookup' ||
+    callbackData === 'cyber:full_scan'
   );
 }
 

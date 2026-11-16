@@ -47,6 +47,13 @@ export function buildMainMenuKeyboard(
 
   const rows: InlineKeyboardRows = [
     [
+      { text: '📱 قسم أدوات وإدارة واتساب', callbackData: 'menu:whatsapp_tools' },
+      {
+        text: '🕵️‍♂️ التحليل الجنائي السيبراني (OSINT)',
+        callbackData: 'menu:cyber_forensics',
+      },
+    ],
+    [
       { text: '📲 ربط حساب واتساب', callbackData: 'menu:link_account' },
       { text: '➕ إضافة حساب آخر', callbackData: 'menu:add_account' },
     ],
@@ -103,6 +110,98 @@ export function buildMainMenuKeyboard(
   rows.push([{ text: '🔄 تحديث القائمة الرئيسية', callbackData: 'nav:refresh' }]);
 
   return rows;
+}
+
+/**
+ * Builds the dedicated WhatsApp Tools & Management Menu (`menu:whatsapp_tools`).
+ */
+export function buildWhatsAppToolsMenuKeyboard(
+  options?: MainMenuKeyboardOptions
+): InlineKeyboardRows {
+  const isAdmin = options?.isAdmin ?? true;
+  const rows: InlineKeyboardRows = [
+    [
+      { text: '📲 ربط حساب واتساب', callbackData: 'menu:link_account' },
+      { text: '➕ إضافة حساب آخر', callbackData: 'menu:add_account' },
+    ],
+    [
+      { text: '📋 إدارة الجلسات', callbackData: 'menu:sessions:page:1' },
+      { text: '📡 حالة الجلسات', callbackData: 'menu:session_status' },
+    ],
+    [
+      { text: '🔌 إدارة المرسلين (Senders)', callbackData: 'menu:senders:page:1' },
+      { text: '👥 إدارة المجموعات', callbackData: 'menu:groups' },
+    ],
+    [
+      { text: '✉️ إرسال رسالة نصية', callbackData: 'menu:send_text' },
+      { text: '📎 إرسال وسائط أو ملف', callbackData: 'menu:send_media' },
+    ],
+    [
+      { text: '📹 اتصال مرئي ببث مسجل', callbackData: 'menu:video_call' },
+      { text: '🔗 الانضمام إلى مجموعة', callbackData: 'menu:join_group' },
+    ],
+    [
+      { text: '📥 قسم استقبال الرسائل', callbackData: 'menu:inbox:page:1' },
+      { text: '⭕ تحميلات الحالات', callbackData: 'menu:stories:page:1' },
+    ],
+    [
+      { text: '🕵️ جلسة مجهولة (تواصل مخفي)', callbackData: 'menu:anon_sessions' },
+      { text: '🛠️ الأدوات ومختبر الدوال', callbackData: 'menu:tools' },
+    ],
+  ];
+
+  if (isAdmin) {
+    rows.push([
+      { text: '🌐 حركة مرور الشبكة والطلبات', callbackData: 'menu:network' },
+      { text: '🛡️ المحلل الأمني والجنائي', callbackData: 'menu:sec_analyzer' },
+    ]);
+  }
+
+  rows.push(
+    buildAppNavigationRow({
+      backCallback: 'menu:main',
+      refreshCallback: 'menu:whatsapp_tools',
+    })
+  );
+  return rows;
+}
+
+/**
+ * Builds the Cyber Forensics & Phone/Social OSINT Menu (`menu:cyber_forensics`).
+ */
+export function buildCyberForensicsMenuKeyboard(): InlineKeyboardRows {
+  return [
+    [
+      {
+        text: '🔎 بحث رقم الهاتف وكشف الأسماء',
+        callbackData: 'cyber:phone_lookup',
+      },
+      {
+        text: '🌐 كشف الحسابات المرتبطة بالرقم',
+        callbackData: 'cyber:social_lookup',
+      },
+    ],
+    [
+      {
+        text: '⚡ الفحص الجنائي الشامل للرقم',
+        callbackData: 'cyber:full_scan',
+      },
+    ],
+    [
+      {
+        text: '🗂️ سجل الفحوصات الجنائية',
+        callbackData: 'cyber:history:page:1',
+      },
+      {
+        text: '🔑 إعدادات Truecaller / Eyecon',
+        callbackData: 'cyber:settings',
+      },
+    ],
+    buildAppNavigationRow({
+      backCallback: 'menu:main',
+      refreshCallback: 'menu:cyber_forensics',
+    }),
+  ];
 }
 
 /**

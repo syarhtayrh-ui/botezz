@@ -1,5 +1,6 @@
 import {
   buildMainMenuKeyboard,
+  buildWhatsAppToolsMenuKeyboard,
   buildAppNavigationRow,
 } from '../keyboards/main-menu';
 import {
@@ -85,6 +86,28 @@ export class StartHandler {
       keyboard: buildMainMenuKeyboard({ isAdmin }),
       toastText: '🏠 القائمة الرئيسية',
       route: 'menu:main',
+    };
+  }
+
+  public renderWhatsAppToolsMenu(options?: {
+    isAdmin?: boolean;
+    actorUserId?: number;
+  }): BotViewResponse {
+    const isAdmin = options?.isAdmin ?? true;
+    const sessions = this.sessionManager.listSessions(options?.actorUserId);
+    const connectedCount = sessions.filter(
+      (s) => s.status === 'CONNECTED' || s.status === 'AUTHENTICATED'
+    ).length;
+
+    return {
+      text:
+        `📱 *قسم أدوات وإدارة واتساب الشامل*\n` +
+        `────────────────────────\n` +
+        `🟢 *الجلسات المتصلة:* *${connectedCount} / ${sessions.length}*\n\n` +
+        `اختر الأداة أو الوظيفة المطلوبة من القائمة أدناه:`,
+      keyboard: buildWhatsAppToolsMenuKeyboard({ isAdmin }),
+      toastText: '📱 أدوات واتساب',
+      route: 'menu:whatsapp_tools',
     };
   }
 
