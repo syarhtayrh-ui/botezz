@@ -1162,6 +1162,26 @@ export class AnonymousSessionEngine {
   }
 
   /**
+   * Toggles `prefer_lid_delivery` (`1` = Strict Ghost Mode `@lid` only, `0` = Flexible `@lid` with PN fallback)
+   * on an Anonymous Chat Room session.
+   */
+  public togglePreferLidDelivery(
+    anonSessionId: string,
+    ownerTelegramId?: number
+  ): AnonymousSession | null {
+    const existing = this.getAnonymousSessionById(anonSessionId, ownerTelegramId);
+    if (!existing) return null;
+    const nextVal = existing.preferLidDelivery ? 0 : 1;
+    const now = Date.now();
+    this.db.sqlite
+      .prepare(
+        `UPDATE anonymous_relay_sessions SET prefer_lid_delivery = ?, last_activity_at = ? WHERE id = ?`
+      )
+      .run(nextVal, now, existing.id);
+    return this.getAnonymousSessionById(existing.id, ownerTelegramId);
+  }
+
+  /**
    * Permanently deletes an anonymous session and its transcript history.
    */
   public deleteAnonymousSession(

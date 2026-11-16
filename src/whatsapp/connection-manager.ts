@@ -1380,6 +1380,7 @@ export interface AnonymousLidSendParams {
   mediaContent?: AnyMessageContent;
   customPushName?: string;
   ghostHeaderMode?: 'alias_banner' | 'plain';
+  allowPnFallback?: boolean;
 }
 
 export interface WhatsAppSessionDriver {
@@ -5176,8 +5177,12 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
         : undefined;
     let lidJid: string | undefined;
     let source = 'ON_WHATSAPP_USYNC';
-    let usedLid = false;
     let fallbackTriggered = false;
+    let discoveredDevices: Array<{
+      id: number;
+      keyIndex?: number;
+      isHosted?: boolean;
+    }> = [];
 
     if (trimmedRecipient.endsWith('@s.whatsapp.net')) {
       pnJid = jidNormalizedUser(trimmedRecipient);
@@ -5215,27 +5220,53 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
       }
     }
 
-    if (!lidJid && !pnJid) {
+    // 1. Query USync account lookup on (pnJid || trimmedRecipient) to discover active device IDs and @lid
+    const lookupTarget = pnJid || trimmedRecipient;
+    const lookup = await this.executeOfficialUSyncAccountLookup(
+      sock,
+      lookupTarget
+    ).catch(() => null);
+    if (lookup) {
+      if (lookup.pnJid && lookup.pnJid.endsWith('@s.whatsapp.net') && !pnJid) {
+        pnJid = jidNormalizedUser(lookup.pnJid);
+      }
+      if (!lidJid && lookup.lidJid && lookup.lidJid.endsWith('@lid')) {
+        lidJid = jidNormalizedUser(lookup.lidJid);
+      }
+      if (Array.isArray(lookup.devices) && lookup.devices.length > 0) {
+        discoveredDevices = lookup.devices;
+      }
+    }
+
+    if (!lidJid) {
       try {
-        const resolved = await this.resolveLidForRecipient(trimmedRecipient);
+        const resolved = await this.resolveLidForRecipient(
+          pnJid || trimmedRecipient
+        );
         pnJid = resolved.pnJid || pnJid;
         if (resolved.lidJid && resolved.lidJid.endsWith('@lid')) {
           lidJid = jidNormalizedUser(resolved.lidJid);
-        } else if (resolved.lidJid && resolved.lidJid.endsWith('@s.whatsapp.net')) {
+          source = resolved.source;
+        } else if (
+          resolved.lidJid &&
+          resolved.lidJid.endsWith('@s.whatsapp.net')
+        ) {
           pnJid = jidNormalizedUser(resolved.lidJid);
+          source = resolved.source;
         }
-        source = resolved.source;
       } catch (err) {
         const normalizedCheck = validateRecipient(
           trimmedRecipient.endsWith('@lid')
             ? `+${trimmedRecipient.slice(0, -4).replace(/\D/g, '')}`
-            : trimmedRecipient
+            : pnJid || trimmedRecipient
         );
         if (
           normalizedCheck.jid.endsWith('@s.whatsapp.net') &&
           typeof sock.onWhatsApp === 'function'
         ) {
-          const waCheck = await sock.onWhatsApp(normalizedCheck.jid).catch(() => []);
+          const waCheck = await sock
+            .onWhatsApp(normalizedCheck.jid)
+            .catch(() => []);
           const waEntry = Array.isArray(waCheck) ? waCheck[0] : undefined;
           if (waEntry && waEntry.exists === false) {
             throw err;
@@ -5245,32 +5276,33 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
           pnJid = jidNormalizedUser(normalizedCheck.jid);
           lidJid = undefined;
           source = 'PN_FALLBACK';
+        } else if (pnJid) {
+          lidJid = undefined;
+          source = 'PN_FALLBACK';
         } else {
           throw err;
         }
       }
-    } else if (pnJid && !lidJid) {
-      // Best-effort non-destructive LID lookup for metadata/mappings without migrating sessions
-      const cachedLid = this.memoryStore.getLidForPn(pnJid);
-      if (cachedLid && cachedLid.endsWith('@lid')) {
-        lidJid = cachedLid;
-        source = 'LID_MAPPING_STORE';
-      } else {
-        try {
-          const resolved = await this.resolveLidForRecipient(pnJid);
-          if (resolved.lidJid && resolved.lidJid.endsWith('@lid')) {
-            lidJid = jidNormalizedUser(resolved.lidJid);
-            source = resolved.source;
-          }
-        } catch {
-          source = 'PN_FALLBACK';
-        }
-      }
     }
 
-    // Record LID <-> PN mapping in memoryStore & lidMapping without touching Signal sessions
-    if (pnJid && lidJid) {
-      await this.syncLidPnMappingToSocket(sock, pnJid, lidJid);
+    // 2. Register LID <-> PN mapping and pre-assert @lid device sessions with force = false
+    if (lidJid) {
+      if (pnJid) {
+        await this.syncLidPnMappingToSocket(sock, pnJid, lidJid);
+      }
+      const lidUser = jidDecode(lidJid)?.user || lidJid.split('@')[0];
+      const deviceIds =
+        discoveredDevices.length > 0
+          ? Array.from(
+              new Set([0, ...discoveredDevices.map((d) => Number(d.id || 0))])
+            )
+          : [0];
+      const lidDeviceJids = deviceIds.map((id) =>
+        id === 0 ? `${lidUser}@lid` : `${lidUser}:${id}@lid`
+      );
+      if (typeof sock.assertSessions === 'function') {
+        await sock.assertSessions(lidDeviceJids, false).catch(() => false);
+      }
     }
 
     const contentPayload: AnyMessageContent = params.mediaContent
@@ -5287,6 +5319,23 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
     if (sock.user && params.customPushName !== undefined) {
       sock.user.name = params.customPushName;
     }
+    if (
+      params.customPushName &&
+      typeof (sock as unknown as { updateProfileName?: (name: string) => Promise<void> })
+        .updateProfileName === 'function'
+    ) {
+      await (
+        sock as unknown as { updateProfileName: (name: string) => Promise<void> }
+      )
+        .updateProfileName(params.customPushName)
+        .catch(() => undefined);
+    }
+
+    const selfLidRaw = sock.user?.lid || sock.authState?.creds?.me?.lid;
+    const selfLid = selfLidRaw ? jidNormalizedUser(selfLidRaw) : undefined;
+    const senderJid =
+      selfLid ||
+      (sock.user?.id ? jidNormalizedUser(sock.user.id) : undefined);
 
     const sendAndCacheImmediately = async (
       targetJid: string
@@ -5300,18 +5349,20 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
 
       let sentMessage: proto.IMessage | undefined;
       if (typeof sock.sendMessage === 'function') {
-        const sent = await sock.sendMessage(targetJid, contentPayload);
+        const sendOpts =
+          targetJid.endsWith('@lid') && (selfLid || senderJid)
+            ? ({ userJid: selfLid || senderJid } as never)
+            : undefined;
+        const sent = await sock.sendMessage(
+          targetJid,
+          contentPayload,
+          sendOpts
+        );
         attemptMsgId =
           sent?.key?.id ||
           SmartProtocolWrapper.generateStandardMessageId(sock.user?.id);
         sentMessage = sent?.message || undefined;
       } else {
-        const selfLid = sock.user?.lid || sock.authState?.creds?.me?.lid;
-        const senderJid = selfLid
-          ? jidNormalizedUser(selfLid)
-          : sock.user?.id
-            ? jidNormalizedUser(sock.user.id)
-            : undefined;
         const waMsg = generateWAMessageFromContent(
           targetJid,
           finalText
@@ -5319,7 +5370,7 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
             : (contentPayload as Record<string, unknown>),
           {
             userJid: targetJid.endsWith('@lid')
-              ? senderJid
+              ? selfLid || senderJid
               : sock.user?.id
                 ? jidNormalizedUser(sock.user.id)
                 : senderJid,
@@ -5361,42 +5412,59 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
     };
 
     try {
-      // Case A: Recipient's phone JID (`<phone>@s.whatsapp.net`) is known
-      if (pnJid) {
+      // CASE A (PRIMARY GHOST PATH): Always send to lidJid (@lid) FIRST when lidJid is resolved!
+      if (lidJid) {
+        await this.simulateHumanPresenceBeforeSend(
+          sock,
+          lidJid,
+          finalText.length || 12
+        );
+        try {
+          const lidAttempt = await sendAndCacheImmediately(lidJid);
+          if (lidAttempt.ack.ok) {
+            return {
+              messageId: lidAttempt.id,
+              targetLid: lidJid,
+              deliveredJid: lidJid,
+              resolvedPn: pnJid,
+              resolutionSource: source,
+              usedLid: true,
+              ackVerified: true,
+              fallbackTriggered: false,
+            };
+          }
+          // Server returned explicit error ACK (e.g. 479 or 463) on @lid:
+          if (!params.allowPnFallback || !pnJid) {
+            throw new WhatsAppConnectionError(
+              `رفض خادم واتساب إرسال الرسالة عبر الهوية المقنّعة (${lidJid}) برمز خطأ (${lidAttempt.ack.errorCode || 'ACK_ERR'}). لم يتم الإرسال عبر رقم الهاتف لحماية هويتك.`
+            );
+          }
+        } catch (lidErr) {
+          if (!params.allowPnFallback || !pnJid) {
+            throw lidErr;
+          }
+        }
+        fallbackTriggered = true;
+      }
+
+      // CASE B (OPTIONAL PN FALLBACK): Only reached if lidJid could not be resolved OR allowPnFallback === true
+      if (pnJid && (params.allowPnFallback || !lidJid)) {
         const verifiedPnJid = await this.resolveDirectRecipientJid(sock, pnJid);
         await this.simulateHumanPresenceBeforeSend(
           sock,
           verifiedPnJid,
           finalText.length || 12
         );
-        const sentAttempt = await sendAndCacheImmediately(verifiedPnJid);
-        usedLid = false;
+        const pnAttempt = await sendAndCacheImmediately(verifiedPnJid);
         return {
-          messageId: sentAttempt.id,
+          messageId: pnAttempt.id,
           targetLid: lidJid || verifiedPnJid,
           deliveredJid: verifiedPnJid,
           resolvedPn: verifiedPnJid,
-          resolutionSource: source,
+          resolutionSource: lidJid ? `${source}_PN_FALLBACK` : source,
           usedLid: false,
-          ackVerified: sentAttempt.ack.ok,
-          fallbackTriggered,
-        };
-      }
-
-      // Case B: Only `<id>@lid` is known (no `pnJid` available)
-      if (lidJid) {
-        await this.canAssertSessionForJid(sock, lidJid);
-        const sentAttempt = await sendAndCacheImmediately(lidJid);
-        usedLid = true;
-        return {
-          messageId: sentAttempt.id,
-          targetLid: lidJid,
-          deliveredJid: lidJid,
-          resolvedPn: undefined,
-          resolutionSource: source,
-          usedLid: true,
-          ackVerified: sentAttempt.ack.ok,
-          fallbackTriggered: false,
+          ackVerified: pnAttempt.ack.ok,
+          fallbackTriggered: Boolean(lidJid) || fallbackTriggered,
         };
       }
 

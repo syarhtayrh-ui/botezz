@@ -5351,6 +5351,10 @@ export class ToolsHandler {
       sess.receiverLidJid ||
       (sess.receiverJid.endsWith('@lid') ? sess.receiverJid : 'سيتم استخراجه تلقائياً عند الإرسال');
 
+    const protectionModeLine = sess.preferLidDelivery
+      ? '🔒 صارم (@lid فقط — يمنع كشف الرقم)'
+      : '🔄 مرن (@lid مع بديل الرقم العادي)';
+
     return {
       text:
         `${renderBreadcrumb(['الرئيسية', 'جلسة مجهولة', sess.id])}\n` +
@@ -5360,13 +5364,23 @@ export class ToolsHandler {
         `📱 *هاتف المستلم (PN):* \`${escapeMarkdown(targetPnDisplay)}\`\n` +
         `🎭 *الهوية المقنّعة (LID):* \`${escapeMarkdown(targetLidDisplay)}\`\n` +
         `📡 *جلسة الإرسال:* \`${escapeMarkdown(sess.sessionId)}\`\n` +
+        `🛡️ *وضع الحماية:* ${protectionModeLine}\n` +
         `🔒 *حالة التشفير:* \`🔒 LID + tcToken + Signal E2EE\`\n` +
+        `💡 *ملاحظة بروتوكولية:* لإخفاء رقم الهاتف تماماً من خادم واتساب عند مراسلة رقم لأول مرة عبر \`@lid\`، يُنصح بتفعيل ميزة اسم المستخدم (\`@username\`) وإخفاء الرقم في إعدادات خصوصية حساب واتساب المربوط.\n` +
         `━━━━━━━━━━━━━━━━━━\n` +
         `📜 *سجل رسائل الجلسة (آخر ${messages.length} رسائل):*\n` +
         transcriptLines.join('\n') +
         `\n━━━━━━━━━━━━━━━━━━\n` +
         `✍️ *أنت الآن داخل الجلسة.* أي رسالة نصية أو وسائط (صورة/فيديو/بصمة صوتية/ملصق/مستند) ترسلها هنا سيتم إيصالها فوراً للمستلم بهوية مجهولة (\`@lid\`)، وأي رد منه سيظهر لك هنا لحظياً.`,
       keyboard: [
+        [
+          {
+            text: sess.preferLidDelivery
+              ? '🔒 وضع الشبح الصارم (@lid فقط)'
+              : '🔄 السماح بالمسار البديل (PN)',
+            callbackData: `anon:toggle_strict:${sess.id}`,
+          },
+        ],
         [
           {
             text: '🔄 تحديث السجل',
@@ -5387,6 +5401,27 @@ export class ToolsHandler {
       toastText: `🕵️ داخل الجلسة ${sess.id}`,
       route: `anon:room:${sess.id}`,
     };
+  }
+
+  public toggleAnonymousRoomStrictMode(
+    adminId: number,
+    anonSessionId: string
+  ): BotViewResponse {
+    const ownerFilter = this.sessionManager.isOwner(adminId) ? undefined : adminId;
+    const updated = this.anonymousEngine.togglePreferLidDelivery(
+      anonSessionId,
+      ownerFilter
+    );
+    if (!updated) {
+      return this.renderAnonymousSessionsHub(
+        adminId,
+        `⚠️ الجلسة المجهولة (\`${escapeMarkdown(anonSessionId)}\`) غير موجودة أو تم حذفها.`
+      );
+    }
+    const modeNotice = updated.preferLidDelivery
+      ? '🔒 *تم تفعيل وضع الشبح الصارم (@lid فقط — يمنع كشف الرقم نهائياً).*'
+      : '🔄 *تم تفعيل الوضع المرن (@lid مع السماح بالمسار البديل @s.whatsapp.net).*';
+    return this.renderAnonymousSessionRoom(adminId, updated.id, modeNotice);
   }
 
   /**
@@ -5427,9 +5462,7 @@ export class ToolsHandler {
         sess.sessionId
       );
 
-      const recipientTarget = sess.receiverJid.endsWith('@s.whatsapp.net')
-        ? sess.receiverJid
-        : sess.receiverLidJid || sess.receiverJid;
+      const recipientTarget = sess.receiverLidJid || sess.receiverJid;
       const fallbackPnJid = sess.receiverJid.endsWith('@s.whatsapp.net')
         ? sess.receiverJid
         : undefined;
@@ -5440,6 +5473,7 @@ export class ToolsHandler {
         text: cleanText,
         customPushName: sess.senderAlias || '🕵️ جلسة مجهولة',
         ghostHeaderMode: 'plain',
+        allowPnFallback: !sess.preferLidDelivery,
       });
 
       const deliveredJid = sendRes.deliveredJid || sendRes.targetLid;
@@ -5474,7 +5508,9 @@ export class ToolsHandler {
         },
       });
 
-      const deliveryBadge = '✅ *تم إرسال الرسالة بنجاح إلى المستلم!*';
+      const deliveryBadge = sendRes.usedLid
+        ? `✅ *تم إرسال الرسالة بهوية مقنّعة عبر بروتوكول (@lid) بنجاح!* (\`${escapeMarkdown(deliveredJid)}\`)`
+        : `⚠️ *تنبيه: تم الإرسال عبر المسار العادي (@s.whatsapp.net) لأن المستلم لا يدعم استلام @lid المباشر (قد يظهر رقمك لدى المستلم).*`;
 
       return this.renderAnonymousSessionRoom(adminId, sess.id, deliveryBadge);
     } catch (err) {
@@ -5525,9 +5561,7 @@ export class ToolsHandler {
         sess.sessionId
       );
 
-      const recipientTarget = sess.receiverJid.endsWith('@s.whatsapp.net')
-        ? sess.receiverJid
-        : sess.receiverLidJid || sess.receiverJid;
+      const recipientTarget = sess.receiverLidJid || sess.receiverJid;
       const fallbackPnJid = sess.receiverJid.endsWith('@s.whatsapp.net')
         ? sess.receiverJid
         : undefined;
@@ -5615,6 +5649,7 @@ export class ToolsHandler {
         mediaContent: mediaContent as never,
         customPushName: sess.senderAlias || '🕵️ جلسة مجهولة',
         ghostHeaderMode: 'plain',
+        allowPnFallback: !sess.preferLidDelivery,
       });
 
       const deliveredJid = sendRes.deliveredJid || sendRes.targetLid;
@@ -5635,10 +5670,14 @@ export class ToolsHandler {
           (deliveredJid.endsWith('@s.whatsapp.net') ? deliveredJid : fallbackPnJid),
       });
 
+      const mediaDeliveryBadge = sendRes.usedLid
+        ? `✅ *تم إرسال الوسائط (${escapeMarkdown(transcriptLabel)}) بهوية مقنّعة عبر بروتوكول (@lid) بنجاح!* (\`${escapeMarkdown(deliveredJid)}\`)`
+        : `⚠️ *تنبيه: تم إرسال الوسائط عبر المسار العادي (@s.whatsapp.net) لأن المستلم لا يدعم استلام @lid المباشر (قد يظهر رقمك لدى المستلم).*`;
+
       return this.renderAnonymousSessionRoom(
         adminId,
         sess.id,
-        `✅ *تم إرسال الوسائط (${escapeMarkdown(transcriptLabel)}) للمستلم بنجاح!*`
+        mediaDeliveryBadge
       );
     } catch (err) {
       const safeErr = toSafeArabicError(err);

@@ -245,15 +245,17 @@ test('1. validateRecipient & LID Resolution + sendAnonymousLidMessage across all
   assert.equal(viaStore.lidJid, '99887766554433@lid');
   assert.equal(viaStore.source, 'LID_MAPPING_STORE');
 
-  // Send anonymous message when pnJid is known: must NOT call migrateSession or forced assertSessions,
-  // and must deliver via verifiedPnJid while caching under both PN and LID and messagesById
+  // Send anonymous message when both pnJid and lidJid are resolved:
+  // must dispatch to lidJid ('99887766554433@lid') FIRST (usedLid: true),
+  // pre-assert @lid device sessions with force = false, and never call migrateSession
   const sendRes = await driver.sendAnonymousLidMessage({
     recipient: '+966501234567',
     text: 'رسالة سرية عبر بروتوكول LID',
   });
   assert.equal(sendRes.targetLid, '99887766554433@lid');
-  assert.equal(sendRes.deliveredJid, '966501234567@s.whatsapp.net');
+  assert.equal(sendRes.deliveredJid, '99887766554433@lid');
   assert.equal(sendRes.resolvedPn, '966501234567@s.whatsapp.net');
+  assert.equal(sendRes.usedLid, true);
   assert.equal(
     fake.migratedSessions.length,
     0,
@@ -261,12 +263,16 @@ test('1. validateRecipient & LID Resolution + sendAnonymousLidMessage across all
   );
   assert.equal(
     fake.assertedSessions.length,
-    0,
-    'sendAnonymousLidMessage must not call assertSessions(..., true) when pnJid is known'
+    1,
+    'sendAnonymousLidMessage must pre-assert @lid device sessions via assertSessions(lidDeviceJids, false)'
+  );
+  assert.ok(
+    fake.assertedSessions[0].includes('99887766554433@lid'),
+    'lidDeviceJids must include the primary @lid JID'
   );
 
   assert.equal(fake.sentMessages.length, 1);
-  assert.equal(fake.sentMessages[0].jid, '966501234567@s.whatsapp.net');
+  assert.equal(fake.sentMessages[0].jid, '99887766554433@lid');
   const sentBody =
     (fake.sentMessages[0].content as { text?: string })?.text ||
     (

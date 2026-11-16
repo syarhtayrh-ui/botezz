@@ -1375,11 +1375,24 @@ test('Zero-byte tctoken protection & 1-to-1 stanza attribute hygiene in sendAnon
   }
 });
 
-test('sendAnonymousLidMessage forensic guarantees: pre-ACK memoryStore caching, JID-agnostic getMessage retry lookup, no migrateSession/forced assertSessions, and direct delivery to +967775224395', async () => {
+test('sendAnonymousLidMessage @lid-first priority, lidDeviceJids pre-assertion (force=false), userJid=selfLid, strict allowPnFallback=false protection, and flexible allowPnFallback=true failover', async () => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'botezz_forensic_anon_'));
   try {
     const driver = new HiroosyBaileysSessionDriver('sess_forensic_anon', tmpDir);
-    const fake = createFakeIdentitySocket();
+    const fake = createFakeIdentitySocket({
+      usyncFn: async () => ({
+        list: [
+          {
+            id: '60124505955@s.whatsapp.net',
+            contact: true,
+            lid: '130804101468269@lid',
+            devices: {
+              deviceList: [{ id: 0 }, { id: 2 }],
+            },
+          } as unknown as { id?: string; lid?: string },
+        ],
+      }),
+    });
     const wsEmitter = new EventEmitter();
     (fake.sock as unknown as { ws: EventEmitter; __ackVerifyTimeoutMs?: number }).ws =
       wsEmitter;
@@ -1390,6 +1403,7 @@ test('sendAnonymousLidMessage forensic guarantees: pre-ACK memoryStore caching, 
     let cachedBeforeAckResolved = false;
     let cachedCrossJidLookupBeforeAck = false;
     let migrateSessionCalled = false;
+    let updatedProfileName: string | undefined;
     const assertSessionsCalls: Array<{ jids: string[]; force?: boolean }> = [];
 
     (
@@ -1403,10 +1417,18 @@ test('sendAnonymousLidMessage forensic guarantees: pre-ACK memoryStore caching, 
     (
       fake.sock as unknown as {
         assertSessions: (jids: string[], force?: boolean) => Promise<boolean>;
+        updateProfileName: (name: string) => Promise<void>;
       }
     ).assertSessions = async (jids: string[], force?: boolean) => {
       assertSessionsCalls.push({ jids, force });
       return false; // false means session already exists locally!
+    };
+    (
+      fake.sock as unknown as {
+        updateProfileName: (name: string) => Promise<void>;
+      }
+    ).updateProfileName = async (name: string) => {
+      updatedProfileName = name;
     };
 
     const origSendMessage = fake.sock.sendMessage.bind(fake.sock);
@@ -1414,24 +1436,22 @@ test('sendAnonymousLidMessage forensic guarantees: pre-ACK memoryStore caching, 
       async (jid, content, opts) => {
         const sent = await origSendMessage(jid, content, opts);
         const msgId = sent?.key?.id || 'msg_forensic_1';
-        // Simulate recipient phone sending <receipt type="retry"/> 10ms after sendMessage resolves
-        // (well BEFORE the 250ms ACK timeout expires)
         setTimeout(() => {
-          const msgByExactJid = driver.memoryStore.getMessage({
-            remoteJid: '967775224395@s.whatsapp.net',
+          const msgByExactLid = driver.memoryStore.getMessage({
+            remoteJid: '130804101468269@lid',
             id: msgId,
           });
-          const msgByDeviceOrLidJid = driver.memoryStore.getMessage({
-            remoteJid: '967775224395:0@s.whatsapp.net',
+          const msgByPnDeviceJid = driver.memoryStore.getMessage({
+            remoteJid: '60124505955:0@s.whatsapp.net',
             id: msgId,
           });
           const msgByPureLidRetry = driver.memoryStore.getMessage({
-            remoteJid: '15938472910283:0@lid',
+            remoteJid: '130804101468269:2@lid',
             id: msgId,
           });
-          cachedBeforeAckResolved = Boolean(msgByExactJid);
+          cachedBeforeAckResolved = Boolean(msgByExactLid);
           cachedCrossJidLookupBeforeAck = Boolean(
-            msgByDeviceOrLidJid && msgByPureLidRetry
+            msgByPnDeviceJid && msgByPureLidRetry
           );
           wsEmitter.emit('CB:ack,class:message', {
             tag: 'ack',
@@ -1443,27 +1463,42 @@ test('sendAnonymousLidMessage forensic guarantees: pre-ACK memoryStore caching, 
 
     attachFakeSocketToDriver(driver, fake.sock);
 
+    // 1. When both pnJid (60124505955@s.whatsapp.net) and lidJid (130804101468269@lid) are resolved,
+    // sendAnonymousLidMessage MUST dispatch to 130804101468269@lid (usedLid: true) FIRST!
     const res = await driver.sendAnonymousLidMessage({
-      recipient: '+967775224395',
-      fallbackPnJid: '967775224395@s.whatsapp.net',
-      text: 'اختبار وصول الرسالة الفوري إلى +967775224395',
+      recipient: '+60124505955',
+      fallbackPnJid: '60124505955@s.whatsapp.net',
+      text: 'رسالة شبح عبر @lid أولاً',
       customPushName: '🕵️ جلسة مجهولة',
       ghostHeaderMode: 'plain',
+      allowPnFallback: false,
     });
 
-    assert.equal(res.deliveredJid, '967775224395@s.whatsapp.net');
-    assert.equal(res.resolvedPn, '967775224395@s.whatsapp.net');
-    assert.equal(res.usedLid, false);
+    assert.equal(res.targetLid, '130804101468269@lid');
+    assert.equal(res.deliveredJid, '130804101468269@lid');
+    assert.equal(res.resolvedPn, '60124505955@s.whatsapp.net');
+    assert.equal(res.usedLid, true);
     assert.equal(res.ackVerified, true);
+    assert.equal(res.fallbackTriggered, false);
+    assert.equal(updatedProfileName, '🕵️ جلسة مجهولة');
     assert.equal(
       migrateSessionCalled,
       false,
       'sendAnonymousLidMessage must NEVER call migrateSession(pnJid, lidJid)'
     );
     assert.equal(
-      assertSessionsCalls.some((c) => c.force === true),
+      assertSessionsCalls.length,
+      1,
+      'sendAnonymousLidMessage must pre-assert @lid device sessions once'
+    );
+    assert.deepEqual(assertSessionsCalls[0]!.jids, [
+      '130804101468269@lid',
+      '130804101468269:2@lid',
+    ]);
+    assert.equal(
+      assertSessionsCalls[0]!.force,
       false,
-      'sendAnonymousLidMessage must NEVER call assertSessions(..., true)'
+      'sendAnonymousLidMessage must call assertSessions(lidDeviceJids, false) with force = false'
     );
     assert.equal(
       cachedBeforeAckResolved,
@@ -1476,15 +1511,65 @@ test('sendAnonymousLidMessage forensic guarantees: pre-ACK memoryStore caching, 
       'SessionMemoryStore.getMessage must return the cached message by key.id regardless of retry remoteJid'
     );
     assert.equal(fake.sentMessages.length, 1);
-    assert.equal(fake.sentMessages[0]!.jid, '967775224395@s.whatsapp.net');
+    assert.equal(fake.sentMessages[0]!.jid, '130804101468269@lid');
     assert.deepEqual(fake.sentMessages[0]!.content, {
-      text: 'اختبار وصول الرسالة الفوري إلى +967775224395',
+      text: 'رسالة شبح عبر @lid أولاً',
     });
     assert.equal(
-      fake.sentMessages[0]!.opts,
-      undefined,
-      'sock.sendMessage must be invoked with clean options identical to sendTextMessage'
+      (fake.sentMessages[0]!.opts as { userJid?: string } | undefined)?.userJid,
+      '10000000000001@lid',
+      'Outbound @lid message must pass selfLid as userJid'
     );
+
+    // 2. When allowPnFallback is false (default in Strict Ghost Mode) and server returns ACK error 479 on @lid,
+    // sendAnonymousLidMessage MUST throw and NEVER fall back to @s.whatsapp.net
+    const driverStrict = new HiroosyBaileysSessionDriver('sess_strict_lid', tmpDir);
+    const fakeStrict = createFakeIdentitySocket();
+    const strictWs = new EventEmitter();
+    (fakeStrict.sock as unknown as { ws: EventEmitter }).ws = strictWs;
+    const origStrictSend = fakeStrict.sock.sendMessage.bind(fakeStrict.sock);
+    (
+      fakeStrict.sock as unknown as { sendMessage: typeof origStrictSend }
+    ).sendMessage = async (jid, content, opts) => {
+      const sent = await origStrictSend(jid, content, opts);
+      const msgId = sent?.key?.id || 'msg_strict_1';
+      setImmediate(() => {
+        strictWs.emit('CB:ack,class:message', {
+          tag: 'ack',
+          attrs: { class: 'message', id: msgId, error: '479' },
+        });
+      });
+      return sent;
+    };
+    attachFakeSocketToDriver(driverStrict, fakeStrict.sock);
+
+    await assert.rejects(
+      () =>
+        driverStrict.sendAnonymousLidMessage({
+          recipient: '77771111222233@lid',
+          fallbackPnJid: '967771234535@s.whatsapp.net',
+          text: 'Strict Ghost Mode blocks PN fallback',
+          allowPnFallback: false,
+        }),
+      /رفض خادم واتساب إرسال الرسالة عبر الهوية المقنّعة/
+    );
+    assert.equal(
+      fakeStrict.sentMessages.length,
+      1,
+      'Strict mode must never send a second message to @s.whatsapp.net'
+    );
+    assert.equal(fakeStrict.sentMessages[0]!.jid, '77771111222233@lid');
+
+    // 3. When allowPnFallback is true (Flexible Mode) and @lid returns ACK error 479, it falls back to @s.whatsapp.net
+    const resFlex = await driverStrict.sendAnonymousLidMessage({
+      recipient: '77771111222233@lid',
+      fallbackPnJid: '967771234535@s.whatsapp.net',
+      text: 'Flexible Mode allows PN fallback',
+      allowPnFallback: true,
+    });
+    assert.equal(resFlex.usedLid, false);
+    assert.equal(resFlex.fallbackTriggered, true);
+    assert.equal(resFlex.deliveredJid, '967771234535@s.whatsapp.net');
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }

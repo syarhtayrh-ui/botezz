@@ -2205,6 +2205,18 @@ export class TelegramBotController {
       }
       return view;
     }
+    if (callbackData.startsWith('anon:toggle_strict:')) {
+      const anonId = callbackData.slice('anon:toggle_strict:'.length).trim();
+      this.activateInputOwner(actorUserId, 'TOOLS');
+      const view = this.toolsHandler.toggleAnonymousRoomStrictMode(
+        actorUserId,
+        anonId
+      );
+      if (this.toolsHandler.getStep(actorUserId) === 'NONE') {
+        this.activateInputOwner(actorUserId, 'NONE');
+      }
+      return view;
+    }
     if (callbackData === 'anon:exit_room') {
       this.activateInputOwner(actorUserId, 'NONE');
       return this.toolsHandler.exitAnonymousSessionRoom(actorUserId);
