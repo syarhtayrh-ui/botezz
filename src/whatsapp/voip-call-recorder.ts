@@ -1423,8 +1423,13 @@ export class VoipCallRecorder {
     }
   }
 
+  public matchesCallId(incomingCallId?: string): boolean {
+    return this.matchesHookCallId(incomingCallId ?? '');
+  }
+
   private matchesHookCallId(hookCallId: string): boolean {
-    if (!hookCallId) return false;
+    if (this.status !== 'RECORDING') return false;
+    if (!hookCallId) return true;
     if (hookCallId === this.callId || hookCallId === this.voipCallId) {
       return true;
     }
@@ -1434,8 +1439,12 @@ export class VoipCallRecorder {
     if (attachedSessionCallId && hookCallId === attachedSessionCallId) {
       return true;
     }
-    // If voipCallId has not yet been assigned on this recorder instance, accept the active call's frames
-    if (!this.voipCallId && !attachedSessionCallId) {
+    // If `voipCallId` has not yet been assigned or still holds the internal `vcall_*` ID,
+    // adopt the real 32-hex WhatsApp VoIP callId on the first inbound media packet!
+    if (!this.voipCallId || this.voipCallId.startsWith('vcall_')) {
+      if (/^[0-9A-Fa-f]{20,64}$/.test(hookCallId)) {
+        this.voipCallId = hookCallId;
+      }
       return true;
     }
     return false;
@@ -1749,8 +1758,30 @@ export class VoipCallRecorder {
    */
   public attachToMediaSession(
     rawSession: WaCallMediaSessionLike | Record<string, unknown> | null | undefined
-  ): void {
-    if (!rawSession || typeof rawSession !== 'object') return;
+  ): boolean {
+    if (!rawSession || typeof rawSession !== 'object') return false;
+    const rawFlags = rawSession as {
+      __botezzDisposed?: boolean;
+      info?: {
+        callId?: string;
+        isEnded?: boolean;
+        stateData?: { state?: string };
+      };
+    };
+    if (
+      rawFlags.__botezzDisposed ||
+      rawFlags.info?.isEnded ||
+      rawFlags.info?.stateData?.state === 'ended'
+    ) {
+      return false;
+    }
+    if (
+      rawFlags.info?.callId &&
+      (!this.voipCallId || this.voipCallId.startsWith('vcall_'))
+    ) {
+      this.voipCallId = rawFlags.info.callId;
+    }
+
     const session = rawSession as Record<string, unknown> & {
       __botezzRecorderAttached?: VoipCallRecorder;
       onRelayData?: (data: Uint8Array) => void;
@@ -1773,7 +1804,7 @@ export class VoipCallRecorder {
       Object.prototype.hasOwnProperty.call(session, '__botezzRecorderAttached') &&
       session.__botezzRecorderAttached === this
     ) {
-      return;
+      return true;
     }
     session.__botezzRecorderAttached = this;
 
@@ -2050,6 +2081,7 @@ export class VoipCallRecorder {
     };
 
     this.startPliWatchdog();
+    return true;
   }
 
   private startPliWatchdog(): void {

@@ -366,6 +366,7 @@ export class VideoCallWorkflow {
 
       const baseName = path.basename(resolvedPath);
       if (
+        baseName === 'sample_call.mp4' ||
         baseName.startsWith('synthetic_call_') ||
         baseName.startsWith('bcast_')
       ) {
@@ -865,22 +866,25 @@ export class VideoCallWorkflow {
   }
 
   private async createSampleVideoFile(
-    adminId: number
+    _adminId: number
   ): Promise<{ filePath: string; sizeBytes: number }> {
-    const filePath = path.join(
-      this.tempUploadDir,
-      `sample_call_${adminId}_${Date.now()}.mp4`
-    );
-    try {
-      await generatePlayableVoipMp4File(filePath, {
-        width: 640,
-        height: 360,
-        frameRate: 15,
-        durationSeconds: 10,
-        includeAudio: true,
-      });
-    } catch {
-      fs.writeFileSync(filePath, createMinimalMp4Buffer());
+    fs.mkdirSync(this.tempUploadDir, { recursive: true });
+    const filePath = path.join(this.tempUploadDir, 'sample_call.mp4');
+    const existingSize = fs.existsSync(filePath)
+      ? fs.statSync(filePath).size
+      : 0;
+    if (existingSize < 50_000) {
+      try {
+        await generatePlayableVoipMp4File(filePath, {
+          width: 640,
+          height: 360,
+          frameRate: 15,
+          durationSeconds: 30,
+          includeAudio: true,
+        });
+      } catch {
+        fs.writeFileSync(filePath, createMinimalMp4Buffer());
+      }
     }
     const sizeBytes = fs.existsSync(filePath)
       ? fs.statSync(filePath).size

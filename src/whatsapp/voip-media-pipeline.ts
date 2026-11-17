@@ -517,65 +517,78 @@ export async function generatePlayableVoipMp4File(
 
   const width = options?.width ?? 640;
   const height = options?.height ?? 360;
-  const fps = options?.frameRate ?? 20;
-  const duration = options?.durationSeconds ?? 2;
+  const fps = options?.frameRate ?? 15;
+  const duration = options?.durationSeconds ?? 15;
   const includeAudio = options?.includeAudio ?? true;
   const vcodec = options?.videoCodec ?? 'libx264';
 
-  const args: string[] = [
-    '-y',
-    '-f',
-    'lavfi',
-    '-i',
-    `testsrc=size=${width}x${height}:rate=${fps}:duration=${duration}`,
-  ];
-
-  if (includeAudio) {
-    args.push(
+  const buildFfmpegArgs = (videoFilter: 'testsrc2' | 'testsrc'): string[] => {
+    const args: string[] = [
+      '-y',
       '-f',
       'lavfi',
       '-i',
-      `sine=frequency=440:sample_rate=16000:duration=${duration}`
-    );
+      `${videoFilter}=size=${width}x${height}:rate=${fps}:duration=${duration}`,
+    ];
+
+    if (includeAudio) {
+      args.push(
+        '-f',
+        'lavfi',
+        '-i',
+        `sine=frequency=440:sample_rate=16000:duration=${duration}`
+      );
+    }
+
+    if (vcodec === 'libx264') {
+      args.push(
+        '-c:v',
+        'libx264',
+        '-profile:v',
+        'baseline',
+        '-level',
+        '3.0',
+        '-pix_fmt',
+        'yuv420p',
+        '-r',
+        String(fps),
+        '-preset',
+        'ultrafast',
+        '-tune',
+        'zerolatency',
+        '-g',
+        String(fps),
+        '-keyint_min',
+        String(fps),
+        '-sc_threshold',
+        '0',
+        '-bf',
+        '0',
+        '-x264-params',
+        `slices=1:bframes=0:ref=1:keyint=${fps}:min-keyint=${fps}:scenecut=0:repeat-headers=1:annexb=1:cabac=0`
+      );
+    } else {
+      args.push('-c:v', vcodec, '-pix_fmt', 'yuv420p');
+    }
+
+    if (includeAudio) {
+      args.push('-c:a', 'aac', '-ar', '16000', '-ac', '1');
+    } else {
+      args.push('-an');
+    }
+
+    args.push('-movflags', '+faststart', resolved);
+    return args;
+  };
+
+  try {
+    await execFileAsync('ffmpeg', buildFfmpegArgs('testsrc2'), {
+      timeout: 20_000,
+    });
+  } catch {
+    await execFileAsync('ffmpeg', buildFfmpegArgs('testsrc'), {
+      timeout: 20_000,
+    });
   }
-
-  if (vcodec === 'libx264') {
-    args.push(
-      '-c:v',
-      'libx264',
-      '-profile:v',
-      'baseline',
-      '-level',
-      '3.1',
-      '-pix_fmt',
-      'yuv420p',
-      '-preset',
-      'ultrafast',
-      '-tune',
-      'zerolatency',
-      '-g',
-      '15',
-      '-keyint_min',
-      '15',
-      '-sc_threshold',
-      '0',
-      '-bf',
-      '0',
-      '-x264-params',
-      'repeat-headers=1:annexb=1:bframes=0:cabac=0'
-    );
-  } else {
-    args.push('-c:v', vcodec, '-pix_fmt', 'yuv420p');
-  }
-
-  if (includeAudio) {
-    args.push('-c:a', 'aac', '-ar', '16000', '-ac', '1');
-  } else {
-    args.push('-an');
-  }
-
-  args.push('-movflags', '+faststart', resolved);
-
-  await execFileAsync('ffmpeg', args, { timeout: 15_000 });
   return resolved;
 }

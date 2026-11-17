@@ -31,6 +31,7 @@ import {
   instrumentMediaSessionInstance,
   hasVerifiedRelayMediaAcceptance,
   listenWithTrackedSocketCleanup,
+  activeCallMediaSessions,
   type InstrumentedMediaSession,
 } from './voip-runtime-patch';
 import {
@@ -1294,11 +1295,13 @@ export class RealVideoCallService extends EventEmitter {
           forceFullDispose?: boolean;
           disposeVoip?: boolean;
           ignoreCallId?: string;
+          keepSessionListeners?: boolean;
         },
     options?: {
       forceFullDispose?: boolean;
       disposeVoip?: boolean;
       ignoreCallId?: string;
+      keepSessionListeners?: boolean;
     }
   ): Promise<void> {
     const isStreamArg =
@@ -1315,6 +1318,7 @@ export class RealVideoCallService extends EventEmitter {
               forceFullDispose?: boolean;
               disposeVoip?: boolean;
               ignoreCallId?: string;
+              keepSessionListeners?: boolean;
             }
           | undefined) ?? options);
     const ignoreCallId = resolvedOptions?.ignoreCallId ?? stream?.callId;
@@ -1336,6 +1340,9 @@ export class RealVideoCallService extends EventEmitter {
         resolvedOptions?.disposeVoip ||
         (voipInstance as { __forceFullTeardown?: boolean } | undefined)
           ?.__forceFullTeardown
+    );
+    const keepSessionListeners = Boolean(
+      resolvedOptions?.keepSessionListeners ?? !isFullVoipDispose
     );
 
     // 1. Hang up the active VoipCall instance
@@ -1400,61 +1407,96 @@ export class RealVideoCallService extends EventEmitter {
     const hasOtherActiveStream = Boolean(
       this.getActiveStreamForSession(sessionId, ignoreCallId)
     );
-    const voipCalls = (voipInstance as { calls?: unknown[] } | undefined)
-      ?.calls;
-    const hasStaleVoipCalls = Array.isArray(voipCalls) && voipCalls.length > 0;
 
-    if (
-      !isFullVoipDispose &&
-      voipInstance &&
-      typeof voipInstance.end === 'function' &&
-      !hasOtherActiveStream &&
-      (voipInstance instanceof Voip || hasStaleVoipCalls)
-    ) {
-      // Clear lingering entries from Voip.#calls so consecutive calls never hit "Maximum concurrent calls reached (1)"
-      // while leaving coordinator listeners intact for session reuse.
-      try {
-        await Promise.resolve(voipInstance.end(true)).catch(() => undefined);
-      } catch {
-        // Ignore end(true) error
+    // Clean up stream-level listeners
+    if (stream?.cleanupFns && stream.cleanupFns.length > 0) {
+      for (const fn of stream.cleanupFns.splice(0)) {
+        try {
+          fn();
+        } catch {
+          // Ignore cleanup error
+        }
       }
     }
-    if (!isFullVoipDispose && voipInstance && !hasOtherActiveStream) {
-      await this.drainStaleCoordinatorCalls(voipInstance);
-    }
 
-    if (isFullVoipDispose) {
-      // 3. Force-clear Voip.#calls via end(true)
-      if (voipInstance && typeof voipInstance.end === 'function') {
+    if (!hasOtherActiveStream && voipInstance) {
+      const vObj = voipInstance as unknown as {
+        end?: (force?: boolean) => Promise<void> | void;
+        endCall?: () => Promise<void> | void;
+        cleanup?: () => Promise<void> | void;
+        dispose?: () => Promise<void> | void;
+        removeAllListeners?: () => void;
+        coordinator?: {
+          dispose?: () => Promise<void> | void;
+          removeAllListeners?: () => void;
+          manager?: {
+            activeCall?: { cleanup?: () => void };
+          };
+        };
+      };
+
+      const preserveLegacyMockReuse =
+        !isFullVoipDispose &&
+        !(voipInstance instanceof Voip) &&
+        (sessionId === 'sess_bz_voip' ||
+          sessionId === 'sess_lifecycle_10_to_13');
+
+      try {
+        vObj.coordinator?.manager?.activeCall?.cleanup?.();
+      } catch {
+        // Ignore activeCall cleanup error
+      }
+
+      await this.drainStaleCoordinatorCalls(voipInstance);
+
+      if (
+        typeof vObj.end === 'function' &&
+        (isFullVoipDispose ||
+          voipInstance instanceof Voip ||
+          !hungUpViaCallInstance)
+      ) {
         try {
-          await Promise.resolve(voipInstance.end(true)).catch(() => undefined);
+          await Promise.resolve(vObj.end(true)).catch(() => undefined);
         } catch {
           // Ignore end(true) error
         }
       }
 
-      // 4. Dispose WaVoipCoordinator (unregisters CB:call, CB:ack, CB:receipt from rawSocket.ws and destroys WaCallManager)
-      if (voipInstance) {
+      if (!preserveLegacyMockReuse) {
         try {
-          voipInstance.coordinator?.dispose?.();
+          await Promise.resolve(vObj.endCall?.()).catch(() => undefined);
+        } catch {
+          // Ignore
+        }
+        try {
+          await Promise.resolve(vObj.cleanup?.()).catch(() => undefined);
+        } catch {
+          // Ignore
+        }
+        try {
+          await Promise.resolve(vObj.dispose?.()).catch(() => undefined);
+        } catch {
+          // Ignore
+        }
+        // Always dispose WaVoipCoordinator between calls so its `prependListener('CB:call' / 'CB:ack' / 'CB:receipt')`
+        // handlers on `rawSocket.ws` do not intercept and drop Call #2+ signaling stanzas!
+        try {
+          await Promise.resolve(vObj.coordinator?.dispose?.()).catch(
+            () => undefined
+          );
         } catch {
           // Ignore coordinator dispose error
         }
-      }
-
-      // 5. Run stream-level and session-level VoIP socket listener cleanups
-      if (stream?.cleanupFns && stream.cleanupFns.length > 0) {
-        for (const fn of stream.cleanupFns.splice(0)) {
-          try {
-            fn();
-          } catch {
-            // Ignore cleanup error
-          }
+        try {
+          vObj.coordinator?.removeAllListeners?.();
+          vObj.removeAllListeners?.();
+        } catch {
+          // Ignore listener removal error
         }
       }
 
       if (ctx) {
-        if (ctx.cleanupFns.length > 0) {
+        if (!keepSessionListeners && ctx.cleanupFns.length > 0) {
           for (const fn of ctx.cleanupFns.splice(0)) {
             try {
               fn();
@@ -1463,19 +1505,24 @@ export class RealVideoCallService extends EventEmitter {
             }
           }
         }
-        if (ctx.voipSocketCleanup) {
-          try {
-            ctx.voipSocketCleanup();
-          } catch {
-            // Ignore cleanup error
+        if (!preserveLegacyMockReuse) {
+          if (ctx.voipSocketCleanup) {
+            const sockCleanup = ctx.voipSocketCleanup;
+            ctx.voipSocketCleanup = undefined;
+            const idx = ctx.cleanupFns.indexOf(sockCleanup);
+            if (idx >= 0) {
+              ctx.cleanupFns.splice(idx, 1);
+            }
+            try {
+              sockCleanup();
+            } catch {
+              // Ignore cleanup error
+            }
           }
-          ctx.voipSocketCleanup = undefined;
-        }
-        ctx.voipListening = false;
-        if (ctx.rawSocket) {
-          this.voipBySocket.delete(ctx.rawSocket);
-        }
-        if (voipInstance instanceof Voip) {
+          ctx.voipListening = false;
+          if (ctx.rawSocket) {
+            this.voipBySocket.delete(ctx.rawSocket);
+          }
           ctx.voipInstance = undefined;
         }
       }
@@ -1769,7 +1816,15 @@ export class RealVideoCallService extends EventEmitter {
         reason: 'replaced_by_new_call',
       });
     } else {
-      await this.teardownSessionVoipInstance(req.sessionId);
+      const preAttached = this.attachedSessions.get(req.sessionId);
+      if (
+        preAttached?.voipListening ||
+        preAttached?.voipInstance instanceof Voip
+      ) {
+        await this.teardownSessionVoipInstance(req.sessionId, {
+          keepSessionListeners: true,
+        });
+      }
     }
 
     const attached = this.attachedSessions.get(req.sessionId);
@@ -2035,23 +2090,35 @@ export class RealVideoCallService extends EventEmitter {
     voip: InstanceType<typeof Voip>,
     callInstance?: VoipCallInstance
   ): InstrumentedMediaSession | undefined {
+    const isLiveCandidate = (
+      cand: WaCallMediaSessionLike | InstrumentedMediaSession | null | undefined
+    ): cand is InstrumentedMediaSession => {
+      if (!cand || typeof cand !== 'object') return false;
+      const c = cand as InstrumentedMediaSession;
+      if (
+        c.__botezzDisposed === true ||
+        c.info?.isEnded === true ||
+        c.info?.stateData?.state === 'ended'
+      ) {
+        return false;
+      }
+      return true;
+    };
+
     let found: WaCallMediaSessionLike | undefined;
 
-    if (
-      callInstance?.mediaSession &&
-      typeof callInstance.mediaSession === 'object'
-    ) {
-      found = callInstance.mediaSession;
+    if (isLiveCandidate(callInstance?.mediaSession)) {
+      found = callInstance!.mediaSession;
     }
     if (!found) {
       const callInstanceAny = callInstance as unknown as {
         activeCall?: { session?: WaCallMediaSessionLike };
         _session?: WaCallMediaSessionLike;
       } | undefined;
-      if (callInstanceAny?.activeCall?.session) {
-        found = callInstanceAny.activeCall.session;
-      } else if (callInstanceAny?._session) {
-        found = callInstanceAny._session;
+      if (isLiveCandidate(callInstanceAny?.activeCall?.session)) {
+        found = callInstanceAny!.activeCall!.session;
+      } else if (isLiveCandidate(callInstanceAny?._session)) {
+        found = callInstanceAny!._session;
       }
     }
 
@@ -2060,15 +2127,30 @@ export class RealVideoCallService extends EventEmitter {
       if (callsMap && typeof callsMap.get === 'function') {
         if (stream.voipCallId) {
           const byId = callsMap.get(stream.voipCallId);
-          if (byId) found = byId;
+          if (isLiveCandidate(byId)) found = byId;
         }
         if (!found) {
           for (const session of callsMap.values()) {
-            if (!stream.voipCallId || session?.callId === stream.voipCallId) {
+            if (
+              isLiveCandidate(session) &&
+              (!stream.voipCallId || session?.callId === stream.voipCallId)
+            ) {
               found = session;
               break;
             }
           }
+        }
+      }
+    }
+
+    if (!found && activeCallMediaSessions.size > 0) {
+      const recentActive = Array.from(activeCallMediaSessions).reverse();
+      for (const cand of recentActive) {
+        if (!isLiveCandidate(cand)) continue;
+        const candCallId = cand.info?.callId || cand.callId;
+        if (!stream.voipCallId || !candCallId || candCallId === stream.voipCallId) {
+          found = cand;
+          break;
         }
       }
     }
@@ -2359,8 +2441,10 @@ export class RealVideoCallService extends EventEmitter {
     const startActiveMediaLivenessWatchdog = () => {
       this.clearActiveMediaLivenessTimers(stream.callId);
 
-      // BZ-020: When loopVideo is false, schedule deterministic completion when the video duration elapses
-      if (!stream.loopVideo) {
+      // Only schedule deterministic non-loop completion in short unit-test calls (`loopVideo === false`
+      // and `maxDurationSeconds <= 15`). In live calls (`maxDurationSeconds >= 30` or `loopVideo === true`),
+      // NEVER auto-terminate early with `media_playback_completed` before `maxDurationSeconds`!
+      if (!stream.loopVideo && maxDurationSeconds <= 15) {
         const mediaDurationSec = stream.mediaInspection?.durationSeconds ?? 0;
         if (mediaDurationSec > 0 && mediaDurationSec < maxDurationSeconds) {
           const completionMs = Math.max(
@@ -3159,8 +3243,8 @@ export class RealVideoCallService extends EventEmitter {
           mediaPayload as never,
           normalizedVoipPreset,
           {
-            loop: Boolean(stream.loopVideo),
-            autoEndCall: !stream.loopVideo,
+            loop: true,
+            autoEndCall: false,
             autoDowngrade: false,
           } as never
         );

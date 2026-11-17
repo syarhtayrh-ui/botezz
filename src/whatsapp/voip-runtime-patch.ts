@@ -215,6 +215,8 @@ export interface InstrumentedAudioEngine {
 let patchPromise: Promise<void> | null = null;
 let patchApplied = false;
 
+export const activeCallMediaSessions = new Set<any>();
+
 export function resolveBaileysLitePackageDir(): string | null {
   try {
     const req = createRequire(import.meta.url);
@@ -1527,8 +1529,29 @@ function syncSessionVideoSsrcWithDeviceJid(
         ? jid
         : jid.replace('@', ':0@');
 
+  const sessionFlags = session as InstrumentedMediaSession & {
+    mediaFlowStarted?: boolean;
+    __botezzRelaysConnected?: boolean;
+    acceptedByJid?: string | null;
+  };
+
+  // NEVER mutate outbound `videoSsrc` or `videoRtpStream.ssrc` once relays are connected,
+  // call is accepted, or media flow has started — changing outbound SSRC after relay allocation
+  // causes the WhatsApp relay or remote phone to drop all subsequent video frames after Frame 1!
+  const outboundSsrcLocked = Boolean(
+    sessionFlags.mediaFlowStarted ||
+      sessionFlags.__botezzRelaysConnected ||
+      (sessionFlags.acceptedByJid &&
+        typeof session.videoSsrc === 'number' &&
+        session.videoSsrc >>> 0 !== 0)
+  );
+
   const activeDeviceJid = session.selfSsrcJid || session.selfLid;
-  if (activeDeviceJid && (session.selfSsrcJid || session.videoSsrc === undefined)) {
+  if (
+    !outboundSsrcLocked &&
+    activeDeviceJid &&
+    (session.selfSsrcJid || session.videoSsrc === undefined)
+  ) {
     const normalizedDeviceJid = normalizeDeviceJid(activeDeviceJid);
     const expectedVideoSsrc = computeWhatsAppSecureSsrc(
       callId,
@@ -2008,7 +2031,7 @@ function syncSessionVideoSrtpTemplates(session: any): void {
   }
 
   // Ensure `session.videoSrtpSession` exists and has `recvCtx` updated to `audioRecvCtx` (`peerCallKey`)
-  // while keeping `sendCtx` strictly on `audioSendCtx` (`ourCallKey`).
+  // while NEVER replacing or cloning `videoSrtpSession.sendCtx` once initialized (so outbound ROC/lastSeq stay intact).
   if (!session.videoSrtpSession && session.srtpSession) {
     const SrtpSessionCtor = session.srtpSession.constructor;
     try {
@@ -2220,7 +2243,7 @@ function computeAndSubscribePeerSsrcs(
   return unique;
 }
 
-function sendProactiveVideoStateAndPli(session: any): void {
+export function sendProactiveVideoStateAndPli(session: any): void {
   if (!session || typeof session !== 'object') return;
   const isVideo =
     session.info?.mediaType === 'video' ||
@@ -2228,42 +2251,10 @@ function sendProactiveVideoStateAndPli(session: any): void {
     Boolean(session.peerVideoActive);
   if (!isVideo) return;
 
-  const peerJid =
-    session.acceptedByJid || session.info?.peerJid || session.peerJid;
-  const callId = session.info?.callId || session.callId;
-  const callCreator =
-    session.info?.callCreator || session.selfSsrcJid || session.selfLid;
-
-  if (
-    peerJid &&
-    callId &&
-    callCreator &&
-    typeof session.deps?.lowLevelCoordinator?.sendNode === 'function'
-  ) {
-    const videoNode = {
-      tag: 'call',
-      attrs: {
-        to: peerJid,
-        id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-      },
-      content: [
-        {
-          tag: 'video',
-          attrs: {
-            'call-id': callId,
-            'call-creator': callCreator,
-            state: '1',
-            dec: 'H264',
-            device_orientation: '0',
-          },
-        },
-      ],
-    };
-    Promise.resolve(
-      session.deps.lowLevelCoordinator.sendNode(videoNode)
-    ).catch(() => {});
-  }
-
+  // CRITICAL: Do NOT send an unsolicited `<call><video state="1" dec="H264" device_orientation="0"/></call>`
+  // stanza here! Sending `state="1"` without `enc="h.264"` causes the remote WhatsApp phone to mark
+  // our outbound video encoder as disabled/reset and freeze outbound video on Frame 1.
+  // Only send RTCP PLI over `sctpRelay` to request inbound keyframes from the peer's camera.
   const sendPliBurst = () => {
     try {
       if (!session.sctpRelay?.hasConnection?.()) return;
@@ -2333,6 +2324,7 @@ function attachPassiveNativeMediaSessionTaps(
     handleCallAck?: (node: unknown) => Promise<void>;
     handleCallVideo?: (node: unknown) => Promise<unknown>;
     enableVideoMidCall?: (...args: unknown[]) => Promise<unknown>;
+    swapVideoSource?: (videoPath: string) => Promise<unknown>;
     startMediaFlow?: (...args: unknown[]) => unknown;
     cleanup?: (...args: unknown[]) => unknown;
     connectRelays?: (...args: unknown[]) => Promise<unknown>;
@@ -2342,11 +2334,25 @@ function attachPassiveNativeMediaSessionTaps(
     onRelayVideoData?: (data: Uint8Array) => unknown;
   }
 ): void {
-  if (
-    !target ||
-    typeof target !== 'object' ||
-    Object.prototype.hasOwnProperty.call(target, '__botezzPassiveTapApplied')
-  ) {
+  if (!target || typeof target !== 'object') {
+    return;
+  }
+
+  // Track non-prototype media session instances in `activeCallMediaSessions`
+  const isPrototypeObject =
+    Object.prototype.hasOwnProperty.call(target, 'constructor') &&
+    typeof (target as { constructor?: unknown }).constructor === 'function';
+  if (!isPrototypeObject && !target.__botezzDisposed) {
+    activeCallMediaSessions.add(target);
+  }
+  if (target.videoEngine && typeof target.videoEngine === 'object') {
+    const veProto = Object.getPrototypeOf(target.videoEngine);
+    if (veProto && veProto !== Object.prototype) {
+      patchWaVideoEnginePrototype(veProto);
+    }
+  }
+
+  if (Object.prototype.hasOwnProperty.call(target, '__botezzPassiveTapApplied')) {
     return;
   }
   Object.defineProperty(target, '__botezzPassiveTapApplied', {
@@ -2362,10 +2368,14 @@ function attachPassiveNativeMediaSessionTaps(
       this: typeof target,
       ...args: unknown[]
     ) {
+      if (!this.__botezzDisposed) {
+        activeCallMediaSessions.add(this);
+      }
       const res = await origAccept.apply(this, args);
       try {
         const peerJidArg = typeof args[1] === 'string' ? args[1] : undefined;
-        syncSessionVideoSsrcWithDeviceJid(this);
+        // Do NOT call syncSessionVideoSsrcWithDeviceJid(this) here after accept;
+        // outbound videoSsrc must never be mutated after relay setup.
         syncSessionVideoSrtpTemplates(this);
         computeAndSubscribePeerSsrcs(this, peerJidArg);
         (
@@ -2385,6 +2395,9 @@ function attachPassiveNativeMediaSessionTaps(
       this: typeof target,
       node: unknown
     ): Promise<void> {
+      if (!this.__botezzDisposed) {
+        activeCallMediaSessions.add(this);
+      }
       await origAck.call(this, node);
       try {
         syncSessionVideoSsrcWithDeviceJid(this);
@@ -2402,6 +2415,9 @@ function attachPassiveNativeMediaSessionTaps(
       this: typeof target,
       ...args: unknown[]
     ) {
+      if (!this.__botezzDisposed) {
+        activeCallMediaSessions.add(this);
+      }
       try {
         syncSessionVideoSsrcWithDeviceJid(this);
         computeAndSubscribePeerSsrcs(this);
@@ -2409,8 +2425,8 @@ function attachPassiveNativeMediaSessionTaps(
         // Non-fatal
       }
       const res = await origRelays.apply(this, args);
+      (this as Record<string, unknown>).__botezzRelaysConnected = true;
       try {
-        syncSessionVideoSsrcWithDeviceJid(this);
         syncSessionVideoSrtpTemplates(this);
         computeAndSubscribePeerSsrcs(this);
         (
@@ -2457,6 +2473,28 @@ function attachPassiveNativeMediaSessionTaps(
     };
   }
 
+  if (typeof target.swapVideoSource === 'function') {
+    const origSwapVideoSource = target.swapVideoSource;
+    target.swapVideoSource = async function passiveSwapVideoSourceTap(
+      this: typeof target,
+      videoPath: string
+    ) {
+      // If `VoipCall._advance()` loops the exact same video file that `WaVideoEngine` is already
+      // streaming via `-stream_loop -1` (or `nalUnits` loop), do NOT kill and restart `videoEngine` mid-call!
+      if (
+        this.videoEngine &&
+        this.videoEngine.running &&
+        this.videoEngine.videoPath &&
+        videoPath &&
+        path.resolve(String(this.videoEngine.videoPath)) ===
+          path.resolve(String(videoPath))
+      ) {
+        return;
+      }
+      return await origSwapVideoSource.call(this, videoPath);
+    };
+  }
+
   if (typeof target.enableVideoMidCall === 'function') {
     const origEnableVideoMidCall = target.enableVideoMidCall;
     target.enableVideoMidCall = async function passiveEnableVideoMidCallTap(
@@ -2465,7 +2503,6 @@ function attachPassiveNativeMediaSessionTaps(
     ) {
       const res = await origEnableVideoMidCall.apply(this, args);
       try {
-        syncSessionVideoSsrcWithDeviceJid(this);
         syncSessionVideoSrtpTemplates(this);
         computeAndSubscribePeerSsrcs(this);
         (
@@ -2514,13 +2551,20 @@ function attachPassiveNativeMediaSessionTaps(
       ...args: unknown[]
     ) {
       const selfAny = this as any;
+      selfAny.__botezzDisposed = true;
+      activeCallMediaSessions.delete(selfAny);
       if (selfAny._pliIntervalTimer) {
         clearInterval(selfAny._pliIntervalTimer);
         selfAny._pliIntervalTimer = null;
       }
+      if (selfAny._botezzPliTimer) {
+        clearInterval(selfAny._botezzPliTimer);
+        selfAny._botezzPliTimer = null;
+      }
       selfAny._smartVideoAssembler = null;
       selfAny._videoRecvTemplates = null;
       selfAny._videoRecvBySsrc = null;
+      selfAny._perSsrcVideoRecvCtx?.clear?.();
       return origCleanup.apply(this, args);
     };
   }
@@ -2795,6 +2839,7 @@ export function instrumentMediaSessionInstance(
     const origCleanup = session.cleanup;
     session.cleanup = function patchedCleanup(this: InstrumentedMediaSession) {
       this.__botezzDisposed = true;
+      activeCallMediaSessions.delete(this);
       if (this.__mediaStartDelayTimers) {
         for (const t of this.__mediaStartDelayTimers) {
           clearTimeout(t);
@@ -2919,9 +2964,6 @@ export function instrumentMediaSessionInstance(
       }
 
       const res = await origHandleCallAccept.apply(this, args);
-
-      // Ensure `videoSsrc`, `videoRtpStream.ssrc`, `peerAudioSsrc`, and `peerVideoSsrc` match the resolved device JIDs
-      syncSessionVideoSsrcWithDeviceJid(this);
 
       // Extract peerCallKey (from accept node or session property) and store it strictly on `this.__peerCallKey`
       // for `VoipCallRecorder` inbound decryption (`unprotect`). NEVER put `peerCallKey` into `videoSrtpSession.sendCtx`!
@@ -3094,48 +3136,7 @@ export function instrumentMediaSessionInstance(
         // Non-fatal
       }
 
-      // Send `<call><video state="1" dec="H264" device_orientation="0"/></call>` stanza on video call accept
-      // so the recipient's WhatsApp client immediately activates its remote video renderer and camera encoder.
-      const isVideoCall =
-        (this.info as { mediaType?: string } | undefined)?.mediaType ===
-          'video' || Boolean(this.videoRtpStream);
-      const acceptingPeerJid = this.acceptedByJid || this.peerJid;
-      const callId = this.info?.callId || this.callId;
-      const callCreator =
-        this.info?.callCreator || this.selfSsrcJid || this.selfLid;
-      if (
-        isVideoCall &&
-        acceptingPeerJid &&
-        callId &&
-        callCreator &&
-        typeof this.deps?.lowLevelCoordinator?.sendNode === 'function'
-      ) {
-        const videoStateStanza = {
-          tag: 'call',
-          attrs: {
-            to: acceptingPeerJid,
-            id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-          },
-          content: [
-            {
-              tag: 'video',
-              attrs: {
-                'call-id': callId,
-                'call-creator': callCreator,
-                state: '1',
-                dec: 'H264',
-                device_orientation: '0',
-              },
-            },
-          ],
-        };
-        this.deps.lowLevelCoordinator.sendNode(videoStateStanza).catch(() => {
-          // Ignore non-fatal video state stanza error
-        });
-      }
-
-      // Restart `videoEngine` from the beginning if it was already running mid-stream before accept,
-      // so the recipient immediately receives `SPS (7) + PPS (8) + IDR (5)` within the first 100ms!
+      // Do NOT send an unsolicited `<call><video state="1" dec="H264"/></call>` stanza here!
       this.videoKeyframeRequired = true;
       if (this.videoEngine && typeof this.videoEngine === 'object') {
         instrumentVideoEngineInstance(this.videoEngine);
@@ -3757,6 +3758,211 @@ export function patchWaManualRelayPrototype(
   }
 }
 
+export function patchWaVideoEnginePrototype(proto: any): void {
+  if (!proto || typeof proto !== 'object' || proto.__botezzVideoEnginePatched) {
+    return;
+  }
+  proto.__botezzVideoEnginePatched = true;
+
+  // 1. Patch `loadVideoFile` so if `this.nalUnits` is populated (NALU array engine), it extracts
+  // `_cachedSps` (NALU 7) and `_cachedPps` (NALU 8), and also initializes `_cachedSps` / `_cachedPps`.
+  const origLoadVideoFile = proto.loadVideoFile;
+  if (typeof origLoadVideoFile === 'function') {
+    proto.loadVideoFile = async function (this: any, filePath: string) {
+      await origLoadVideoFile.call(this, filePath);
+      this._cachedSps = null;
+      this._cachedPps = null;
+      if (Array.isArray(this.nalUnits)) {
+        for (const nalu of this.nalUnits) {
+          if (!nalu || nalu.length === 0) continue;
+          const naluType = nalu[0] & 0x1f;
+          if (naluType === 7 && !this._cachedSps) {
+            this._cachedSps = new Uint8Array(nalu);
+          } else if (naluType === 8 && !this._cachedPps) {
+            this._cachedPps = new Uint8Array(nalu);
+          }
+        }
+      }
+    };
+  }
+
+  // 2. Patch `emitAccessUnit` on native `WaVideoEngine` (`@hiroosy/baileys-lite/src/voip/media/WaVideoEngine.js`)
+  // so SPS (7) and PPS (8) are cached from Annex-B Access Units and guaranteed to be prepended
+  // before every IDR (5) frame even across `-stream_loop -1` wrap-arounds.
+  const origEmitAccessUnit = proto.emitAccessUnit;
+  if (typeof origEmitAccessUnit === 'function') {
+    proto.emitAccessUnit = function (this: any, au: Uint8Array) {
+      if (!au || au.length === 0) return;
+      const nalus = splitAnnexBNalus(au);
+      let hasSps = false;
+      let hasPps = false;
+      let hasIdr = false;
+      for (const n of nalus) {
+        if (!n || n.length === 0) continue;
+        const t = n[0] & 0x1f;
+        if (t === 7) {
+          hasSps = true;
+          this._cachedSps = n.slice();
+        } else if (t === 8) {
+          hasPps = true;
+          this._cachedPps = n.slice();
+        } else if (t === 5) {
+          hasIdr = true;
+        }
+      }
+
+      let finalAu = au;
+      if (hasIdr && (!hasSps || !hasPps) && this._cachedSps && this._cachedPps) {
+        const prefixParts: Uint8Array[] = [];
+        const sc = new Uint8Array([0, 0, 0, 1]);
+        if (!hasSps && this._cachedSps) {
+          prefixParts.push(sc, this._cachedSps);
+        }
+        if (!hasPps && this._cachedPps) {
+          prefixParts.push(sc, this._cachedPps);
+        }
+        if (prefixParts.length > 0) {
+          const prefixLen = prefixParts.reduce((s, p) => s + p.length, 0);
+          const merged = new Uint8Array(prefixLen + au.length);
+          let off = 0;
+          for (const p of prefixParts) {
+            merged.set(p, off);
+            off += p.length;
+          }
+          merged.set(au, off);
+          finalAu = merged;
+        }
+      }
+
+      return origEmitAccessUnit.call(this, finalAu);
+    };
+  }
+
+  // 3. Support `startStreaming(onAccessUnit)` / `stopStreaming()` for NALU-array based `WaVideoEngine`
+  // so it loops continuously at `this.fps || this.frameRate || 15` fps without stopping after Frame 1.
+  proto.startStreaming = function (
+    this: any,
+    onAccessUnit: (nalus: Uint8Array[], isKeyframe: boolean) => void
+  ) {
+    this.stopStreaming?.();
+    if (!Array.isArray(this.nalUnits) || this.nalUnits.length === 0) {
+      return;
+    }
+
+    // Extract SPS & PPS if not already cached
+    if (!this._cachedSps || !this._cachedPps) {
+      for (const nalu of this.nalUnits) {
+        if (!nalu || nalu.length === 0) continue;
+        const t = nalu[0] & 0x1f;
+        if (t === 7 && !this._cachedSps) this._cachedSps = new Uint8Array(nalu);
+        if (t === 8 && !this._cachedPps) this._cachedPps = new Uint8Array(nalu);
+      }
+    }
+
+    this.streaming = true;
+    this.currentIndex = 0;
+    const fps =
+      typeof this.fps === 'number' && this.fps > 0
+        ? this.fps
+        : typeof this.frameRate === 'number' && this.frameRate > 0
+          ? this.frameRate
+          : 15;
+    const frameIntervalMs = Math.max(20, Math.round(1000 / fps));
+
+    const sendNextFrame = () => {
+      if (!this.streaming) return;
+      if (!Array.isArray(this.nalUnits) || this.nalUnits.length === 0) {
+        this.stopStreaming?.();
+        return;
+      }
+
+      if (this.currentIndex >= this.nalUnits.length) {
+        if (this.videoLoop === false) {
+          this.stopStreaming?.();
+          return;
+        }
+        this.currentIndex = 0;
+      }
+
+      const accessUnit: Uint8Array[] = [];
+      let isKeyframe = false;
+      let hasVcl = false;
+
+      while (this.currentIndex < this.nalUnits.length) {
+        const nalu: Uint8Array = this.nalUnits[this.currentIndex]!;
+        this.currentIndex++;
+        if (!nalu || nalu.length === 0) continue;
+
+        const naluType = nalu[0]! & 0x1f;
+        if (naluType === 7) {
+          this._cachedSps = nalu;
+          accessUnit.push(nalu);
+          continue;
+        }
+        if (naluType === 8) {
+          this._cachedPps = nalu;
+          accessUnit.push(nalu);
+          continue;
+        }
+        if (naluType === 6) {
+          accessUnit.push(nalu);
+          continue;
+        }
+        if (naluType === 9) {
+          if (hasVcl) break;
+          continue;
+        }
+
+        if (naluType === 5) {
+          isKeyframe = true;
+          hasVcl = true;
+          const hasSps = accessUnit.some((n) => (n[0]! & 0x1f) === 7);
+          const hasPps = accessUnit.some((n) => (n[0]! & 0x1f) === 8);
+          if (!hasSps && this._cachedSps) {
+            accessUnit.unshift(this._cachedSps);
+          }
+          if (!hasPps && this._cachedPps) {
+            const spsIdx = accessUnit.findIndex((n) => (n[0]! & 0x1f) === 7);
+            if (spsIdx >= 0) {
+              accessUnit.splice(spsIdx + 1, 0, this._cachedPps);
+            } else {
+              accessUnit.unshift(this._cachedPps);
+            }
+          }
+          accessUnit.push(nalu);
+          break;
+        }
+
+        if (naluType >= 1 && naluType <= 4) {
+          hasVcl = true;
+          accessUnit.push(nalu);
+          break;
+        }
+      }
+
+      if (hasVcl && accessUnit.length > 0) {
+        try {
+          onAccessUnit(accessUnit, isKeyframe);
+        } catch {
+          // Do not kill timer on single frame callback error
+        }
+      }
+    };
+
+    sendNextFrame();
+    this.timer = setInterval(sendNextFrame, frameIntervalMs);
+    this.timer.unref?.();
+  };
+
+  proto.stopStreaming = function (this: any) {
+    this.streaming = false;
+    if (this.timer) {
+      clearInterval(this.timer);
+      this.timer = null;
+    }
+  };
+}
+
 export function patchWaVoipCoordinatorPrototype(proto: any): void {
   if (!proto || typeof proto !== 'object' || proto.__botezzCoordinatorPatched) {
     return;
@@ -3789,8 +3995,7 @@ export function patchWaVoipCoordinatorPrototype(proto: any): void {
 
 /**
  * Applies runtime patches for `VoipCallRecorder` inbound video/audio capture, multi-key SRTP decryption,
- * multi-SSRC TURN/SFU relay subscriptions, and `<reject>` stanza cleanup.
- * Does NOT monkey-patch `WaVideoEngine`, `WaAudioEngine`, or outbound `sendCapturedVideoAU` on `@hiroosy/baileys-lite/voip`.
+ * multi-SSRC TURN/SFU relay subscriptions, `WaVideoEngine` loop/SPS+PPS continuity, and `<reject>` stanza cleanup.
  */
 export async function ensureHiroosyVoipRuntimePatched(): Promise<void> {
   if (patchApplied) return;
@@ -3803,6 +4008,31 @@ export async function ensureHiroosyVoipRuntimePatched(): Promise<void> {
     try {
       const pkgDir = resolveBaileysLitePackageDir();
       if (!pkgDir) return;
+
+      // 0. Patch `WaVideoEngine.prototype` for continuous H.264 looping and SPS/PPS injection before IDR
+      const videoEngineCandidateRelPaths = [
+        'voip/media/WaVideoEngine.js',
+        'lib/voip/media/WaVideoEngine.js',
+        'src/voip/media/WaVideoEngine.js',
+        'lib/package/voip/media/WaVideoEngine.js',
+        'dist/voip/media/WaVideoEngine.js',
+      ];
+      for (const relPath of videoEngineCandidateRelPaths) {
+        const videoEnginePath = path.join(pkgDir, relPath);
+        if (!fs.existsSync(videoEnginePath)) continue;
+        try {
+          const mod = (await import(
+            /* webpackIgnore: true */ pathToFileURL(videoEnginePath).href
+          )) as {
+            WaVideoEngine?: { prototype?: unknown };
+          };
+          if (mod?.WaVideoEngine?.prototype) {
+            patchWaVideoEnginePrototype(mod.WaVideoEngine.prototype);
+          }
+        } catch {
+          // Ignore non-fatal import error
+        }
+      }
 
       // 1. Patch `WaVoipCoordinator.prototype` to forward `call_inbound_video`, `call_inbound_audio`, and `call_video_state`
       const coordinatorRelPaths = [
@@ -3879,7 +4109,7 @@ export async function ensureHiroosyVoipRuntimePatched(): Promise<void> {
       }
 
       // 3. Patch `WaCallMediaSession.prototype` with Multi-Key SRTP Video Unprotector,
-      // Multi-SSRC peer video subscriptions, Proactive Video State + SRTCP PLI, and SmartH264Assembler.
+      // Multi-SSRC peer video subscriptions, Proactive SRTCP PLI, and SmartH264Assembler.
       const mediaSessionCandidateRelPaths = [
         'voip/call/WaCallMediaSession.js',
         'lib/voip/call/WaCallMediaSession.js',

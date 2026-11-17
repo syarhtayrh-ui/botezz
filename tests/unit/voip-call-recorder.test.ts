@@ -1913,8 +1913,240 @@ describe('Two-Way VoIP Video Call Recording (VoipCallRecorder)', () => {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }
   });
+
+  it('Consecutive calls #1, #2, #3 isolate sessions cleanly, adopt 32-hex callId, and prepend SPS/PPS before every IDR frame without unsolicited <video state="1"/> stanzas', async () => {
+    const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'botezz-voip-consecutive-'));
+    try {
+      const {
+        patchWaVideoEnginePrototype,
+        activeCallMediaSessions,
+        sendProactiveVideoStateAndPli,
+      } = await import('../../src/whatsapp/voip-runtime-patch.js');
+
+      // 1. Verify patchWaVideoEnginePrototype caches SPS/PPS and injects them before IDR frames on loop wrap-around
+      const sps = new Uint8Array([0x67, 0x42, 0xc0, 0x1e]);
+      const pps = new Uint8Array([0x68, 0xce, 0x3c, 0x80]);
+      const idr = new Uint8Array([0x65, 0x88, 0x84, 0x21]);
+      const pFrame = new Uint8Array([0x41, 0x9a, 0x22, 0x11]);
+
+      class FakeWaVideoEngine {
+        nalUnits: Uint8Array[] = [sps, pps, idr, pFrame];
+        fps = 50;
+        streaming = false;
+        timer: ReturnType<typeof setInterval> | null = null;
+        emittedAnnexB: Uint8Array[] = [];
+        emitAccessUnit(au: Uint8Array) {
+          this.emittedAnnexB.push(au);
+        }
+        startStreaming(_onAccessUnit: (nalus: Uint8Array[], isKeyframe: boolean) => void) {}
+        stopStreaming() {}
+      }
+      patchWaVideoEnginePrototype(FakeWaVideoEngine.prototype);
+      const engine = new FakeWaVideoEngine();
+
+      // 1a. Test Annex-B emitAccessUnit SPS/PPS caching + injection before bare IDR
+      const sc = new Uint8Array([0, 0, 0, 1]);
+      const firstAu = Buffer.concat([sc, sps, sc, pps, sc, idr]);
+      const bareIdrAu = Buffer.concat([sc, idr]);
+      engine.emitAccessUnit(firstAu);
+      engine.emitAccessUnit(bareIdrAu);
+      assert.equal(engine.emittedAnnexB.length, 2, 'Should emit both Annex-B access units');
+      assert.ok(
+        engine.emittedAnnexB[1]!.byteLength > bareIdrAu.byteLength,
+        'Bare Annex-B IDR frame must have cached SPS and PPS prepended'
+      );
+
+      // 1b. Test NALU-array startStreaming continuous loop wrap-around
+      const streamedUnits: Array<{ types: number[]; isKeyframe: boolean }> = [];
+      engine.startStreaming((nalus, isKeyframe) => {
+        streamedUnits.push({
+          types: nalus.map((n) => n[0]! & 0x1f),
+          isKeyframe,
+        });
+      });
+      await new Promise((resolve) => setTimeout(resolve, 75));
+      engine.stopStreaming();
+      assert.ok(
+        streamedUnits.length >= 3,
+        `Should loop continuously beyond 2 frames (got ${streamedUnits.length})`
+      );
+      assert.deepEqual(
+        streamedUnits[0]!.types,
+        [7, 8, 5],
+        'Frame 1 must carry SPS (7), PPS (8), IDR (5)'
+      );
+      assert.deepEqual(
+        streamedUnits[1]!.types,
+        [1],
+        'Frame 2 must carry P-frame (1)'
+      );
+      assert.deepEqual(
+        streamedUnits[2]!.types,
+        [7, 8, 5],
+        'Loop wrap-around Frame 3 must carry SPS (7), PPS (8), IDR (5)'
+      );
+
+      // 2. Verify sendProactiveVideoStateAndPli sends RTCP PLI via sctpRelay and NEVER sends unsolicited <video state="1" dec="H264"/> stanza
+      let sentXmlStanzas = 0;
+      let sentPliPackets = 0;
+      const fakeSessionForPli: Record<string, unknown> = {
+        callId: 'A1B2C3D4E5F60718293A4B5C6D7E8F90',
+        info: {
+          callId: 'A1B2C3D4E5F60718293A4B5C6D7E8F90',
+          mediaType: 'video',
+        },
+        videoSsrc: 11111,
+        _lastInboundVideoSsrc: 22222,
+        videoRtcpSession: {
+          protect: (_ssrc: number, plainPli: Uint8Array) => plainPli,
+        },
+        socket: {
+          sendNode: async () => {
+            sentXmlStanzas++;
+          },
+        },
+        sctpRelay: {
+          hasConnection: () => true,
+          broadcast: (ab: ArrayBuffer) => {
+            const pkt = new Uint8Array(ab);
+            if (pkt.byteLength >= 12 && pkt[1] === 206) {
+              sentPliPackets++;
+            }
+            return true;
+          },
+        },
+      };
+      sendProactiveVideoStateAndPli(fakeSessionForPli);
+      if (fakeSessionForPli._pliIntervalTimer) {
+        clearInterval(fakeSessionForPli._pliIntervalTimer as ReturnType<typeof setInterval>);
+      }
+      assert.equal(
+        sentXmlStanzas,
+        0,
+        'Must NEVER send unsolicited <call><video state="1" dec="H264"/></call> XML stanzas that freeze remote decoding'
+      );
+      assert.equal(sentPliPackets, 1, 'Must send RTCP PLI over sctpRelay');
+
+      // 3. Simulate 3 consecutive calls (#1, #2, #3) and verify stale disposed sessions are rejected and 32-hex callIds are adopted
+      activeCallMediaSessions.clear();
+      const spsNalu = new Uint8Array([0x67, 0x42, 0xc0, 0x1e, 0xda, 0x02, 0x80, 0xf6]);
+      const ppsNalu = new Uint8Array([0x68, 0xce, 0x3c, 0x80]);
+      const idrNalu = new Uint8Array([0x65, 0x88, 0x84, 0x21, 0xa0, 0x55, 0xaa, 0xff]);
+      const previousDisposedSessions: Record<string, unknown>[] = [];
+
+      for (let callNum = 1; callNum <= 3; callNum++) {
+        const internalCallId = `vcall_consecutive_0${callNum}`;
+        const realHexCallId = `ABCDEF0123456789ABCDEF012345670${callNum}`;
+        const peerKeys4: SrtpKeyMaterial = {
+          sessionKey: crypto.randomBytes(16),
+          sessionSalt: crypto.randomBytes(14),
+          authKey: crypto.randomBytes(20),
+          authTagLen: 4,
+        };
+        const recorder = new VoipCallRecorder({
+          callId: internalCallId,
+          sessionId: 'sess_consecutive',
+          recipientJid: '966501234567@s.whatsapp.net',
+          outboundVideoPath: path.join(tmpDir, 'unused.mp4'),
+          recordingsDir: tmpDir,
+          isMockMode: false,
+        });
+
+        // Attempt to attach all previously disposed sessions first — recorder MUST ignore them
+        for (const oldDead of previousDisposedSessions) {
+          assert.equal(
+            recorder.attachToMediaSession(oldDead),
+            false,
+            `Call #${callNum} must reject disposed session from earlier call`
+          );
+        }
+
+        const liveSession: Record<string, unknown> = {
+          info: {
+            callId: realHexCallId,
+            isEnded: false,
+            stateData: { state: 'active' },
+          },
+          videoAssembler: { active: true },
+          srtpSession: { recvCtx: peerKeys4 },
+          videoSrtpSession: { recvCtx: peerKeys4 },
+          onDecodedAudio: (_pcm: Int16Array) => undefined,
+          onRelayVideoData: (_pkt: Uint8Array) => undefined,
+        };
+        activeCallMediaSessions.add(liveSession);
+
+        assert.equal(
+          recorder.attachToMediaSession(liveSession),
+          true,
+          `Call #${callNum} must attach to live session`
+        );
+        assert.equal(
+          recorder.matchesCallId(realHexCallId),
+          true,
+          `Call #${callNum} must adopt and match the real 32-hex WhatsApp VoIP callId`
+        );
+
+        const onRelayVideoData = liveSession.onRelayVideoData as (pkt: Uint8Array) => void;
+        onRelayVideoData(
+          protectRtpForTest(
+            buildRawRtpPacket({
+              payloadType: 96,
+              seq: 100 + callNum * 10,
+              timestamp: 9000,
+              ssrc: 0x12345678,
+              payload: spsNalu,
+            }),
+            peerKeys4
+          )
+        );
+        onRelayVideoData(
+          protectRtpForTest(
+            buildRawRtpPacket({
+              payloadType: 96,
+              seq: 101 + callNum * 10,
+              timestamp: 9000,
+              ssrc: 0x12345678,
+              payload: ppsNalu,
+            }),
+            peerKeys4
+          )
+        );
+        onRelayVideoData(
+          protectRtpForTest(
+            buildRawRtpPacket({
+              payloadType: 96,
+              seq: 102 + callNum * 10,
+              timestamp: 9000,
+              ssrc: 0x12345678,
+              marker: true,
+              payload: idrNalu,
+            }),
+            peerKeys4
+          )
+        );
+
+        const onDecodedAudio = liveSession.onDecodedAudio as (pcm: Int16Array) => void;
+        onDecodedAudio(new Int16Array(320).fill(callNum * 100));
+
+        assert.equal(
+          recorder.inboundVideoFramesRecorded,
+          1,
+          `Call #${callNum} must record inbound video frames`
+        );
+        assert.equal(
+          recorder.inboundAudioPacketsRecorded,
+          1,
+          `Call #${callNum} must record inbound audio packets`
+        );
+
+        recorder.dispose();
+        liveSession.__botezzDisposed = true;
+        (liveSession.info as Record<string, unknown>).isEnded = true;
+        activeCallMediaSessions.delete(liveSession);
+        previousDisposedSessions.push(liveSession);
+      }
+    } finally {
+      fs.rmSync(tmpDir, { recursive: true, force: true });
+    }
+  });
 });
-
-
-
-
