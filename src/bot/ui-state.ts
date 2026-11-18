@@ -209,8 +209,14 @@ export function isNavigableRoute(callbackData: string): boolean {
     callbackData.startsWith('tools:menfess_relay:') ||
     callbackData === 'cyber:settings' ||
     callbackData.startsWith('cyber:history:page:') ||
+    callbackData.startsWith('cyber:catalog:page:') ||
+    callbackData.startsWith('cyber:mod:') ||
+    callbackData === 'cyber:smart_scan' ||
     callbackData === 'cyber:phone_lookup' ||
     callbackData === 'cyber:social_lookup' ||
+    callbackData === 'cyber:breach_lookup' ||
+    callbackData === 'cyber:ten_engines_lookup' ||
+    callbackData === 'cyber:handle_lookup' ||
     callbackData === 'cyber:full_scan'
   );
 }

@@ -167,33 +167,93 @@ export function buildWhatsAppToolsMenuKeyboard(
 }
 
 /**
- * Builds the Cyber Forensics & Phone/Social OSINT Menu (`menu:cyber_forensics`).
+ * Builds the Cyber Forensics & Phone/Social/Breach OSINT Menu (`menu:cyber_forensics`).
  */
 export function buildCyberForensicsMenuKeyboard(): InlineKeyboardRows {
   return [
     [
       {
-        text: '🔎 بحث رقم الهاتف وكشف الأسماء',
+        text: '🧠 الفحص الجنائي الذكي الشامل (Auto-Detect OSINT)',
+        callbackData: 'cyber:smart_scan',
+      },
+    ],
+    [
+      {
+        text: '🔎 كاشف الأرقام والأسماء وواتساب',
         callbackData: 'cyber:phone_lookup',
       },
       {
-        text: '🌐 كشف الحسابات المرتبطة بالرقم',
+        text: '🌐 كاشف الحسابات المرتبطة (15+ منصة)',
         callbackData: 'cyber:social_lookup',
       },
     ],
     [
       {
-        text: '⚡ الفحص الجنائي الشامل للرقم',
-        callbackData: 'cyber:full_scan',
+        text: '🏴‍☠️ فاحص التسريبات والاختراقات (Leaks)',
+        callbackData: 'cyber:breach_lookup',
+      },
+      {
+        text: '🕸️ البحث الحي في 10 محركات بحث',
+        callbackData: 'cyber:ten_engines_lookup',
       },
     ],
     [
       {
-        text: '🗂️ سجل الفحوصات الجنائية',
+        text: '👤 فحص المعرفات والألعاب + TikTok/Reddit (35+ موقع)',
+        callbackData: 'cyber:mod:username',
+      },
+      {
+        text: '📧 فحص البريد + Gravatar + DNS + توليد الصيغ',
+        callbackData: 'cyber:mod:email',
+      },
+    ],
+    [
+      {
+        text: '🌐 النطاقات والـ IP (crt.sh / Shodan / DNS / CMS)',
+        callbackData: 'cyber:mod:domain_ip',
+      },
+      {
+        text: '🖼️ جنائيات الصور وEXIF/GPS + تطهير البيانات',
+        callbackData: 'cyber:mod:media',
+      },
+    ],
+    [
+      {
+        text: '✈️ الطيران والسفن والظلال الشمسية (SunCalc / ADS-B)',
+        callbackData: 'cyber:mod:geo_transport',
+      },
+      {
+        text: '🏛️ الشركات والعقوبات والعملات الرقمية (OCCRP / BTC)',
+        callbackData: 'cyber:mod:corp_crypto',
+      },
+    ],
+    [
+      {
+        text: '🕰️ الأرشيف التاريخي ودوركس الأشخاص (Wayback / Dorks)',
+        callbackData: 'cyber:mod:archive_dorks',
+      },
+      {
+        text: '🕵️ كشف الهوية باليوزر أو الإيميل (Sherlock)',
+        callbackData: 'cyber:handle_lookup',
+      },
+    ],
+    [
+      {
+        text: '⚡ الفحص الجنائي الشامل MAX (الملف الكامل)',
+        callbackData: 'cyber:full_scan',
+      },
+      {
+        text: '🧰 دليل 92 أداة استخبارات جنائية معتمدة',
+        callbackData: 'cyber:catalog:page:1',
+      },
+    ],
+    [
+      {
+        text: '📁 سجل الفحوصات الجنائية',
         callbackData: 'cyber:history:page:1',
       },
       {
-        text: '🔑 إعدادات Truecaller / Eyecon',
+        text: '🔑 إعدادات الكواشف ومفاتيح API',
         callbackData: 'cyber:settings',
       },
     ],
@@ -218,17 +278,25 @@ export function buildBackCancelRow(backCallback = 'nav:back'): InlineButtonSpec[
 /**
  * Builds a consistent application navigation bar (Back, Refresh, Home).
  */
-export function buildAppNavigationRow(params?: {
-  backCallback?: string;
-  refreshCallback?: string;
-  includeCancel?: boolean;
-}): InlineButtonSpec[] {
+export function buildAppNavigationRow(
+  params?:
+    | string
+    | {
+        backCallback?: string;
+        refreshCallback?: string;
+        includeCancel?: boolean;
+      }
+): InlineButtonSpec[] {
+  const normalized =
+    typeof params === 'string'
+      ? { backCallback: params, refreshCallback: params }
+      : params;
   const row: InlineButtonSpec[] = [
-    { text: '🔙 رجوع', callbackData: params?.backCallback || 'nav:back' },
-    { text: '🔄 تحديث', callbackData: params?.refreshCallback || 'nav:refresh' },
+    { text: '🔙 رجوع', callbackData: normalized?.backCallback || 'nav:back' },
+    { text: '🔄 تحديث', callbackData: normalized?.refreshCallback || 'nav:refresh' },
     { text: '🏠 الرئيسية', callbackData: 'menu:main' },
   ];
-  if (params?.includeCancel) {
+  if (normalized?.includeCancel) {
     row.push({ text: '❌ إلغاء', callbackData: 'workflow:cancel' });
   }
   return row;

@@ -1387,6 +1387,107 @@ test('Deep Status Downloader & Deep Message Inbox: all formats, zip fallback, ed
     );
     assert.ok(lookupPrompt.text.includes('قسم البحث عن رقم الهاتف وكشف الأسماء المرتبطة'));
     assert.equal(env.controller.uiState.getActiveInputOwner(ownerId), 'CYBER_FORENSICS');
+
+    // Phase 1 Bug Fixes Verification:
+    // Bug #2: Global E.164 calling codes (+61 Australia, +81 Japan, and unknown +999 fallback to UN instead of YE)
+    const parsedAu = env.controller.cyberForensicsEngine.parseAndNormalizePhoneInput('+61412345678');
+    assert.equal(parsedAu.countryCode, '61');
+    assert.equal(parsedAu.isoCountry2, 'AU');
+
+    const parsedUnknown = env.controller.cyberForensicsEngine.parseAndNormalizePhoneInput('+99912345678');
+    assert.equal(parsedUnknown.isoCountry2, 'UN');
+    assert.notEqual(parsedUnknown.countryCode, '967');
+
+    // Bug #8: Persistent SQLite Full Forensic Report Cache & JSON Export Attachment
+    const cachedReport = {
+      reportId: 'rep_test_au_01',
+      generatedAtIso: new Date().toISOString(),
+      mode: 'FULL_FORENSIC' as const,
+      phone: parsedAu,
+      discoveredNames: [
+        {
+          name: 'Test Australian Subject',
+          source: 'Unit Test Vault',
+          confidence: 'HIGH' as const,
+          observedAtIso: new Date().toISOString(),
+        },
+      ],
+      whatsappFootprint: {
+        checked: false,
+        registered: false,
+      },
+      socialAccounts: [],
+      searchEngineStats: [],
+      liveWebMentions: [],
+      breachExposures: [],
+      pasteAndCodeHits: [],
+      osintDorks: [],
+      isDisposableBurner: false,
+      disposableMatchedDomains: [],
+    };
+    env.controller.cyberForensicsEngine.saveFullForensicReportToCache(cachedReport);
+    const retrievedFromSqlite = env.controller.cyberForensicsEngine.getFullForensicReportFromCache(
+      parsedAu.digitsOnly
+    );
+    assert.ok(retrievedFromSqlite);
+    assert.equal(retrievedFromSqlite.phone.e164, '+61412345678');
+
+    const exportedJsonView = env.controller.cyberForensicsHandler.exportReportJsonAttachment(
+      parsedAu.digitsOnly
+    );
+    assert.ok(exportedJsonView.mediaAttachments && exportedJsonView.mediaAttachments.length === 1);
+    assert.equal(exportedJsonView.mediaAttachments[0]?.type, 'document');
+
+    // Phase 2 Verification: 92-Tool 8-Module Cyber Forensics Suite
+    const smartPrompt = await env.controller.handleCallbackQuery(
+      ownerId,
+      'cyber:smart_scan',
+      { skipDuplicateCheck: true }
+    );
+    assert.ok(smartPrompt.text.includes('الفحص الجنائي الذكي الشامل'));
+
+    const catalogPage1 = await env.controller.handleCallbackQuery(
+      ownerId,
+      'cyber:catalog:page:1',
+      { skipDuplicateCheck: true }
+    );
+    assert.ok(catalogPage1.text.includes('كتالوج ترسانة الاستخبارات الجنائية (92 أداة معتمدة)'));
+    // Strictly verify zero excluded paid tools appear anywhere in catalog
+    const forbiddenTools = ['Dehashed', 'Hunchly', 'SameID', 'PimEyes'];
+    for (const forbidden of forbiddenTools) {
+      assert.equal(
+        catalogPage1.text.toLowerCase().includes(forbidden.toLowerCase()),
+        false,
+        `Forbidden tool ${forbidden} must not appear`
+      );
+    }
+
+    // Verify Media EXIF & GPS + SunCalc / ExifPurge workflow
+    const mediaPrompt = await env.controller.handleCallbackQuery(
+      ownerId,
+      'cyber:mod:media',
+      { skipDuplicateCheck: true }
+    );
+    assert.ok(mediaPrompt.text.includes('تحليل الصور والوسائط والمستندات'));
+    assert.equal(env.controller.uiState.getActiveInputOwner(ownerId), 'CYBER_FORENSICS');
+
+    // Create a minimal valid JPEG with APP1 EXIF header and SOI/EOI markers
+    const minimalJpegWithExif = Buffer.concat([
+      Buffer.from([0xff, 0xd8]), // SOI
+      Buffer.from([0xff, 0xe1, 0x00, 0x10]), // APP1 length 16
+      Buffer.from('Exif\0\0', 'ascii'),
+      Buffer.from([0x49, 0x49, 0x2a, 0x00, 0x08, 0x00, 0x00, 0x00]), // TIFF header
+      Buffer.from([0xff, 0xc0, 0x00, 0x0b, 0x08, 0x01, 0x90, 0x02, 0x80, 0x01, 0x01, 0x00, 0x00]), // SOF0 640x400
+      Buffer.from([0xff, 0xd9]), // EOI
+    ]);
+    const mediaReportView = await env.controller.handleMediaUpload(ownerId, {
+      fileName: 'evidence_sample.jpg',
+      mimeType: 'image/jpeg',
+      sizeBytes: minimalJpegWithExif.length,
+      buffer: minimalJpegWithExif,
+    });
+    assert.ok(mediaReportView.text.includes('تقرير التحليل الجنائي للوسائط والمستندات'));
+    assert.ok(mediaReportView.text.includes('640 × 400'));
   } finally {
     await env.cleanup();
   }

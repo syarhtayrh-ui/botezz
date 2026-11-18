@@ -1741,5 +1741,235 @@ async function sessionManagerCloseSafe(db: AppDatabase, tmpDir: string): Promise
   }
 }
 
+// ============================================================================
+// 8. WHATSAPP SERVER ERROR 463 PROTOCOL FIXES (TCTOKEN CROSS-SYNC, HARVESTER, CSTOKEN, 2-STAGE @LID)
+// ============================================================================
 
+test('Error 463 Fix: syncLidPnMapping cross-copies tctoken between pnJid and lidJid, harvester captures inbound <tctoken>, buildPrivacyChildNodeForLidSend computes <cstoken> fallback, and sendAnonymousLidMessage performs two-stage @lid dispatch on 463', async () => {
+  const crypto = await import('node:crypto');
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'botezz_err463_'));
+  try {
+    const driver = new HiroosyBaileysSessionDriver('sess_err463', tmpDir);
+    const fake = createFakeIdentitySocket();
+    const wsEmitter = new EventEmitter();
+    (fake.sock as unknown as { ws: EventEmitter }).ws = wsEmitter;
+    attachFakeSocketToDriver(driver, fake.sock);
 
+    // 1. Gap 1: syncLidPnMapping cross-copies tctoken from pnJid to lidJid
+    const sampleToken = Buffer.from('deadbeefcafe01020304', 'hex');
+    const nowTs = String(Math.floor(Date.now() / 1000));
+    await fake.sock.authState.keys.set({
+      tctoken: {
+        '967715371939@s.whatsapp.net': {
+          token: sampleToken,
+          timestamp: nowTs,
+        },
+      },
+    });
+
+    await driver.syncLidPnMapping(
+      '967715371939@s.whatsapp.net',
+      '36597986795687@lid'
+    );
+
+    const syncedTokens = await fake.sock.authState.keys.get('tctoken', [
+      '967715371939@s.whatsapp.net',
+      '36597986795687@lid',
+    ]);
+    assert.ok(
+      syncedTokens['36597986795687@lid']?.token,
+      'Expected syncLidPnMapping to cross-copy tctoken from pnJid to lidJid'
+    );
+    assert.deepEqual(
+      Buffer.from(syncedTokens['36597986795687@lid']!.token!),
+      sampleToken
+    );
+
+    // 2. Gap 2: Inbound <message> and <notification type="privacy_token"> harvester persists token under both PN and LID
+    const harvestedMsgToken = Buffer.from('1122334455667788', 'hex');
+    wsEmitter.emit('CB:message', {
+      tag: 'message',
+      attrs: {
+        id: 'MSG_WITH_TCTOKEN_1',
+        from: '967715371939@s.whatsapp.net',
+        sender_lid: '36597986795687@lid',
+      },
+      content: [
+        {
+          tag: 'tctoken',
+          attrs: { t: nowTs },
+          content: harvestedMsgToken,
+        },
+      ],
+    } satisfies BinaryNode);
+
+    await new Promise((r) => setTimeout(r, 25));
+    const afterMsgHarvest = await fake.sock.authState.keys.get('tctoken', [
+      '967715371939@s.whatsapp.net',
+      '36597986795687@lid',
+    ]);
+    assert.deepEqual(
+      Buffer.from(afterMsgHarvest['36597986795687@lid']!.token!),
+      harvestedMsgToken,
+      'Expected CB:message <tctoken> harvester to update lidJid token'
+    );
+    assert.deepEqual(
+      Buffer.from(afterMsgHarvest['967715371939@s.whatsapp.net']!.token!),
+      harvestedMsgToken,
+      'Expected CB:message <tctoken> harvester to update pnJid token'
+    );
+
+    const harvestedNotifToken = Buffer.from('9988776655443322', 'hex');
+    wsEmitter.emit('CB:notification,type:privacy_token', {
+      tag: 'notification',
+      attrs: {
+        type: 'privacy_token',
+        from: '967715371939@s.whatsapp.net',
+      },
+      content: [
+        {
+          tag: 'tokens',
+          attrs: {},
+          content: [
+            {
+              tag: 'token',
+              attrs: {
+                type: 'trusted_contact',
+                t: nowTs,
+                jid: '967715371939@s.whatsapp.net',
+              },
+              content: harvestedNotifToken,
+            },
+          ],
+        },
+      ],
+    } satisfies BinaryNode);
+
+    await new Promise((r) => setTimeout(r, 25));
+    const afterNotifHarvest = await fake.sock.authState.keys.get('tctoken', [
+      '967715371939@s.whatsapp.net',
+      '36597986795687@lid',
+    ]);
+    assert.deepEqual(
+      Buffer.from(afterNotifHarvest['36597986795687@lid']!.token!),
+      harvestedNotifToken,
+      'Expected CB:notification,type:privacy_token harvester to cross-persist under mapped lidJid'
+    );
+
+    // 3. Gap 3: When no tctoken exists and nctSalt is in creds, buildPrivacyChildNodeForLidSend computes <cstoken>
+    const nctSalt = Buffer.from('botezz_nct_salt_secret_key_32b!!', 'utf8');
+    (
+      fake.sock.authState.creds as unknown as Record<string, unknown>
+    ).nctSalt = nctSalt;
+
+    const csNode = await driver.buildPrivacyChildNodeForLidSend(
+      fake.sock,
+      '55556666777788@lid',
+      '967700000001@s.whatsapp.net'
+    );
+    assert.ok(csNode, 'Expected <cstoken> child node when nctSalt is present');
+    assert.equal(csNode!.tag, 'cstoken');
+    const expectedHmac = crypto
+      .createHmac('sha256', nctSalt)
+      .update('55556666777788@lid', 'utf8')
+      .digest();
+    assert.deepEqual(Buffer.from(csNode!.content as Uint8Array), expectedHmac);
+
+    // 4. Gap 4: Two-stage @lid dispatch on Error 463 via relayMessage interceptor + restoration in finally
+    const interceptedRelayCalls: Array<{
+      jid: string;
+      opts?: Record<string, unknown>;
+    }> = [];
+    const baseRelay = fake.sock.relayMessage.bind(fake.sock);
+    (
+      fake.sock as unknown as {
+        sendMessage: WASocket['sendMessage'];
+      }
+    ).sendMessage = async (jid, content, opts) => {
+      const id = `LID_463_TRY_${interceptedRelayCalls.length + 1}`;
+      const recordOpts = (opts || {}) as Record<string, unknown>;
+      await fake.sock.relayMessage(jid, content as never, {
+        messageId: id,
+        additionalAttributes: recordOpts.additionalAttributes as
+          | Record<string, string>
+          | undefined,
+        additionalNodes: recordOpts.additionalNodes as BinaryNode[] | undefined,
+      });
+      return {
+        key: { remoteJid: jid, fromMe: true, id },
+        message: content as never,
+      };
+    };
+    (
+      fake.sock as unknown as {
+        relayMessage: typeof baseRelay;
+      }
+    ).relayMessage = async (jid, msg, opts) => {
+      interceptedRelayCalls.push({
+        jid,
+        opts: opts as Record<string, unknown> | undefined,
+      });
+      const id =
+        (opts as { messageId?: string } | undefined)?.messageId || 'MSG_1';
+      const attemptNum = interceptedRelayCalls.length;
+      setImmediate(() => {
+        if (attemptNum === 1) {
+          // Attempt 1A fails with WhatsApp Server Error 463
+          wsEmitter.emit('CB:ack,class:message', {
+            tag: 'ack',
+            attrs: { class: 'message', id, error: '463' },
+          });
+        } else {
+          // Attempt 1B succeeds!
+          wsEmitter.emit('CB:ack,class:message', {
+            tag: 'ack',
+            attrs: { class: 'message', id },
+          });
+        }
+      });
+      return baseRelay(jid, msg, opts);
+    };
+
+    const customRelayRef = fake.sock.relayMessage;
+    const twoStageRes = await driver.sendAnonymousLidMessage({
+      recipient: '55556666777788@lid',
+      fallbackPnJid: '967700000001@s.whatsapp.net',
+      text: 'اختبار تجاوز خطأ 463 على مرحلتين',
+      allowPnFallback: false,
+    });
+
+    assert.equal(twoStageRes.usedLid, true);
+    assert.equal(twoStageRes.deliveredJid, '55556666777788@lid');
+    assert.equal(
+      interceptedRelayCalls.length,
+      2,
+      'Expected Attempt 1A (with peer_recipient_pn) followed by Attempt 1B (without peer_recipient_pn) on Error 463'
+    );
+    const attrs1A = (
+      interceptedRelayCalls[0]!.opts?.additionalAttributes as
+        | Record<string, string>
+        | undefined
+    );
+    const attrs1B = (
+      interceptedRelayCalls[1]!.opts?.additionalAttributes as
+        | Record<string, string>
+        | undefined
+    );
+    assert.equal(attrs1A?.peer_recipient_pn, '967700000001@s.whatsapp.net');
+    assert.equal(attrs1A?.addressing_mode, undefined);
+    assert.equal(attrs1B?.peer_recipient_pn, undefined);
+    const nodes1A = (interceptedRelayCalls[0]!.opts?.additionalNodes ||
+      []) as BinaryNode[];
+    assert.ok(
+      nodes1A.some((n) => n.tag === 'cstoken'),
+      'Expected <cstoken> child node attached on @lid stanza when no tctoken exists'
+    );
+    assert.equal(
+      fake.sock.relayMessage,
+      customRelayRef,
+      'Expected sock.relayMessage to be restored in finally block'
+    );
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});

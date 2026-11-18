@@ -89,6 +89,7 @@ import {
   extractAddressingContext,
   USERNAME_QUERY_IDS,
   resolveTcTokenStorageJid,
+  isTcTokenExpired,
   extractCleanLid,
   extractCleanPn,
 } from './identity-privacy-service';
@@ -2013,9 +2014,11 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
     sock.ev.on('message-receipt.update', onReceipt as never);
     sock.ev.on('messages.update', onMessagesUpdate as never);
     const unbindTelemetry = this.instrumentSocketForTelemetry(sock);
+    const unbindHarvester = this.installInboundPrivacyTokenHarvester(sock);
     this.evCleanup = () => {
       unbind();
       unbindTelemetry();
+      unbindHarvester();
       try {
         sock.ev.off('message-receipt.update', onReceipt as never);
         sock.ev.off('messages.update', onMessagesUpdate as never);
@@ -2024,6 +2027,194 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
       }
     };
     return this.evCleanup;
+  }
+
+  /**
+   * Harvests `<tctoken>` child nodes from incoming `<message>` stanzas and
+   * `<notification type="privacy_token">` stanzas (`whatsmeow/tctoken.go` parity),
+   * persisting each token into `sock.authState.keys` (`tctoken`) and `identityService.privacyTokens`
+   * under both the sender's `@s.whatsapp.net` PN JID and `@lid` JID.
+   */
+  public installInboundPrivacyTokenHarvester(sock: WASocket): () => void {
+    const anySock = sock as unknown as Record<string, unknown> & {
+      __botezzPrivacyHarvesterInstalled?: boolean;
+      ws?: {
+        on?: (event: string, cb: (node: BinaryNode) => void) => void;
+        off?: (event: string, cb: (node: BinaryNode) => void) => void;
+      };
+    };
+    if (anySock.__botezzPrivacyHarvesterInstalled) {
+      return () => undefined;
+    }
+    const ws = anySock.ws;
+    if (typeof ws?.on !== 'function') {
+      return () => undefined;
+    }
+    anySock.__botezzPrivacyHarvesterInstalled = true;
+
+    const persistTokenForCandidateJids = async (
+      tokenBuf: Buffer,
+      tSec: string,
+      rawCandidateJids: Array<string | undefined>
+    ) => {
+      const candidateJids = new Set<string>();
+      for (const raw of rawCandidateJids) {
+        if (!raw || typeof raw !== 'string') continue;
+        const norm = jidNormalizedUser(raw);
+        if (norm.endsWith('@s.whatsapp.net') || norm.endsWith('@lid')) {
+          candidateJids.add(norm);
+        }
+      }
+      if (candidateJids.size === 0) return;
+
+      for (const j of Array.from(candidateJids)) {
+        if (j.endsWith('@s.whatsapp.net')) {
+          const mappedLid =
+            this.memoryStore.getLidForPn(j) ||
+            this.extractLidString(
+              await Promise.resolve(
+                sock.signalRepository?.lidMapping?.getLIDForPN?.(j)
+              ).catch(() => undefined)
+            );
+          if (mappedLid && mappedLid.endsWith('@lid')) {
+            candidateJids.add(jidNormalizedUser(mappedLid));
+          }
+        } else if (j.endsWith('@lid')) {
+          const mappedPn =
+            this.memoryStore.getPnForLid(j) ||
+            (await Promise.resolve(
+              sock.signalRepository?.lidMapping?.getPNForLID?.(j)
+            ).catch(() => undefined)) ||
+            undefined;
+          if (mappedPn && mappedPn.endsWith('@s.whatsapp.net')) {
+            candidateJids.add(jidNormalizedUser(mappedPn));
+          }
+        }
+      }
+
+      const pnList = Array.from(candidateJids).filter((j) =>
+        j.endsWith('@s.whatsapp.net')
+      );
+      const lidList = Array.from(candidateJids).filter((j) =>
+        j.endsWith('@lid')
+      );
+      if (pnList[0] && lidList[0]) {
+        this.memoryStore.recordLidMapping(lidList[0], pnList[0]);
+      }
+
+      const keys = sock.authState?.keys as
+        | {
+            set?: (
+              data: Record<string, Record<string, unknown>>
+            ) => Promise<void>;
+          }
+        | undefined;
+      if (typeof keys?.set === 'function') {
+        const patch: Record<string, { token: Buffer; timestamp: string }> = {};
+        for (const jid of candidateJids) {
+          patch[jid] = { token: tokenBuf, timestamp: tSec };
+        }
+        await keys.set({ tctoken: patch }).catch(() => undefined);
+      }
+
+      const tsNum = Number(tSec) || Math.floor(Date.now() / 1000);
+      for (const jid of candidateJids) {
+        try {
+          await this.identityService?.privacyTokens?.captureIncomingPrivacyToken?.({
+            fallbackJid: jid,
+            rawTokenBytes: tokenBuf,
+            timestampSec: tsNum,
+          });
+        } catch {
+          // Best-effort
+        }
+      }
+      void this.flushAuthWrites().catch(() => undefined);
+    };
+
+    const onMessageNode = (node: BinaryNode) => {
+      try {
+        if (!node || typeof node !== 'object') return;
+        const tcNode = getBinaryNodeChild(node, 'tctoken');
+        const rawContent = tcNode?.content;
+        const tokenBuf = Buffer.isBuffer(rawContent)
+          ? rawContent
+          : rawContent instanceof Uint8Array
+            ? Buffer.from(rawContent)
+            : undefined;
+        if (!tokenBuf || tokenBuf.length === 0) return;
+
+        const tSec =
+          tcNode?.attrs?.t || String(Math.floor(Date.now() / 1000));
+        const attrs = node.attrs || {};
+        void persistTokenForCandidateJids(tokenBuf, tSec, [
+          attrs.from,
+          attrs.sender_pn,
+          attrs.sender_lid,
+          attrs.participant,
+          attrs.participant_pn,
+          attrs.participant_lid,
+        ]);
+      } catch {
+        // Never disrupt incoming message pipeline
+      }
+    };
+
+    const onPrivacyNotificationNode = (node: BinaryNode) => {
+      try {
+        if (!node || typeof node !== 'object') return;
+        const tokensParent = getBinaryNodeChild(node, 'tokens');
+        const tokenNodes = getBinaryNodeChildren(tokensParent, 'token');
+        if (!Array.isArray(tokenNodes) || tokenNodes.length === 0) return;
+
+        for (const tNode of tokenNodes) {
+          if (
+            tNode.attrs?.type &&
+            tNode.attrs.type !== 'trusted_contact'
+          ) {
+            continue;
+          }
+          const rawContent = tNode.content;
+          const tokenBuf = Buffer.isBuffer(rawContent)
+            ? rawContent
+            : rawContent instanceof Uint8Array
+              ? Buffer.from(rawContent)
+              : undefined;
+          if (!tokenBuf || tokenBuf.length === 0) continue;
+
+          const tSec =
+            tNode.attrs?.t || String(Math.floor(Date.now() / 1000));
+          void persistTokenForCandidateJids(tokenBuf, tSec, [
+            tNode.attrs?.jid,
+            node.attrs?.sender_lid,
+            node.attrs?.participant_lid,
+            node.attrs?.sender_pn,
+            node.attrs?.participant_pn,
+            node.attrs?.from,
+          ]);
+        }
+      } catch {
+        // Ignore
+      }
+    };
+
+    ws.on('CB:message', onMessageNode);
+    ws.on('CB:notification,type:privacy_token', onPrivacyNotificationNode);
+
+    return () => {
+      anySock.__botezzPrivacyHarvesterInstalled = false;
+      if (typeof ws.off === 'function') {
+        try {
+          ws.off('CB:message', onMessageNode);
+          ws.off(
+            'CB:notification,type:privacy_token',
+            onPrivacyNotificationNode
+          );
+        } catch {
+          // Ignore
+        }
+      }
+    };
   }
 
   private instrumentSocketForTelemetry(sock: WASocket): () => void {
@@ -2040,6 +2231,7 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
     }
     anySock.__botezzTelemetryInstrumented = true;
     this.instrumentSignalRepositoryForForensics(sock);
+    const unbindHarvester = this.installInboundPrivacyTokenHarvester(sock);
     const monitor = getNetworkTrafficMonitor();
 
     if (typeof sock.query === 'function') {
@@ -2554,6 +2746,7 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
     }
 
     return () => {
+      unbindHarvester();
       if (typeof ws?.off === 'function') {
         for (const item of wsCallbacks) {
           try {
@@ -4331,6 +4524,39 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
     } catch {
       // Best-effort
     }
+
+    // Cross-sync any existing Privacy Token (tctoken) between pnJid and lidJid
+    // so Baileys' internal buildTcTokenFromJid(lidJid) always finds the token under @lid!
+    const keys = sock.authState?.keys as
+      | {
+          get?: (
+            type: string,
+            ids: string[]
+          ) => Promise<
+            Record<
+              string,
+              { token?: Uint8Array; timestamp?: string | number } | undefined
+            >
+          >;
+          set?: (
+            data: Record<string, Record<string, unknown>>
+          ) => Promise<void>;
+        }
+      | undefined;
+    if (typeof keys?.get === 'function' && typeof keys?.set === 'function') {
+      try {
+        const existing = await keys.get('tctoken', [cleanPn, cleanLid]);
+        const pnEntry = existing?.[cleanPn];
+        const lidEntry = existing?.[cleanLid];
+        if (pnEntry?.token && !lidEntry?.token) {
+          await keys.set({ tctoken: { [cleanLid]: pnEntry } });
+        } else if (lidEntry?.token && !pnEntry?.token) {
+          await keys.set({ tctoken: { [cleanPn]: lidEntry } });
+        }
+      } catch {
+        // Best-effort
+      }
+    }
   }
 
   public async syncLidPnMapping(pnJid?: string, lidJid?: string): Promise<void> {
@@ -5097,6 +5323,147 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
   }
 
   /**
+   * Builds or resolves the privacy child node (`<tctoken>` or `<cstoken>`) for an outbound 1-on-1 `@lid` message,
+   * mirroring any stored `tctoken` from `pnJid` to `lidJid` in `authState.keys` and falling back to
+   * `<cstoken>` (`HMAC-SHA256(nctSalt, lidJid)`) per `whatsmeow/cstoken.go` when no `tctoken` is present.
+   */
+  public async buildPrivacyChildNodeForLidSend(
+    sock: WASocket,
+    lidJid: string,
+    pnJid?: string
+  ): Promise<BinaryNode | undefined> {
+    const cleanLid = jidNormalizedUser(lidJid);
+    const cleanPn =
+      pnJid && pnJid.endsWith('@s.whatsapp.net')
+        ? jidNormalizedUser(pnJid)
+        : undefined;
+    const lookupIds = [cleanLid, ...(cleanPn ? [cleanPn] : [])];
+
+    const keys = sock.authState?.keys as
+      | {
+          get?: (
+            type: string,
+            ids: string[]
+          ) => Promise<
+            Record<
+              string,
+              { token?: Uint8Array; timestamp?: string | number } | undefined
+            >
+          >;
+          set?: (
+            data: Record<string, Record<string, unknown>>
+          ) => Promise<void>;
+        }
+      | undefined;
+
+    // 1. Check authState.keys ('tctoken') for either lidJid or pnJid
+    if (typeof keys?.get === 'function') {
+      try {
+        const stored = await keys.get('tctoken', lookupIds);
+        const entry =
+          stored?.[cleanLid]?.token
+            ? stored[cleanLid]
+            : cleanPn && stored?.[cleanPn]?.token
+              ? stored[cleanPn]
+              : undefined;
+        if (entry?.token) {
+          if (!stored?.[cleanLid]?.token && typeof keys.set === 'function') {
+            await keys
+              .set({ tctoken: { [cleanLid]: entry } })
+              .catch(() => undefined);
+          }
+          const buf = Buffer.isBuffer(entry.token)
+            ? entry.token
+            : entry.token instanceof Uint8Array
+              ? Buffer.from(entry.token)
+              : undefined;
+          if (buf && buf.length > 0 && !isTcTokenExpired(entry.timestamp)) {
+            return {
+              tag: 'tctoken',
+              attrs: {},
+              content: buf,
+            };
+          }
+        }
+      } catch {
+        // Ignore
+      }
+    }
+
+    // 2. Check identityService.privacyTokens cache
+    try {
+      for (const k of lookupIds) {
+        const rec =
+          await this.identityService?.privacyTokens?.getValidPrivacyToken?.(k);
+        if (rec?.token?.length) {
+          const buf = Buffer.from(rec.token);
+          if (typeof keys?.set === 'function') {
+            await keys
+              .set({
+                tctoken: {
+                  [cleanLid]: {
+                    token: buf,
+                    timestamp: String(
+                      rec.timestampSec || Math.floor(Date.now() / 1000)
+                    ),
+                  },
+                },
+              })
+              .catch(() => undefined);
+          }
+          return {
+            tag: 'tctoken',
+            attrs: {},
+            content: buf,
+          };
+        }
+      }
+    } catch {
+      // Ignore
+    }
+
+    // 3. Proactively issue our own trusted_contact token to [lidJid, pnJid] so recipient can reply
+    const issueFn = (
+      sock as unknown as {
+        issuePrivacyTokens?: (
+          jids: string[],
+          ts?: number
+        ) => Promise<unknown>;
+      }
+    ).issuePrivacyTokens;
+    if (typeof issueFn === 'function') {
+      const nowSec = Math.floor(Date.now() / 1000);
+      await issueFn.call(sock, lookupIds, nowSec).catch(() => undefined);
+    }
+
+    // 4. Fallback to <cstoken> (Client-Static Token: HMAC-SHA256(nctSalt, lidJid)) per whatsmeow/cstoken.go
+    const creds = sock.authState?.creds as Record<string, unknown> | undefined;
+    const rawSalt = creds?.nctSalt || creds?.clientStaticSalt;
+    if (rawSalt) {
+      const saltBuf = Buffer.isBuffer(rawSalt)
+        ? rawSalt
+        : rawSalt instanceof Uint8Array
+          ? Buffer.from(rawSalt)
+          : typeof rawSalt === 'string'
+            ? Buffer.from(rawSalt, 'base64')
+            : undefined;
+      if (saltBuf && saltBuf.length > 0) {
+        const csToken = crypto
+          .createHmac('sha256', saltBuf)
+          .update(cleanLid, 'utf8')
+          .digest();
+        return {
+          tag: 'cstoken',
+          attrs: {},
+          content: csToken,
+        };
+      }
+    }
+
+    return undefined;
+  }
+
+  /**
    * Sends a protocol-verified message from the Anonymous Room or `/anonmsg` via `@hiroosy/baileys-lite`.
    * - Never calls `migrateSession(pnJid, lidJid)` (which deletes the working `pnJid` Signal session).
    * - Never calls `assertSessions(..., true)` with `force = true` (which overwrites valid Signal ratchets).
@@ -5285,7 +5652,7 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
       }
     }
 
-    // 2. Register LID <-> PN mapping and pre-assert @lid device sessions with force = false
+    // 2. Register LID <-> PN mapping (and cross-sync tctoken) and pre-assert @lid device sessions with force = false
     if (lidJid) {
       if (pnJid) {
         await this.syncLidPnMappingToSocket(sock, pnJid, lidJid);
@@ -5338,7 +5705,8 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
       (sock.user?.id ? jidNormalizedUser(sock.user.id) : undefined);
 
     const sendAndCacheImmediately = async (
-      targetJid: string
+      targetJid: string,
+      opts?: { includePeerRecipientPn?: boolean }
     ): Promise<{
       id: string;
       message: proto.IMessage;
@@ -5347,42 +5715,168 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
       let attemptMsgId: string | undefined;
       const ackTracker = this.waitForServerMessageAck(sock, () => attemptMsgId);
 
+      const isLidTarget = targetJid.endsWith('@lid');
+      const privacyChildNode = isLidTarget
+        ? await this.buildPrivacyChildNodeForLidSend(sock, targetJid, pnJid)
+        : undefined;
+
+      const savedRelayMessageRef =
+        typeof sock.relayMessage === 'function' ? sock.relayMessage : undefined;
+      const origRelayMessage = savedRelayMessageRef
+        ? savedRelayMessageRef.bind(sock)
+        : undefined;
+      if (origRelayMessage && isLidTarget) {
+        (sock as unknown as { relayMessage: typeof origRelayMessage }).relayMessage =
+          async (rJid, rMsg, rOpts) => {
+            const mergedOpts: Record<string, unknown> = { ...(rOpts || {}) };
+            if (rJid.endsWith('@lid')) {
+              const nextAttrs: Record<string, string> = {
+                ...((mergedOpts.additionalAttributes as
+                  | Record<string, string>
+                  | undefined) || {}),
+              };
+              delete nextAttrs.addressing_mode;
+              if (
+                opts?.includePeerRecipientPn &&
+                pnJid &&
+                pnJid.endsWith('@s.whatsapp.net')
+              ) {
+                nextAttrs.peer_recipient_pn = jidNormalizedUser(pnJid);
+              }
+              mergedOpts.additionalAttributes = nextAttrs;
+
+              if (privacyChildNode) {
+                const existingNodes = Array.isArray(mergedOpts.additionalNodes)
+                  ? [...(mergedOpts.additionalNodes as BinaryNode[])]
+                  : [];
+                if (
+                  privacyChildNode.tag === 'cstoken' &&
+                  !existingNodes.some(
+                    (n) => n?.tag === 'tctoken' || n?.tag === 'cstoken'
+                  )
+                ) {
+                  existingNodes.push(privacyChildNode);
+                  mergedOpts.additionalNodes = existingNodes;
+                } else if (
+                  privacyChildNode.tag === 'tctoken' &&
+                  !existingNodes.some((n) => n?.tag === 'tctoken')
+                ) {
+                  existingNodes.push(privacyChildNode);
+                  mergedOpts.additionalNodes = existingNodes;
+                }
+              }
+            }
+
+            if (
+              typeof mergedOpts.messageId === 'string' &&
+              rMsg &&
+              typeof rMsg === 'object'
+            ) {
+              attemptMsgId = mergedOpts.messageId;
+              this.memoryStore.cacheSentMessage(
+                rJid,
+                attemptMsgId,
+                rMsg as proto.IMessage
+              );
+              if (lidJid && lidJid !== rJid) {
+                this.memoryStore.cacheSentMessage(
+                  lidJid,
+                  attemptMsgId,
+                  rMsg as proto.IMessage
+                );
+              }
+              if (pnJid && pnJid !== rJid) {
+                this.memoryStore.cacheSentMessage(
+                  pnJid,
+                  attemptMsgId,
+                  rMsg as proto.IMessage
+                );
+              }
+              ackTracker.notifyMsgIdKnown(attemptMsgId);
+            }
+
+            return origRelayMessage(rJid, rMsg, mergedOpts as never);
+          };
+      }
+
       let sentMessage: proto.IMessage | undefined;
-      if (typeof sock.sendMessage === 'function') {
-        const sendOpts =
-          targetJid.endsWith('@lid') && (selfLid || senderJid)
-            ? ({ userJid: selfLid || senderJid } as never)
-            : undefined;
-        const sent = await sock.sendMessage(
-          targetJid,
-          contentPayload,
-          sendOpts
-        );
-        attemptMsgId =
-          sent?.key?.id ||
-          SmartProtocolWrapper.generateStandardMessageId(sock.user?.id);
-        sentMessage = sent?.message || undefined;
-      } else {
-        const waMsg = generateWAMessageFromContent(
-          targetJid,
-          finalText
-            ? { extendedTextMessage: { text: finalText } }
-            : (contentPayload as Record<string, unknown>),
-          {
-            userJid: targetJid.endsWith('@lid')
-              ? selfLid || senderJid
-              : sock.user?.id
-                ? jidNormalizedUser(sock.user.id)
-                : senderJid,
+      try {
+        if (typeof sock.sendMessage === 'function') {
+          const lidAdditionalAttrs: Record<string, string> = {};
+          if (
+            isLidTarget &&
+            opts?.includePeerRecipientPn &&
+            pnJid &&
+            pnJid.endsWith('@s.whatsapp.net')
+          ) {
+            lidAdditionalAttrs.peer_recipient_pn = jidNormalizedUser(pnJid);
           }
-        );
-        attemptMsgId =
-          waMsg.key?.id ||
-          SmartProtocolWrapper.generateStandardMessageId(sock.user?.id);
-        sentMessage = waMsg.message || undefined;
-        await sock.relayMessage(targetJid, waMsg.message!, {
-          messageId: attemptMsgId,
-        });
+          const lidAdditionalNodes: BinaryNode[] = [];
+          if (isLidTarget && privacyChildNode) {
+            const privacyTokenOn1to1 = (
+              sock as unknown as {
+                serverProps?: { privacyTokenOn1to1?: boolean };
+              }
+            ).serverProps?.privacyTokenOn1to1;
+            if (
+              privacyChildNode.tag === 'cstoken' ||
+              privacyTokenOn1to1 === false
+            ) {
+              lidAdditionalNodes.push(privacyChildNode);
+            }
+          }
+
+          const sendOpts = isLidTarget
+            ? ({
+                ...(selfLid || senderJid
+                  ? { userJid: selfLid || senderJid }
+                  : {}),
+                ...(Object.keys(lidAdditionalAttrs).length > 0
+                  ? { additionalAttributes: lidAdditionalAttrs }
+                  : {}),
+                ...(lidAdditionalNodes.length > 0
+                  ? { additionalNodes: lidAdditionalNodes }
+                  : {}),
+              } as never)
+            : undefined;
+          const sent = await sock.sendMessage(
+            targetJid,
+            contentPayload,
+            sendOpts
+          );
+          attemptMsgId =
+            sent?.key?.id ||
+            attemptMsgId ||
+            SmartProtocolWrapper.generateStandardMessageId(sock.user?.id);
+          sentMessage = sent?.message || undefined;
+        } else {
+          const waMsg = generateWAMessageFromContent(
+            targetJid,
+            finalText
+              ? { extendedTextMessage: { text: finalText } }
+              : (contentPayload as Record<string, unknown>),
+            {
+              userJid: isLidTarget
+                ? selfLid || senderJid
+                : sock.user?.id
+                  ? jidNormalizedUser(sock.user.id)
+                  : senderJid,
+            }
+          );
+          attemptMsgId =
+            waMsg.key?.id ||
+            SmartProtocolWrapper.generateStandardMessageId(sock.user?.id);
+          sentMessage = waMsg.message || undefined;
+          await sock.relayMessage(targetJid, waMsg.message!, {
+            messageId: attemptMsgId,
+          });
+        }
+      } finally {
+        if (savedRelayMessageRef && isLidTarget) {
+          (
+            sock as unknown as { relayMessage: typeof savedRelayMessageRef }
+          ).relayMessage = savedRelayMessageRef;
+        }
       }
 
       const protoToCache =
@@ -5393,19 +5887,19 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
 
       // CRITICAL: Cache message in memoryStore and flush auth writes IMMEDIATELY
       // BEFORE awaiting ackTracker.promise so `<receipt type="retry"/>` is served within 50-300ms
-      this.memoryStore.cacheSentMessage(targetJid, attemptMsgId, protoToCache);
+      this.memoryStore.cacheSentMessage(targetJid, attemptMsgId!, protoToCache);
       if (lidJid && lidJid !== targetJid) {
-        this.memoryStore.cacheSentMessage(lidJid, attemptMsgId, protoToCache);
+        this.memoryStore.cacheSentMessage(lidJid, attemptMsgId!, protoToCache);
       }
       if (pnJid && pnJid !== targetJid) {
-        this.memoryStore.cacheSentMessage(pnJid, attemptMsgId, protoToCache);
+        this.memoryStore.cacheSentMessage(pnJid, attemptMsgId!, protoToCache);
       }
       await Promise.allSettled([this.credsSaveChain, this.flushAuthWrites()]);
 
-      ackTracker.notifyMsgIdKnown(attemptMsgId);
+      ackTracker.notifyMsgIdKnown(attemptMsgId!);
       const ack = await ackTracker.promise;
       return {
-        id: attemptMsgId,
+        id: attemptMsgId!,
         message: protoToCache,
         ack,
       };
@@ -5420,7 +5914,22 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
           finalText.length || 12
         );
         try {
-          const lidAttempt = await sendAndCacheImmediately(lidJid);
+          // Attempt 1A: Send to @lid with peer_recipient_pn + (<tctoken> or <cstoken>)
+          let lidAttempt = await sendAndCacheImmediately(lidJid, {
+            includePeerRecipientPn: true,
+          });
+
+          // Attempt 1B: If server returned 463 when peer_recipient_pn was attached, retry pure @lid stanza
+          if (
+            !lidAttempt.ack.ok &&
+            lidAttempt.ack.errorCode === 463 &&
+            pnJid
+          ) {
+            lidAttempt = await sendAndCacheImmediately(lidJid, {
+              includePeerRecipientPn: false,
+            });
+          }
+
           if (lidAttempt.ack.ok) {
             return {
               messageId: lidAttempt.id,
@@ -5433,10 +5942,17 @@ export class HiroosyBaileysSessionDriver implements WhatsAppSessionDriver {
               fallbackTriggered: false,
             };
           }
-          // Server returned explicit error ACK (e.g. 479 or 463) on @lid:
+
+          // Server returned explicit error ACK (e.g. 463 or 479) on @lid:
           if (!params.allowPnFallback || !pnJid) {
+            const errCode = lidAttempt.ack.errorCode || 'ACK_ERR';
+            if (errCode === 463) {
+              throw new WhatsAppConnectionError(
+                `رفض خادم واتساب إرسال الرسالة عبر الهوية المقنّعة (${lidJid}) برمز خطأ (463 — قيد المحادثات الجديدة بدون توكن خصوصية نشط من المستلم). لتجاوز قيد 463 لهذا الرقم، اضغط على زر (🔄 تبديل وضع الحماية) أدناه للسماح بتأسيس الجلسة، أو اطلب من المستلم إرسال رسالة واحدة أولاً لتوليد توكن الخصوصية (tctoken).`
+              );
+            }
             throw new WhatsAppConnectionError(
-              `رفض خادم واتساب إرسال الرسالة عبر الهوية المقنّعة (${lidJid}) برمز خطأ (${lidAttempt.ack.errorCode || 'ACK_ERR'}). لم يتم الإرسال عبر رقم الهاتف لحماية هويتك.`
+              `رفض خادم واتساب إرسال الرسالة عبر الهوية المقنّعة (${lidJid}) برمز خطأ (${errCode}). لم يتم الإرسال عبر رقم الهاتف لحماية هويتك.`
             );
           }
         } catch (lidErr) {

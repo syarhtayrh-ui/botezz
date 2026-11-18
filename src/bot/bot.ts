@@ -1182,10 +1182,94 @@ export class TelegramBotController {
       return this.cyberForensicsHandler.promptSocialLookup(actorUserId);
     }
 
+    if (callbackData === 'cyber:breach_lookup') {
+      this.cancelAllWorkflowsForAdmin(actorUserId);
+      this.activateInputOwner(actorUserId, 'CYBER_FORENSICS');
+      return this.cyberForensicsHandler.promptBreachLookup(actorUserId);
+    }
+
+    if (callbackData === 'cyber:ten_engines_lookup') {
+      this.cancelAllWorkflowsForAdmin(actorUserId);
+      this.activateInputOwner(actorUserId, 'CYBER_FORENSICS');
+      return this.cyberForensicsHandler.promptTenEnginesLookup(actorUserId);
+    }
+
+    if (callbackData === 'cyber:handle_lookup') {
+      this.cancelAllWorkflowsForAdmin(actorUserId);
+      this.activateInputOwner(actorUserId, 'CYBER_FORENSICS');
+      return this.cyberForensicsHandler.promptHandleOrEmailPivot(actorUserId);
+    }
+
     if (callbackData === 'cyber:full_scan') {
       this.cancelAllWorkflowsForAdmin(actorUserId);
       this.activateInputOwner(actorUserId, 'CYBER_FORENSICS');
       return this.cyberForensicsHandler.promptFullScan(actorUserId);
+    }
+
+    if (callbackData === 'cyber:smart_scan') {
+      this.cancelAllWorkflowsForAdmin(actorUserId);
+      this.activateInputOwner(actorUserId, 'CYBER_FORENSICS');
+      return this.cyberForensicsHandler.promptSmartAutoScan(actorUserId);
+    }
+
+    if (callbackData === 'cyber:mod:phone') {
+      this.cancelAllWorkflowsForAdmin(actorUserId);
+      this.activateInputOwner(actorUserId, 'CYBER_FORENSICS');
+      return this.cyberForensicsHandler.promptFullScan(actorUserId);
+    }
+
+    if (callbackData === 'cyber:mod:username') {
+      this.cancelAllWorkflowsForAdmin(actorUserId);
+      this.activateInputOwner(actorUserId, 'CYBER_FORENSICS');
+      return this.cyberForensicsHandler.promptUsernameModule(actorUserId);
+    }
+
+    if (callbackData === 'cyber:mod:email') {
+      this.cancelAllWorkflowsForAdmin(actorUserId);
+      this.activateInputOwner(actorUserId, 'CYBER_FORENSICS');
+      return this.cyberForensicsHandler.promptEmailModule(actorUserId);
+    }
+
+    if (callbackData === 'cyber:mod:domain_ip') {
+      this.cancelAllWorkflowsForAdmin(actorUserId);
+      this.activateInputOwner(actorUserId, 'CYBER_FORENSICS');
+      return this.cyberForensicsHandler.promptDomainIpModule(actorUserId);
+    }
+
+    if (callbackData === 'cyber:mod:media') {
+      this.cancelAllWorkflowsForAdmin(actorUserId);
+      this.activateInputOwner(actorUserId, 'CYBER_FORENSICS');
+      return this.cyberForensicsHandler.promptMediaForensicsModule(actorUserId);
+    }
+
+    if (callbackData === 'cyber:mod:geo_transport') {
+      this.cancelAllWorkflowsForAdmin(actorUserId);
+      this.activateInputOwner(actorUserId, 'CYBER_FORENSICS');
+      return this.cyberForensicsHandler.promptGeoTransportModule(actorUserId);
+    }
+
+    if (callbackData === 'cyber:mod:corp_crypto') {
+      this.cancelAllWorkflowsForAdmin(actorUserId);
+      this.activateInputOwner(actorUserId, 'CYBER_FORENSICS');
+      return this.cyberForensicsHandler.promptCorpCryptoModule(actorUserId);
+    }
+
+    if (callbackData === 'cyber:mod:archive_dorks') {
+      this.cancelAllWorkflowsForAdmin(actorUserId);
+      this.activateInputOwner(actorUserId, 'CYBER_FORENSICS');
+      return this.cyberForensicsHandler.promptArchiveDorksModule(actorUserId);
+    }
+
+    if (callbackData.startsWith('cyber:catalog:page:')) {
+      const page = Number(callbackData.split(':').pop() || '1') || 1;
+      this.activateInputOwner(actorUserId, 'NONE');
+      return this.cyberForensicsHandler.renderOsintCatalogPage(page);
+    }
+
+    if (callbackData.startsWith('cyber:exif_purge:')) {
+      const mediaId = callbackData.slice('cyber:exif_purge:'.length).trim();
+      this.activateInputOwner(actorUserId, 'NONE');
+      return this.cyberForensicsHandler.purgeMediaExifById(mediaId);
     }
 
     if (callbackData === 'cyber:settings') {
@@ -1247,6 +1331,18 @@ export class TelegramBotController {
       };
     }
 
+    if (callbackData === 'cyber:leakcheck_set') {
+      this.cyberForensicsHandler.setInputStep(
+        actorUserId,
+        'AWAITING_LEAKCHECK_KEY'
+      );
+      this.activateInputOwner(actorUserId, 'CYBER_FORENSICS');
+      return {
+        text: `🔓 *أرسل الآن مفتاح LeakCheck API لحفظه (أو اتركه فارغاً لاستخدام الوضع العام المجاني):*`,
+        keyboard: [buildBackCancelRow('cyber:settings')],
+      };
+    }
+
     if (callbackData.startsWith('cyber:history:page:')) {
       const page = Number(callbackData.split(':').pop() || '1') || 1;
       this.activateInputOwner(actorUserId, 'NONE');
@@ -1270,6 +1366,26 @@ export class TelegramBotController {
         actorUserId,
         digits,
         'SOCIAL_ONLY'
+      );
+    }
+
+    if (callbackData.startsWith('cyber:run_breach:')) {
+      const digits = callbackData.slice('cyber:run_breach:'.length);
+      this.activateInputOwner(actorUserId, 'NONE');
+      return this.cyberForensicsHandler.executeInvestigationAndFormatView(
+        actorUserId,
+        digits,
+        'BREACH_LEAKS_ONLY'
+      );
+    }
+
+    if (callbackData.startsWith('cyber:run_engines:')) {
+      const digits = callbackData.slice('cyber:run_engines:'.length);
+      this.activateInputOwner(actorUserId, 'NONE');
+      return this.cyberForensicsHandler.executeInvestigationAndFormatView(
+        actorUserId,
+        digits,
+        'TEN_ENGINES_SCRAPE_ONLY'
       );
     }
 
@@ -2541,6 +2657,15 @@ export class TelegramBotController {
       this.activateInputOwner(actorUserId, 'TOOLS');
     } else if (isAwaitingMenfessMedia || isMenfessCaption) {
       view = await this.toolsHandler.handleMenfessMediaUpload(
+        actorUserId,
+        upload
+      );
+      this.activateInputOwner(actorUserId, 'NONE');
+    } else if (
+      this.uiState.getActiveInputOwner(actorUserId) === 'CYBER_FORENSICS' ||
+      mode === 'CYBER_FORENSICS'
+    ) {
+      view = await this.cyberForensicsHandler.handleMediaAttachment(
         actorUserId,
         upload
       );
