@@ -2602,10 +2602,14 @@ export class TelegramBotController {
     upload: IncomingTelegramMediaUpload,
     options?: HandleInteractionOptions
   ): Promise<BotViewResponse> {
+    const safeFilename =
+      upload.originalFilename ||
+      (upload as { fileName?: string }).fileName ||
+      'uploaded_media.bin';
     verifyTelegramAdmin({
       candidateUserId: actorUserId,
       configuredAdminId: this.deps.config.TELEGRAM_ADMIN_ID,
-      actionDescription: `upload:${upload.originalFilename.slice(0, 24)}`,
+      actionDescription: `upload:${safeFilename.slice(0, 24)}`,
       auditRepo: this.deps.auditRepo,
       settingsRepo: this.deps.settingsRepo,
       chatId: options?.chatId,
@@ -2617,7 +2621,7 @@ export class TelegramBotController {
 
     const mode = this.getConversationMode(actorUserId);
     const caption = (upload.caption || '').trim();
-    const lowerName = upload.originalFilename.toLowerCase();
+    const lowerName = safeFilename.toLowerCase();
     const isCodeExtension =
       lowerName.endsWith('.js') ||
       lowerName.endsWith('.ts') ||

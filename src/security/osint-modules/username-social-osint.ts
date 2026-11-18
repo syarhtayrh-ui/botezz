@@ -629,7 +629,7 @@ export function extractTikTokVideoTimestamp(rawInput: string): TikTokTimestampRe
   const videoId = idMatch[1];
   try {
     const snowFlake = BigInt(videoId);
-    const unixTimestampSeconds = Number(snowFlake >> 32n);
+    const unixTimestampSeconds = Number(snowFlake >> BigInt(32));
     if (
       !Number.isFinite(unixTimestampSeconds) ||
       unixTimestampSeconds < 1400000000 ||

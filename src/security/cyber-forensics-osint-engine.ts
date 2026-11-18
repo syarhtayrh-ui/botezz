@@ -484,7 +484,7 @@ export class CyberForensicsOsintEngine {
     private readonly sessionManager: SessionManager
   ) {}
 
-  public parseAndNormalizePhoneInput(rawInput: string): NormalizedPhoneTarget {
+  public parseAndNormalizePhoneInput(rawInput: string): NormalizedPhoneMetadata {
     return parseAndNormalizePhoneInput(rawInput);
   }
 

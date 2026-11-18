@@ -1436,7 +1436,7 @@ test('Deep Status Downloader & Deep Message Inbox: all formats, zip fallback, ed
       parsedAu.digitsOnly
     );
     assert.ok(exportedJsonView.mediaAttachments && exportedJsonView.mediaAttachments.length === 1);
-    assert.equal(exportedJsonView.mediaAttachments[0]?.type, 'document');
+    assert.equal(exportedJsonView.mediaAttachments[0]?.kind, 'document');
 
     // Phase 2 Verification: 92-Tool 8-Module Cyber Forensics Suite
     const smartPrompt = await env.controller.handleCallbackQuery(
@@ -1451,7 +1451,7 @@ test('Deep Status Downloader & Deep Message Inbox: all formats, zip fallback, ed
       'cyber:catalog:page:1',
       { skipDuplicateCheck: true }
     );
-    assert.ok(catalogPage1.text.includes('كتالوج ترسانة الاستخبارات الجنائية (92 أداة معتمدة)'));
+    assert.ok(catalogPage1.text.includes('دليل أدوات الاستخبارات الجنائية المعتمدة (92 أداة مجانية ومفتوحة)'));
     // Strictly verify zero excluded paid tools appear anywhere in catalog
     const forbiddenTools = ['Dehashed', 'Hunchly', 'SameID', 'PimEyes'];
     for (const forbidden of forbiddenTools) {
@@ -1468,7 +1468,7 @@ test('Deep Status Downloader & Deep Message Inbox: all formats, zip fallback, ed
       'cyber:mod:media',
       { skipDuplicateCheck: true }
     );
-    assert.ok(mediaPrompt.text.includes('تحليل الصور والوسائط والمستندات'));
+    assert.ok(mediaPrompt.text.includes('مختبر الجنائيات الرقمية للصور والوسائط والمستندات'));
     assert.equal(env.controller.uiState.getActiveInputOwner(ownerId), 'CYBER_FORENSICS');
 
     // Create a minimal valid JPEG with APP1 EXIF header and SOI/EOI markers
@@ -1481,13 +1481,14 @@ test('Deep Status Downloader & Deep Message Inbox: all formats, zip fallback, ed
       Buffer.from([0xff, 0xd9]), // EOI
     ]);
     const mediaReportView = await env.controller.handleMediaUpload(ownerId, {
-      fileName: 'evidence_sample.jpg',
+      telegramFileId: 'file_id_exif_test_01',
+      originalFilename: 'evidence_sample.jpg',
       mimeType: 'image/jpeg',
-      sizeBytes: minimalJpegWithExif.length,
-      buffer: minimalJpegWithExif,
+      fileSizeBytes: minimalJpegWithExif.length,
+      contentBuffer: minimalJpegWithExif,
     });
-    assert.ok(mediaReportView.text.includes('تقرير التحليل الجنائي للوسائط والمستندات'));
-    assert.ok(mediaReportView.text.includes('640 × 400'));
+    assert.ok(mediaReportView.text.includes('تقرير المختبر الجنائي للوسائط والصور'));
+    assert.ok(mediaReportView.text.includes('640x400 px'));
   } finally {
     await env.cleanup();
   }
