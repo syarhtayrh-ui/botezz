@@ -1744,9 +1744,8 @@ describe('Two-Way VoIP Video Call Recording (VoipCallRecorder)', () => {
     await ensureHiroosyVoipRuntimePatched();
 
     // 1. Verify Protobuf encoding of buildMultiSenderSubscriptions and buildPeerSsrcDescriptorEntries against stun.js
-    const stunMod = await import(
-      '../../node_modules/@hiroosy/baileys-lite/src/voip/relay/stun.js'
-    );
+    // @ts-expect-error untyped internal baileys-lite stun.js module
+    const stunMod = await import('../../node_modules/@hiroosy/baileys-lite/src/voip/relay/stun.js');
     const singleSsrc = 0x12345678;
     const expectedSingleSub = stunMod.buildSenderSubscriptions(singleSsrc);
     const actualMultiSub = buildMultiSenderSubscriptions([singleSsrc]);
@@ -2145,6 +2144,89 @@ describe('Two-Way VoIP Video Call Recording (VoipCallRecorder)', () => {
         activeCallMediaSessions.delete(liveSession);
         previousDisposedSessions.push(liveSession);
       }
+
+      // 4. Verify sendProactiveVideoStateAndPli sends <call><video state="1" enc="h.264" dec="H264"/></call> once when deps.lowLevelCoordinator.sendNode is present
+      const sentNodes: Array<Record<string, unknown>> = [];
+      const fullVideoSession: Record<string, unknown> = {
+        callId: 'A1B2C3D4E5F60718293A4B5C6D7E8F90',
+        acceptedByJid: '966501234567:0@s.whatsapp.net',
+        selfSsrcJid: '966509998877:0@s.whatsapp.net',
+        info: {
+          callId: 'A1B2C3D4E5F60718293A4B5C6D7E8F90',
+          mediaType: 'video',
+          peerJid: '966501234567:0@s.whatsapp.net',
+          callCreator: '966509998877:0@s.whatsapp.net',
+        },
+        deps: {
+          lowLevelCoordinator: {
+            sendNode: async (node: Record<string, unknown>) => {
+              sentNodes.push(node);
+            },
+          },
+        },
+      };
+      sendProactiveVideoStateAndPli(fullVideoSession);
+      sendProactiveVideoStateAndPli(fullVideoSession); // second call must not duplicate
+      if (fullVideoSession._pliIntervalTimer) {
+        clearInterval(fullVideoSession._pliIntervalTimer as ReturnType<typeof setInterval>);
+      }
+      assert.equal(sentNodes.length, 1, 'Should send <call><video state="1"/></call> exactly once');
+      const videoChild = (sentNodes[0]!.content as Array<{ tag: string; attrs: Record<string, string> }>)[0]!;
+      assert.equal(videoChild.tag, 'video');
+      assert.equal(videoChild.attrs.state, '1');
+      assert.equal(videoChild.attrs.enc, 'h.264');
+      assert.equal(videoChild.attrs.dec, 'H264');
+
+      // 5. Verify syncPeerRecvKeysOnMediaSession prioritizes srtpSession.recvCtx (post-accept peerCallKey) over stale __peerRecvCtx (pre-accept ourCallKey)
+      const { syncPeerRecvKeysOnMediaSession } = await import('../../src/whatsapp/voip-call-recorder.js');
+      const staleOurKey = new Uint8Array(16).fill(0x11);
+      const freshPeerKey = new Uint8Array(16).fill(0x99);
+      const mockKeySession: Record<string, unknown> = {
+        __peerRecvCtx: {
+          sessionKey: staleOurKey,
+          sessionSalt: new Uint8Array(14).fill(0x22),
+          authKey: new Uint8Array(20).fill(0x33),
+        },
+        srtpSession: {
+          recvCtx: {
+            sessionKey: freshPeerKey,
+            sessionSalt: new Uint8Array(14).fill(0xaa),
+            authKey: new Uint8Array(20).fill(0xbb),
+          },
+        },
+        videoSrtpSession: {
+          recvCtx: {
+            sessionKey: staleOurKey,
+            sessionSalt: new Uint8Array(14).fill(0x22),
+            authKey: new Uint8Array(20).fill(0x33),
+          },
+        },
+      };
+      syncPeerRecvKeysOnMediaSession(mockKeySession);
+      assert.deepEqual(
+        (mockKeySession.videoSrtpSession as { recvCtx: { sessionKey: Uint8Array } }).recvCtx.sessionKey,
+        freshPeerKey,
+        'videoSrtpSession.recvCtx must adopt srtpSession.recvCtx (peerCallKey) over stale __peerRecvCtx'
+      );
+
+      // 6. Verify non-loop playback (videoLoop = false) invokes _botezzOnPlaybackCompleted after one pass
+      const nonLoopEngine = new FakeWaVideoEngine() as FakeWaVideoEngine & {
+        videoLoop?: boolean;
+        _botezzOnPlaybackCompleted?: () => void;
+      };
+      nonLoopEngine.videoLoop = false;
+      let playbackCompletedFired = false;
+      nonLoopEngine._botezzOnPlaybackCompleted = () => {
+        playbackCompletedFired = true;
+      };
+      const nonLoopFrames: number[][] = [];
+      nonLoopEngine.startStreaming((nalus) => {
+        nonLoopFrames.push(nalus.map((n) => n[0]! & 0x1f));
+      });
+      await new Promise((resolve) => setTimeout(resolve, 90));
+      nonLoopEngine.stopStreaming();
+      assert.equal(nonLoopFrames.length, 2, 'Non-loop videoEngine must emit exactly 2 frames and stop');
+      assert.equal(playbackCompletedFired, true, 'Non-loop videoEngine must invoke _botezzOnPlaybackCompleted');
     } finally {
       fs.rmSync(tmpDir, { recursive: true, force: true });
     }

@@ -730,9 +730,23 @@ export class RealVideoCallService extends EventEmitter {
     if (
       existing &&
       existing.driver === driver &&
-      existing.rawSocket === rawSocket
+      existing.rawSocket === rawSocket &&
+      rawSocket !== undefined
     ) {
       return;
+    }
+
+    // If the session previously had a different/closed rawSocket, clean up its Voip instance and listeners
+    if (existing?.rawSocket && existing.rawSocket !== rawSocket) {
+      const oldVoip = existing.voipInstance ?? this.voipBySocket.get(existing.rawSocket);
+      if (oldVoip) {
+        try {
+          oldVoip.coordinator?.dispose?.();
+        } catch {
+          // Ignore old coordinator dispose error
+        }
+      }
+      this.voipBySocket.delete(existing.rawSocket);
     }
 
     this.detachSession(sessionId);
@@ -756,9 +770,29 @@ export class RealVideoCallService extends EventEmitter {
       | undefined;
 
     if (ev && typeof ev.on === 'function') {
+      const boundSocket = rawSocket;
       const listener = (update: Record<string, unknown>) => {
         if (update?.connection === 'close') {
           this.handleSocketClosed(sessionId, 'WhatsApp socket connection closed');
+          // CRITICAL: Immediately purge the closed socket reference and its Voip instance so
+          // subsequent calls never reuse the dead socket and throw "Connection Closed"!
+          const currentCtx = this.attachedSessions.get(sessionId);
+          if (currentCtx && currentCtx.rawSocket === boundSocket) {
+            if (boundSocket) {
+              const staleVoip =
+                currentCtx.voipInstance ?? this.voipBySocket.get(boundSocket);
+              try {
+                staleVoip?.coordinator?.dispose?.();
+              } catch {
+                // Ignore dispose error
+              }
+              this.voipBySocket.delete(boundSocket);
+            }
+            currentCtx.rawSocket = undefined;
+            currentCtx.voipInstance = undefined;
+            currentCtx.voipListening = false;
+            currentCtx.voipSocketCleanup = undefined;
+          }
         }
       };
       ev.on('connection.update', listener);
@@ -878,18 +912,35 @@ export class RealVideoCallService extends EventEmitter {
   ): Promise<InstanceType<typeof Voip> | undefined> {
     await ensureHiroosyVoipRuntimePatched();
     let ctx = this.attachedSessions.get(sessionId);
-    if (!ctx && this.sessionManager) {
+
+    // Always query sessionManager.getDriver(sessionId) first so reconnected sockets are picked up immediately!
+    let liveDriver: WhatsAppSessionDriver | undefined;
+    if (this.sessionManager) {
       try {
-        const driver = this.sessionManager.getDriver(sessionId);
-        if (driver) {
-          this.attachSession(sessionId, driver);
-          ctx = this.attachedSessions.get(sessionId);
-        }
+        liveDriver = this.sessionManager.getDriver(sessionId);
       } catch {
-        // Ignore if session driver not available
+        liveDriver = ctx?.driver;
       }
+    } else {
+      liveDriver = ctx?.driver;
     }
-    const rawSocket = ctx?.rawSocket ?? ctx?.driver?.getRawSocket?.() ?? undefined;
+
+    const liveRawSocket =
+      liveDriver?.getRawSocket?.() ?? ctx?.rawSocket ?? undefined;
+
+    if (
+      liveDriver &&
+      (!ctx || ctx.driver !== liveDriver || (liveRawSocket && ctx.rawSocket !== liveRawSocket))
+    ) {
+      this.attachSession(sessionId, liveDriver);
+      ctx = this.attachedSessions.get(sessionId);
+    }
+
+    const rawSocket =
+      liveDriver?.getRawSocket?.() ??
+      ctx?.driver?.getRawSocket?.() ??
+      ctx?.rawSocket ??
+      undefined;
     if (!rawSocket) return undefined;
 
     const tmpDir = path.resolve(
@@ -1828,15 +1879,33 @@ export class RealVideoCallService extends EventEmitter {
     }
 
     const attached = this.attachedSessions.get(req.sessionId);
-    const driver =
-      req.driver ||
-      attached?.driver ||
-      this.sessionManager?.getDriver(req.sessionId, actorTelegramId);
+
+    // CRITICAL: Always resolve the latest connected driver from `sessionManager` FIRST,
+    // and resolve `driver.getRawSocket()` BEFORE falling back to `attached?.rawSocket`!
+    // Otherwise, after Baileys reconnects a closed WebSocket, `attached?.rawSocket` still points
+    // to the old dead socket and throws "Protocol failure (Connection Closed)" on every call!
+    let liveManagerDriver: WhatsAppSessionDriver | undefined;
+    if (!req.driver && this.sessionManager) {
+      try {
+        liveManagerDriver = this.sessionManager.getDriver(
+          req.sessionId,
+          actorTelegramId
+        );
+      } catch {
+        try {
+          liveManagerDriver = this.sessionManager.getDriver(req.sessionId);
+        } catch {
+          liveManagerDriver = undefined;
+        }
+      }
+    }
+
+    const driver = req.driver || liveManagerDriver || attached?.driver;
 
     const rawSocket =
       (req.socket as Record<string, unknown> | undefined) ||
-      attached?.rawSocket ||
       driver?.getRawSocket?.() ||
+      attached?.rawSocket ||
       undefined;
 
     if (!driver && !rawSocket) {
@@ -2143,6 +2212,15 @@ export class RealVideoCallService extends EventEmitter {
       }
     }
 
+    if (!found) {
+      const mgrSession = (
+        voip.coordinator?.manager as { session?: WaCallMediaSessionLike } | undefined
+      )?.session;
+      if (isLiveCandidate(mgrSession)) {
+        found = mgrSession;
+      }
+    }
+
     if (!found && activeCallMediaSessions.size > 0) {
       const recentActive = Array.from(activeCallMediaSessions).reverse();
       for (const cand of recentActive) {
@@ -2158,6 +2236,20 @@ export class RealVideoCallService extends EventEmitter {
     const instrumented = instrumentMediaSessionInstance(found);
     if (instrumented?.videoEngine) {
       instrumented.videoEngine.videoLoop = stream.loopVideo;
+      (instrumented.videoEngine as Record<string, unknown>).loop = stream.loopVideo;
+      (
+        instrumented.videoEngine as {
+          _botezzOnPlaybackCompleted?: () => void;
+        }
+      )._botezzOnPlaybackCompleted = () => {
+        if (!stream.loopVideo && !this.isTerminalState(stream.callState)) {
+          void this.stopVideoCall(stream.sessionId, stream.callId, {
+            autoCompleted: true,
+            deleteFile: false,
+            reason: 'media_playback_completed',
+          });
+        }
+      };
     }
     if (instrumented && stream.recorder) {
       stream.recorder.attachToMediaSession(instrumented);
@@ -2337,8 +2429,9 @@ export class RealVideoCallService extends EventEmitter {
       fs.mkdirSync(tmpDir, { recursive: true });
 
       const ctx = this.attachedSessions.get(stream.sessionId);
-      let voip = ctx?.voipInstance ?? this.voipBySocket.get(rawSocket);
-      if (!voip) {
+      const existingVoip = ctx?.voipInstance ?? this.voipBySocket.get(rawSocket);
+      let voip: InstanceType<typeof Voip>;
+      if (!existingVoip) {
         voip = new Voip(rawSocket as never, {
           voipLogLevel: 'warn',
           maxConcurrentCalls: 1,
@@ -2349,8 +2442,11 @@ export class RealVideoCallService extends EventEmitter {
           ctx.voipInstance = voip;
           ctx.voipListening = false;
         }
-      } else if (ctx && !ctx.voipInstance) {
-        ctx.voipInstance = voip;
+      } else {
+        voip = existingVoip;
+        if (ctx && !ctx.voipInstance) {
+          ctx.voipInstance = voip;
+        }
       }
       stream.voipInstance = voip;
       this.bindVoipIncomingListener(stream.sessionId, ctx, voip);
@@ -2441,15 +2537,12 @@ export class RealVideoCallService extends EventEmitter {
     const startActiveMediaLivenessWatchdog = () => {
       this.clearActiveMediaLivenessTimers(stream.callId);
 
-      // Only schedule deterministic non-loop completion in short unit-test calls (`loopVideo === false`
-      // and `maxDurationSeconds <= 15`). In live calls (`maxDurationSeconds >= 30` or `loopVideo === true`),
-      // NEVER auto-terminate early with `media_playback_completed` before `maxDurationSeconds`!
-      if (!stream.loopVideo && maxDurationSeconds <= 15) {
+      if (!stream.loopVideo) {
         const mediaDurationSec = stream.mediaInspection?.durationSeconds ?? 0;
         if (mediaDurationSec > 0 && mediaDurationSec < maxDurationSeconds) {
           const completionMs = Math.max(
             250,
-            Math.ceil(mediaDurationSec * 1000) + 250
+            Math.ceil(mediaDurationSec * 1000) + 500
           );
           const completionTimer = setTimeout(() => {
             if (this.isTerminalState(stream.callState)) return;
@@ -3243,7 +3336,7 @@ export class RealVideoCallService extends EventEmitter {
           mediaPayload as never,
           normalizedVoipPreset,
           {
-            loop: true,
+            loop: Boolean(stream.loopVideo),
             autoEndCall: false,
             autoDowngrade: false,
           } as never
@@ -3270,6 +3363,45 @@ export class RealVideoCallService extends EventEmitter {
           await this.drainStaleCoordinatorCalls(voip);
           await new Promise((r) => setTimeout(r, 150));
           callResult = await invokeVoipCall();
+        } else if (/connection closed|socket closed|not connected/i.test(callErrMsg)) {
+          // If the cached socket closed right before or during call setup, pull the fresh live socket
+          // from `sessionManager.getDriver(stream.sessionId)` and retry on a brand-new Voip instance!
+          log.warn(
+            'voip.call encountered Connection Closed; refreshing live socket from driver and retrying',
+            {
+              callId: stream.callId,
+              sessionId: stream.sessionId,
+              error: callErrMsg,
+            }
+          );
+          try {
+            voip.coordinator?.dispose?.();
+          } catch {
+            // Ignore dispose error
+          }
+          this.voipBySocket.delete(rawSocket);
+
+          const freshDriver =
+            this.sessionManager?.getDriver(stream.sessionId, actorTelegramId) ??
+            ctx?.driver;
+          const freshSocket = freshDriver?.getRawSocket?.();
+          if (freshSocket && freshSocket !== rawSocket) {
+            if (freshDriver) {
+              this.attachSession(stream.sessionId, freshDriver);
+            }
+            const refreshedVoip = await this.ensureVoipInstanceForSession(
+              stream.sessionId
+            );
+            if (refreshedVoip) {
+              voip = refreshedVoip;
+              stream.voipInstance = voip;
+              callResult = await invokeVoipCall();
+            } else {
+              throw callErr;
+            }
+          } else {
+            throw callErr;
+          }
         } else {
           throw callErr;
         }

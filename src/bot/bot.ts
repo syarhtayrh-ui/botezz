@@ -113,8 +113,11 @@ export interface IncomingTelegramMediaUpload {
   originalFilename: string;
   mimeType: string;
   sizeBytes: number;
+  fileSizeBytes?: number;
   contentBuffer: Buffer;
   caption?: string;
+  telegramMediaKind?: 'photo' | 'video' | 'audio' | 'voice' | 'document' | 'sticker';
+  telegramFileId?: string;
 }
 
 /**

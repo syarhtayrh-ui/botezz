@@ -1296,7 +1296,7 @@ test('Deep Status Downloader & Deep Message Inbox: all formats, zip fallback, ed
     const incAlert = env.controller.videoCallWorkflow.renderIncomingCallAlert({
       callId: 'inc_call_test_99',
       sessionId: sess.id,
-      callerJid: '966509998877@s.whatsapp.net',
+      peerJid: '966509998877@s.whatsapp.net',
       isVideo: true,
       receivedAtIso: new Date().toISOString(),
     });
@@ -1402,7 +1402,7 @@ test('Deep Status Downloader & Deep Message Inbox: all formats, zip fallback, ed
     const cachedReport = {
       reportId: 'rep_test_au_01',
       generatedAtIso: new Date().toISOString(),
-      mode: 'FULL_FORENSIC' as const,
+      mode: 'FULL_DOSSIER' as const,
       phone: parsedAu,
       discoveredNames: [
         {
@@ -1415,6 +1415,9 @@ test('Deep Status Downloader & Deep Message Inbox: all formats, zip fallback, ed
       whatsappFootprint: {
         checked: false,
         registered: false,
+        linkedDevices: [],
+        businessWebsites: [],
+        directChatUrl: 'https://wa.me/61412345678',
       },
       socialAccounts: [],
       searchEngineStats: [],
@@ -1481,10 +1484,9 @@ test('Deep Status Downloader & Deep Message Inbox: all formats, zip fallback, ed
       Buffer.from([0xff, 0xd9]), // EOI
     ]);
     const mediaReportView = await env.controller.handleMediaUpload(ownerId, {
-      telegramFileId: 'file_id_exif_test_01',
       originalFilename: 'evidence_sample.jpg',
       mimeType: 'image/jpeg',
-      fileSizeBytes: minimalJpegWithExif.length,
+      sizeBytes: minimalJpegWithExif.length,
       contentBuffer: minimalJpegWithExif,
     });
     assert.ok(mediaReportView.text.includes('تقرير المختبر الجنائي للوسائط والصور'));

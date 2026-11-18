@@ -1531,20 +1531,8 @@ function syncSessionVideoSsrcWithDeviceJid(
 
   const sessionFlags = session as InstrumentedMediaSession & {
     mediaFlowStarted?: boolean;
-    __botezzRelaysConnected?: boolean;
-    acceptedByJid?: string | null;
   };
-
-  // NEVER mutate outbound `videoSsrc` or `videoRtpStream.ssrc` once relays are connected,
-  // call is accepted, or media flow has started — changing outbound SSRC after relay allocation
-  // causes the WhatsApp relay or remote phone to drop all subsequent video frames after Frame 1!
-  const outboundSsrcLocked = Boolean(
-    sessionFlags.mediaFlowStarted ||
-      sessionFlags.__botezzRelaysConnected ||
-      (sessionFlags.acceptedByJid &&
-        typeof session.videoSsrc === 'number' &&
-        session.videoSsrc >>> 0 !== 0)
-  );
+  const outboundSsrcLocked = Boolean(sessionFlags.mediaFlowStarted);
 
   const activeDeviceJid = session.selfSsrcJid || session.selfLid;
   if (
@@ -2006,12 +1994,27 @@ function buildRtcpPliPacket(senderSsrc: number, mediaSsrc: number): Uint8Array {
 
 function syncSessionVideoSrtpTemplates(session: any): void {
   if (!session || typeof session !== 'object') return;
-  syncReceiveOnlySrtpOnMediaSession(session);
 
-  const templates: any[] = [];
   const audioRecvCtx = session.srtpSession?.recvCtx;
   const audioSendCtx = session.srtpSession?.sendCtx;
 
+  if (
+    audioRecvCtx &&
+    audioRecvCtx.sessionKey instanceof Uint8Array &&
+    audioRecvCtx.sessionSalt instanceof Uint8Array &&
+    audioRecvCtx.authKey instanceof Uint8Array
+  ) {
+    session.__peerRecvCtx = {
+      sessionKey: audioRecvCtx.sessionKey,
+      sessionSalt: audioRecvCtx.sessionSalt,
+      authKey: audioRecvCtx.authKey,
+      authTagLen: audioRecvCtx.authTagLen ?? 4,
+    };
+  } else {
+    syncReceiveOnlySrtpOnMediaSession(session);
+  }
+
+  const templates: any[] = [];
   if (audioRecvCtx) {
     templates.push(cloneSrtpRecvContext(audioRecvCtx));
   }
@@ -2057,8 +2060,16 @@ function syncSessionVideoSrtpTemplates(session: any): void {
   }
 
   if (templates.length > 0) {
-    session._videoRecvTemplates = templates.filter(Boolean);
-    session._videoRecvBySsrc = new Map<number, any[]>();
+    const newHex = templates
+      .map((t: any) =>
+        t?.sessionKey ? Buffer.from(t.sessionKey).toString('hex') : ''
+      )
+      .join('|');
+    if (session._videoRecvTemplatesHex !== newHex) {
+      session._videoRecvTemplatesHex = newHex;
+      session._videoRecvTemplates = templates.filter(Boolean);
+      session._videoRecvBySsrc = new Map<number, any[]>();
+    }
   }
 }
 
@@ -2251,10 +2262,47 @@ export function sendProactiveVideoStateAndPli(session: any): void {
     Boolean(session.peerVideoActive);
   if (!isVideo) return;
 
-  // CRITICAL: Do NOT send an unsolicited `<call><video state="1" dec="H264" device_orientation="0"/></call>`
-  // stanza here! Sending `state="1"` without `enc="h.264"` causes the remote WhatsApp phone to mark
-  // our outbound video encoder as disabled/reset and freeze outbound video on Frame 1.
-  // Only send RTCP PLI over `sctpRelay` to request inbound keyframes from the peer's camera.
+  const peerJid =
+    session.acceptedByJid || session.info?.peerJid || session.peerJid;
+  const callId = session.info?.callId || session.callId;
+  const callCreator =
+    session.info?.callCreator || session.selfSsrcJid || session.selfLid;
+
+  if (
+    !session._botezzSentVideoStateEnabled &&
+    peerJid &&
+    callId &&
+    callCreator &&
+    typeof session.deps?.lowLevelCoordinator?.sendNode === 'function'
+  ) {
+    session._botezzSentVideoStateEnabled = true;
+    const videoNode = {
+      tag: 'call',
+      attrs: {
+        to: peerJid,
+        id: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+      },
+      content: [
+        {
+          tag: 'video',
+          attrs: {
+            'call-id': callId,
+            'call-creator': callCreator,
+            state: '1',
+            enc: 'h.264',
+            dec: 'H264',
+            screen_width: '640',
+            screen_height: '360',
+            device_orientation: '0',
+          },
+        },
+      ],
+    };
+    Promise.resolve(
+      session.deps.lowLevelCoordinator.sendNode(videoNode)
+    ).catch(() => {});
+  }
+
   const sendPliBurst = () => {
     try {
       if (!session.sctpRelay?.hasConnection?.()) return;
@@ -2352,7 +2400,7 @@ function attachPassiveNativeMediaSessionTaps(
     }
   }
 
-  if (Object.prototype.hasOwnProperty.call(target, '__botezzPassiveTapApplied')) {
+  if (target.__botezzPassiveTapApplied) {
     return;
   }
   Object.defineProperty(target, '__botezzPassiveTapApplied', {
@@ -2374,8 +2422,7 @@ function attachPassiveNativeMediaSessionTaps(
       const res = await origAccept.apply(this, args);
       try {
         const peerJidArg = typeof args[1] === 'string' ? args[1] : undefined;
-        // Do NOT call syncSessionVideoSsrcWithDeviceJid(this) here after accept;
-        // outbound videoSsrc must never be mutated after relay setup.
+        syncSessionVideoSsrcWithDeviceJid(this);
         syncSessionVideoSrtpTemplates(this);
         computeAndSubscribePeerSsrcs(this, peerJidArg);
         (
@@ -2576,7 +2623,12 @@ function attachPassiveNativeMediaSessionTaps(
     ) {
       const selfAny = this as any;
       try {
-        if (!selfAny.__peerRecvCtx?.sessionKey) {
+        if (
+          !selfAny._videoRecvTemplates ||
+          selfAny._videoRecvTemplates.length === 0 ||
+          (selfAny.srtpSession?.recvCtx?.sessionKey instanceof Uint8Array &&
+            selfAny.__peerRecvCtx?.sessionKey !== selfAny.srtpSession.recvCtx.sessionKey)
+        ) {
           syncSessionVideoSrtpTemplates(selfAny);
         }
         const packet = data instanceof Uint8Array ? data : null;
@@ -2637,7 +2689,12 @@ function attachPassiveNativeMediaSessionTaps(
     ) {
       const selfAny = this as any;
       try {
-        if (!selfAny.__peerRecvCtx?.sessionKey) {
+        if (
+          !selfAny._videoRecvTemplates ||
+          selfAny._videoRecvTemplates.length === 0 ||
+          (selfAny.srtpSession?.recvCtx?.sessionKey instanceof Uint8Array &&
+            selfAny.__peerRecvCtx?.sessionKey !== selfAny.srtpSession.recvCtx.sessionKey)
+        ) {
           syncSessionVideoSrtpTemplates(selfAny);
         }
 
@@ -2722,7 +2779,7 @@ export function instrumentMediaSessionInstance(
     (session as { constructor?: { name?: string } }).constructor?.name ===
     'WaCallMediaSession';
   if (isNativeWaCallMediaSession) {
-    syncReceiveOnlySrtpOnMediaSession(session);
+    syncSessionVideoSrtpTemplates(session);
     syncSessionVideoSsrcWithDeviceJid(session);
     if (Object.prototype.hasOwnProperty.call(session, '__botezzInstrumented')) {
       return session;
@@ -3877,8 +3934,13 @@ export function patchWaVideoEnginePrototype(proto: any): void {
       }
 
       if (this.currentIndex >= this.nalUnits.length) {
-        if (this.videoLoop === false) {
+        if (this.videoLoop === false || this.loop === false) {
           this.stopStreaming?.();
+          try {
+            this._botezzOnPlaybackCompleted?.();
+          } catch {
+            // Ignore completion callback error
+          }
           return;
         }
         this.currentIndex = 0;

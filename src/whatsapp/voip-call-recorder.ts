@@ -977,7 +977,7 @@ export function syncPeerRecvKeysOnMediaSession(
     }
   }
 
-  const primaryRecv = s.__peerRecvCtx ?? s.srtpSession?.recvCtx;
+  const primaryRecv = s.srtpSession?.recvCtx ?? s.__peerRecvCtx;
   const videoRecv = s.videoSrtpSession?.recvCtx;
   if (
     primaryRecv &&
@@ -1807,6 +1807,16 @@ export class VoipCallRecorder {
       return true;
     }
     session.__botezzRecorderAttached = this;
+
+    const isNativeTappedSession =
+      Boolean((session as { __botezzPassiveTapApplied?: boolean }).__botezzPassiveTapApplied) &&
+      (session as { constructor?: { name?: string } }).constructor?.name ===
+        'WaCallMediaSession';
+
+    if (isNativeTappedSession) {
+      this.startPliWatchdog();
+      return true;
+    }
 
     // 1. Wrap `onRelayData` to sync receive keys and inspect packets if native videoAssembler did not handle them
     const origOnRelayData =
